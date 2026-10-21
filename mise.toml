@@ -1,0 +1,6 @@
+[tools]
+node = "22"
+pnpm = "10.33.0"
+java = "temurin-21"
+clojure = "latest"
+opentofu = "1.10"
