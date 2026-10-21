@@ -27,17 +27,17 @@ jobs:
     env:
       UPSTREAM_REF_INPUT: ${{ inputs.upstream_ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: jdx/mise-action@v2.4.4
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.m2
             ~/.gitlibs
             ~/.local/share/pnpm/store
-            .upstream/deps/db-sync/.shadow-cljs
+            .cache/shadow-cljs
           key: upstream-build-${{ inputs.upstream_ref || hashFiles('UPSTREAM_REF') }}
           restore-keys: |
             upstream-build-
@@ -48,13 +48,23 @@ jobs:
           npm test
 
       - name: Fetch patched upstream
-        run: scripts/fetch-upstream.sh .upstream "$UPSTREAM_REF_INPUT"
+        run: |
+          scripts/fetch-upstream.sh .upstream "$UPSTREAM_REF_INPUT"
+          if [ -d .cache/shadow-cljs ]; then
+            cp -a .cache/shadow-cljs .upstream/deps/db-sync/.shadow-cljs
+          fi
 
       - name: Check upstream bindings
         run: node scripts/check-upstream-bindings.mjs .upstream/deps/db-sync/worker/wrangler.toml
 
       - name: Build
-        run: scripts/build.sh .upstream
+        run: |
+          scripts/build.sh .upstream
+          rm -rf .cache/shadow-cljs
+          if [ -d .upstream/deps/db-sync/.shadow-cljs ]; then
+            mkdir -p .cache
+            cp -a .upstream/deps/db-sync/.shadow-cljs .cache/shadow-cljs
+          fi
 
       - name: Render and dry-run deploy for both plans
         run: |
@@ -74,6 +84,9 @@ jobs:
           done
 
       - name: OpenTofu format and validate
+        env:
+          TF_VAR_tofu_encryption_passphrase: ci-dummy-passphrase-not-a-secret
+          TF_VAR_cloudflare_account_id: "00000000000000000000000000000000"
         run: |
           tofu -chdir=infra fmt -check -recursive
           tofu -chdir=infra init -backend=false -input=false

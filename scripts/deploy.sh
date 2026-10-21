@@ -15,12 +15,17 @@ wrangler="$repo_root/$upstream/deps/db-sync/node_modules/.bin/wrangler"
 settings="config/settings.json"
 
 setting() {
-  node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]]))' "$settings" "$1"
+  node -e '
+    const value = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]];
+    if (typeof value !== "string" || value === "") { console.error("missing setting: " + process.argv[2]); process.exit(1); }
+    process.stdout.write(value);
+  ' "$settings" "$1"
 }
 plan="$(setting plan)"
 hostname="$(setting hostname)"
 d1_name="$(setting d1DatabaseName)"
 
+trap 'rm -f tofu-output.json' EXIT
 tofu -chdir=infra output -json > tofu-output.json
 
 node scripts/render-wrangler.mjs \
@@ -36,7 +41,7 @@ cd "$worker_dir"
 
 umask 077
 secrets_file="$(mktemp)"
-trap 'rm -f "$secrets_file"' EXIT
+trap 'rm -f "$secrets_file" "$repo_root/tofu-output.json"' EXIT
 node -e '
   const { ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN } = process.env;
   require("fs").writeFileSync(process.argv[1], JSON.stringify({ ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN }));

@@ -9,3 +9,4 @@ infra/backend.hcl
 tofu-output.json
 *.tfstate
 *.tfstate.*
+.cache/
