@@ -11,9 +11,26 @@ function must(value, what) {
   return value;
 }
 
+const FORBIDDEN_TOP_LEVEL = [
+  "kv_namespaces", "queues", "services", "hyperdrive", "vectorize",
+  "account_id", "route", "routes",
+];
+
+// Upstream's account-scoped bindings must be exactly the one we rewrite; anything else
+// would carry upstream (Logseq account) resource ids into our config.
+function exactlyOne(list, binding, table) {
+  if (!Array.isArray(list) || list.length !== 1 || list[0].binding !== binding) {
+    throw new Error(`${table} must contain exactly one binding: ${binding}`);
+  }
+  return list[0];
+}
+
 export function renderWrangler({ upstreamToml, settings, tofuOutputs }) {
   const cfg = parse(upstreamToml);
   delete cfg.env;
+  for (const key of FORBIDDEN_TOP_LEVEL) {
+    if (key in cfg) throw new Error(`forbidden top-level key: ${key}`);
+  }
 
   cfg.name = must(settings.workerName, "settings.workerName");
   cfg.workers_dev = false;
@@ -22,26 +39,19 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs }) {
     { pattern: must(settings.hostname, "settings.hostname"), custom_domain: true },
   ];
 
-  for (const b of cfg.r2_buckets ?? []) {
-    if (b.binding === "LOGSEQ_SYNC_ASSETS") {
-      b.bucket_name = must(settings.assetsBucket, "settings.assetsBucket");
-    }
-  }
+  const r2 = exactlyOne(cfg.r2_buckets, "LOGSEQ_SYNC_ASSETS", "r2_buckets");
+  r2.bucket_name = must(settings.assetsBucket, "settings.assetsBucket");
 
   const databaseId = must(tofuOutputs?.d1_database_id, "d1_database_id");
-  for (const b of cfg.d1_databases ?? []) {
-    if (b.binding === "DB") {
-      b.database_name = must(settings.d1DatabaseName, "settings.d1DatabaseName");
-      b.database_id = databaseId;
-    }
-  }
+  const d1 = exactlyOne(cfg.d1_databases, "DB", "d1_databases");
+  d1.database_name = must(settings.d1DatabaseName, "settings.d1DatabaseName");
+  d1.database_id = databaseId;
 
   for (const r of cfg.ratelimits ?? []) {
-    const id = settings.rateLimitNamespaces?.[r.name];
-    if (id === undefined) {
-      throw new Error(`missing rateLimitNamespaces entry: ${r.name}`);
-    }
-    r.namespace_id = id;
+    r.namespace_id = must(
+      settings.rateLimitNamespaces?.[r.name],
+      `rateLimitNamespaces entry: ${r.name}`,
+    );
   }
 
   if (settings.plan === "free") {

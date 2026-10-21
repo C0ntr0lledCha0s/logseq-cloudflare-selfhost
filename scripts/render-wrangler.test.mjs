@@ -101,3 +101,66 @@ test("unknown rate limiter throws", () => {
 test("missing d1_database_id throws", () => {
   assert.throws(() => render({ tofuOutputs: {} }), /d1_database_id/);
 });
+
+test("rendered output contains no upstream account identifiers", () => {
+  const up = parse(fixture);
+  const sections = [up, ...Object.values(up.env)];
+  const ours = new Set(["1001", "1002"]);
+  const leaks = new Set();
+  for (const s of sections) {
+    for (const b of s.r2_buckets ?? []) leaks.add(b.bucket_name);
+    for (const d of s.d1_databases ?? []) {
+      leaks.add(d.database_name);
+      leaks.add(d.database_id);
+    }
+    for (const r of s.ratelimits ?? []) {
+      if (!ours.has(r.namespace_id)) leaks.add(r.namespace_id);
+    }
+  }
+  assert.ok(leaks.size >= 6);
+  for (const plan of ["free", "paid"]) {
+    const text = renderWrangler({
+      upstreamToml: fixture,
+      settings: { ...settings, plan },
+      tofuOutputs,
+    });
+    for (const id of leaks) {
+      assert.equal(text.includes(`"${id}"`), false, `${plan} leaks ${id}`);
+    }
+  }
+});
+
+test("renamed, missing or extra r2/d1 bindings throw", () => {
+  const swap = (from, to) => fixture.replace(from, to);
+  assert.throws(
+    () => render({ upstreamToml: swap('binding = "LOGSEQ_SYNC_ASSETS"\nbucket_name = "logseq-sync-assets-prod"', 'binding = "RENAMED"\nbucket_name = "logseq-sync-assets-prod"') }),
+    /exactly one binding: LOGSEQ_SYNC_ASSETS/,
+  );
+  assert.throws(
+    () => render({ upstreamToml: swap('binding = "DB"\ndatabase_name', 'binding = "OTHER"\ndatabase_name') }),
+    /exactly one binding: DB/,
+  );
+  const extraR2 = fixture.replace("[[d1_databases]]", '[[r2_buckets]]\nbinding = "X"\nbucket_name = "x"\n\n[[d1_databases]]');
+  assert.throws(() => render({ upstreamToml: extraR2 }), /r2_buckets/);
+  const extraD1 = fixture.replace("[[migrations]]", '[[d1_databases]]\nbinding = "X"\ndatabase_name = "x"\ndatabase_id = "y"\n\n[[migrations]]');
+  assert.throws(() => render({ upstreamToml: extraD1 }), /d1_databases/);
+});
+
+test("account-scoped top-level keys throw", () => {
+  const cases = {
+    kv_namespaces: '[[kv_namespaces]]\nbinding = "KV"\nid = "x"\n\n',
+    queues: '[[queues.producers]]\nbinding = "Q"\nqueue = "q"\n\n',
+    services: '[[services]]\nbinding = "S"\nservice = "s"\n\n',
+    hyperdrive: '[[hyperdrive]]\nbinding = "H"\nid = "h"\n\n',
+    vectorize: '[[vectorize]]\nbinding = "V"\nindex_name = "v"\n\n',
+    account_id: null,
+    route: null,
+    routes: null,
+  };
+  for (const [key, block] of Object.entries(cases)) {
+    const toml = block
+      ? block + fixture
+      : `${key} = ${key === "routes" ? '["a.example.com"]' : '"x"'}\n` + fixture;
+    assert.throws(() => render({ upstreamToml: toml }), new RegExp(`forbidden top-level key: ${key}`), key);
+  }
+});
