@@ -10,7 +10,6 @@ const script = join(root, "scripts", "smoke-test.sh");
 
 const healthy = (req, res) => {
   const { method, url } = req;
-  const authed = Boolean(req.headers.authorization);
   const reply = (code, body = "") => {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(body);
@@ -18,7 +17,7 @@ const healthy = (req, res) => {
   if (method === "GET" && url === "/health") return reply(200, '{"ok":true}');
   if (method === "GET" && url === "/openapi.json") return reply(200, "{}");
   if (method === "GET" && url === "/api/v1/graphs") {
-    return authed && req.headers.authorization === "Bearer logseq_pat_secret"
+    return req.headers.authorization === "Bearer logseq_pat_secret"
       ? reply(200, "[]")
       : reply(401, "{}");
   }
@@ -26,20 +25,21 @@ const healthy = (req, res) => {
   return reply(404);
 };
 
-async function withStub(handler, args, fn) {
+async function withStub(handler, fn) {
   const server = createServer(handler);
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
     return await fn(base);
   } finally {
+    server.closeAllConnections?.();
     await new Promise((r) => server.close(r));
   }
 }
 
-function run(base, env = {}) {
-  return new Promise((resolveRun) => {
-    const child = spawn(script, [base], {
+function spawnScript(args, env = {}) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(script, args, {
       cwd: root,
       env: { ...process.env, SMOKE_PAT: "", PLAN: "", ...env },
     });
@@ -47,12 +47,15 @@ function run(base, env = {}) {
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
     child.on("close", (status) => resolveRun({ status, stdout, stderr }));
   });
 }
 
-test("passes against a healthy stub", async () => {
-  await withStub(healthy, null, async (base) => {
+const run = (base, env) => spawnScript([base], env);
+
+test("passes against a healthy stub", { timeout: 120000 }, async () => {
+  await withStub(healthy, async (base) => {
     const r = await run(base + "/");
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^ok health$/m);
@@ -62,28 +65,28 @@ test("passes against a healthy stub", async () => {
   });
 });
 
-test("fails when unauthenticated graphs list is 200", async () => {
+test("fails when unauthenticated graphs list is 200", { timeout: 120000 }, async () => {
   const h = (req, res) =>
     req.url === "/api/v1/graphs" ? (res.writeHead(200), res.end("[]")) : healthy(req, res);
-  await withStub(h, null, async (base) => {
+  await withStub(h, async (base) => {
     const r = await run(base);
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAIL unauthenticated-graphs: 200/);
   });
 });
 
-test("fails when health body is wrong", async () => {
+test("fails when health body is wrong", { timeout: 120000 }, async () => {
   const h = (req, res) =>
     req.url === "/health" ? (res.writeHead(200), res.end('{"ok":false}')) : healthy(req, res);
-  await withStub(h, null, async (base) => {
+  await withStub(h, async (base) => {
     const r = await run(base);
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAIL health: body/);
   });
 });
 
-test("never prints the PAT and checks it", async () => {
-  await withStub(healthy, null, async (base) => {
+test("never prints the PAT and checks it", { timeout: 120000 }, async () => {
+  await withStub(healthy, async (base) => {
     const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^ok pat-graphs$/m);
@@ -91,12 +94,12 @@ test("never prints the PAT and checks it", async () => {
   });
 });
 
-test("fails when the PAT is rejected without leaking it", async () => {
+test("fails when the PAT is rejected without leaking it", { timeout: 120000 }, async () => {
   const h = (req, res) =>
     req.url === "/api/v1/graphs" && req.headers.authorization
       ? (res.writeHead(403), res.end("{}"))
       : healthy(req, res);
-  await withStub(h, null, async (base) => {
+  await withStub(h, async (base) => {
     const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAIL pat-graphs: 403/);
@@ -104,41 +107,35 @@ test("fails when the PAT is rejected without leaking it", async () => {
   });
 });
 
-test("paid plan checks /mcp is 401", async () => {
-  await withStub(healthy, null, async (base) => {
+test("paid plan checks /mcp is 401", { timeout: 120000 }, async () => {
+  await withStub(healthy, async (base) => {
     const r = await run(base, { PLAN: "paid" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /^ok mcp-unauthenticated$/m);
   });
   const h = (req, res) =>
     req.url === "/mcp" ? (res.writeHead(404), res.end()) : healthy(req, res);
-  await withStub(h, null, async (base) => {
+  await withStub(h, async (base) => {
     const r = await run(base, { PLAN: "paid" });
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAIL mcp-unauthenticated: 404/);
   });
 });
 
-test("connection refused is a FAIL, not a crash", async () => {
+test("connection refused is a FAIL, not a crash", { timeout: 120000 }, async () => {
   const r = await run("http://127.0.0.1:1");
   assert.equal(r.status, 1);
   assert.match(r.stdout, /FAIL health: 000/);
 });
 
-test("rejects an invalid PLAN with exit 2", async () => {
+test("rejects an invalid PLAN with exit 2", { timeout: 120000 }, async () => {
   const r = await run("http://127.0.0.1:1", { PLAN: "enterprise" });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /usage/i);
 });
 
-test("requires a base url", async () => {
-  const r = await new Promise((res) => {
-    const c = spawn(script, [], { cwd: root });
-    let stderr = "";
-    c.stderr.on("data", (d) => (stderr += d));
-    c.on("error", (e) => res({ status: -1, stderr: String(e) }));
-    c.on("close", (status) => res({ status, stderr }));
-  });
+test("requires a base url", { timeout: 120000 }, async () => {
+  const r = await spawnScript([]);
   assert.equal(r.status, 2);
   assert.match(r.stderr, /usage/i);
 });
