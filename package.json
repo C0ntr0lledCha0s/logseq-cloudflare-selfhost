@@ -5,7 +5,7 @@
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test \"scripts/*.test.mjs\""
   },
   "dependencies": {
     "smol-toml": "^1.9.1"
