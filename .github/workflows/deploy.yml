@@ -1,0 +1,81 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      ASSET_LINK_SECRET: ${{ secrets.ASSET_LINK_SECRET }}
+      DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
+      SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2.4.4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            ~/.local/share/pnpm/store
+            .upstream/deps/db-sync/.shadow-cljs
+          key: upstream-build-${{ hashFiles('UPSTREAM_REF') }}
+
+      - run: npm ci
+
+      - name: Write backend config
+        run: |
+          cat > infra/backend.hcl <<HCL
+          bucket = "logseq-selfhost-tofu-state"
+          key    = "logseq-sync/terraform.tfstate"
+
+          endpoints = {
+            s3 = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          }
+
+          region = "auto"
+
+          skip_credentials_validation = true
+          skip_region_validation      = true
+          skip_requesting_account_id  = true
+          skip_metadata_api_check     = true
+          skip_s3_checksum            = true
+
+          use_path_style = true
+          HCL
+
+      - name: Tofu init
+        run: tofu -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Tofu apply
+        run: tofu -chdir=infra apply -auto-approve -input=false
+
+      - name: Fetch, check and build upstream
+        run: |
+          scripts/fetch-upstream.sh .upstream
+          node scripts/check-upstream-bindings.mjs .upstream/deps/db-sync/worker/wrangler.toml
+          scripts/build.sh .upstream
+
+      - name: Deploy
+        run: scripts/deploy.sh
