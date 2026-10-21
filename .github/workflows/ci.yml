@@ -72,9 +72,11 @@ jobs:
           echo '{"d1_database_id":{"value":"00000000-0000-0000-0000-000000000000"}}' > "$placeholder"
           worker_dir="$PWD/.upstream/deps/db-sync/worker"
           wrangler="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler"
+          pristine="$RUNNER_TEMP/upstream-wrangler.toml"
+          cp "$worker_dir/wrangler.toml" "$pristine"
           for plan in free paid; do
             node scripts/render-wrangler.mjs \
-              --upstream "$worker_dir/wrangler.toml" \
+              --upstream "$pristine" \
               --settings config/settings.json \
               --tofu-outputs "$placeholder" \
               --out "$RUNNER_TEMP/wrangler.$plan.toml" \

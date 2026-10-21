@@ -28,8 +28,12 @@ d1_name="$(setting d1DatabaseName)"
 trap 'rm -f tofu-output.json' EXIT
 tofu -chdir=infra output -json > tofu-output.json
 
+# Keep a pristine copy (saved once, first run) so re-runs in the same checkout never
+# treat a rendered file as the upstream input.
+pristine="$worker_dir/wrangler.upstream.toml"
+[ -e "$pristine" ] || cp "$worker_dir/wrangler.toml" "$pristine"
 node scripts/render-wrangler.mjs \
-  --upstream "$worker_dir/wrangler.toml" \
+  --upstream "$pristine" \
   --settings "$settings" \
   --tofu-outputs tofu-output.json \
   --out "$worker_dir/wrangler.toml" \
