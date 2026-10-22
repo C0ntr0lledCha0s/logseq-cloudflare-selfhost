@@ -61,7 +61,7 @@ eval "$(mise activate bash)"   # or zsh; puts node, pnpm, tofu, rclone on PATH
 npm ci
 ```
 
-The commands below assume mise is activated in your shell. Where a command runs through `scripts/with-r2-credentials.sh`, the wrapper itself needs `node` and `curl` on `PATH`.
+The commands below assume mise is activated in your shell. `mise activate` only works in interactive shells. In scripts or other non-interactive shells, prefix commands with `mise exec --` instead, as several examples below do. Where a command runs through `scripts/with-r2-credentials.sh`, the wrapper itself needs `node` and `curl` on `PATH`.
 
 ## 0. Install nightly Logseq on every device
 
@@ -281,16 +281,20 @@ If you want the authenticated smoke check, store the PAT as `SMOKE_PAT`: in `.en
 
 **Fallback without the tab.** You can create a PAT over HTTP using the Cognito ID token from a signed-in client. Find it in the desktop or web devtools: Application → Local Storage → `id-token`. Then:
 
+The token goes to curl as a config file on stdin (`-K -`), so it never appears in the process list (`ps`). The repo's scripts do the same.
+
 ```bash
 read -rs ID_TOKEN   # paste the id-token, then Enter
 
 # Find the graph's id
-curl -H "Authorization: Bearer $ID_TOKEN" https://sync.example.com/graphs
+printf 'header = "Authorization: Bearer %s"\n' "$ID_TOKEN" |
+  curl -sS -K - https://sync.example.com/graphs
 
 # Create the token (expires-at is optional; the default and maximum is one year)
-curl -X POST https://sync.example.com/api/v1/personal-access-tokens \
-  -H "Authorization: Bearer $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"graph-id":"…","permission":"both"}'
+printf 'header = "Authorization: Bearer %s"\n' "$ID_TOKEN" |
+  curl -sS -K - -X POST https://sync.example.com/api/v1/personal-access-tokens \
+    -H 'content-type: application/json' \
+    -d '{"graph-id":"…","permission":"both"}'
 ```
 
 Two more calls on the same path, both with the ID token:
@@ -311,8 +315,11 @@ In the cloud environment the remote session runs in:
 Check access from the session:
 
 ```bash
-curl -H "Authorization: Bearer $LOGSEQ_PAT" "$LOGSEQ_BASE_URL/api/v1/graphs"
+printf 'header = "Authorization: Bearer %s"\n' "$LOGSEQ_PAT" |
+  curl -sS -K - "$LOGSEQ_BASE_URL/api/v1/graphs"
 ```
+
+The shorter `curl -H "Authorization: Bearer $LOGSEQ_PAT" "$LOGSEQ_BASE_URL/api/v1/graphs"` also works. The trade-off is that it puts the token on the command line, where other processes in the environment can see it in `ps`.
 
 `GET $LOGSEQ_BASE_URL/openapi.json` describes all operations. Rate limits are 120 reads and 20 writes per minute per token.
 
@@ -354,7 +361,7 @@ $W versions list --name logseq-sync
 $W rollback <version-id> --name logseq-sync -m "roll back upstream bump"
 ```
 
-**Rolling back the database.** If a migration went wrong, restore D1 with Time Travel. It covers 7 days on Free and 30 on Paid:
+**Rolling back the database.** If a migration went wrong, restore D1 with Time Travel. It covers 7 days on Free and 30 on Paid. These commands haven't been exercised on this setup yet. Pass the database name explicitly, as here, or run them from `.upstream/deps/db-sync/worker`, where the rendered `wrangler.toml` lives:
 
 ```bash
 $W d1 time-travel info logseq-sync-index --timestamp 2026-10-21T12:00:00Z
@@ -383,7 +390,10 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
 **Restore:**
 
 - **Graphs.** The real restore path is re-uploading the graph from a desktop client, which holds a full local copy. Upstream has no tool that imports a snapshot back into a Durable Object. The snapshots are SQLite files for inspection and last-resort recovery.
-- **D1.** Use Time Travel (section 6) within its window. Beyond that, load an `index.sql` export into a fresh, empty D1 database with `wrangler d1 execute <database> --remote --file index.sql`. The export contains the schema, so it won't load over the existing tables.
+- **D1.** Prefer Time Travel (section 6) while it's within its window. Treat the `index.sql` export as a last resort, and note that this path hasn't been exercised yet:
+  - The export contains the schema, so it won't load over the existing tables. You'd load it into a fresh, empty database with `wrangler d1 execute <new-database> --remote --file index.sql`.
+  - That new database has a new ID, which OpenTofu doesn't manage and the deploy doesn't point at.
+  - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
 - **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials.
 
 **Limits.** Backups live in the same Cloudflare account. If you lose the account, only your clients' local copies remain. An off-account copy is on the backlog.
@@ -440,7 +450,7 @@ MCP on this server hasn't been verified end to end yet. To go back, set `"plan":
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
 | `429 rate limit exceeded` | The per-token limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
-| Smoke test `FAIL health 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
+| Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
 
 ## Backlog
 
