@@ -66,4 +66,7 @@ Pending.
 
 ## S5 — Nightly clients against the pinned server
 
-Pending.
+**Result: pass on desktop, web and Android.**
+
+- The desktop nightly (`2.0.2-alpha+nightly.20261021`), the web app and the Android nightly APK from the same release all sync against the server built from the pinned upstream commit.
+- No iOS nightly build exists, so iOS is untested. The App Store release predates PATs.
