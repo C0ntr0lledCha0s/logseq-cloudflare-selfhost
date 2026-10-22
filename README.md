@@ -220,9 +220,11 @@ The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the s
 If `.env.local` already exists, load it as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments:
 
 ```bash
+repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # run inside this checkout
+echo "Pushing to $repo"
 for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE \
             ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME; do
-  printf '%s' "${!name}" | gh secret set "$name" --env production
+  printf '%s' "${!name}" | gh secret set "$name" --env production -R "$repo"
 done
 ```
 
