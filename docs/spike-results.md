@@ -39,7 +39,14 @@ Run on the owner's Cloudflare account, Workers Free plan, on 2026-10-22, against
 - **Creating the PAT works.** A nightly desktop build (`2.0.2-alpha+nightly.20261021`) created a `logseq_pat_` token against the self-hosted server, with permission `both`. That proves the PAT-gate patch: the unpatched server would have refused this account.
 - **The REST API works on Free.** `GET /api/v1/graphs` with the PAT returned 200, and the full smoke test passed (`health`, `openapi`, `unauthenticated-graphs`, `pat-graphs`).
 - **Rate-limit bindings work on Free.** There was no `503 rate limiter unavailable`.
-- **Note:** the first graph synced was end-to-end encrypted (`graph-e2ee? true`). REST reads and writes on an E2EE graph need client-side encryption. Agent use needs a graph created **without** encryption.
+- **Side-by-side read test.** Each graph has its own PAT, and both contain a "Hello World" block:
+
+  | | E2EE graph | Unencrypted graph |
+  |---|---|---|
+  | `listPages` | Titles come back as `[iv ciphertext]` packages. Journal page titles stay plaintext. | Plaintext titles |
+  | `searchGraph` "Hello World" | 0 results: the server only holds ciphertext | 1 result: the block, with its uuid, page id and order |
+
+- **Conclusion:** an unencrypted graph works directly for agent use. An E2EE graph needs client-side decryption (see the backlog item for a client-side MCP), and server-side search can never match its text.
 
 ## S3 — Real graph within Free CPU limits
 
