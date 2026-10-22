@@ -41,7 +41,7 @@ Your graph content is not sent to Logseq. The patched server no longer calls `ap
 
 | Plan | Price | Notes |
 |---|---|---|
-| Workers Free (default) | $0 within the free allowances | Verified working, including the REST API and its rate limiters. Daily caps include 100k Worker requests, 100k D1 row writes and 5M D1 row reads. The front Worker gets 10 ms CPU per request. D1 Time Travel covers 7 days. |
+| Workers Free (default) | $0 within the free allowances | Verified working, including the REST API and its rate limiters. Daily caps include 100k Worker requests, 100k D1 row writes and 5M D1 row reads. The front Worker gets 10 ms CPU per request. In testing, the median request used 2.6 ms and the slowest 1% used up to 92 ms, but Cloudflare didn't reject them. Larger imports may hit the limit (see Troubleshooting). D1 Time Travel covers 7 days. |
 | Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s) and enables MCP (Worker Loader). D1 Time Travel covers 30 days. |
 
 R2 is billed separately. It has a monthly free tier, but Cloudflare asks for a payment method before you can enable it. Check Cloudflare's current pricing pages for the exact allowances.
@@ -230,7 +230,7 @@ done
 
 ## 2. First deploy
 
-You can deploy either from your machine (verified) or from GitHub Actions (**not yet verified**). Both run the same script, `scripts/deploy.sh`, which:
+You can deploy either from your machine or from GitHub Actions; both have been verified. Both run the same script, `scripts/deploy.sh`, which:
 
 1. reads the OpenTofu outputs (the D1 database ID);
 2. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`);
@@ -247,7 +247,7 @@ scripts/with-r2-credentials.sh mise exec -- scripts/deploy.sh
 
 **A local deploy ships whatever is in your `.upstream` checkout.** After merging a bump PR, run `rm -rf .upstream` and redo 1.5 before deploying locally, or you'll roll the server back to the older upstream commit.
 
-**From GitHub Actions (not yet verified):** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow). The workflow runs `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`.
+**From GitHub Actions:** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow). The workflow runs `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`.
 
 A passing smoke test prints:
 
@@ -393,7 +393,7 @@ $W d1 time-travel restore logseq-sync-index --timestamp 2026-10-21T12:00:00Z
 
 ## 7. Backups and restore
 
-`backup.yml` runs daily at 14:00 UTC, and on demand. **The first scheduled or dispatched run has not been verified yet:** run it once from Actions → backup → Run workflow and check the result. It uses the `production` environment and writes to `logseq-sync-backups/<YYYY-MM-DD>/`:
+`backup.yml` runs daily at 14:00 UTC, and on demand (Actions → backup → Run workflow). A dispatched run has been verified: it printed `backup: d1=ok graphs=2/2 assets=ok`. It uses the `production` environment and writes to `logseq-sync-backups/<YYYY-MM-DD>/`:
 
 | What | How | Where |
 |---|---|---|
@@ -421,7 +421,7 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
 
 **Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop both the daily backup and the weekly bump. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml` and `gh workflow enable bump-upstream.yml`. Check occasionally that the latest runs are recent.
 
-**First-run risk.** If rclone gets a 403 on its bucket check, set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. This is unverified: it is the usual fix for R2 tokens that can't list buckets, but it hasn't been tried here.
+**If rclone gets a 403 on its bucket check,** set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. That's the usual fix for R2 tokens that can't list buckets. The verified setup didn't need it, because the token from 1.1 can list buckets.
 
 **Limits.** Backups live in the same Cloudflare account. If you lose the account, only your clients' local copies remain. An off-account copy is on the backlog.
 
@@ -478,7 +478,7 @@ MCP on this server hasn't been verified end to end yet. To go back, set `"plan":
 | `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
 | Backups or the weekly bump stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` (section 7). |
-| Backup fails with 403 on the bucket check | Unverified fix: set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7). |
+| Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
 | Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |

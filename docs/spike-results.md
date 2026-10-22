@@ -55,7 +55,31 @@ Run on the owner's Cloudflare account, Workers Free plan, on 2026-10-22, against
 
 ## S3 — Real graph within Free CPU limits
 
-Pending.
+**Result: pass, with a margin warning.**
+
+The 24 hours covered real use plus a graph import. Data comes from the GraphQL Analytics API (`workersInvocationsAdaptive` and `durableObjectsInvocationsAdaptiveGroups`), which the deploy token can query.
+
+**Front Worker:**
+- 366 successful requests, 0 errors, and no CPU-limit or resource-limit outcomes.
+- 17 client and stream disconnects, which is normal when clients close sockets.
+- CPU per request: p50 2.6 ms, p99 50 ms, max 92 ms.
+
+**Durable Objects:** 150 successful requests, plus 7 client disconnects.
+
+**The margin warning:** the slowest 1% of front-Worker requests used 5–9× Free's nominal 10 ms CPU limit, but Cloudflare didn't reject them. Larger imports may start getting `exceededCpu` (error 1102) responses. If they do, switch to the paid plan.
+
+## First GitHub Actions runs
+
+- **`deploy.yml`:** passed on the merge to `main`.
+  - OpenTofu reported no changes.
+  - There were no migrations to apply.
+  - The new version deployed, with the custom domain masked as `***` in the log.
+  - The smoke test passed `health`, `openapi`, `unauthenticated-graphs` and `pat-graphs`.
+  - No account ID or other secret appeared in the log.
+- **`backup.yml`:** passed on a manual dispatch, printing `backup: d1=ok graphs=2/2 assets=ok`.
+  - The bucket now holds `<date>/index.sql`, two graph snapshots and `graphs/index.json`.
+  - rclone needed no `NO_CHECK_BUCKET` override.
+  - No graph IDs appeared in the log.
 
 ## S4 — R2 state locking
 
