@@ -102,5 +102,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           ASSET_LINK_SECRET: ${{ secrets.ASSET_LINK_SECRET }}
           DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
+          SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
         run: scripts/deploy.sh

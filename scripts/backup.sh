@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Usage: backup.sh <out-dir>   (expects .upstream fetched and `pnpm install` run in .upstream/deps/db-sync)
 # Env: WRANGLER (path to wrangler binary), CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
-#      DB_SYNC_ADMIN_TOKEN, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY. node and rclone come from PATH.
+#      DB_SYNC_ADMIN_TOKEN, SYNC_HOSTNAME, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY. node and rclone come from PATH.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_arg="${1:?usage: backup.sh <out-dir>}"
 : "${WRANGLER:?}" "${CLOUDFLARE_API_TOKEN:?}" "${CLOUDFLARE_ACCOUNT_ID:?}" "${DB_SYNC_ADMIN_TOKEN:?}"
-: "${R2_ACCESS_KEY_ID:?}" "${R2_SECRET_ACCESS_KEY:?}"
+: "${SYNC_HOSTNAME:?}" "${R2_ACCESS_KEY_ID:?}" "${R2_SECRET_ACCESS_KEY:?}"
 
 settings="$repo_root/config/settings.json"
 setting() {
@@ -17,7 +17,6 @@ setting() {
     process.stdout.write(value);
   ' "$settings" "$1"
 }
-hostname="$(setting hostname)"
 d1_name="$(setting d1DatabaseName)"
 assets_bucket="$(setting assetsBucket)"
 backups_bucket="$(setting backupsBucket)"
@@ -69,7 +68,7 @@ while IFS= read -r graph_id; do
   graphs_total=$n
   mapping="$mapping$n=$graph_id"$'\n'
   file="$out/graphs/$n.sqlite"
-  if node "$download_script" --base-url "https://$hostname" --graph-id "$graph_id" --output "$file" >> "$log" 2>&1 \
+  if node "$download_script" --base-url "https://$SYNC_HOSTNAME" --graph-id "$graph_id" --output "$file" >> "$log" 2>&1 \
     && put "$file" "graphs/$n.sqlite"; then
     graphs_ok=$((graphs_ok + 1))
   fi

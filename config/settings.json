@@ -1,4 +1,4 @@
-{"plan":"free","workerName":"logseq-sync","hostname":"sync.example.com",
+{"plan":"free","workerName":"logseq-sync",
  "d1DatabaseName":"logseq-sync-index","assetsBucket":"logseq-sync-assets","backupsBucket":"logseq-sync-backups",
  "backupRetentionDays":90,
  "rateLimitNamespaces":{"SEMANTIC_READ_RATE_LIMITER":"1001","SEMANTIC_WRITE_RATE_LIMITER":"1002"}}

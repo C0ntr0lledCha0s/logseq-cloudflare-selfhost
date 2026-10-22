@@ -25,7 +25,7 @@ function exactlyOne(list, binding, table) {
   return list[0];
 }
 
-export function renderWrangler({ upstreamToml, settings, tofuOutputs }) {
+export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }) {
   const cfg = parse(upstreamToml);
   delete cfg.env;
   for (const key of FORBIDDEN_TOP_LEVEL) {
@@ -36,7 +36,7 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs }) {
   cfg.workers_dev = false;
   cfg.preview_urls = false;
   cfg.routes = [
-    { pattern: must(settings.hostname, "settings.hostname"), custom_domain: true },
+    { pattern: must(hostname, "hostname"), custom_domain: true },
   ];
 
   const r2 = exactlyOne(cfg.r2_buckets, "LOGSEQ_SYNC_ASSETS", "r2_buckets");
@@ -82,12 +82,13 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       "tofu-outputs": { type: "string" },
       out: { type: "string" },
       plan: { type: "string" },
+      hostname: { type: "string" },
     },
   });
-  for (const k of ["upstream", "settings", "tofu-outputs", "out"]) {
+  for (const k of ["upstream", "settings", "tofu-outputs", "out", "hostname"]) {
     if (!values[k]) {
       console.error(
-        "usage: render-wrangler.mjs --upstream <toml> --settings <json> --tofu-outputs <json> --out <path> [--plan free|paid]",
+        "usage: render-wrangler.mjs --upstream <toml> --settings <json> --tofu-outputs <json> --out <path> --hostname <host> [--plan free|paid]",
       );
       process.exit(2);
     }
@@ -99,6 +100,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     upstreamToml: readFileSync(values.upstream, "utf8"),
     settings,
     tofuOutputs: { d1_database_id: tofu.d1_database_id?.value },
+    hostname: values.hostname,
   });
   writeFileSync(values.out, toml);
 }

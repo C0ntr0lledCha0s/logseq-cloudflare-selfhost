@@ -87,6 +87,7 @@ function run(ctx, env = {}) {
         CLOUDFLARE_API_TOKEN: "cf-token-secret",
         CLOUDFLARE_ACCOUNT_ID: "acct123",
         DB_SYNC_ADMIN_TOKEN: "admin-token-secret",
+        SYNC_HOSTNAME: "sync.example.com",
         R2_ACCESS_KEY_ID: "r2-key-id",
         R2_SECRET_ACCESS_KEY: "r2-secret",
         ...env,
@@ -173,4 +174,12 @@ test("requires WRANGLER", { timeout: 30000 }, () =>
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /WRANGLER/);
     assert.ok(!existsSync(join(ctx.out, "index.sql")));
+  }));
+
+test("fails fast when SYNC_HOSTNAME is unset", { timeout: 30000 }, () =>
+  withCtx(async (ctx) => {
+    const r = await run(ctx, { SYNC_HOSTNAME: "" });
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /SYNC_HOSTNAME/);
+    assert.ok(!/download_graph_db|wrangler/.test(r.log));
   }));

@@ -187,14 +187,14 @@ logseq-cloudflare-selfhost/
   README.md                      # the step-by-step guide (section 11)
   LICENSE                        # AGPL-3.0-or-later (call: patches are derived from AGPL Logseq code)
   UPSTREAM_REF                   # pinned logseq/logseq commit SHA, one line
-  config/settings.json           # plan, hostname, resource names, rate-limit namespace ids
+  config/settings.json           # plan, resource names, rate-limit namespace ids (the hostname is not stored: it comes from SYNC_HOSTNAME)
   config/expected-bindings.json  # binding/var names we expect upstream's wrangler.toml to declare
   patches/0001-pat-gate-allow-authenticated-users.patch
   infra/                         # OpenTofu: providers.tf, backend.tf, encryption.tf, main.tf, outputs.tf
   scripts/
     fetch-upstream.sh            # clone logseq/logseq at UPSTREAM_REF, apply patches (git apply --check first)
     check-upstream-bindings.mjs  # compare upstream wrangler.toml to expected-bindings.json; fail on diff
-    render-wrangler.mjs          # settings.json + tofu outputs → wrangler.toml written into upstream/deps/db-sync/worker/
+    render-wrangler.mjs          # settings.json + tofu outputs + --hostname → wrangler.toml written into upstream/deps/db-sync/worker/
     smoke-test.sh
     backup.sh
   skills/logseq-rest-api/SKILL.md  # vendored copy from upstream .agents/skills, for remote Claude sessions

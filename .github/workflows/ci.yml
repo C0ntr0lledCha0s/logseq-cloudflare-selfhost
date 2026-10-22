@@ -80,6 +80,7 @@ jobs:
               --settings config/settings.json \
               --tofu-outputs "$placeholder" \
               --out "$RUNNER_TEMP/wrangler.$plan.toml" \
+              --hostname sync.example.com \
               --plan "$plan"
             cp "$RUNNER_TEMP/wrangler.$plan.toml" "$worker_dir/wrangler.toml"
             (cd "$worker_dir" && "$wrangler" deploy --dry-run --outdir "$RUNNER_TEMP/dry-run-$plan")

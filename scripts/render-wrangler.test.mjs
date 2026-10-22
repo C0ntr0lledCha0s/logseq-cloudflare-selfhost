@@ -14,12 +14,13 @@ const fixture = readFileSync(
 const settings = JSON.parse(
   readFileSync(join(root, "config", "settings.json"), "utf8"),
 );
+const hostname = "sync.example.com";
 const tofuOutputs = { d1_database_id: "00000000-0000-0000-0000-000000000000" };
 
 function render(over = {}) {
   const { upstreamToml = fixture, ...rest } = over;
   return parse(
-    renderWrangler({ upstreamToml, settings, tofuOutputs, ...rest }),
+    renderWrangler({ upstreamToml, settings, tofuOutputs, hostname, ...rest }),
   );
 }
 
@@ -43,7 +44,7 @@ test("paid plan keeps limits and worker_loaders", () => {
   assert.equal(out.worker_loaders[0].binding, "LOADER");
 });
 
-test("names, ids and domain come from settings", () => {
+test("names and ids come from settings, domain from hostname", () => {
   const out = render();
   assert.equal(out.name, "logseq-sync");
   assert.equal(out.workers_dev, false);
@@ -123,6 +124,7 @@ test("rendered output contains no upstream account identifiers", () => {
       upstreamToml: fixture,
       settings: { ...settings, plan },
       tofuOutputs,
+      hostname,
     });
     for (const id of leaks) {
       assert.equal(text.includes(`"${id}"`), false, `${plan} leaks ${id}`);
@@ -162,5 +164,11 @@ test("account-scoped top-level keys throw", () => {
       ? block + fixture
       : `${key} = ${key === "routes" ? '["a.example.com"]' : '"x"'}\n` + fixture;
     assert.throws(() => render({ upstreamToml: toml }), new RegExp(`forbidden top-level key: ${key}`), key);
+  }
+});
+
+test("missing or empty hostname is rejected", () => {
+  for (const bad of [undefined, null, ""]) {
+    assert.throws(() => render({ hostname: bad }), /missing hostname/);
   }
 });

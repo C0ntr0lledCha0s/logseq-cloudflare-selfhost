@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Usage: deploy.sh   (run from anywhere; expects .upstream fetched and built)
-# Env: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN,
+# Env: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN, SYNC_HOSTNAME,
 #      optional SMOKE_PAT. OpenTofu state access env (backend creds, passphrase) must also be set.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-: "${CLOUDFLARE_API_TOKEN:?}" "${CLOUDFLARE_ACCOUNT_ID:?}" "${ASSET_LINK_SECRET:?}" "${DB_SYNC_ADMIN_TOKEN:?}"
+: "${CLOUDFLARE_API_TOKEN:?}" "${CLOUDFLARE_ACCOUNT_ID:?}" "${ASSET_LINK_SECRET:?}" "${DB_SYNC_ADMIN_TOKEN:?}" "${SYNC_HOSTNAME:?}"
 
 upstream=".upstream"
 worker_dir="$repo_root/$upstream/deps/db-sync/worker"
@@ -22,7 +22,6 @@ setting() {
   ' "$settings" "$1"
 }
 plan="$(setting plan)"
-hostname="$(setting hostname)"
 d1_name="$(setting d1DatabaseName)"
 
 trap 'rm -f tofu-output.json' EXIT
@@ -37,6 +36,7 @@ node scripts/render-wrangler.mjs \
   --settings "$settings" \
   --tofu-outputs tofu-output.json \
   --out "$worker_dir/wrangler.toml" \
+  --hostname "$SYNC_HOSTNAME" \
   --plan "$plan"
 
 cd "$worker_dir"
@@ -53,4 +53,4 @@ node -e '
 "$wrangler" secret bulk "$secrets_file"
 
 cd "$repo_root"
-PLAN="$plan" scripts/smoke-test.sh "https://$hostname"
+PLAN="$plan" scripts/smoke-test.sh "https://$SYNC_HOSTNAME"
