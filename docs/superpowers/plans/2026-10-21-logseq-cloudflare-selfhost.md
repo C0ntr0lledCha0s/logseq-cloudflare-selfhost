@@ -365,7 +365,7 @@ Each step that touches Cloudflare needs the owner's go-ahead in the session. Rec
     6. `scripts/deploy.sh`.
   - Secrets (environment `production`):
     - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`;
-    - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`;
+    - (no R2 secrets: `scripts/with-r2-credentials.sh` derives them from the token per step);
     - `TOFU_ENCRYPTION_PASSPHRASE`;
     - `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`;
     - `SYNC_HOSTNAME` (only on the deploy and backup steps).
@@ -418,7 +418,7 @@ Each step that touches Cloudflare needs the owner's go-ahead in the session. Rec
 - `scripts/backup.sh <out-dir>`. It expects `.upstream` fetched and `pnpm install --frozen-lockfile` run in `.upstream/deps/db-sync`. No cljs build is needed, but `download_graph_db.js` requires `better-sqlite3` and `transit-js`. It also expects env:
   - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`;
   - `DB_SYNC_ADMIN_TOKEN`;
-  - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`.
+  - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (derived from the token by `scripts/with-r2-credentials.sh`, which wraps the call).
 
   It reads names from `config/settings.json` and the hostname from the required `SYNC_HOSTNAME` env var. With `DATE=$(date -u +%F)`:
   1. `wrangler d1 export <d1> --remote --output <out>/index.sql`, then upload to `<backupsBucket>/<DATE>/index.sql` (`wrangler r2 object put --remote`). **This runs first and uploads before anything else can fail.**

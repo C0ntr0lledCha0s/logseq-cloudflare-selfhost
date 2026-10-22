@@ -44,6 +44,7 @@ function run(args, env = {}) {
         CLOUDFLARE_API_TOKEN: TOKEN,
         CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
         GITHUB_ACTIONS: "",
+        WITH_R2_TEST: "1",
         ...env,
       },
     });
@@ -135,4 +136,33 @@ test("masks derived values in GitHub Actions, never the token", { timeout: 60000
     assert.ok(r.stdout.includes(`::add-mask::${TOKEN_ID}`));
     assert.ok(!(r.stdout + r.stderr).includes(TOKEN));
   });
+});
+
+test("CF_API_BASE without the test switch fails and never calls the stub", { timeout: 60000 }, async () => {
+  let calls = 0;
+  const h = (req, res) => {
+    calls += 1;
+    verifyHandler(success)(req, res);
+  };
+  await withStub(h, async (base) => {
+    const r = await run(["true"], { CF_API_BASE: base, GITHUB_ACTIONS: "true", WITH_R2_TEST: "" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /WITH_R2_TEST/);
+    assert.equal(calls, 0);
+  });
+});
+
+test("rejects a non-https, non-loopback CF_API_BASE", { timeout: 60000 }, async () => {
+  for (const base of ["http://example.com", "http://127.0.0.1.evil.com:80", "ftp://x"]) {
+    const r = await run(["true"], { CF_API_BASE: base });
+    assert.notEqual(r.status, 0, base);
+    assert.match(r.stderr, /CF_API_BASE must be/);
+  }
+});
+
+test("rejects a token with stray whitespace", { timeout: 60000 }, async () => {
+  const r = await run(["true"], { CLOUDFLARE_API_TOKEN: `${TOKEN}\n`, CF_API_BASE: "http://127.0.0.1:1" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /unexpected characters/);
+  assert.ok(!r.stderr.includes(TOKEN));
 });

@@ -2,7 +2,9 @@
 # Run a command with R2 S3 credentials derived from the Cloudflare API token.
 # Usage: with-r2-credentials.sh <command> [args...]
 # Env (required): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
-# Env (TEST ONLY): CF_API_BASE overrides https://api.cloudflare.com/client/v4.
+# Env (TEST ONLY): CF_API_BASE overrides https://api.cloudflare.com/client/v4 and
+# is honoured only together with WITH_R2_TEST=1; it must be https://, or
+# http://127.0.0.1:<port> for local stubs.
 #
 # R2 accepts credentials derived from an account-owned API token:
 #   access key id     = the token id (from the token verify endpoint)
@@ -19,7 +21,24 @@ set -euo pipefail
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required}"
 : "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID is required}"
 
-api_base="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
+# The token is interpolated into a curl config line, so it must be a plain token.
+[[ "$CLOUDFLARE_API_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]] || {
+  echo "with-r2-credentials: CLOUDFLARE_API_TOKEN has unexpected characters (stray whitespace or newline?)" >&2
+  exit 1
+}
+
+api_base="https://api.cloudflare.com/client/v4"
+if [ -n "${CF_API_BASE:-}" ]; then
+  [ "${WITH_R2_TEST:-}" = "1" ] || {
+    echo "with-r2-credentials: CF_API_BASE is test-only and requires WITH_R2_TEST=1" >&2
+    exit 1
+  }
+  [[ "$CF_API_BASE" =~ ^(https://[^[:space:]]+|http://127\.0\.0\.1:[0-9]+)$ ]] || {
+    echo "with-r2-credentials: CF_API_BASE must be https:// or http://127.0.0.1:<port>" >&2
+    exit 1
+  }
+  api_base="$CF_API_BASE"
+fi
 
 # The token is fed to curl on stdin so it never appears in the process list.
 # Tokens are assumed to contain no '"' or '\' (curl config quoting).
