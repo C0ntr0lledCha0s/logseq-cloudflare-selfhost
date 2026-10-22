@@ -77,9 +77,10 @@
   - `.gitignore`
 
 **Interfaces:**
+- The hostname is deliberately not in settings (the repo is public): it is the required `SYNC_HOSTNAME` setting (env var locally, `production` environment secret in Actions).
 - Produces `config/settings.json`, consumed by Tasks 4, 6 and 10:
   ```json
-  {"plan":"free","workerName":"logseq-sync","hostname":"sync.example.com",
+  {"plan":"free","workerName":"logseq-sync",
    "d1DatabaseName":"logseq-sync-index","assetsBucket":"logseq-sync-assets","backupsBucket":"logseq-sync-backups",
    "backupRetentionDays":90,
    "rateLimitNamespaces":{"SEMANTIC_READ_RATE_LIMITER":"1001","SEMANTIC_WRITE_RATE_LIMITER":"1002"}}
@@ -194,9 +195,9 @@
 
 **Interfaces:**
 - Consumes the Task 1 `settings.json` shape and the Task 3 fixture.
-- `export function renderWrangler({upstreamToml: string, settings: object, tofuOutputs: {d1_database_id: string}}): string`. Starting from the parsed upstream toml:
+- `export function renderWrangler({upstreamToml: string, settings: object, tofuOutputs: {d1_database_id: string}, hostname: string}): string`. Starting from the parsed upstream toml:
   1. Drop `env`.
-  2. Set `name = settings.workerName`, `workers_dev = false`, `preview_urls = false`, `routes = [{pattern: settings.hostname, custom_domain: true}]`.
+  2. Set `name = settings.workerName`, `workers_dev = false`, `preview_urls = false`, `routes = [{pattern: hostname, custom_domain: true}]`.
   3. R2 `LOGSEQ_SYNC_ASSETS`: set `bucket_name = settings.assetsBucket`.
   4. D1 `DB`: set `database_name = settings.d1DatabaseName`, `database_id = tofuOutputs.d1_database_id`.
   5. Rate limiters: set each `namespace_id` from `settings.rateLimitNamespaces[name]`. Throw if a name is missing from settings.
@@ -205,7 +206,7 @@
   8. Stringify with `smol-toml`.
 
   Everything else is kept as upstream has it: `main`, `compatibility_date`, `compatibility_flags`, `observability`, DO bindings, `migrations`, `version_metadata`, and the Cognito vars.
-- CLI: `node scripts/render-wrangler.mjs --upstream <toml> --settings config/settings.json --tofu-outputs <tofu-output.json> --out <path>`.
+- CLI: `node scripts/render-wrangler.mjs --upstream <toml> --settings config/settings.json --tofu-outputs <tofu-output.json> --out <path> --hostname <host>`.
   - `<tofu-output.json>` is `tofu output -json`, so it reads `.d1_database_id.value`.
   - The CLI also accepts `--plan` to override `settings.plan`.
 
@@ -345,7 +346,7 @@ Each step that touches Cloudflare needs the owner's go-ahead in the session. Rec
     8. `tofu fmt -check` + `tofu validate` (`-backend=false`).
   - Cache `~/.m2`, `~/.gitlibs`, the pnpm store and `.upstream/deps/db-sync/.shadow-cljs`, keyed on `UPSTREAM_REF`.
   - Output `ci_result` (`success`/`failure`) for `workflow_call`.
-- **`scripts/deploy.sh`** expects `.upstream` to be built, plus env `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, optional `SMOKE_PAT`. It runs, in this order:
+- **`scripts/deploy.sh`** expects `.upstream` to be built, plus env `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `SYNC_HOSTNAME`, optional `SMOKE_PAT`. It runs, in this order:
   1. `tofu output -json > tofu-output.json`;
   2. render into `.upstream/deps/db-sync/worker/wrangler.toml`;
   3. `wrangler d1 migrations apply <d1DatabaseName> --remote`;
@@ -364,9 +365,10 @@ Each step that touches Cloudflare needs the owner's go-ahead in the session. Rec
     6. `scripts/deploy.sh`.
   - Secrets (environment `production`):
     - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`;
-    - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`;
+    - (no R2 secrets: `scripts/with-r2-credentials.sh` derives them from the token per step);
     - `TOFU_ENCRYPTION_PASSPHRASE`;
     - `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`;
+    - `SYNC_HOSTNAME` (only on the deploy and backup steps).
     - `SMOKE_PAT` (optional).
 
 - [ ] **Step 1:** Write the files. Run `actionlint` (via `mise` or `go run`) and `shellcheck scripts/*.sh`. Expected: no findings.
@@ -416,9 +418,9 @@ Each step that touches Cloudflare needs the owner's go-ahead in the session. Rec
 - `scripts/backup.sh <out-dir>`. It expects `.upstream` fetched and `pnpm install --frozen-lockfile` run in `.upstream/deps/db-sync`. No cljs build is needed, but `download_graph_db.js` requires `better-sqlite3` and `transit-js`. It also expects env:
   - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`;
   - `DB_SYNC_ADMIN_TOKEN`;
-  - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`.
+  - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (derived from the token by `scripts/with-r2-credentials.sh`, which wraps the call).
 
-  It reads names and the hostname from `config/settings.json`. With `DATE=$(date -u +%F)`:
+  It reads names from `config/settings.json` and the hostname from the required `SYNC_HOSTNAME` env var. With `DATE=$(date -u +%F)`:
   1. `wrangler d1 export <d1> --remote --output <out>/index.sql`, then upload to `<backupsBucket>/<DATE>/index.sql` (`wrangler r2 object put --remote`). **This runs first and uploads before anything else can fail.**
   2. List graph ids with `wrangler d1 execute <d1> --remote --json --command "select graph_id from graphs"`. For each id, run `node .upstream/deps/db-sync/worker/scripts/download_graph_db.js --base-url https://<hostname> --graph-id <id> --output <out>/graphs/<n>.sqlite` (with `DB_SYNC_ADMIN_TOKEN` in the env), then upload to `<DATE>/graphs/`.
      - Files are numbered `<n>`, not named by id, so ids never reach logs. Write a `graphs/index.json` mapping n→id, uploaded but never printed.

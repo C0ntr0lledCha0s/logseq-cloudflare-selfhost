@@ -1,0 +1,38 @@
+name: backup
+
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+
+      - name: Fetch upstream and install dependencies
+        run: |
+          scripts/fetch-upstream.sh .upstream
+          cd .upstream/deps/db-sync
+          pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Backup
+        env:
+          WRANGLER: ${{ github.workspace }}/.upstream/deps/db-sync/node_modules/.bin/wrangler
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
+          SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
+        run: scripts/with-r2-credentials.sh scripts/backup.sh backup-out

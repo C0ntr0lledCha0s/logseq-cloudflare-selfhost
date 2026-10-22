@@ -1,0 +1,126 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
+index 1c40b24..f4fcae9 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
+@@ -1,6 +1,5 @@
+ (ns logseq.db-sync.worker.handler.personal-access-token
+-  (:require [clojure.set :as set]
+-            [clojure.string :as string]
++  (:require [clojure.string :as string]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
+             [logseq.db-sync.worker.auth :as auth]
+@@ -10,42 +9,13 @@
+ (def ^:private one-year-ms (* 365 24 60 60 1000))
+ (def ^:private one-day-ms (* 24 60 60 1000))
+ (def ^:private permissions #{"read" "write" "both"})
+-(def ^:private rtc-groups #{"team" "rtc_2025_07_10"})
+ (def ^:private collection-path "/api/v1/personal-access-tokens")
+-(def ^:private user-info-url "https://api.logseq.com/file-sync/user_info")
+ 
+ (defn route?
+   [path]
+   (or (= collection-path path)
+       (string/starts-with? path (str collection-path "/"))))
+ 
+-(defn- claims-groups
+-  [claims]
+-  (let [groups (some-> claims (aget "cognito:groups"))]
+-    (cond
+-      (array? groups) (set (array-seq groups))
+-      (string? groups) (->> (string/split groups #"[\[\]\s,\"]+")
+-                            (remove string/blank?)
+-                            set)
+-      :else #{})))
+-
+-(defn- <rtc-user?
+-  [request claims]
+-  (let [claim-groups (claims-groups claims)]
+-    (if (seq claim-groups)
+-      (p/resolved (boolean (seq (set/intersection rtc-groups claim-groups))))
+-      (-> (p/let [token (auth/token-from-request request)
+-                  response (js/fetch user-info-url
+-                                     #js {:method "POST"
+-                                          :headers #js {"authorization" (str "Bearer " token)
+-                                                        "content-type" "application/json"}
+-                                          :body "{}"})
+-                  user-info (when (.-ok response) (.json response))
+-                  user-groups (claims-groups
+-                               #js {"cognito:groups" (some-> user-info (aget "UserGroups"))})]
+-            (boolean (seq (set/intersection rtc-groups user-groups))))
+-          (p/catch (fn [_] false))))))
+-
+ (defn- random-hex
+   [size]
+   (let [payload (js/Uint8Array. size)]
+@@ -133,25 +103,21 @@
+         user-id (aget claims "sub")]
+     (if-not (string? user-id)
+       (http/unauthorized)
+-      (p/let [rtc-user? (<rtc-user? request claims)]
+-        (cond
+-          (not rtc-user?)
+-          (http/forbidden)
++      (cond
++        (and (= method "GET") (= path collection-path))
++        (p/let [tokens (index/<personal-access-tokens-list (aget env "DB") user-id)]
++          (http/json-response nil {:tokens tokens}))
+ 
+-          (and (= method "GET") (= path collection-path))
+-          (p/let [tokens (index/<personal-access-tokens-list (aget env "DB") user-id)]
+-            (http/json-response nil {:tokens tokens}))
++        (and (= method "POST") (= path collection-path))
++        (<create! request env user-id)
+ 
+-          (and (= method "POST") (= path collection-path))
+-          (<create! request env user-id)
++        (and (= method "DELETE") (token-id-from-path path))
++        (p/let [_ (index/<personal-access-token-delete!
++                   (aget env "DB") (token-id-from-path path) user-id)]
++          (common/options-response))
+ 
+-          (and (= method "DELETE") (token-id-from-path path))
+-          (p/let [_ (index/<personal-access-token-delete!
+-                     (aget env "DB") (token-id-from-path path) user-id)]
+-            (common/options-response))
+-
+-          :else
+-          (http/not-found))))))
++        :else
++        (http/not-found)))))
+ 
+ (defn handle
+   [request env]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+index b4f0aa0..109efe1 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+@@ -509,17 +509,21 @@
+ (defn- d1-results [rows]
+   #js {:results (clj->js rows)})
+ 
+-(deftest pat-management-requires-rtc-group-login-jwt-test
++(deftest pat-management-allows-any-authenticated-user-test
+   (async done
+-         (let [request (pat-management-request "GET" "/api/v1/personal-access-tokens")]
++         (let [request (pat-management-request "GET" "/api/v1/personal-access-tokens")
++               original-fetch (.-fetch js/globalThis)]
++           (set! (.-fetch js/globalThis)
++                 (fn [& _] (throw (ex-info "no outbound fetch" {}))))
+            (-> (p/with-redefs [auth/auth-claims
+-                               (fn [_ _]
+-                                 (p/resolved #js {"sub" "user-1"
+-                                                  "cognito:groups" #js ["beta-tester"]}))]
++                               (fn [_ _] (p/resolved #js {"sub" "user-1"}))
++                               index/<personal-access-tokens-list
++                               (fn [_ _] (p/resolved []))]
+                  (p/let [response (dispatch/handle-worker-fetch request #js {"DB" #js {}})
+                          body (json-body response)]
+-                   (is (= 403 (.-status response)))
+-                   (is (= "forbidden" (:error body)))))
++                   (is (= 200 (.-status response)))
++                   (is (= {:tokens []} body))))
++               (p/finally (fn [] (set! (.-fetch js/globalThis) original-fetch)))
+                (p/then (fn [] (done)))
+                (p/catch (fn [error]
+                           (is false (str error))

@@ -1,0 +1,101 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            ~/.local/share/pnpm/store
+            .cache/shadow-cljs
+          key: upstream-build-${{ hashFiles('UPSTREAM_REF') }}
+
+      - run: npm ci
+
+      - name: Write backend config
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          cat > infra/backend.hcl <<HCL
+          bucket = "logseq-selfhost-tofu-state"
+          key    = "logseq-sync/terraform.tfstate"
+
+          endpoints = {
+            s3 = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          }
+
+          region = "auto"
+
+          skip_credentials_validation = true
+          skip_region_validation      = true
+          skip_requesting_account_id  = true
+          skip_metadata_api_check     = true
+          skip_s3_checksum            = true
+
+          use_path_style = true
+          use_lockfile   = true
+          HCL
+
+      - name: Tofu init
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
+        run: scripts/with-r2-credentials.sh tofu -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Tofu apply
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
+        run: scripts/with-r2-credentials.sh tofu -chdir=infra apply -auto-approve -input=false
+
+      - name: Fetch, check and build upstream
+        run: |
+          scripts/fetch-upstream.sh .upstream
+          if [ -d .cache/shadow-cljs ]; then
+            cp -a .cache/shadow-cljs .upstream/deps/db-sync/.shadow-cljs
+          fi
+          node scripts/check-upstream-bindings.mjs .upstream/deps/db-sync/worker/wrangler.toml
+          scripts/build.sh .upstream
+          rm -rf .cache/shadow-cljs
+          if [ -d .upstream/deps/db-sync/.shadow-cljs ]; then
+            mkdir -p .cache
+            cp -a .upstream/deps/db-sync/.shadow-cljs .cache/shadow-cljs
+          fi
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
+          ASSET_LINK_SECRET: ${{ secrets.ASSET_LINK_SECRET }}
+          DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
+          SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
+          SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
+        run: scripts/with-r2-credentials.sh scripts/deploy.sh

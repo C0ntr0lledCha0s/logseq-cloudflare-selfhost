@@ -1,0 +1,12 @@
+node_modules/
+.upstream/
+infra/.terraform/
+*.tfplan
+wrangler.rendered.toml
+backup-out/
+.env.local
+infra/backend.hcl
+tofu-output.json
+*.tfstate
+*.tfstate.*
+.cache/

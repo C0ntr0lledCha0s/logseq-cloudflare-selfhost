@@ -187,14 +187,14 @@ logseq-cloudflare-selfhost/
   README.md                      # the step-by-step guide (section 11)
   LICENSE                        # AGPL-3.0-or-later (call: patches are derived from AGPL Logseq code)
   UPSTREAM_REF                   # pinned logseq/logseq commit SHA, one line
-  config/settings.json           # plan, hostname, resource names, rate-limit namespace ids
+  config/settings.json           # plan, resource names, rate-limit namespace ids (the hostname is not stored: it comes from SYNC_HOSTNAME)
   config/expected-bindings.json  # binding/var names we expect upstream's wrangler.toml to declare
   patches/0001-pat-gate-allow-authenticated-users.patch
   infra/                         # OpenTofu: providers.tf, backend.tf, encryption.tf, main.tf, outputs.tf
   scripts/
     fetch-upstream.sh            # clone logseq/logseq at UPSTREAM_REF, apply patches (git apply --check first)
     check-upstream-bindings.mjs  # compare upstream wrangler.toml to expected-bindings.json; fail on diff
-    render-wrangler.mjs          # settings.json + tofu outputs → wrangler.toml written into upstream/deps/db-sync/worker/
+    render-wrangler.mjs          # settings.json + tofu outputs + --hostname → wrangler.toml written into upstream/deps/db-sync/worker/
     smoke-test.sh
     backup.sh
   skills/logseq-rest-api/SKILL.md  # vendored copy from upstream .agents/skills, for remote Claude sessions
@@ -256,27 +256,24 @@ logseq-cloudflare-selfhost/
 
 **Manual bootstrap** (documented in the guide):
 
-1. Cloudflare API token, scoped to the account and the zone:
-   - Workers Scripts:Edit;
-   - Workers Routes:Edit (zone);
-   - D1:Edit;
-   - Workers R2 Storage:Edit;
-   - DNS:Edit (zone, for custom domain records);
-   - Account Settings:Read.
+1. One Cloudflare account-owned API token with two policies:
+   - account: Workers Scripts:Edit, D1:Edit, Workers R2 Storage:Edit, Account Settings:Read;
+   - zone (`example.com`): Workers Routes:Edit, DNS:Edit (custom domain records).
 
    The builder verifies the minimal set during the spike.
-2. R2 S3 API credentials (access key id and secret). These are used by the OpenTofu backend and by backups for asset copying.
+2. The OpenTofu state bucket, created once with `wrangler r2 bucket create`.
 3. Three generated values (`openssl rand -hex 32`):
    - `ASSET_LINK_SECRET`;
    - `DB_SYNC_ADMIN_TOKEN`;
    - `TOFU_ENCRYPTION_PASSPHRASE`.
 
+R2 S3 credentials are not stored. `scripts/with-r2-credentials.sh` derives them from the token: the access key id is the token id (from `/accounts/{id}/tokens/verify`) and the secret is the SHA-256 hex of the token value. It exports them (`AWS_*` for the OpenTofu backend, `R2_*` for backups) only to the wrapped command, so steps that run upstream build code never see them.
+
 **Storage**
 
 - **GitHub Actions secrets:**
   - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`;
-  - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`;
-  - `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `TOFU_ENCRYPTION_PASSPHRASE`.
+  - `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `TOFU_ENCRYPTION_PASSPHRASE`, `SYNC_HOSTNAME`, `SMOKE_PAT` (optional).
 - **Worker secrets:** set on each deploy with `wrangler secret bulk` from the GitHub secrets. This is idempotent.
 - Nothing secret is in the repo, the rendered toml, or logs.
 - `render-wrangler.mjs` refuses to emit `DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS` or any `SENTRY_*` key.

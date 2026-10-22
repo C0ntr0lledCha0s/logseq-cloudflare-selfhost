@@ -1,0 +1,21 @@
+# Copy to backend.hcl (git-ignored) and replace the placeholder.
+bucket = "logseq-selfhost-tofu-state"
+key    = "logseq-sync/terraform.tfstate"
+
+endpoints = {
+  s3 = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+}
+
+region = "auto"
+
+skip_credentials_validation = true
+skip_region_validation      = true
+skip_requesting_account_id  = true
+skip_metadata_api_check     = true
+skip_s3_checksum            = true
+
+use_path_style = true
+
+# R2 honours the conditional writes OpenTofu's lockfile needs (verified in
+# spike item S4: a concurrent plan fails with "Error acquiring the state lock").
+use_lockfile = true
