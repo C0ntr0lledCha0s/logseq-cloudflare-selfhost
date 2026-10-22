@@ -123,7 +123,7 @@ It asks for those three (the token is read silently), generates the rest with `o
 |---|---|---|
 | `CLOUDFLARE_API_TOKEN` | The token from 1.1 | You supply |
 | `CLOUDFLARE_ACCOUNT_ID` | Dashboard → Account home → Account ID (`<account-id>`) | You supply |
-| `SYNC_HOSTNAME` | `sync.example.com` (no scheme). It is never committed. | You supply |
+| `SYNC_HOSTNAME` | A fully qualified hostname such as `sync.example.com` (no scheme). It is never committed. | You supply |
 | `ASSET_LINK_SECRET` | The HMAC key for signed asset links. | Generated |
 | `DB_SYNC_ADMIN_TOKEN` | Admin header token. It bypasses graph access checks, and backups use it. | Generated |
 | `TOFU_ENCRYPTION_PASSPHRASE` | Encrypts the OpenTofu state and plans. | Generated |
@@ -215,7 +215,7 @@ Then add the secrets:
 | `SYNC_HOSTNAME` | Yes |
 | `SMOKE_PAT` | Optional. It enables the authenticated smoke check. |
 
-The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the six secrets above in the `production` environment, passing each value to `gh` on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in.
+The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the six secrets above in the `production` environment of the repo that owns your checkout (it prints the repo name first and passes it to `gh` with `-R`), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in.
 
 If `.env.local` already exists, load it as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments:
 

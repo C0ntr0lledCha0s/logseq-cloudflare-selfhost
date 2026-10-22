@@ -58,6 +58,10 @@ command -v openssl >/dev/null || {
 }
 
 # Fill any of the three inputs not already in the environment from the terminal.
+if [ ! -t 0 ] && { [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] || [ -z "${SYNC_HOSTNAME:-}" ]; }; then
+  echo "init-env: no terminal: export CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, SYNC_HOSTNAME" >&2
+  exit 1
+fi
 if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
   read -rsp "Cloudflare API token: " CLOUDFLARE_API_TOKEN
   echo
@@ -104,9 +108,31 @@ set +o noclobber
 echo "Wrote $env_file (mode 600). Generated ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN and TOFU_ENCRYPTION_PASSPHRASE."
 
 if [ "$push" = 1 ]; then
+  recovery="init-env: .env.local was written; re-run the push with the README 1.8 loop"
+  # Target the repo that owns this checkout, whatever the current directory is.
+  target_repo="$(cd "$repo_root" && gh repo view --json nameWithOwner -q .nameWithOwner)" || {
+    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
+  [ -n "$target_repo" ] || {
+    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
+  echo "Pushing secrets to $target_repo (environment: production)"
+  gh api "repos/$target_repo/environments/production" >/dev/null || {
+    echo "init-env: environment 'production' not found in $target_repo; create it first (README 1.8)" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
   for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE \
     ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME; do
-    printf '%s' "${!name}" | gh secret set "$name" --env production
+    printf '%s' "${!name}" | gh secret set "$name" -R "$target_repo" --env production || {
+      echo "init-env: failed to set $name" >&2
+      echo "$recovery" >&2
+      exit 1
+    }
   done
   echo "Pushed 6 secrets to the GitHub production environment."
 fi

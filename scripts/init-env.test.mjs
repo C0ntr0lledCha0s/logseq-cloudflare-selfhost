@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync,
-  readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
+  readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -38,17 +38,18 @@ function stubGh(dir, { failOn } = {}) {
 const fs = require("fs");
 const stdin = fs.readFileSync(0, "utf8");
 const argv = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, stdin }) + "\\n");
-process.exit(argv[2] === ${JSON.stringify(failOn ?? "")} ? 1 : 0);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, stdin, cwd: process.cwd() }) + "\\n");
+if (argv[0] === "repo") process.stdout.write("expected/repo\\n");
+process.exit(argv[0] === "secret" && argv[2] === ${JSON.stringify(failOn ?? "")} ? 1 : 0);
 `,
   );
   chmodSync(join(bin, "gh"), 0o755);
   return { bin, log };
 }
-function spawnScript(args, env) {
+function spawnScript(args, env, cwd = root) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(script, args, {
-      cwd: root,
+      cwd,
       env: { ...process.env, CLOUDFLARE_API_TOKEN: "", CLOUDFLARE_ACCOUNT_ID: "", SYNC_HOSTNAME: "", ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -61,8 +62,8 @@ function spawnScript(args, env) {
   });
 }
 
-const run = (dir, args = [], env = {}) =>
-  spawnScript(args, { INIT_ENV_TEST: "1", INIT_ENV_REPO_ROOT: dir, ...inputs, ...env });
+const run = (dir, args = [], env = {}, cwd) =>
+  spawnScript(args, { INIT_ENV_TEST: "1", INIT_ENV_REPO_ROOT: dir, ...inputs, ...env }, cwd);
 
 const parseEnv = (dir) =>
   Object.fromEntries(
@@ -139,17 +140,24 @@ test("INIT_ENV_REPO_ROOT without INIT_ENV_TEST=1 is rejected", { timeout: 60000 
 test("--push sets each secret via gh with the value on stdin only", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
     const { bin, log } = stubGh(dir);
-    const r = await run(dir, ["--push"], { PATH: `${bin}:${process.env.PATH}` });
+    const elsewhere = mkdtempSync(join(tmpdir(), "init-env-cwd-"));
+    const r = await run(dir, ["--push"], { PATH: `${bin}:${process.env.PATH}` }, elsewhere);
+    rmSync(elsewhere, { recursive: true, force: true });
     assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /expected\/repo/);
     const env = parseEnv(dir);
-    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const all = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(all[0].argv.slice(0, 2), ["repo", "view"]);
+    assert.equal(realpathSync(all[0].cwd), realpathSync(dir), "repo derived from the checkout, not cwd");
+    assert.deepEqual(all[1].argv, ["api", "repos/expected/repo/environments/production"]);
+    const calls = all.slice(2);
     const names = [
       "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE",
       "ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "SYNC_HOSTNAME",
     ];
     assert.equal(calls.length, names.length);
     calls.forEach((c, i) => {
-      assert.deepEqual(c.argv, ["secret", "set", names[i], "--env", "production"]);
+      assert.deepEqual(c.argv, ["secret", "set", names[i], "-R", "expected/repo", "--env", "production"]);
       assert.equal(c.stdin, env[names[i]]);
       assert.ok(!c.argv.join(" ").includes(env[names[i]]), "value in argv");
     });
@@ -175,11 +183,23 @@ test("--push fails fast when gh is missing", { timeout: 60000 }, async () => {
   });
 });
 
+test("no terminal and missing inputs fails with a clear message", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const r = await run(dir, [], { SYNC_HOSTNAME: "" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /no terminal: export CLOUDFLARE_API_TOKEN/);
+    assert.equal(existsSync(join(dir, ".env.local")), false);
+  });
+});
+
 test("--push stops when gh fails", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
     const { bin, log } = stubGh(dir, { failOn: "CLOUDFLARE_ACCOUNT_ID" });
     const r = await run(dir, ["--push"], { PATH: `${bin}:${process.env.PATH}` });
     assert.notEqual(r.status, 0);
-    assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+    const secretCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((c) => c.argv[0] === "secret");
+    assert.equal(secretCalls.length, 2);
+    assert.match(r.stderr, /re-run the push with the README 1\.8 loop/);
+    assert.equal(existsSync(join(dir, ".env.local")), true);
   });
 });
