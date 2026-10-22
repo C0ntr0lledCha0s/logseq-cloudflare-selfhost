@@ -16,5 +16,6 @@ skip_s3_checksum            = true
 
 use_path_style = true
 
-# use_lockfile is decided by spike item S4 (R2 conditional-write support).
-# use_lockfile = true
+# R2 honours the conditional writes OpenTofu's lockfile needs (verified in
+# spike item S4: a concurrent plan fails with "Error acquiring the state lock").
+use_lockfile = true

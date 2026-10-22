@@ -5,6 +5,10 @@ locals {
 resource "cloudflare_d1_database" "index" {
   account_id = var.cloudflare_account_id
   name       = local.settings.d1DatabaseName
+  # Pinned to Cloudflare's default; left unset, the provider plans an update on every apply.
+  read_replication = {
+    mode = "disabled"
+  }
 
   lifecycle {
     prevent_destroy = true
