@@ -46,6 +46,11 @@ Run on the owner's Cloudflare account, Workers Free plan, on 2026-10-22, against
   | `listPages` | Titles come back as `[iv ciphertext]` packages. Journal page titles stay plaintext. | Plaintext titles |
   | `searchGraph` "Hello World" | 0 results: the server only holds ciphertext | 1 result: the block, with its uuid, page id and order |
 
+- **Write round-trip (unencrypted graph):**
+  - `createPage` returned 201.
+  - `insertBlockChildren` (append one block) returned 201.
+  - `listPageBlocks` returned 200 with the block.
+  - The new page and block appeared in both the nightly desktop app and the web app through sync.
 - **Conclusion:** an unencrypted graph works directly for agent use. An E2EE graph needs client-side decryption (see the backlog item for a client-side MCP), and server-side search can never match its text.
 
 ## S3 — Real graph within Free CPU limits
