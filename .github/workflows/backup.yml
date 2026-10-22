@@ -35,6 +35,4 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
           SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: scripts/backup.sh backup-out
+        run: scripts/with-r2-credentials.sh scripts/backup.sh backup-out
