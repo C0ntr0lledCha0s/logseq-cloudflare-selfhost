@@ -71,7 +71,7 @@ PATs, their settings tab and the matching D1 migration arrived upstream on 2026-
 |---|---|---|
 | Desktop (macOS, Windows, Linux) | The `nightly` pre-release on [github.com/logseq/logseq/releases](https://github.com/logseq/logseq/releases/tag/nightly) | Verified |
 | Android | The APK attached to the same `nightly` release | Verified |
-| Web | Logseq's nightly web build | Verified |
+| Web | `https://app.logseq.com` | Verified (signed in and synced against the self-hosted server via Settings → Advanced → Sync Server URL) |
 | iOS | No nightly build exists. The App Store release predates PATs. | Untested |
 
 If you rely on iOS, you can't use this server from it until a release ships with PAT support.
@@ -109,23 +109,27 @@ Open **Workers & Pages** in the dashboard once. That creates your account's `wor
 
 `.env.local` holds the same values the GitHub `production` environment holds, so you can run everything from your machine. It is git-ignored.
 
+**You supply only three things: the Cloudflare API token, the Cloudflare account ID, and your hostname. The other three values are generated.**
+
 ```bash
-cp .env.local.example .env.local && chmod 600 .env.local
-openssl rand -hex 32   # run three times: one value each for ASSET_LINK_SECRET,
-                       # DB_SYNC_ADMIN_TOKEN and TOFU_ENCRYPTION_PASSPHRASE
+scripts/init-env.sh
 ```
 
-| Name | Value |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | The token from 1.1 |
-| `CLOUDFLARE_ACCOUNT_ID` | Dashboard → Account home → Account ID (`<account-id>`) |
-| `ASSET_LINK_SECRET` | Generated. The HMAC key for signed asset links. |
-| `DB_SYNC_ADMIN_TOKEN` | Generated. Admin header token. It bypasses graph access checks, and backups use it. |
-| `TOFU_ENCRYPTION_PASSPHRASE` | Generated. Encrypts the OpenTofu state and plans. **Store it in a password manager**: without it, the state can't be decrypted. |
-| `SYNC_HOSTNAME` | `sync.example.com` (no scheme). It is never committed. |
-| `SMOKE_PAT` | Optional. Leave it empty until you have a PAT (section 4). |
+It asks for those three (the token is read silently), generates the rest with `openssl rand -hex 32`, writes `.env.local` with mode 600 and prints no secret values. It refuses to run if `.env.local` already exists, so move an old one aside first. To skip the prompts, export `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and `SYNC_HOSTNAME` beforehand.
 
-**If a value contains `$`, single-quote it** (`NAME='va$lue'`). Otherwise the shell expands it when the file is sourced. The generated hex values are safe as they are.
+**Copy `TOFU_ENCRYPTION_PASSPHRASE` from `.env.local` into a password manager now.** It encrypts the OpenTofu state and plans. Without it the state can't be decrypted.
+
+| Name | Value | Source |
+|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | The token from 1.1 | You supply |
+| `CLOUDFLARE_ACCOUNT_ID` | Dashboard → Account home → Account ID (`<account-id>`) | You supply |
+| `SYNC_HOSTNAME` | `sync.example.com` (no scheme). It is never committed. | You supply |
+| `ASSET_LINK_SECRET` | The HMAC key for signed asset links. | Generated |
+| `DB_SYNC_ADMIN_TOKEN` | Admin header token. It bypasses graph access checks, and backups use it. | Generated |
+| `TOFU_ENCRYPTION_PASSPHRASE` | Encrypts the OpenTofu state and plans. | Generated |
+| `SMOKE_PAT` | Optional. Leave it empty until you have a PAT (section 4). | Later |
+
+Manual fallback: `cp .env.local.example .env.local && chmod 600 .env.local`, then fill it in, using `openssl rand -hex 32` for each generated value. **If you hand-edit a value containing `$`, single-quote it** (`NAME='va$lue'`), otherwise the shell expands it when the file is sourced. Generated hex values are safe as they are.
 
 Load it into each new shell that runs the commands below. OpenTofu reads its two inputs from `TF_VAR_*`:
 
@@ -192,6 +196,13 @@ Because every push to `main` deploys, also protect `main` with the ruleset in [`
 gh api -X POST 'repos/{owner}/{repo}/rulesets' --input .github/rulesets/protect-main.json
 ```
 
+Allow the weekly bump workflow to open its pull request: **Settings → Actions → General → Workflow permissions → tick "Allow GitHub Actions to create and approve pull requests"**. Or:
+
+```bash
+gh api -X PUT 'repos/{owner}/{repo}/actions/permissions/workflow' \
+  -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+```
+
 Then add the secrets:
 
 | Secret | Required |
@@ -204,7 +215,9 @@ Then add the secrets:
 | `SYNC_HOSTNAME` | Yes |
 | `SMOKE_PAT` | Optional. It enables the authenticated smoke check. |
 
-`gh secret set NAME --env production` prompts for the value, so it never lands in your shell history. To copy the values from `.env.local` after loading it as in 1.4 (bash):
+The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the six secrets above in the `production` environment, passing each value to `gh` on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in.
+
+If `.env.local` already exists, load it as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments:
 
 ```bash
 for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE \
@@ -215,7 +228,7 @@ done
 
 ## 2. First deploy
 
-You can deploy either from your machine or from GitHub Actions. Both run the same script, `scripts/deploy.sh`, which:
+You can deploy either from your machine (verified) or from GitHub Actions (**not yet verified**). Both run the same script, `scripts/deploy.sh`, which:
 
 1. reads the OpenTofu outputs (the D1 database ID);
 2. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`);
@@ -230,7 +243,9 @@ You can deploy either from your machine or from GitHub Actions. Both run the sam
 scripts/with-r2-credentials.sh mise exec -- scripts/deploy.sh
 ```
 
-**From GitHub Actions:** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow). The workflow runs `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`.
+**A local deploy ships whatever is in your `.upstream` checkout.** After merging a bump PR, run `rm -rf .upstream` and redo 1.5 before deploying locally, or you'll roll the server back to the older upstream commit.
+
+**From GitHub Actions (not yet verified):** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow). The workflow runs `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`.
 
 A passing smoke test prints:
 
@@ -283,7 +298,7 @@ The **Personal Access Tokens** tab appears in Settings once a custom sync server
 
 For an agent that reads and writes, choose `both`. The token (`logseq_pat_…`) is shown once. Store it in a password manager.
 
-If you want the authenticated smoke check, store the PAT as `SMOKE_PAT`: in `.env.local`, and with `gh secret set SMOKE_PAT --env production`.
+**Naming with several graphs.** Make one token per graph and name each `PAT_<GRAPH>` in upper snake case, for example `PAT_JOURNAL` and `PAT_WORK`, in your password manager and in `.env.local` (see the commented examples in `.env.local.example`). `SMOKE_PAT` is just whichever one of them the smoke test should use: in `.env.local`, and with `gh secret set SMOKE_PAT --env production`.
 
 **Fallback without the tab.** You can create a PAT over HTTP using the Cognito ID token from a signed-in client. Find it in the desktop or web devtools: Application → Local Storage → `id-token`. Then:
 
@@ -313,8 +328,8 @@ Two more calls on the same path, both with the ID token:
 In the cloud environment the remote session runs in:
 
 1. **Add the secrets as environment variables:**
-   - `LOGSEQ_PAT`: the `logseq_pat_…` token from section 4;
-   - `LOGSEQ_BASE_URL`: `https://sync.example.com`.
+   - `LOGSEQ_PAT`: the `logseq_pat_…` token from section 4 for your default graph. With several graphs, add one `LOGSEQ_PAT_<GRAPH>` per graph instead (for example `LOGSEQ_PAT_JOURNAL`, matching `PAT_JOURNAL`);
+   - `LOGSEQ_BASE_URL`: `https://sync.example.com`, shared by all of them.
 2. **Allow outbound network access** to `sync.example.com` in the environment's network settings. With a restrictive network policy, add the hostname to the allowed domains.
 3. **Add the skill** to the repo the session works in. Copy `skills/logseq-rest-api/SKILL.md` from this repo to `.claude/skills/logseq-rest-api/SKILL.md` there. It's a vendored copy of upstream's skill, and it documents the API's operations, request shapes and E2EE behaviour.
 
@@ -327,7 +342,7 @@ printf 'header = "Authorization: Bearer %s"\n' "$LOGSEQ_PAT" |
 
 The shorter `curl -H "Authorization: Bearer $LOGSEQ_PAT" "$LOGSEQ_BASE_URL/api/v1/graphs"` also works. The trade-off is that it puts the token on the command line, where other processes in the environment can see it in `ps`.
 
-`GET $LOGSEQ_BASE_URL/openapi.json` describes all operations. Rate limits are 120 reads and 20 writes per minute per token.
+`GET $LOGSEQ_BASE_URL/openapi.json` describes all operations. Rate limits are 120 reads and 20 writes per minute.
 
 A write round trip has been verified on an unencrypted graph: `createPage` and `insertBlockChildren` from the REST API appeared in both the desktop and web apps through sync.
 
@@ -357,7 +372,7 @@ You can also run it from Actions → bump-upstream → Run workflow.
 - **New migrations.** They're applied before the new code deploys, and upstream migrations have so far been additive. Read them anyway.
 - **Client compatibility.** Keep your nightly clients updated. If a client stops syncing after a bump, update the client or move `UPSTREAM_REF` closer to the client's nightly commit.
 
-**Merging** the PR to `main` deploys it.
+**Merging** the PR to `main` deploys it. Local deploys are different: `scripts/deploy.sh` ships your `.upstream` checkout, so after merging run `rm -rf .upstream` and redo 1.5 first (see section 2).
 
 **Rolling back code.** List the Worker's versions and roll back to the previous one. Then revert the bump commit on `main`, so the next deploy doesn't roll forward again. Run this from the repo root with `.env.local` loaded:
 
@@ -376,7 +391,7 @@ $W d1 time-travel restore logseq-sync-index --timestamp 2026-10-21T12:00:00Z
 
 ## 7. Backups and restore
 
-`backup.yml` runs daily at 14:00 UTC, and on demand. It uses the `production` environment and writes to `logseq-sync-backups/<YYYY-MM-DD>/`:
+`backup.yml` runs daily at 14:00 UTC, and on demand. **The first scheduled or dispatched run has not been verified yet:** run it once from Actions → backup → Run workflow and check the result. It uses the `production` environment and writes to `logseq-sync-backups/<YYYY-MM-DD>/`:
 
 | What | How | Where |
 |---|---|---|
@@ -401,6 +416,10 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
   - That new database has a new ID, which OpenTofu doesn't manage and the deploy doesn't point at.
   - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
 - **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials.
+
+**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop both the daily backup and the weekly bump. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml` and `gh workflow enable bump-upstream.yml`. Check occasionally that the latest runs are recent.
+
+**First-run risk.** If rclone gets a 403 on its bucket check, set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. This is unverified: it is the usual fix for R2 tokens that can't list buckets, but it hasn't been tried here.
 
 **Limits.** Backups live in the same Cloudflare account. If you lose the account, only your clients' local copies remain. An off-account copy is on the backlog.
 
@@ -454,8 +473,12 @@ MCP on this server hasn't been verified end to end yet. To go back, set `"plan":
 | The client syncs to Logseq's servers again | You logged out, which clears the custom URL. Re-enter it, then sign in. |
 | `exceededCpu` / "Worker exceeded CPU time limit" in the Worker logs, or sync stalls on large graphs | The Free plan's 10 ms CPU per request is too little. Switch to paid (section 8). |
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
-| `429 rate limit exceeded` | The per-token limit is 120 reads or 20 writes per minute. Slow down. |
+| `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
+| Backups or the weekly bump stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` (section 7). |
+| Backup fails with 403 on the bucket check | Unverified fix: set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7). |
+| The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
+| Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
 | Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
 
 ## Backlog
