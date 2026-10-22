@@ -186,6 +186,12 @@ gh api -X POST 'repos/{owner}/{repo}/environments/production/deployment-branch-p
   -f name=main -f type=branch
 ```
 
+Because every push to `main` deploys, also protect `main` with the ruleset in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It blocks deletion and force pushes, requires a pull request, and requires the `check` CI job to pass. Repository admins can still bypass it through a pull request, which you'll need for the weekly bump PRs: they are opened with the default token, so CI doesn't run on them, and their check runs inside the bump workflow instead. Import it via **Settings → Rules → Rulesets → New ruleset → Import a ruleset**, or:
+
+```bash
+gh api -X POST 'repos/{owner}/{repo}/rulesets' --input .github/rulesets/protect-main.json
+```
+
 Then add the secrets:
 
 | Secret | Required |
