@@ -450,7 +450,7 @@ MCP on this server hasn't been verified end to end yet. To go back, set `"plan":
 - **`DB_SYNC_ADMIN_TOKEN` bypasses graph access checks.** It can read every graph. Keep it only in `.env.local` and the `production` environment.
 - **The Cloudflare API token** controls everything here, including the derived R2 keys. Treat it like a root password.
 - **PATs** are graph-scoped. Give agents the narrowest permission that works, and revoke unused tokens in Settings.
-- **Secrets stay out of the repo and the logs.** The repo, the rendered `wrangler.toml` and the logs hold no secrets. The OpenTofu state and plans are encrypted. `deploy.yml` and `backup.yml` never run on pull requests, and `ci.yml` uses no secrets, so fork PRs can't reach them.
+- **Secrets stay out of the repo and the logs.** The repo, the rendered `wrangler.toml` and the logs hold no secrets. The OpenTofu state and plans are encrypted. The OpenTofu outputs are marked sensitive, and `deploy.yml` and `deploy.sh` mask the D1 database id in Actions logs, so it and the other resource ids stay out of public run logs. `deploy.yml` and `backup.yml` never run on pull requests, and `ci.yml` uses no secrets, so fork PRs can't reach them.
 - **Your hostname is public.** Certificate transparency logs publish it, and internet scanners start probing a new hostname within hours. You'll see requests for paths like `/.env` in the Worker logs. They're harmless, but expected. Keeping `SYNC_HOSTNAME` out of the repo only avoids advertising it.
 
 **Rotating secrets:**
