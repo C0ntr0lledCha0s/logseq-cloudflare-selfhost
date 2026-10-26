@@ -172,7 +172,7 @@ This creates:
 
 - the D1 database `logseq-sync-index`;
 - the R2 buckets `logseq-sync-assets` and `logseq-sync-backups`;
-- a lifecycle rule that expires backups after 90 days.
+- a lifecycle rule that expires dated backups (`daily/`) after 90 days.
 
 All three resources have `prevent_destroy`. Names and retention come from `config/settings.json`.
 
@@ -371,7 +371,7 @@ You can also run it from Actions → bump-upstream → Run workflow.
   - upstream added or removed a binding or var (`unexpected:` / `missing:` from `check-upstream-bindings.mjs`).
 
   Check what changed upstream, then update the patch, `config/expected-bindings.json` or `render-wrangler.mjs` in a normal PR.
-- **New migrations.** They're applied before the new code deploys, and upstream migrations have so far been additive. Read them anyway.
+- **New migrations.** They're applied before the new code deploys, and upstream migrations have so far been additive. Read them anyway. `render-wrangler.mjs` refuses any Durable Object migration with `deleted_classes`, `renamed_classes` or `transferred_classes`, because graphs live in Durable Objects and those would destroy or move them; such a bump fails CI until you review it by hand.
 - **Client compatibility.** Keep your nightly clients updated. If a client stops syncing after a bump, update the client or move `UPSTREAM_REF` closer to the client's nightly commit.
 
 **Merging** the PR to `main` deploys it. Local deploys are different: `scripts/deploy.sh` ships your `.upstream` checkout, so after merging run `rm -rf .upstream` and redo 1.5 first (see section 2).
@@ -393,15 +393,18 @@ $W d1 time-travel restore logseq-sync-index --timestamp 2026-10-21T12:00:00Z
 
 ## 7. Backups and restore
 
-`backup.yml` runs daily at 14:00 UTC, and on demand (Actions → backup → Run workflow). A dispatched run has been verified: it printed `backup: d1=ok graphs=2/2 assets=ok`. It uses the `production` environment and writes to `logseq-sync-backups/<YYYY-MM-DD>/`:
+`backup.yml` runs daily at 14:00 UTC, and on demand (Actions → backup → Run workflow). A dispatched run has been verified: it printed `backup: d1=ok graphs=2/2 assets=ok`. It uses the `production` environment and writes to `logseq-sync-backups`:
 
 | What | How | Where |
 |---|---|---|
-| D1 index | `wrangler d1 export … --remote` | `<date>/index.sql` |
-| Graph snapshots | Upstream `download_graph_db.js`, using the admin token, one per graph | `<date>/graphs/<n>.sqlite`, plus `<date>/graphs/index.json` mapping `n` to the graph ID |
-| Assets | `rclone sync` of `logseq-sync-assets` | `assets/` (a mirror, not dated) |
+| D1 index | `wrangler d1 export … --remote` | `daily/<YYYY-MM-DD>/index.sql` |
+| Graph snapshots | Upstream `download_graph_db.js`, using the admin token, one per graph | `daily/<date>/graphs/<n>.sqlite`, plus `daily/<date>/graphs/index.json` mapping `n` to the graph ID |
+| Assets | `rclone sync` of `logseq-sync-assets`, with `--backup-dir` | `assets/` (a mirror, never expires); files deleted or overwritten in the live bucket are moved to `daily/<date>/assets-deleted/` |
+| Run log | wrangler, rclone and download output | `daily/<date>/backup.log` (private; it contains graph IDs) |
 
-The lifecycle rule deletes objects older than 90 days (`backupRetentionDays`). The logs show counts only, never graph IDs. The job fails if any part fails.
+The lifecycle rule deletes objects under `daily/` older than 90 days (`backupRetentionDays`). The `assets/` mirror is outside that prefix, so it never expires. The public run logs show counts only, never graph IDs. The job fails if any part fails, and then prints the bucket path of the uploaded `backup.log`, which is where to look to diagnose it.
+
+Backups written before this layout sit at `<date>/` with no `daily/` prefix, so the lifecycle rule won't expire them. Once newer backups exist, delete them by hand.
 
 To run a backup locally, with `.env.local` loaded and `.upstream` built:
 
@@ -417,7 +420,7 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
   - The export contains the schema, so it won't load over the existing tables. You'd load it into a fresh, empty database with `wrangler d1 execute <new-database> --remote --file index.sql`.
   - That new database has a new ID, which OpenTofu doesn't manage and the deploy doesn't point at.
   - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
-- **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials.
+- **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials. An asset deleted by accident or by an attacker is no longer in the mirror after the next backup, but it is kept in `daily/<date>/assets-deleted/` for the retention window; restore it from there.
 
 **Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop both the daily backup and the weekly bump. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml` and `gh workflow enable bump-upstream.yml`. Check occasionally that the latest runs are recent.
 
