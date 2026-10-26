@@ -99,6 +99,21 @@ test("unknown rate limiter throws", () => {
   );
 });
 
+for (const [key, value] of [
+  ["deleted_classes", '[ "SyncDO" ]'],
+  ["renamed_classes", '[ { from = "SyncDO", to = "Other" } ]'],
+  ["transferred_classes", '[ { from = "SyncDO", from_script = "x", to = "Other" } ]'],
+]) {
+  test(`${key} in a migration is refused`, () => {
+    const toml = fixture.replace(
+      '[[migrations]]\ntag = "v1"',
+      `[[migrations]]\ntag = "v9"\n${key} = ${value}\n\n[[migrations]]\ntag = "v1"`,
+    );
+    assert.notEqual(toml, fixture);
+    assert.throws(() => render({ upstreamToml: toml }), /destructive Durable Object migration v9 refused/);
+  });
+}
+
 test("missing d1_database_id throws", () => {
   assert.throws(() => render({ tofuOutputs: {} }), /d1_database_id/);
 });

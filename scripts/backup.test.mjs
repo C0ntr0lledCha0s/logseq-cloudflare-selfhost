@@ -26,10 +26,6 @@ if [ "$1 $2" = "d1 execute" ]; then
   node -e 'console.log(JSON.stringify([{results: process.env.STUB_GRAPH_IDS.split(",").filter(Boolean).map((g) => ({graph_id: g})), success: true}]))'
   exit 0
 fi
-if [ "$1 $2" = "r2 object" ]; then
-  echo "uploading $*"
-  exit 0
-fi
 exit 2
 `;
 
@@ -51,7 +47,8 @@ exec "$REAL_NODE" "$@"
 const rcloneStub = `#!/usr/bin/env bash
 echo "rclone $*" >> "$STUB_LOG"
 echo "R2_ENDPOINT=\${RCLONE_CONFIG_R2_ENDPOINT:-unset}" >> "$STUB_LOG"
-[ -n "\${STUB_RCLONE_FAIL:-}" ] && exit 1
+[ -n "\${STUB_RCLONE_FAIL:-}" ] && [ "$1" = sync ] && exit 1
+[ -n "\${STUB_LOG_UPLOAD_FAIL:-}" ] && [ "$1" = copyto ] && case "$*" in *backup.log) exit 1;; esac
 exit 0
 `;
 
@@ -116,13 +113,19 @@ test("uploads d1 export before graphs", { timeout: 30000 }, () =>
     const r = await run(ctx);
     assert.equal(r.code, 0, r.stderr);
     const lines = r.log.split("\n");
-    const put = lines.findIndex((l) => /r2 object put.*index\.sql/.test(l));
+    const put = lines.findIndex((l) => /rclone copyto .*index\.sql r2:logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/index\.sql/.test(l));
     const dl = lines.findIndex((l) => l.includes("download_graph_db.js"));
     assert.ok(put >= 0, "index.sql upload missing");
     assert.ok(dl > put, "graph download happened before index.sql upload");
     assert.match(r.stdout, /backup: d1=ok graphs=3\/3 assets=ok/);
-    assert.match(r.log, /logseq-sync-backups\/\d{4}-\d\d-\d\d\/graphs\/index\.json/);
-    assert.match(r.log, /rclone sync r2:logseq-sync-assets r2:logseq-sync-backups\/assets/);
+    assert.match(r.log, /r2:logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/graphs\/index\.json/);
+    assert.ok(!/wrangler r2 object/.test(r.log), "uploads must go through rclone");
+    assert.match(
+      r.log,
+      /rclone sync r2:logseq-sync-assets r2:logseq-sync-backups\/assets --backup-dir r2:logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/assets-deleted/,
+    );
+    assert.match(r.log, /rclone copyto .*backup\.log r2:logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/backup\.log/);
+    assert.match(r.stdout, /log=ok/);
     assert.match(r.log, /R2_ENDPOINT=https:\/\/acct123\.r2\.cloudflarestorage\.com/);
     assert.match(r.log, /DB_SYNC_ADMIN_TOKEN=admin-token-secret/);
     assert.ok(!/--admin-token|admin-token-secret.*node|node.*admin-token-secret/.test(r.log));
@@ -133,7 +136,7 @@ test("one failed graph still exits 1 after uploading the rest", { timeout: 30000
     const r = await run(ctx, { STUB_FAIL_DOWNLOAD: "2" });
     assert.equal(r.code, 1);
     assert.match(r.stdout, /graphs=2\/3/);
-    const uploads = r.log.split("\n").filter((l) => /r2 object put.*graphs\/\d+\.sqlite/.test(l));
+    const uploads = r.log.split("\n").filter((l) => /rclone copyto .*graphs\/\d+\.sqlite r2:.*\/daily\/.*graphs\/\d+\.sqlite/.test(l));
     assert.equal(uploads.length, 2);
   }));
 
@@ -145,6 +148,22 @@ test("never prints graph ids", { timeout: 30000 }, () =>
     for (const secret of ["admin-token-secret", "cf-token-secret", "r2-secret"]) {
       assert.ok(!printed.includes(secret), "secret leaked");
     }
+  }));
+
+test("failure still uploads the log and points at it without printing ids", { timeout: 30000 }, () =>
+  withCtx(async (ctx) => {
+    const r = await run(ctx, { STUB_FAIL_DOWNLOAD: "2" });
+    assert.equal(r.code, 1);
+    assert.match(r.log, /rclone copyto .*backup\.log r2:logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/backup\.log/);
+    assert.match(r.stdout, /see logseq-sync-backups\/daily\/\d{4}-\d\d-\d\d\/backup\.log/);
+    for (const id of GRAPH_IDS) assert.ok(!(r.stdout + r.stderr).includes(id), "graph id leaked");
+  }));
+
+test("a failed log upload is counted but does not change the result", { timeout: 30000 }, () =>
+  withCtx(async (ctx) => {
+    const r = await run(ctx, { STUB_LOG_UPLOAD_FAIL: "1" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /log=fail/);
   }));
 
 test("zero graphs is valid", { timeout: 30000 }, () =>

@@ -26,6 +26,11 @@ d1_name="$(setting d1DatabaseName)"
 
 trap 'rm -f tofu-output.json' EXIT
 tofu -chdir=infra output -json > tofu-output.json
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  # Mask the D1 id so wrangler output can never print it in the public run log.
+  d1_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).d1_database_id.value)' tofu-output.json)"
+  echo "::add-mask::$d1_id"
+fi
 
 # Keep a pristine copy (saved once, first run) so re-runs in the same checkout never
 # treat a rendered file as the upstream input.

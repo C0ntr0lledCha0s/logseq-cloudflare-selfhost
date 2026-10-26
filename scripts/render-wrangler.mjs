@@ -32,6 +32,16 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
     if (key in cfg) throw new Error(`forbidden top-level key: ${key}`);
   }
 
+  for (const m of cfg.migrations ?? []) {
+    for (const key of ["deleted_classes", "renamed_classes", "transferred_classes"]) {
+      if (Array.isArray(m[key]) ? m[key].length > 0 : m[key] !== undefined) {
+        throw new Error(
+          `destructive Durable Object migration ${m.tag} refused (${key}) — graphs live in Durable Objects; review manually`,
+        );
+      }
+    }
+  }
+
   cfg.name = must(settings.workerName, "settings.workerName");
   cfg.workers_dev = false;
   cfg.preview_urls = false;

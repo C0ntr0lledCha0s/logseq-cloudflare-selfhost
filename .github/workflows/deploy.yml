@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
 
@@ -65,6 +67,23 @@ jobs:
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
         run: scripts/with-r2-credentials.sh tofu -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Mask the D1 id
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
+        # `tofu output -json` prints {} on a first-ever run (no outputs yet) and fails on
+        # backend or auth errors. The id is only ever printed inside ::add-mask::, so
+        # `tofu apply` refresh lines are masked too.
+        run: |
+          scripts/with-r2-credentials.sh tofu -chdir=infra output -json > "$RUNNER_TEMP/tofu-output.json"
+          node -e '
+            const out = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            if (out.d1_database_id) console.log("::add-mask::" + out.d1_database_id.value);
+          ' "$RUNNER_TEMP/tofu-output.json"
+          rm -f "$RUNNER_TEMP/tofu-output.json"
 
       - name: Tofu apply
         env:
