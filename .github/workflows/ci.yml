@@ -5,6 +5,9 @@ on:
   push:
     branches-ignore:
       - main
+  # The bump workflow dispatches CI on its PR branch: PRs opened with the
+  # default token don't trigger pull_request runs without approval.
+  workflow_dispatch:
   workflow_call:
     inputs:
       upstream_ref:
