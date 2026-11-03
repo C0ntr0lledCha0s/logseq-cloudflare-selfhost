@@ -60,6 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     env:
@@ -109,3 +110,9 @@ jobs:
           else
             gh pr create --base "$BASE_BRANCH" --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
           fi
+
+      # Runs started by the default token don't trigger pull_request CI
+      # (it waits for approval), but workflow_dispatch is allowed. This puts
+      # the required `check` status on the PR's head commit.
+      - name: Run CI on the bump branch
+        run: gh workflow run ci.yml --ref "$(git branch --show-current)"
