@@ -51,3 +51,33 @@ resource "cloudflare_r2_bucket_lifecycle" "backups" {
     }
   }]
 }
+
+# Optional connector (connector.enabled in config/settings.json). enabled=false is only
+# guaranteed safe for installs that never enabled it: turning the connector off after it
+# was enabled plans a destroy of these two resources, which prevent_destroy refuses (the
+# data would be lost), so remove them from state deliberately instead.
+resource "cloudflare_workers_kv_namespace" "connector_oauth" {
+  count = local.settings.connector.enabled ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  title      = "logseq-connector-oauth"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_d1_database" "connector" {
+  count = local.settings.connector.enabled ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  name       = local.settings.connector.d1DatabaseName
+  # Pinned to Cloudflare's default; left unset, the provider plans an update on every apply.
+  read_replication = {
+    mode = "disabled"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
