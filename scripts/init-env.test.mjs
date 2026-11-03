@@ -342,8 +342,16 @@ test("--add-missing --push pushes only added names with -R", { timeout: 60000 },
 for (const [name, env, pattern] of [
   ["non-numeric OWNER_GITHUB_USER_ID", { OWNER_GITHUB_USER_ID: "octocat" }, /OWNER_GITHUB_USER_ID/],
   ["empty-ish OWNER_GITHUB_USER_ID with a space", { OWNER_GITHUB_USER_ID: "12 34" }, /OWNER_GITHUB_USER_ID/],
+  ["OWNER_GITHUB_USER_ID with a leading zero", { OWNER_GITHUB_USER_ID: "01234" }, /OWNER_GITHUB_USER_ID must be a positive integer/],
+  ["OWNER_GITHUB_USER_ID of zero", { OWNER_GITHUB_USER_ID: "0" }, /OWNER_GITHUB_USER_ID must be a positive integer/],
   ["CONNECTOR_HOSTNAME with scheme", { CONNECTOR_HOSTNAME: "https://mcp.example.com" }, /CONNECTOR_HOSTNAME/],
   ["CONNECTOR_HOSTNAME with slash", { CONNECTOR_HOSTNAME: "mcp.example.com/x" }, /CONNECTOR_HOSTNAME/],
+  ["CONNECTOR_HOSTNAME with uppercase", { CONNECTOR_HOSTNAME: "MCP.Example.com" }, /CONNECTOR_HOSTNAME must be lowercase/],
+  ["CONNECTOR_HOSTNAME with a port", { CONNECTOR_HOSTNAME: "mcp.example.com:443" }, /CONNECTOR_HOSTNAME must be a bare lowercase hostname/],
+  ["CONNECTOR_HOSTNAME with a trailing dot", { CONNECTOR_HOSTNAME: "mcp.example.com." }, /CONNECTOR_HOSTNAME must be a bare lowercase hostname/],
+  ["CONNECTOR_HOSTNAME with one label", { CONNECTOR_HOSTNAME: "localhost" }, /CONNECTOR_HOSTNAME must be a bare lowercase hostname/],
+  ["CONNECTOR_HOSTNAME with a 64-character label", { CONNECTOR_HOSTNAME: `${"a".repeat(64)}.example.com` }, /CONNECTOR_HOSTNAME must be a bare lowercase hostname/],
+  ["CONNECTOR_HOSTNAME over 253 characters", { CONNECTOR_HOSTNAME: `${Array(4).fill("a".repeat(63)).join(".")}.com` }, /CONNECTOR_HOSTNAME must be a bare lowercase hostname/],
   ["GITHUB_CLIENT_SECRET with whitespace", { GITHUB_CLIENT_SECRET: "abc def" }, /GITHUB_CLIENT_SECRET/],
   ["GITHUB_CLIENT_ID with whitespace", { GITHUB_CLIENT_ID: "abc def" }, /GITHUB_CLIENT_ID/],
 ]) {
@@ -466,5 +474,16 @@ test("--add-missing --push names the mapped secret when gh fails", { timeout: 60
     const r = await run(dir, ["--add-missing", "--push"], { ...CONNECTOR_INPUTS, PATH: `${bin}:${process.env.PATH}` });
     assert.notEqual(r.status, 0);
     assert.match(r.stderr, /failed to set CONNECTOR_GITHUB_CLIENT_ID/);
+  });
+});
+
+test("--add-missing accepts a 253-character lowercase CONNECTOR_HOSTNAME", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, EXISTING);
+    const host = `${Array(3).fill("a".repeat(63)).join(".")}.${"b".repeat(61)}`;
+    assert.equal(host.length, 253);
+    const r = await run(dir, ["--add-missing"], { ...CONNECTOR_INPUTS, CONNECTOR_HOSTNAME: host });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(parseEnv(dir).CONNECTOR_HOSTNAME, host);
   });
 });

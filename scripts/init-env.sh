@@ -129,6 +129,7 @@ for name in $need_inputs; do
 done
 
 hostname_re='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+connector_hostname_re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
 for name in $need_inputs; do
   value="${!name}"
   case "$name" in
@@ -144,11 +145,22 @@ for name in $need_inputs; do
         exit 1
       }
       ;;
-    SYNC_HOSTNAME | CONNECTOR_HOSTNAME)
+    SYNC_HOSTNAME)
       [[ "$value" =~ $hostname_re ]] || {
         echo "init-env: $name must be a bare hostname like sync.example.com (no scheme, slash or space)" >&2
         exit 1
       }
+      ;;
+    CONNECTOR_HOSTNAME)
+      # The connector Worker accepts only this form (connector/src/config.ts) and fails every request otherwise.
+      [[ ! "$value" =~ [A-Z] ]] || {
+        echo "init-env: CONNECTOR_HOSTNAME must be lowercase (e.g. mcp.example.com)" >&2
+        exit 1
+      }
+      if [[ ! "$value" =~ $connector_hostname_re ]] || [ "${#value}" -gt 253 ]; then
+        echo "init-env: CONNECTOR_HOSTNAME must be a bare lowercase hostname like mcp.example.com (no scheme, port, slash, space or trailing dot; at most 253 characters)" >&2
+        exit 1
+      fi
       ;;
     GITHUB_CLIENT_ID | GITHUB_CLIENT_SECRET)
       [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || {
@@ -157,8 +169,8 @@ for name in $need_inputs; do
       }
       ;;
     OWNER_GITHUB_USER_ID)
-      [[ "$value" =~ ^[0-9]+$ ]] || {
-        echo "init-env: OWNER_GITHUB_USER_ID must be numeric (your GitHub user id, not your login)" >&2
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+        echo "init-env: OWNER_GITHUB_USER_ID must be a positive integer with no leading zeros (your numeric GitHub user id, not your login)" >&2
         exit 1
       }
       ;;

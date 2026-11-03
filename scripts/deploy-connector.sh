@@ -48,6 +48,22 @@ esac
 : "${GITHUB_CLIENT_ID:?}" "${GITHUB_CLIENT_SECRET:?}" "${OWNER_GITHUB_USER_ID:?}"
 : "${COOKIE_ENCRYPTION_KEY:?}" "${GRAPH_TOKEN_KEY:?}" "${CONNECTOR_HOSTNAME:?}"
 
+# The Worker fails every request unless these match connector/src/config.ts, so check them before
+# anything is rendered or deployed (the secrets may have been set by hand). Values are never printed.
+connector_hostname_re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+[[ ! "$CONNECTOR_HOSTNAME" =~ [A-Z] ]] || {
+  echo "deploy-connector: CONNECTOR_HOSTNAME must be lowercase" >&2
+  exit 1
+}
+if [[ ! "$CONNECTOR_HOSTNAME" =~ $connector_hostname_re ]] || [ "${#CONNECTOR_HOSTNAME}" -gt 253 ]; then
+  echo "deploy-connector: CONNECTOR_HOSTNAME must be a bare lowercase hostname (no scheme, port, slash, space or trailing dot; at most 253 characters)" >&2
+  exit 1
+fi
+[[ "$OWNER_GITHUB_USER_ID" =~ ^[1-9][0-9]*$ ]] || {
+  echo "deploy-connector: OWNER_GITHUB_USER_ID must be a positive integer with no leading zeros" >&2
+  exit 1
+}
+
 connector_dir="$repo_root/connector"
 wrangler="$connector_dir/node_modules/.bin/wrangler"
 d1_name="$(connector_setting d1DatabaseName)"
