@@ -42,7 +42,7 @@ async function withStub(handler, fn) {
 
 function spawnScript(args) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(script, args, { cwd: root, env: process.env });
+    const child = spawn(script, args, { cwd: root, env: { ...process.env, SMOKE_RETRY_DELAY: "0.05" } });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
@@ -119,6 +119,20 @@ test("fails when /graphs does not redirect to /login", { timeout: 120000 }, asyn
     const r = await run(base);
     assert.equal(r.status, 1);
     assert.match(r.stdout, /FAIL wizard-requires-login: location/);
+  });
+});
+
+test("retries the first request until the Worker answers", { timeout: 120000 }, async () => {
+  let metadataCalls = 0;
+  const h = (req, res) => {
+    if (req.url === METADATA_PATH && ++metadataCalls < 3) return (res.writeHead(522), res.end());
+    return healthy(req, res);
+  };
+  await withStub(h, async (base) => {
+    const r = await run(base);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(metadataCalls, 3);
+    assert.match(r.stdout, /^ok oauth-metadata$/m);
   });
 });
 

@@ -25,6 +25,8 @@ const ORIGINAL_NAMES = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE",
   "ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "SYNC_HOSTNAME",
 ];
+// GitHub rejects secret names starting with GITHUB_, so --push sets these two under a CONNECTOR_ prefix.
+const pushedName = (n) => (n === "GITHUB_CLIENT_ID" || n === "GITHUB_CLIENT_SECRET" ? `CONNECTOR_${n}` : n);
 const CONNECTOR_NAMES = [
   "CONNECTOR_HOSTNAME", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
   "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY",
@@ -323,11 +325,14 @@ test("--add-missing --push pushes only added names with -R", { timeout: 60000 },
     const calls = all.slice(2);
     assert.equal(calls.length, CONNECTOR_NAMES.length);
     calls.forEach((c, i) => {
-      assert.deepEqual(c.argv, ["secret", "set", CONNECTOR_NAMES[i], "-R", "expected/repo", "--env", "production"]);
+      assert.deepEqual(c.argv, ["secret", "set", pushedName(CONNECTOR_NAMES[i]), "-R", "expected/repo", "--env", "production"]);
       assert.equal(c.stdin, env[CONNECTOR_NAMES[i]]);
       assert.ok(!c.argv.join(" ").includes(env[CONNECTOR_NAMES[i]]), "value in argv");
     });
     assert.match(r.stdout, /Pushed 6 secrets/);
+    const pushed = calls.map((c) => c.argv[2]);
+    assert.ok(pushed.includes("CONNECTOR_GITHUB_CLIENT_ID") && pushed.includes("CONNECTOR_GITHUB_CLIENT_SECRET"));
+    assert.ok(pushed.every((n) => !n.startsWith("GITHUB_")), "GitHub rejects GITHUB_-prefixed secret names");
     for (const v of secretsOf(env)) {
       assert.ok(!r.stdout.includes(v) && !r.stderr.includes(v), "secret leaked to output");
     }
@@ -451,5 +456,15 @@ test("--add-missing no-terminal message lists only the unset inputs", { timeout:
     assert.notEqual(r.status, 0);
     assert.match(r.stderr, /no terminal: export GITHUB_CLIENT_SECRET, OWNER_GITHUB_USER_ID\n/);
     assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), EXISTING);
+  });
+});
+
+test("--add-missing --push names the mapped secret when gh fails", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, EXISTING);
+    const { bin } = stubGh(dir, { failOn: "CONNECTOR_GITHUB_CLIENT_ID" });
+    const r = await run(dir, ["--add-missing", "--push"], { ...CONNECTOR_INPUTS, PATH: `${bin}:${process.env.PATH}` });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /failed to set CONNECTOR_GITHUB_CLIENT_ID/);
   });
 });

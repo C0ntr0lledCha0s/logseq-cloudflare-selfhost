@@ -94,7 +94,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
-        run: scripts/with-r2-credentials.sh tofu -chdir=infra apply -auto-approve -input=false
+        # On the first run with the connector enabled the mask step sees no connector ids yet,
+        # so scrub `[id=...]` from apply output. Explicit bash enables pipefail, so a failed
+        # apply still fails the step.
+        shell: bash
+        run: scripts/with-r2-credentials.sh tofu -chdir=infra apply -auto-approve -input=false 2>&1 | sed -E 's/\[id=[^]]*\]/[id=***]/g'
 
       - name: Fetch, check and build upstream
         run: |
@@ -122,6 +126,11 @@ jobs:
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
         run: scripts/with-r2-credentials.sh scripts/deploy.sh
 
+      - name: Prepare connector
+        run: |
+          scripts/vendor-upstream-api.sh .upstream
+          npm --prefix connector ci
+
       - name: Deploy connector
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -135,7 +144,4 @@ jobs:
           COOKIE_ENCRYPTION_KEY: ${{ secrets.COOKIE_ENCRYPTION_KEY }}
           GRAPH_TOKEN_KEY: ${{ secrets.GRAPH_TOKEN_KEY }}
           CONNECTOR_HOSTNAME: ${{ secrets.CONNECTOR_HOSTNAME }}
-        run: |
-          scripts/vendor-upstream-api.sh .upstream
-          npm --prefix connector ci
-          scripts/with-r2-credentials.sh scripts/deploy-connector.sh
+        run: scripts/with-r2-credentials.sh scripts/deploy-connector.sh

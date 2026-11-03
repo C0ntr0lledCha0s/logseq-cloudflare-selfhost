@@ -233,8 +233,13 @@ if [ "$push" = 1 ]; then
   }
   pushed=0
   for name in $add_names; do
-    printf '%s' "${!name}" | gh secret set "$name" -R "$target_repo" --env production || {
-      echo "init-env: failed to set $name" >&2
+    # GitHub rejects secret names starting with GITHUB_; .env.local keeps the GITHUB_* names.
+    secret_name="$name"
+    case "$name" in
+      GITHUB_CLIENT_ID | GITHUB_CLIENT_SECRET) secret_name="CONNECTOR_$name" ;;
+    esac
+    printf '%s' "${!name}" | gh secret set "$secret_name" -R "$target_repo" --env production || {
+      echo "init-env: failed to set $secret_name" >&2
       echo "$recovery" >&2
       exit 1
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Post-deploy smoke test for the connector Worker. Usage: smoke-connector.sh <base-url>
+# Env: SMOKE_RETRY_DELAY seconds between attempts at the first request (default 3).
 set -euo pipefail
 
 usage() {
@@ -36,7 +37,13 @@ fail() {
 }
 
 # The path @cloudflare/workers-oauth-provider serves for the /mcp resource (see connector/test/auth.test.ts).
-code="$(status "$base/.well-known/oauth-protected-resource/mcp")"
+# A fresh deploy can take a few seconds to answer on its custom domain, so the first request
+# is attempted up to 5 times; every later check runs against a Worker that has already answered.
+for attempt in 1 2 3 4 5; do
+  code="$(status "$base/.well-known/oauth-protected-resource/mcp")"
+  [ "$code" = 200 ] && break
+  [ "$attempt" -lt 5 ] && sleep "${SMOKE_RETRY_DELAY:-3}"
+done
 if [ "$code" != 200 ]; then
   fail oauth-metadata "$code"
 fi

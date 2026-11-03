@@ -4,12 +4,21 @@
 # Env (only when enabled): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET,
 #      OWNER_GITHUB_USER_ID, COOKIE_ENCRYPTION_KEY, GRAPH_TOKEN_KEY, CONNECTOR_HOSTNAME.
 #      OpenTofu state access env (backend creds, passphrase) must also be set.
+# Env (TEST ONLY): DEPLOY_CONNECTOR_SETTINGS overrides the settings file path; honoured only
+#      together with DEPLOY_CONNECTOR_TEST=1.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 settings="config/settings.json"
+if [ -n "${DEPLOY_CONNECTOR_SETTINGS:-}" ]; then
+  [ "${DEPLOY_CONNECTOR_TEST:-}" = "1" ] || {
+    echo "deploy-connector: DEPLOY_CONNECTOR_SETTINGS is test-only and requires DEPLOY_CONNECTOR_TEST=1" >&2
+    exit 1
+  }
+  settings="$DEPLOY_CONNECTOR_SETTINGS"
+fi
 
 # connector_setting <key>: prints a string value of settings.connector.<key>, or "true"/"false" for booleans.
 # A missing key is an error.
