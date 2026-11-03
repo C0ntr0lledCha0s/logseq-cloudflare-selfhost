@@ -16,6 +16,13 @@ export interface GraphRecord {
   lastUsedAt: string | null;
 }
 
+/** A connected graph as a tool call uses it: where to send the request, with which PAT, and whether writes are allowed. */
+export interface ResolvedGraph {
+  graphId: string;
+  mode: GraphMode;
+  pat: string;
+}
+
 export type NewGraph = Omit<GraphRecord, "lastUsedAt"> & { token: string };
 export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "permission" | "expiresAt">>;
 
@@ -100,18 +107,28 @@ export class GraphStore {
 
   /** The decrypted PAT. Throws if the alias is unknown or the ciphertext does not authenticate. */
   async token(alias: string): Promise<string> {
+    const graph = await this.resolve(alias);
+    if (!graph) throw new Error(`unknown graph alias: ${alias}`);
+    return graph.pat;
+  }
+
+  /**
+   * What a tool call needs, read in one query so the mode and token always come from the same row.
+   * Null for an unknown alias; throws if the ciphertext does not authenticate.
+   */
+  async resolve(alias: string): Promise<ResolvedGraph | null> {
     const row = await this.db
-      .prepare("SELECT graph_id, token_ct, token_iv, key_id FROM graphs WHERE alias = ?")
+      .prepare("SELECT graph_id, mode, token_ct, token_iv, key_id FROM graphs WHERE alias = ?")
       .bind(alias)
-      .first<{ graph_id: string; token_ct: string; token_iv: string; key_id: string }>();
-    if (!row) throw new Error(`unknown graph alias: ${alias}`);
+      .first<{ graph_id: string; mode: GraphMode; token_ct: string; token_iv: string; key_id: string }>();
+    if (!row) return null;
     if (row.key_id !== KEY_ID) throw new Error(`unsupported token key id: ${row.key_id}`);
     const plain = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: fromBase64url(row.token_iv), additionalData: new TextEncoder().encode(row.graph_id) },
       await this.key,
       fromBase64url(row.token_ct),
     );
-    return new TextDecoder().decode(plain);
+    return { graphId: row.graph_id, mode: row.mode, pat: new TextDecoder().decode(plain) };
   }
 
   /** Rejects an invalid alias or token, a duplicate alias, and a graph ID that is already connected. */

@@ -1,12 +1,10 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import committedManifest from "../tools-manifest.json";
 import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
-import { type GraphAccess, registerGraphTools } from "../src/tools/semantic";
+import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { type OpenApiSpec, buildManifest, checkManifest } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
@@ -28,7 +26,7 @@ function dateIn(days: number): string {
   return new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 }
 
-function testEnv(): Env {
+function testEnv(overrides: Partial<Env> = {}): Env {
   const sync = {
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -41,7 +39,7 @@ function testEnv(): Env {
       return syncHandler(request);
     },
   } as unknown as Fetcher;
-  return { ...env, SYNC: sync } as Env;
+  return { ...env, SYNC: sync, ...overrides } as Env;
 }
 
 beforeEach(async () => {
@@ -107,7 +105,7 @@ async function rpc(handler: Handler, method: string, params: unknown, e: Env = t
 }
 
 function connector(e: Env = testEnv()): Handler {
-  return (request, _env, ctx) => mcpHandler(e)(request, e, ctx);
+  return (request, _env, ctx) => mcpHandler(e, ctx)(request, e, ctx);
 }
 
 async function listTools(): Promise<any[]> {
@@ -260,11 +258,13 @@ describe("routing", () => {
     expect(syncRequests).toHaveLength(0);
   });
 
-  it("dot-segment path arguments are refused without a sync call", async () => {
+  it("dot-segment and empty path arguments are refused without a sync call", async () => {
     for (const pageId of ["..", "."]) {
       const result = await callTool("get_page", { graph: "work", "page-id": pageId });
-      expect(result.isError).toBe(true);
+      expect(result).toEqual({ isError: true, text: "path arguments may not be '.' or '..'" });
     }
+    const empty = await callTool("get_page", { graph: "work", "page-id": "" });
+    expect(empty).toEqual({ isError: true, text: "path arguments may not be empty" });
     expect(syncRequests).toHaveLength(0);
   });
 
@@ -321,31 +321,44 @@ describe("errors", () => {
 
   it("a failing touch does not mask the tool result", async () => {
     syncHandler = () => Response.json({ ok: true });
-    const e = testEnv();
-    const graphs = store();
-    const access: GraphAccess = {
-      env: e,
-      resolve: async (alias) => {
-        const record = await graphs.get(alias);
-        if (!record) throw new Error("test resolves known aliases only");
-        return { graphId: record.graphId, pat: await graphs.token(alias), mode: record.mode };
+    // The store's D1 answers every query except the last-used update.
+    const db = {
+      prepare(sql: string) {
+        if (sql.startsWith("UPDATE graphs SET last_used_at")) throw new Error("D1 unavailable");
+        return env.DB.prepare(sql);
       },
-      touch: async () => {
-        throw new Error("D1 unavailable");
-      },
-    };
-    const handler = createMcpHandler(
-      () => {
-        const server = new McpServer({ name: "test", version: "0.0.0" });
-        registerGraphTools(server, spec, access);
-        return server;
-      },
-      { route: "/mcp" },
-    );
-    const result = await callTool("get_page", { graph: "work", "page-id": "p1" }, handler);
+    } as unknown as D1Database;
+    const result = await callTool("get_page", { graph: "work", "page-id": "p1" }, connector(testEnv({ DB: db })));
     expect(result.isError).toBe(false);
     expect(JSON.parse(result.text)).toEqual({ ok: true });
-    expect(logged().join("\n")).not.toContain("D1 unavailable");
+    // The touch runs alongside the response, so the two lines may come in either order.
+    const lines = logged().map((line) => line.replace(/ms=\d+$/, "ms=N")).sort();
+    expect(lines).toEqual([
+      "tool get_page graph=work status=ok ms=N",
+      "tool get_page graph=work status=touch-failed ms=N",
+    ]);
+  });
+
+  it("caps result text at 150,000 characters with a truncation notice", async () => {
+    syncHandler = () => Response.json({ pages: [{ title: "x".repeat(200_000) }] });
+    const result = await callTool("list_pages", { graph: "work" });
+    expect(result.isError).toBe(false);
+    expect(result.text).toHaveLength(RESULT_CHAR_LIMIT);
+    expect(result.text).toMatch(/\[truncated: the result had \d+ characters and the limit is 150000; .*\]$/);
+
+    // Across several items: text after the cut is dropped, other content is kept.
+    const capped = capResult({
+      content: [
+        { type: "text", text: "a".repeat(100_000) },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+        { type: "text", text: "b".repeat(100_000) },
+        { type: "text", text: "c" },
+      ],
+    });
+    expect(capped.content.map((c) => c.type)).toEqual(["text", "image", "text"]);
+    const texts = capped.content.flatMap((c) => (c.type === "text" ? [c.text] : []));
+    expect(texts.join("")).toHaveLength(RESULT_CHAR_LIMIT);
+    expect(capResult({ content: [{ type: "text", text: "short" }] })).toEqual({ content: [{ type: "text", text: "short" }] });
   });
 });
 

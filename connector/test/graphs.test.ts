@@ -168,4 +168,13 @@ describe("GraphStore", () => {
     expect(new Date(at).toISOString()).toBe(at);
     await expect(s.touch("missing")).rejects.toThrow();
   });
+
+  it("resolve returns the graph id, mode and decrypted token from one row, or null for an unknown alias", async () => {
+    const s = store();
+    await s.add({ ...BASE, mode: "read" });
+    expect(await s.resolve("work")).toEqual({ graphId: BASE.graphId, mode: "read", pat: TOKEN });
+    expect(await s.resolve("missing")).toBeNull();
+    await s.remove("work");
+    expect(await s.resolve("work")).toBeNull();
+  });
 });

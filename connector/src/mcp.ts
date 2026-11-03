@@ -2,36 +2,53 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { type StatelessMcpHandler, createMcpHandler } from "agents/mcp/server";
 import openapi from "../vendor/openapi.json";
 import { GraphStore } from "./graphs";
-import { ToolError } from "./tools/common";
+import { logTool } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
-import { type GraphAccess, registerGraphTools } from "./tools/semantic";
+import { type GraphTool, buildGraphTools, registerGraphTools } from "./tools/semantic";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
 const spec = openapi as unknown as OpenApiSpec;
 
-function graphAccess(env: Env, store: GraphStore): GraphAccess {
-  return {
-    env,
-    async resolve(alias) {
-      const graph = await store.get(alias);
-      if (!graph) {
-        throw new ToolError(`unknown graph '${alias}' — call list_graphs for the connected aliases`, "unknown-graph");
-      }
-      return { graphId: graph.graphId, pat: await store.token(alias), mode: graph.mode };
-    },
-    touch: (alias) => store.touch(alias),
-  };
+interface IsolateTools {
+  store: GraphStore;
+  graphTools: GraphTool[];
+}
+
+/**
+ * Per isolate: the env object is the same for every request an isolate serves, so the store and the
+ * built graph tools are made once. Each request still gets its own server (it binds one transport).
+ */
+const isolates = new WeakMap<Env, IsolateTools>();
+
+function isolateTools(env: Env): IsolateTools {
+  let tools = isolates.get(env);
+  if (!tools) {
+    const store = new GraphStore(env.DB, env.GRAPH_TOKEN_KEY);
+    tools = { store, graphTools: buildGraphTools(spec, { env, resolve: (alias) => store.resolve(alias) }) };
+    isolates.set(env, tools);
+  }
+  return tools;
+}
+
+/** Records a use after the response; a failure is logged and never reaches the tool result. */
+async function touch(store: GraphStore, tool: string, alias: string): Promise<void> {
+  const started = Date.now();
+  try {
+    await store.touch(alias);
+  } catch {
+    logTool(tool, alias, "touch-failed", started);
+  }
 }
 
 /** The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are now. */
-export function mcpHandler(env: Env): StatelessMcpHandler {
+export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler {
+  const { store, graphTools } = isolateTools(env);
   return createMcpHandler(
     () => {
-      const store = new GraphStore(env.DB, env.GRAPH_TOKEN_KEY);
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
       registerHandwrittenTools(server, env, store);
-      registerGraphTools(server, spec, graphAccess(env, store));
+      registerGraphTools(server, graphTools, (tool, alias) => ctx.waitUntil(touch(store, tool, alias)));
       return server;
     },
     // The Worker already answers 421 for any host but CONNECTOR_HOSTNAME (src/index.ts).
@@ -42,6 +59,6 @@ export function mcpHandler(env: Env): StatelessMcpHandler {
 /** The provider's `apiHandler`: only reached with a valid access token for this host's `/mcp`. */
 export const mcpApiHandler = {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return mcpHandler(env)(request, env, ctx);
+    return mcpHandler(env, ctx)(request, env, ctx);
   },
 };
