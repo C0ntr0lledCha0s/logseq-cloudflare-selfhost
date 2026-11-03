@@ -126,12 +126,22 @@ jobs:
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
         run: scripts/with-r2-credentials.sh scripts/deploy.sh
 
+      # A disabled connector skips both connector steps, so the deploy is exactly as without it.
+      # scripts/deploy-connector.sh also exits early when disabled.
+      - name: Read connector setting
+        id: connector
+        run: |
+          enabled="$(node -p 'const v = require("./config/settings.json").connector.enabled; if (typeof v !== "boolean") throw new Error("settings.connector.enabled must be true or false"); v')"
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Prepare connector
+        if: steps.connector.outputs.enabled == 'true'
         run: |
           scripts/vendor-upstream-api.sh .upstream
           npm --prefix connector ci
 
       - name: Deploy connector
+        if: steps.connector.outputs.enabled == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
