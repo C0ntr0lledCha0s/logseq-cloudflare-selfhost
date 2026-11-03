@@ -75,6 +75,11 @@
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
   },
   {
+    "name": "get_page_outline",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/outline"
+  },
+  {
     "name": "get_property",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"

@@ -1,0 +1,173 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index bdbd9d52a8..4e4be65541 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -320,6 +320,41 @@
+          (cond-> {:blocks (mapv #(page-block-tree db %) roots)}
+            next-cursor (assoc :next-cursor next-cursor)))))))
+ 
++;; getPageOutline renders a page's whole block tree as a markdown outline with id refs resolved
++;; to titles, so an agent can read a page in one call.
++(def ^:private max-outline-blocks 2000)
++
++(defn- outline-property-lines [db entity indent]
++  (for [{:keys [title value]} (entity-properties-response db entity)
++        :let [values (if (vector? value) value [value])
++              text (string/join ", " (map #(if (map? %) (page-ref/->page-ref (:title %)) (str %)) values))]]
++    (str indent "  " title ":: " text)))
++
++(defn- outline-children [db entity]
++  (->> (:block/_parent entity)
++       (remove entity-util/hidden?)
++       (sort-by :block/order)))
++
++(defn- page-outline [db page]
++  (let [lines (transient [])
++        n (volatile! 0)
++        truncated? (volatile! false)]
++    (letfn [(walk [entity depth]
++              (doseq [block (outline-children db entity)]
++                (if (>= @n max-outline-blocks)
++                  (vreset! truncated? true)
++                  (let [indent (apply str (repeat depth "  "))
++                        status (some-> (:logseq.property/status block) :block/title)
++                        title (or (db-content/recur-replace-uuid-in-block-title block) "")]
++                    (vswap! n inc)
++                    (conj! lines (str indent "- " (when status (str "[" status "] ")) title))
++                    (doseq [line (outline-property-lines db block indent)] (conj! lines line))
++                    (walk block (inc depth))))))]
++      (walk page 0))
++    {:markdown (string/join "\n" (persistent! lines))
++     :block-count @n
++     :truncated @truncated?}))
++
+ (defn- non-blank-string? [v]
+   (and (string? v) (seq v)))
+ 
+@@ -662,6 +697,14 @@
+         (paginated-page-blocks-response db page url))
+       (http/not-found))
+ 
++    :semantic/pages-outline
++    (if-let [page (find-visible-entity db (:page-id path-params))]
++      (cond
++        (not (page? page)) (http/bad-request "block is not a page")
++        e2ee? (http/error-response "page outlines are unavailable for E2EE graphs" 409)
++        :else (http/json-response nil (merge (block-detail-response db page) (page-outline db page))))
++      (http/not-found))
++
+     :semantic/pages-references
+     (if-let [page (find-visible-entity db (:page-id path-params))]
+       (if (page? page)
+@@ -1094,7 +1137,8 @@
+                             paginate-bounded)))))
+ 
+ (def ^:private page-handlers
+-  #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-references :semantic/pages-get
++  #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
++    :semantic/pages-references :semantic/pages-get
+     :semantic/pages-update :semantic/pages-delete})
+ 
+ (def ^:private block-handlers
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index bb6fa2d213..e3f3a43395 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -12,6 +12,8 @@
+     :handler :semantic/pages-create :operation-id "createPage" :scope "logseq/write" :rate-class :write}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id/blocks" :internal-path "/semantic/pages/:page-id/blocks"
+     :handler :semantic/pages-blocks :operation-id "listPageBlocks" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id/outline" :internal-path "/semantic/pages/:page-id/outline"
++    :handler :semantic/pages-outline :operation-id "getPageOutline" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id/references" :internal-path "/semantic/pages/:page-id/references"
+     :handler :semantic/pages-references :operation-id "listPageReferences" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
+@@ -88,6 +90,7 @@
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+    "createPage" ["Create a page" "Creates a page block with the supplied title."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
++   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and user and library block properties as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+@@ -313,6 +316,7 @@
+                   (list-response :assets "AssetResponse" "A cursor page of asset blocks")
+                   "searchGraph" (list-response :results "SearchResultResponse" "A cursor page of search results")
+                   "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
++                  "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+                   "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
+                   "updateBlock" (entity-response "BlockResponse" "The updated block")
+@@ -372,6 +376,11 @@
+                                                                        :items {:$ref "#/components/schemas/EntityProperty"}}}}]}
+               :PageResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}]}
+               :PageDetailResponse {:allOf [{:$ref "#/components/schemas/BlockDetailResponse"}]}
++              :PageOutlineResponse {:allOf [{:$ref "#/components/schemas/PageDetailResponse"}
++                                            {:type "object" :required ["markdown" "block-count" "truncated"]
++                                             :properties {:markdown {:type "string"}
++                                                          :block-count {:type "integer"}
++                                                          :truncated {:type "boolean"}}}]}
+               :TagResponse {:type "object" :required ["uuid" "title"]
+                             :properties {:uuid {:type "string"}
+                                          :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 89d198b116..35a3dce179 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -894,6 +894,56 @@
+                               (is false (str error))
+                               (done)))))))))
+ 
++(deftest semantic-get-page-outline-renders-resolved-markdown-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (storage/init-schema! sql)
++             (let [conn (sqlite-export/create-conn)
++                   author-id (random-uuid)
++                   page-id (random-uuid)
++                   fantasy-id (random-uuid)
++                   {:keys [init-tx block-props-tx]}
++                   (sqlite-build/build-blocks-tx
++                    {:properties {:user.property/genre {:logseq.property/type :default
++                                                        :db/cardinality :db.cardinality/many
++                                                        :build/closed-values [{:value "Fantasy" :uuid fantasy-id}]}}
++                     :classes {:user.class/Book {}}
++                     :pages-and-blocks
++                     [{:page {:block/title "Brandon Sanderson" :block/uuid author-id :build/keep-uuid? true}}
++                      {:page {:block/title "Sunlit Man" :block/uuid page-id :build/keep-uuid? true
++                              :build/tags [:user.class/Book]
++                              :build/properties {:user.property/genre #{[:block/uuid fantasy-id]}}}
++                       :blocks [{:block/title (str "Written by [[" author-id "]]")
++                                 :build/children [{:block/title "Nested note"
++                                                   :build/properties {:user.property/genre #{[:block/uuid fantasy-id]}}}]}
++                                {:block/title "Finish the book"
++                                 :build/properties {:logseq.property/status :logseq.property/status.doing}}]}]})
++                   _ (d/transact! conn init-tx)
++                   _ (d/transact! conn block-props-tx)
++                   self #js {:sql sql :conn conn :schema-ready true}]
++               (-> (p/let [response (sync-handler/handle-http
++                                     self (semantic-json-request (str "/semantic/pages/" page-id "/outline?graph-id=graph-1") "GET" nil))
++                            body (json-body response)
++                            not-page (sync-handler/handle-http
++                                      self (semantic-json-request (str "/semantic/pages/" (random-uuid) "/outline?graph-id=graph-1") "GET" nil))]
++                     (is (= 200 (.-status response)))
++                     (is (= 404 (.-status not-page)))
++                     (is (= "Sunlit Man" (:title body)))
++                     (is (some #(= "user.class/Book" (:ident %)) (:tags body)))
++                     (is (= "user.property/genre" (:ident (first (:properties body)))))
++                     (is (= (string/join "\n" ["- Written by [[Brandon Sanderson]]"
++                                                "  - Nested note"
++                                                "    genre:: [[Fantasy]]"
++                                                "- [Doing] Finish the book"])
++                            (:markdown body)))
++                     (is (= 3 (:block-count body)))
++                     (is (false? (:truncated body))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error]
++                              (is false (str error))
++                              (done)))))))))
++
+ (deftest semantic-set-block-property-resolves-class-values-test
+   (async done
+          (with-memory-sql-async
