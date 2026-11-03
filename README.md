@@ -675,7 +675,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 ### 11.9 Security model
 
-- **Owner only.** Both the MCP sign-in and the `/graphs` wizard accept only the GitHub user ID in `OWNER_GITHUB_USER_ID`. Any other account is refused before a grant or session is created. OAuth codes go only to claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) or to loopback addresses (`localhost`, `127.0.0.1`).
+- **Owner only.** Both the MCP sign-in and the `/graphs` wizard accept only the GitHub user ID in `OWNER_GITHUB_USER_ID`. Any other account is refused before a grant or session is created. The ID is checked again on every MCP request, so changing `OWNER_GITHUB_USER_ID` and redeploying revokes the existing grants. OAuth codes go only to claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) or to loopback addresses (`localhost`, `127.0.0.1`).
 - **Tokens are encrypted.** Each PAT is stored in the connector's D1 database with AES-GCM under `GRAPH_TOKEN_KEY`. No tool returns a token, and the wizard never shows one again. Treat `GRAPH_TOKEN_KEY` like the tokens themselves.
 - **Only unencrypted graphs.** The wizard refuses end-to-end encrypted graphs. Everything in section 3 about unencrypted graphs applies, and the connector is one more piece of deployed code that can read them.
 - **Narrow access per graph.** Connect a graph read-only, with a `read` token, when Claude only needs to read it.

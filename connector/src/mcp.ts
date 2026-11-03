@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { type StatelessMcpHandler, createMcpHandler } from "agents/mcp/server";
 import openapi from "../vendor/openapi.json";
+import { isOwner } from "./auth/github";
+import type { GrantProps } from "./auth/routes";
 import { GraphStore } from "./graphs";
 import { registerAssetTools } from "./tools/assets";
 import { logTool } from "./tools/common";
@@ -61,9 +63,15 @@ export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler
   );
 }
 
-/** The provider's `apiHandler`: only reached with a valid access token for this host's `/mcp`. */
+/**
+ * The provider's `apiHandler`: only reached with a valid access token for this host's `/mcp`. The
+ * owner is checked again on every request, so changing OWNER_GITHUB_USER_ID revokes existing grants.
+ */
 export const mcpApiHandler = {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // The provider sets props to the decrypted GrantProps stored with the grant (src/auth/routes.ts).
+    const props = ctx.props as GrantProps;
+    if (!isOwner(props.githubUserId, env)) return new Response("Forbidden", { status: 403 });
     return mcpHandler(env, ctx)(request, env, ctx);
   },
 };

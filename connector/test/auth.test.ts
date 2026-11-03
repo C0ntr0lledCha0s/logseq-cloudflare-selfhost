@@ -132,6 +132,52 @@ async function startAuthorization(h: ReturnType<typeof harness>) {
   return { clientId, verifier, githubUrl };
 }
 
+/** Runs the whole owner sign-in and token exchange, and returns the access token for `/mcp`. */
+async function issueAccessToken(h: ReturnType<typeof harness>): Promise<string> {
+  const { clientId, verifier, githubUrl } = await startAuthorization(h);
+  const callback = await h.call(
+    `/callback?${new URLSearchParams({ code: "good-code", state: githubUrl.searchParams.get("state")! })}`,
+  );
+  const code = new URL(callback.headers.get("Location")!).searchParams.get("code")!;
+  const tokenRes = await h.call("/token", {
+    method: "POST",
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: clientId,
+      redirect_uri: CLIENT_REDIRECT,
+      code_verifier: verifier,
+      resource: `${ORIGIN}/mcp`,
+    }),
+  });
+  expect(tokenRes.status).toBe(200);
+  const { access_token: accessToken } = (await tokenRes.json()) as { access_token: string };
+  return accessToken;
+}
+
+/** One `tools/call` of connector_help at `/mcp` with `accessToken`. */
+function callConnectorHelp(h: ReturnType<typeof harness>, accessToken: string): Promise<Response> {
+  return h.call(
+    "/mcp",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "connector_help", arguments: {} },
+      }),
+    },
+    false,
+  );
+}
+
 async function grantKeysFor(userId: string): Promise<string[]> {
   const listed = await env.OAUTH_KV.list({ prefix: `grant:${userId}:` });
   return listed.keys.map((k) => k.name);
@@ -299,47 +345,20 @@ describe("GitHub sign-in for MCP authorization", () => {
 
   it("the issued token reaches the connector_help tool at /mcp", async () => {
     const h = harness();
-    const { clientId, verifier, githubUrl } = await startAuthorization(h);
-    const callback = await h.call(
-      `/callback?${new URLSearchParams({ code: "good-code", state: githubUrl.searchParams.get("state")! })}`,
-    );
-    const code = new URL(callback.headers.get("Location")!).searchParams.get("code")!;
-    const tokenRes = await h.call("/token", {
-      method: "POST",
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        client_id: clientId,
-        redirect_uri: CLIENT_REDIRECT,
-        code_verifier: verifier,
-        resource: `${ORIGIN}/mcp`,
-      }),
-    });
-    expect(tokenRes.status).toBe(200);
-    const { access_token: accessToken } = (await tokenRes.json()) as { access_token: string };
-
-    const mcp = await h.call(
-      "/mcp",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          Accept: "application/json, text/event-stream",
-          "MCP-Protocol-Version": "2025-06-18",
-        },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "tools/call",
-          params: { name: "connector_help", arguments: {} },
-        }),
-      },
-      false,
-    );
+    const accessToken = await issueAccessToken(h);
+    const mcp = await callConnectorHelp(h, accessToken);
     expect(mcp.status).toBe(200);
     const text = await mcp.text();
     expect(text).toContain("insert_block_tree");
+  });
+
+  it("changing OWNER_GITHUB_USER_ID revokes existing grants at /mcp with 403", async () => {
+    const accessToken = await issueAccessToken(harness());
+    // Same KV (the grant is still valid), but the owner is now someone else.
+    const changed = harness(undefined, { OWNER_GITHUB_USER_ID: "2002" });
+    const mcp = await callConnectorHelp(changed, accessToken);
+    expect(mcp.status).toBe(403);
+    expect(await mcp.text()).not.toContain("insert_block_tree");
   });
 
   it("second GitHub account is refused at /callback with 403 and no code or session issued", async () => {
