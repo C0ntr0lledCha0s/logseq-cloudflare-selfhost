@@ -1,0 +1,8 @@
+// Test-only config for the workers pool: dummy bindings, no real ids. The deploy config is
+// rendered from wrangler.template.jsonc by scripts/render-connector-wrangler.mjs.
+{
+  "name": "logseq-connector-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-11",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"]
+}

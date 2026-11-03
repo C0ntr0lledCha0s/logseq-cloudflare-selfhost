@@ -10,3 +10,7 @@ tofu-output.json
 *.tfstate
 *.tfstate.*
 .cache/
+connector/wrangler.json
+connector/vendor/
+connector/.wrangler/
+connector/node_modules/
