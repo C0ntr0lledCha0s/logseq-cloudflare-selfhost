@@ -67,9 +67,6 @@ function stripTrailingCommas(text) {
 
 export function renderConnectorWrangler({ template, settings, hostname, tofuOutputs }) {
   const connector = must(settings?.connector, "settings.connector");
-  if (connector.enabled !== true) {
-    throw new Error("settings.connector.enabled must be true to render (rendering means deploying)");
-  }
 
   const cfg = JSON.parse(stripJsonc(must(template, "template")));
   for (const key of FORBIDDEN_TOP_LEVEL) {

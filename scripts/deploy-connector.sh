@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: deploy-connector.sh   (run from anywhere; expects .upstream fetched and built)
-# Does nothing when settings.connector.enabled is false. Otherwise deploys the connector Worker.
+# Does nothing unless CONNECTOR_ENABLED is true. Otherwise deploys the connector Worker.
+# Env: CONNECTOR_ENABLED: true, or false/unset/empty for off (anything else is an error).
 # Env (only when enabled): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET,
 #      OWNER_GITHUB_USER_ID, COOKIE_ENCRYPTION_KEY, GRAPH_TOKEN_KEY, CONNECTOR_HOSTNAME.
 #      OpenTofu state access env (backend creds, passphrase) must also be set.
@@ -20,29 +21,27 @@ if [ -n "${DEPLOY_CONNECTOR_SETTINGS:-}" ]; then
   settings="$DEPLOY_CONNECTOR_SETTINGS"
 fi
 
-# connector_setting <key>: prints a string value of settings.connector.<key>, or "true"/"false" for booleans.
-# A missing key is an error.
-connector_setting() {
-  node -e '
-    const connector = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).connector;
-    const value = connector?.[process.argv[2]];
-    if (typeof value === "boolean" || (typeof value === "string" && value !== "")) process.stdout.write(String(value));
-    else { console.error("missing setting: connector." + process.argv[2]); process.exit(1); }
-  ' "$settings" "$1"
-}
-
-enabled="$(connector_setting enabled)"
-case "$enabled" in
+case "${CONNECTOR_ENABLED:-false}" in
   false)
     echo "connector disabled"
     exit 0
     ;;
   true) ;;
   *)
-    echo "settings.connector.enabled must be true or false" >&2
+    echo "deploy-connector: CONNECTOR_ENABLED must be true or false (unset means false)" >&2
     exit 1
     ;;
 esac
+
+# connector_setting <key>: prints the non-empty string settings.connector.<key>. A missing key is an error.
+connector_setting() {
+  node -e '
+    const connector = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).connector;
+    const value = connector?.[process.argv[2]];
+    if (typeof value === "string" && value !== "") process.stdout.write(value);
+    else { console.error("missing setting: connector." + process.argv[2]); process.exit(1); }
+  ' "$settings" "$1"
+}
 
 : "${CLOUDFLARE_API_TOKEN:?}" "${CLOUDFLARE_ACCOUNT_ID:?}"
 : "${GITHUB_CLIENT_ID:?}" "${GITHUB_CLIENT_SECRET:?}" "${OWNER_GITHUB_USER_ID:?}"

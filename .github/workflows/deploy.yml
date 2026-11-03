@@ -60,6 +60,28 @@ jobs:
           use_lockfile   = true
           HCL
 
+      # CONNECTOR_ENABLED is a GitHub variable (repository or `production` environment), so a fork
+      # opts in without editing a committed file. Unset or empty means off. The normalised value
+      # goes to every later step: OpenTofu as TF_VAR_connector_enabled, and deploy-connector.sh.
+      # A disabled connector skips both connector steps, so the deploy is exactly as without it.
+      - name: Read connector setting
+        id: connector
+        env:
+          CONNECTOR_ENABLED: ${{ vars.CONNECTOR_ENABLED }}
+        run: |
+          case "${CONNECTOR_ENABLED:-false}" in
+            true | false) enabled="${CONNECTOR_ENABLED:-false}" ;;
+            *)
+              echo "::error::The CONNECTOR_ENABLED variable must be true or false (unset means false)"
+              exit 1
+              ;;
+          esac
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          {
+            echo "CONNECTOR_ENABLED=$enabled"
+            echo "TF_VAR_connector_enabled=$enabled"
+          } >> "$GITHUB_ENV"
+
       - name: Tofu init
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -127,14 +149,6 @@ jobs:
           SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
         run: scripts/with-r2-credentials.sh scripts/deploy.sh
-
-      # A disabled connector skips both connector steps, so the deploy is exactly as without it.
-      # scripts/deploy-connector.sh also exits early when disabled.
-      - name: Read connector setting
-        id: connector
-        run: |
-          enabled="$(node -p 'const v = require("./config/settings.json").connector.enabled; if (typeof v !== "boolean") throw new Error("settings.connector.enabled must be true or false"); v')"
-          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
 
       - name: Prepare connector
         if: steps.connector.outputs.enabled == 'true'

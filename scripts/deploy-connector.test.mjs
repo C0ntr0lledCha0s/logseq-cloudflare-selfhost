@@ -11,7 +11,7 @@ const script = join(root, "scripts", "deploy-connector.sh");
 
 const SECRET_NAMES = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
-  "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY", "CONNECTOR_HOSTNAME",
+  "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY", "CONNECTOR_HOSTNAME", "CONNECTOR_ENABLED",
 ];
 
 async function runWith(connector, env = {}) {
@@ -43,41 +43,48 @@ async function runWith(connector, env = {}) {
   }
 }
 
-test("disabled connector is a no-op that needs no env", { timeout: 60000 }, async () => {
-  const r = await runWith({ enabled: false, workerName: "logseq-connector", d1DatabaseName: "logseq-connector" });
-  assert.equal(r.status, 0, r.stdout + r.stderr);
-  assert.equal(r.stdout.trim(), "connector disabled");
-});
-
-test("enabled connector with missing env fails naming only the variable", { timeout: 60000 }, async () => {
-  const enabled = { enabled: true, workerName: "logseq-connector", d1DatabaseName: "logseq-connector" };
-  const r = await runWith(enabled, { CLOUDFLARE_API_TOKEN: "tok", CLOUDFLARE_ACCOUNT_ID: "acct" });
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /GITHUB_CLIENT_ID/);
-  assert.doesNotMatch(r.stdout + r.stderr, /tok|acct/);
-});
-
-test("a missing or non-boolean enabled key fails", { timeout: 60000 }, async () => {
-  const missing = await runWith({ workerName: "logseq-connector" });
-  assert.equal(missing.status, 1);
-  assert.match(missing.stderr, /missing setting: connector\.enabled/);
-  const bad = await runWith({ enabled: "yes" });
-  assert.equal(bad.status, 1);
-  assert.match(bad.stderr, /must be true or false/);
-});
-
-test("the settings override requires the test switch", { timeout: 60000 }, async () => {
-  const r = await runWith({ enabled: false }, { DEPLOY_CONNECTOR_TEST: "" });
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /test-only/);
-});
-
-const ENABLED = { enabled: true, workerName: "logseq-connector", d1DatabaseName: "logseq-connector" };
+const CONNECTOR = { workerName: "logseq-connector", d1DatabaseName: "logseq-connector" };
 const VALID_ENV = {
   CLOUDFLARE_API_TOKEN: "tok", CLOUDFLARE_ACCOUNT_ID: "acct", GITHUB_CLIENT_ID: "cid", GITHUB_CLIENT_SECRET: "csecret",
   OWNER_GITHUB_USER_ID: "1234567", COOKIE_ENCRYPTION_KEY: "a".repeat(64), GRAPH_TOKEN_KEY: "b".repeat(64),
   CONNECTOR_HOSTNAME: "mcp.example.com",
 };
+
+test("a disabled connector is a no-op that needs no env", { timeout: 60000 }, async () => {
+  for (const enabled of ["false", ""]) {
+    const r = await runWith(CONNECTOR, { CONNECTOR_ENABLED: enabled });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim(), "connector disabled", JSON.stringify(enabled));
+  }
+});
+
+test("enabled connector with missing env fails naming only the variable", { timeout: 60000 }, async () => {
+  const r = await runWith(CONNECTOR, { CONNECTOR_ENABLED: "true", CLOUDFLARE_API_TOKEN: "tok", CLOUDFLARE_ACCOUNT_ID: "acct" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /GITHUB_CLIENT_ID/);
+  assert.doesNotMatch(r.stdout + r.stderr, /tok|acct/);
+});
+
+test("a CONNECTOR_ENABLED other than true or false fails", { timeout: 60000 }, async () => {
+  for (const enabled of ["yes", "TRUE", "1"]) {
+    const r = await runWith(CONNECTOR, { CONNECTOR_ENABLED: enabled });
+    assert.equal(r.status, 1, enabled);
+    assert.match(r.stderr, /CONNECTOR_ENABLED must be true or false/, enabled);
+  }
+});
+
+test("an enabled connector with no d1DatabaseName setting fails", { timeout: 60000 }, async () => {
+  const r = await runWith({ workerName: "logseq-connector" }, { ...VALID_ENV, CONNECTOR_ENABLED: "true" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /missing setting: connector\.d1DatabaseName/);
+});
+
+test("the settings override requires the test switch", { timeout: 60000 }, async () => {
+  const r = await runWith(CONNECTOR, { DEPLOY_CONNECTOR_TEST: "" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /test-only/);
+});
+
 
 /** Runs with a `tofu` stub first on PATH that records whether it was called and then fails. */
 async function runWithTofuStub(env) {
@@ -88,7 +95,7 @@ async function runWithTofuStub(env) {
     const marker = join(dir, "tofu-called");
     writeFileSync(join(bin, "tofu"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
     chmodSync(join(bin, "tofu"), 0o755);
-    const r = await runWith(ENABLED, { ...VALID_ENV, ...env, PATH: `${bin}:${process.env.PATH}` });
+    const r = await runWith(CONNECTOR, { ...VALID_ENV, CONNECTOR_ENABLED: "true", ...env, PATH: `${bin}:${process.env.PATH}` });
     return { ...r, tofuCalled: existsSync(marker) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
