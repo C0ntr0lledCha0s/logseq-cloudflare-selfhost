@@ -19,6 +19,15 @@ export interface GraphRecord {
 export type NewGraph = Omit<GraphRecord, "lastUsedAt"> & { token: string };
 export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "permission" | "expiresAt">>;
 
+const DAY_MS = 86_400_000;
+/** Token expiries this close (in days) or closer are flagged to the owner. */
+export const EXPIRY_WARN_DAYS = 30;
+
+/** Days from `now` until an expiry date (YYYY-MM-DD, midnight UTC), rounded up; 0 or less once expired. */
+export function daysUntilExpiry(expiresAt: string, now: number): number {
+  return Math.ceil((Date.parse(expiresAt) - now) / DAY_MS);
+}
+
 const ALIAS_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const TOKEN_PATTERN = /^logseq_pat_[A-Za-z0-9_-]+$/;
 /** Identifies the GRAPH_TOKEN_KEY generation used for a row; there is only one so far. */

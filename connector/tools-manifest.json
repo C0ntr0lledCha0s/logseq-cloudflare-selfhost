@@ -1,0 +1,177 @@
+[
+  {
+    "name": "batch_delete_block_property",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-delete"
+  },
+  {
+    "name": "batch_set_block_property",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-set"
+  },
+  {
+    "name": "capture_to_today",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/capture"
+  },
+  {
+    "name": "connector_help",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "create_page",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/pages"
+  },
+  {
+    "name": "create_property",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/properties"
+  },
+  {
+    "name": "create_tag",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/tags"
+  },
+  {
+    "name": "create_task",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/tasks"
+  },
+  {
+    "name": "delete_block",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+  },
+  {
+    "name": "delete_block_property",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
+  },
+  {
+    "name": "delete_page",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+  },
+  {
+    "name": "delete_property",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+  },
+  {
+    "name": "delete_tag",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+  },
+  {
+    "name": "get_block",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+  },
+  {
+    "name": "get_page",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+  },
+  {
+    "name": "get_property",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+  },
+  {
+    "name": "get_tag",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+  },
+  {
+    "name": "insert_block_children",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/children"
+  },
+  {
+    "name": "insert_block_tree",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-trees"
+  },
+  {
+    "name": "list_assets",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/assets"
+  },
+  {
+    "name": "list_graphs",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "list_page_blocks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/blocks"
+  },
+  {
+    "name": "list_page_references",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/references"
+  },
+  {
+    "name": "list_pages",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages"
+  },
+  {
+    "name": "list_properties",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/properties"
+  },
+  {
+    "name": "list_tag_objects",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}/objects"
+  },
+  {
+    "name": "list_tags",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/tags"
+  },
+  {
+    "name": "list_tasks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/tasks"
+  },
+  {
+    "name": "move_blocks",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-moves"
+  },
+  {
+    "name": "search_graph",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/search"
+  },
+  {
+    "name": "set_block_property",
+    "method": "PUT",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
+  },
+  {
+    "name": "update_block",
+    "method": "PATCH",
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+  },
+  {
+    "name": "update_page",
+    "method": "PATCH",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+  },
+  {
+    "name": "update_property",
+    "method": "PATCH",
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+  },
+  {
+    "name": "update_tag",
+    "method": "PATCH",
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+  }
+]

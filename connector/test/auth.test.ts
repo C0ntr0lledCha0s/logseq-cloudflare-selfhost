@@ -297,7 +297,7 @@ describe("GitHub sign-in for MCP authorization", () => {
     expect(callback.headers.getSetCookie().some((c) => c.startsWith("__Host-connector-session="))).toBe(false);
   });
 
-  it("the issued token reaches the ping tool at /mcp", async () => {
+  it("the issued token reaches the connector_help tool at /mcp", async () => {
     const h = harness();
     const { clientId, verifier, githubUrl } = await startAuthorization(h);
     const callback = await h.call(
@@ -332,14 +332,14 @@ describe("GitHub sign-in for MCP authorization", () => {
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
-          params: { name: "ping", arguments: {} },
+          params: { name: "connector_help", arguments: {} },
         }),
       },
       false,
     );
     expect(mcp.status).toBe(200);
     const text = await mcp.text();
-    expect(text).toContain("pong");
+    expect(text).toContain("insert_block_tree");
   });
 
   it("second GitHub account is refused at /callback with 403 and no code or session issued", async () => {

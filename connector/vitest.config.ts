@@ -14,6 +14,10 @@ export default defineConfig(async () => {
         },
       }),
     ],
-    test: { include: ["test/**/*.test.ts"], setupFiles: ["./test/apply-migrations.ts"] },
+    test: {
+      include: ["test/**/*.test.ts"],
+      globalSetup: ["./vitest.global-setup.mjs"],
+      setupFiles: ["./test/apply-migrations.ts"],
+    },
   };
 });

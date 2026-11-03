@@ -1,4 +1,4 @@
-import type { GraphRecord } from "../graphs";
+import { EXPIRY_WARN_DAYS, type GraphRecord, daysUntilExpiry } from "../graphs";
 import { escapeHtml, htmlPage } from "../html";
 
 // Server-rendered pages for the "Connect a graph" wizard. Every dynamic value is escaped, and no
@@ -14,9 +14,6 @@ const STYLE = `<style>
   dl { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; }
   dt { font-weight: 600; }
 </style>`;
-
-const DAY_MS = 86_400_000;
-const WARN_DAYS = 30;
 
 /** Fields the confirm and edit forms show again after a validation error. Never a token. */
 export interface GraphFormValues {
@@ -70,17 +67,12 @@ function tokenField(): string {
   <input type="password" name="token" autocomplete="off" spellcheck="false" required size="50"></label>`;
 }
 
-/** Days from `now` until an expiry date (YYYY-MM-DD, midnight UTC), rounded up. */
-function daysUntil(expiresAt: string, now: number): number {
-  return Math.ceil((Date.parse(expiresAt) - now) / DAY_MS);
-}
-
 function expiryText(expiresAt: string | null, now: number): string {
   if (expiresAt === null) return "unknown";
   const date = escapeHtml(expiresAt.slice(0, 10));
-  const days = daysUntil(expiresAt, now);
+  const days = daysUntilExpiry(expiresAt, now);
   if (days <= 0) return `${date} <span class="warning">Expired: create a new token in Logseq and replace it below.</span>`;
-  if (days <= WARN_DAYS) {
+  if (days <= EXPIRY_WARN_DAYS) {
     const unit = days === 1 ? "day" : "days";
     return `${date} <span class="warning">Expires in ${days} ${unit}: create a new token in Logseq and replace it below.</span>`;
   }
