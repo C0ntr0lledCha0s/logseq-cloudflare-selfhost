@@ -2,33 +2,15 @@ import { OAuthProvider, type OAuthProviderOptions } from "@cloudflare/workers-oa
 import type { GitHubFetch } from "./auth/github";
 import { isAllowedRedirectUri } from "./auth/redirect-uris";
 import { type DefaultEnv, authRoute } from "./auth/routes";
-import { csrfToken, requireOwnerSession } from "./auth/session";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
-import { escapeHtml, htmlPage } from "./html";
 import { mcpApiHandler } from "./mcp";
-
-/** Placeholder for the "Connect a graph" wizard, behind the owner's session. */
-async function graphsPage(request: Request, env: DefaultEnv): Promise<Response> {
-  const session = await requireOwnerSession(request, env);
-  if (session instanceof Response) return session;
-  return htmlPage(
-    200,
-    "Connected graphs",
-    `<h1>Connected graphs — coming soon</h1>
-<form method="post" action="/logout">
-  <input type="hidden" name="csrf" value="${escapeHtml(csrfToken(session))}">
-  <button>Sign out</button>
-</form>`,
-  );
-}
+import { wizardRoute } from "./wizard/routes";
 
 function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
   return {
     async fetch(request, env) {
-      const url = new URL(request.url);
-      if (url.pathname === "/graphs" && request.method === "GET") return graphsPage(request, env);
-      const auth = authRoute(request, env, githubFetch);
-      if (auth) return auth;
+      const route = authRoute(request, env, githubFetch) ?? wizardRoute(request, env);
+      if (route) return route;
       return new Response("Not found", { status: 404 });
     },
   };

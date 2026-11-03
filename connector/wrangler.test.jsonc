@@ -14,6 +14,9 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Tests replace SYNC per call (see test/wizard.test.ts); vitest.config.ts backs it with a stub
+  // that fails loudly, so nothing reaches a real logseq-sync Worker.
+  "services": [{ "binding": "SYNC", "service": "logseq-sync" }],
   // Dummy values only. In production these are Worker secrets.
   "vars": {
     "GITHUB_CLIENT_ID": "test-github-client-id",

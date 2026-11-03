@@ -10,14 +10,14 @@ export interface GraphRecord {
   graphName: string;
   mode: GraphMode;
   permission: GraphPermission;
-  /** ISO-8601 UTC, or null when the token does not expire. */
+  /** The token's expiry as the owner entered it (ISO-8601 date, YYYY-MM-DD), or null when unknown. */
   expiresAt: string | null;
   /** ISO-8601 UTC, or null if never used. */
   lastUsedAt: string | null;
 }
 
 export type NewGraph = Omit<GraphRecord, "lastUsedAt"> & { token: string };
-export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "expiresAt">>;
+export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "permission" | "expiresAt">>;
 
 const ALIAS_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const TOKEN_PATTERN = /^logseq_pat_[A-Za-z0-9_-]+$/;
@@ -147,6 +147,10 @@ export class GraphStore {
     if (patch.mode !== undefined) {
       sets.push("mode = ?");
       values.push(patch.mode);
+    }
+    if (patch.permission !== undefined) {
+      sets.push("permission = ?");
+      values.push(patch.permission);
     }
     if (patch.expiresAt !== undefined) {
       sets.push("expires_at = ?");

@@ -13,10 +13,11 @@ const SESSION_COOKIE = "__Host-connector-session";
 const LOGIN_COOKIE = "__Host-connector-login";
 const SESSION_SECONDS = 8 * 60 * 60;
 const LOGIN_SECONDS = 10 * 60;
+const PENDING_SECONDS = 10 * 60;
 /** Prefix that tells a wizard sign-in `state` apart from the OAuth library's (base64url, no dot). */
 export const LOGIN_STATE_PREFIX = "login.";
 
-type Purpose = "session" | "login";
+type Purpose = "session" | "login" | "pending-token";
 
 function cookie(name: string, value: string, maxAge: number): string {
   return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
@@ -132,4 +133,39 @@ export async function finishLogin(request: Request, env: Env, state: string): Pr
 
 export function clearLoginCookie(): string {
   return cookie(LOGIN_COOKIE, "", 0);
+}
+
+/** A checked token waiting for the owner to confirm the connection. */
+export interface PendingGraph {
+  token: string;
+  graphId: string;
+  graphName: string;
+}
+
+/**
+ * Seals a pending graph (token included) for the confirm form's hidden field: encrypted with
+ * COOKIE_ENCRYPTION_KEY for the "pending-token" purpose, tied to this session, valid for 10 minutes.
+ */
+export async function sealPendingGraph(env: Env, session: OwnerSession, pending: PendingGraph): Promise<string> {
+  const { token, graphId, graphName } = pending;
+  return seal(env, "pending-token", { token, graphId, graphName, sid: session.csrf, exp: now() + PENDING_SECONDS });
+}
+
+/** The pending graph, or undefined when the value is tampered with, expired, or sealed for another session. */
+export async function openPendingGraph(env: Env, session: OwnerSession, value: string): Promise<PendingGraph | undefined> {
+  const payload = (await unseal(env, "pending-token", value)) as
+    | { token?: unknown; graphId?: unknown; graphName?: unknown; sid?: unknown; exp?: unknown }
+    | undefined;
+  if (
+    !payload ||
+    typeof payload.token !== "string" ||
+    typeof payload.graphId !== "string" ||
+    typeof payload.graphName !== "string" ||
+    typeof payload.sid !== "string" ||
+    typeof payload.exp !== "number"
+  ) {
+    return undefined;
+  }
+  if (payload.exp <= now() || !timingSafeEqual(payload.sid, session.csrf)) return undefined;
+  return { token: payload.token, graphId: payload.graphId, graphName: payload.graphName };
 }

@@ -556,7 +556,7 @@ describe("wizard session", () => {
 
     const graphs = await h.call("/graphs");
     expect(graphs.status).toBe(200);
-    expect(await graphs.text()).toContain("Connected graphs — coming soon");
+    expect(await graphs.text()).toContain("<h1>Connected graphs</h1>");
     // Signing in to the wizard issues no OAuth grant (KV is shared across tests in this file).
     expect(await grantKeysFor(String(OWNER_ID))).toEqual(grantsBefore);
   });

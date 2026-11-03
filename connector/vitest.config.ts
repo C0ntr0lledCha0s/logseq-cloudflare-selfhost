@@ -7,7 +7,11 @@ export default defineConfig(async () => {
     plugins: [
       cloudflareTest({
         wrangler: { configPath: "./wrangler.test.jsonc" },
-        miniflare: { bindings: { TEST_MIGRATIONS: migrations } },
+        miniflare: {
+          bindings: { TEST_MIGRATIONS: migrations },
+          // Tests pass their own SYNC stub in the env; reaching this one is a test bug.
+          serviceBindings: { SYNC: () => new Response("SYNC is not stubbed in this test", { status: 599 }) },
+        },
       }),
     ],
     test: { include: ["test/**/*.test.ts"], setupFiles: ["./test/apply-migrations.ts"] },

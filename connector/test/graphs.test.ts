@@ -142,12 +142,12 @@ describe("GraphStore", () => {
     expect(await s.get("missing")).toBeNull();
   });
 
-  it("update changes mode and expiresAt; renaming keeps uniqueness and normalizes", async () => {
+  it("update changes mode, permission and expiresAt; renaming keeps uniqueness and normalizes", async () => {
     const s = store();
     await s.add(BASE);
     await s.add({ ...BASE, alias: "home", graphId: "g2" });
-    await s.update("work", { mode: "read", expiresAt: "2027-01-01T00:00:00.000Z" });
-    expect(await s.get("work")).toMatchObject({ mode: "read", expiresAt: "2027-01-01T00:00:00.000Z" });
+    await s.update("work", { mode: "read", permission: "read", expiresAt: "2027-01-01" });
+    expect(await s.get("work")).toMatchObject({ mode: "read", permission: "read", expiresAt: "2027-01-01" });
     await s.update("work", { expiresAt: null });
     expect((await s.get("work"))!.expiresAt).toBeNull();
 
