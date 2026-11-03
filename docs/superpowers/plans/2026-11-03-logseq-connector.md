@@ -382,8 +382,8 @@ Record each result in `docs/spike-results.md` under `## Connector`, without iden
   - which client registration was used (CIMD or DCR);
   - that `list_graphs` runs;
   - that a second GitHub account is refused.
-- [ ] **Step 4:** The owner connects James through `/graphs`.
-- [ ] **Step 5: C3 (Claude Code cloud session).** In a session with only the connector enabled, read a page and create a page in James.
+- [ ] **Step 4:** The owner connects the first graph through `/graphs`.
+- [ ] **Step 5: C3 (Claude Code cloud session).** In a session with only the connector enabled, read a page and create a page in the first graph.
 - [ ] **Step 6: C4 (flashcards).** Through the tools, tag a block with `Card`, via `set_block_property` on `:block/tags` or the tag endpoints. Record which works, and that it appears in Logseq's flashcard review. Then update the `connector_help` text in a follow-up commit.
 - [ ] **Step 7: C5 (files).** Test `save_document`, `save_file_from_url` (a public PDF) and `read_file` (text and image). Confirm the assets in Logseq.
 - [ ] **Step 8: C6 (annotations).** Do read-only tools run without a prompt and deletes prompt, in claude.ai?
