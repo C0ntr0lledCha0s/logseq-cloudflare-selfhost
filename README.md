@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies one small patch at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies two small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -28,6 +28,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 
 - **A sync server you own.** The Worker, its Durable Objects (one per graph), the D1 index database and the R2 asset bucket all live in your Cloudflare account. The only public entry point is your custom domain: `workers.dev` and preview URLs are turned off.
 - **PATs for your own account.** Upstream only lets accounts in Logseq's internal groups create PATs. The patch in `patches/0001-pat-gate-allow-authenticated-users.patch` lets any signed-in account create, list and revoke its own PATs. That is what makes the REST API usable from scripts and agents.
+- **Property values in the REST API.** Upstream's `getPage` and `getBlock` return only a page's or block's title and position. `patches/0002-semantic-get-returns-tags-and-properties.patch` adds its tags and its user and library property values (e.g. `schema.property/genre`), so Claude can read them through the connector. Built-in `logseq.*` properties are left out.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
