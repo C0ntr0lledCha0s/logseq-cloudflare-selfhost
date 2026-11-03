@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies two small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies three small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -29,6 +29,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **A sync server you own.** The Worker, its Durable Objects (one per graph), the D1 index database and the R2 asset bucket all live in your Cloudflare account. The only public entry point is your custom domain: `workers.dev` and preview URLs are turned off.
 - **PATs for your own account.** Upstream only lets accounts in Logseq's internal groups create PATs. The patch in `patches/0001-pat-gate-allow-authenticated-users.patch` lets any signed-in account create, list and revoke its own PATs. That is what makes the REST API usable from scripts and agents.
 - **Property values in the REST API.** Upstream's `getPage` and `getBlock` return only a page's or block's title and position. `patches/0002-semantic-get-returns-tags-and-properties.patch` adds its tags and its user and library property values (e.g. `schema.property/genre`), so Claude can read them through the connector. Built-in `logseq.*` properties are left out.
+- **Pages as readable outlines.** `patches/0003-semantic-page-outline.patch` adds `getPageOutline` (the connector's `get_page_outline`). It returns a page's tags, its property values and its whole block tree as a markdown outline, in one call, with `[[links]]` shown as page titles instead of UUIDs. It refuses E2EE graphs.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
@@ -671,7 +672,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 - **`list_graphs`** lists the connected graphs: alias, Logseq name, mode and expiry status. Nothing secret.
 - **`connector_help`** gives Claude the conventions for well-formed Logseq content: `insert_block_tree` for whole notes, `[[Page]]` links, `create_task` for tasks, `capture_to_today` for the journal.
-- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`), blocks (`get_block`, `update_block`, `delete_block`, `insert_block_children`, `insert_block_tree`, `move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `search_graph` and `list_assets`. `connector/tools-manifest.json` has the full list.
+- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `get_page_outline`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`), blocks (`get_block`, `update_block`, `delete_block`, `insert_block_children`, `insert_block_tree`, `move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `search_graph` and `list_assets`. `connector/tools-manifest.json` has the full list.
 - **Files:**
   - `save_document` saves text (as UTF-8) or base64 bytes, at most 150,000 characters, under a file name whose extension sets the type;
   - `save_file_from_url` downloads a file and saves it. Only `https` on port 443, at most 25 MiB, and only `text/*`, PDF, PNG, JPEG, GIF, WebP, JSON and Office (`application/vnd.openxmlformats-officedocument.*`) files. Private, loopback, link-local and other internal addresses are refused, and each of at most 5 redirects is checked again;

@@ -7,6 +7,7 @@ import { runTool, textResult } from "./common";
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
   "Address a graph by its alias from list_graphs; graphs marked read-only refuse every write.",
+  "To read a page, use get_page_outline: one call returns its tags, property values and whole block tree as markdown with [[links]] resolved. get_page and get_block return one entity's tags and property values.",
   "Prefer insert_block_tree for whole notes such as a meeting transcript: it writes a nested block tree in one call, and writes are rate-limited to about 20 per minute, so batch them.",
   "Link pages by writing [[Page]] in titles and block text (people, projects, topics).",
   "Create tasks and action items with create_task, never as TODO text.",
