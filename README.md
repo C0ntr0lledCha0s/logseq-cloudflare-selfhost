@@ -576,6 +576,7 @@ The two GitHub names change on the way because GitHub forbids secret names that 
 
 - **Copy `GRAPH_TOKEN_KEY` and `COOKIE_ENCRYPTION_KEY` into your password manager.**
 - **A name that's present but empty** in `.env.local` stops the script. Fill it in by hand.
+- **A missing `TOFU_ENCRYPTION_PASSPHRASE`, `ASSET_LINK_SECRET` or `DB_SYNC_ADMIN_TOKEN`** stops the script before it writes or pushes anything. Restore the value from your password manager: `--add-missing` never generates these, because a new value wouldn't match the deployed one, and a new passphrase can't decrypt the OpenTofu state.
 - **If the push fails,** `.env.local` has already been written. Load it and push with the loop in 1.8, with the connector line uncommented.
 
 ### 11.5 Turn it on

@@ -277,23 +277,58 @@ test("--add-missing appends only missing names, preserves existing bytes, mode 6
   });
 });
 
-test("--add-missing fills missing original names too and handles no trailing newline", { timeout: 60000 }, async () => {
+// The three secrets whose value the deployment already depends on: --add-missing never generates them.
+const STATE_SECRETS = {
+  TOFU_ENCRYPTION_PASSPHRASE: /OpenTofu state/,
+  ASSET_LINK_SECRET: /deployed sync Worker/,
+  DB_SYNC_ADMIN_TOKEN: /deployed sync Worker/,
+};
+
+test("--add-missing fills missing prompted original names too and handles no trailing newline", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
-    const existing = "SMOKE_PAT=keep";
+    const state = SIX_ORIGINAL.filter((l) => l.split("=")[0] in STATE_SECRETS);
+    const existing = `${state.join("\n")}\nSMOKE_PAT=keep`;
     writeExisting(dir, existing);
     const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const after = readFileSync(join(dir, ".env.local"), "utf8");
     assert.ok(after.startsWith(existing + "\n"));
+    const added = after.slice(existing.length).split("\n").filter((l) => /^[A-Z_]+=/.test(l)).map((l) => l.split("=")[0]);
+    assert.deepEqual(added, ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "SYNC_HOSTNAME", ...CONNECTOR_NAMES]);
     const env = parseEnv(dir);
     assert.equal(env.SMOKE_PAT, "keep");
     assert.equal(env.CLOUDFLARE_API_TOKEN, TOKEN);
     assert.equal(env.SYNC_HOSTNAME, HOST);
-    for (const k of ["ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "TOFU_ENCRYPTION_PASSPHRASE", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY"]) {
-      assert.match(env[k], HEX64, k);
-    }
+    for (const k of ["COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY"]) assert.match(env[k], HEX64, k);
     for (const name of [...ORIGINAL_NAMES, ...CONNECTOR_NAMES]) assert.ok(name in env, name);
     assert.match(r.stdout, /password manager/);
+  });
+});
+
+for (const [missing, why] of Object.entries(STATE_SECRETS)) {
+  test(`--add-missing --push refuses, writing and pushing nothing, when ${missing} is missing`, { timeout: 60000 }, async () => {
+    await withDir(async (dir) => {
+      const existing = `${SIX_ORIGINAL.filter((l) => !l.startsWith(`${missing}=`)).join("\n")}\n`;
+      writeExisting(dir, existing);
+      const { bin, log } = stubGh(dir);
+      const r = await run(dir, ["--add-missing", "--push"], { ...CONNECTOR_INPUTS, PATH: `${bin}:${process.env.PATH}` });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, new RegExp(`${missing} is missing from \\.env\\.local — restore it from your password manager`));
+      assert.match(r.stderr, why);
+      assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), existing);
+      assert.equal(existsSync(log), false, "gh must not be called");
+    });
+  });
+}
+
+test("--add-missing names every missing state secret at once", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, "SMOKE_PAT=keep\n");
+    const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
+    assert.notEqual(r.status, 0);
+    for (const name of Object.keys(STATE_SECRETS)) assert.match(r.stderr, new RegExp(`${name} is missing`));
+    assert.match(r.stderr, /nothing was written or pushed/);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), "SMOKE_PAT=keep\n");
   });
 });
 

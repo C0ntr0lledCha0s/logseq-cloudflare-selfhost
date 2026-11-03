@@ -10,6 +10,8 @@
 #                  COOKIE_ENCRYPTION_KEY and GRAPH_TOKEN_KEY (the last two generated). Existing
 #                  lines are never rewritten. With --push, only the newly added names are pushed.
 #                  A name that is present but empty is an error: fill it by hand.
+#                  TOFU_ENCRYPTION_PASSPHRASE, ASSET_LINK_SECRET and DB_SYNC_ADMIN_TOKEN are never
+#                  generated in this mode: if one is missing, nothing is written or pushed (restore it).
 # Input: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, SYNC_HOSTNAME (and, with --add-missing and
 #   when missing, the four connector inputs) are read from the environment when set, otherwise
 #   prompted for on the terminal (the token and the GitHub client secret silently).
@@ -86,6 +88,25 @@ if [ "$add_missing" = 1 ]; then
       exit 1
     fi
   done
+  # A new value for these would not match the deployed one (and a new passphrase cannot decrypt
+  # the OpenTofu state), so they must be restored, never regenerated.
+  state_missing=0
+  for name in TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN; do
+    case "$add_names " in
+      *" $name "*)
+        state_missing=1
+        case "$name" in
+          TOFU_ENCRYPTION_PASSPHRASE) why="generating a new one locks you out of the OpenTofu state" ;;
+          *) why="generating a new one would not match the value the deployed sync Worker uses" ;;
+        esac
+        echo "init-env: $name is missing from .env.local — restore it from your password manager; $why" >&2
+        ;;
+    esac
+  done
+  if [ "$state_missing" = 1 ]; then
+    echo "init-env: nothing was written or pushed" >&2
+    exit 1
+  fi
 else
   add_names=" $original_names"
 fi
