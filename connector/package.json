@@ -6,7 +6,7 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "test": "vitest run",
-    "types": "wrangler types --config wrangler.test.jsonc --no-include-runtime",
+    "types": "wrangler types --config wrangler.test.jsonc --no-include-runtime --strict-vars=false",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
