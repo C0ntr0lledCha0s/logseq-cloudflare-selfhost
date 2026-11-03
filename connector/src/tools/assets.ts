@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { ResolvedGraph } from "../graphs";
@@ -26,8 +27,8 @@ export const FILE_TYPES: readonly string[] = [
 ];
 const MIB = 1024 * 1024;
 export const URL_MAX_BYTES = 25 * MIB;
-/** read_file returns images up to this size as image content, and describes larger ones. */
-const IMAGE_MAX_BYTES = 5 * MIB;
+/** read_file returns images up to this size (5 MiB once base64-encoded) as image content, and describes larger ones. */
+export const IMAGE_MAX_BYTES = 3_932_160;
 /** claude.ai caps one tool argument at about the same size as one result. */
 const ARGUMENT_CHAR_LIMIT = RESULT_CHAR_LIMIT;
 /** UTF-8 needs at most 4 bytes per UTF-16 code unit, so this many bytes always fill a result. */
@@ -60,7 +61,6 @@ const EXTENSION_TYPES: Record<string, string> = {
   gif: "image/gif",
   webp: "image/webp",
 };
-const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
 const graphArg = z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION);
 const pageArg = z
@@ -74,11 +74,24 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** Native base64 (nodejs_compat): a JavaScript loop over the bytes costs too much CPU time per MiB. */
 function toBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(binary);
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
 }
+
+/** True when `bytes` start with `prefix`, where null matches any byte. */
+function startsWith(bytes: Uint8Array, prefix: readonly (number | null)[]): boolean {
+  return bytes.length >= prefix.length && prefix.every((b, i) => b === null || bytes[i] === b);
+}
+
+/** Leading bytes of each image type read_file returns as image content. */
+const IMAGE_MAGIC: Record<string, readonly (number | null)[]> = {
+  "image/png": [0x89, 0x50, 0x4e, 0x47],
+  "image/jpeg": [0xff, 0xd8, 0xff],
+  "image/gif": [0x47, 0x49, 0x46, 0x38],
+  // "RIFF", four size bytes, "WEBP".
+  "image/webp": [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50],
+};
 
 function fromBase64(text: string): Uint8Array {
   let binary: string;
@@ -202,9 +215,10 @@ async function readFile(access: GraphAccess, alias: string, assetUuid: string): 
   const meta = assetMeta(await metaResponse.json());
   const fileName = `${meta.title}.${meta.type}`;
   const mediaType = EXTENSION_TYPES[meta.type.toLowerCase()];
-  const isImage = mediaType !== undefined && IMAGE_TYPES.has(mediaType) && meta.size <= IMAGE_MAX_BYTES;
+  const isImage = mediaType !== undefined && Object.hasOwn(IMAGE_MAGIC, mediaType) && meta.size <= IMAGE_MAX_BYTES;
   const isText = mediaType !== undefined && (mediaType.startsWith("text/") || mediaType === "application/json");
-  if (!isImage && !isText) return textResult(JSON.stringify({ fileName, type: meta.type, size: meta.size }));
+  const description = () => textResult(JSON.stringify({ fileName, type: meta.type, size: meta.size }));
+  if (!isImage && !isText) return description();
 
   // The signed URL's origin is whatever the sync server saw (sync.internal over the binding); only its
   // path and query are used, and they go over SYNC, never the public Internet. The signature is the
@@ -220,6 +234,8 @@ async function readFile(access: GraphAccess, alias: string, assetUuid: string): 
   if (isImage) {
     const { bytes, complete } = await readUpTo(fileResponse.body, IMAGE_MAX_BYTES);
     if (!complete) throw new Error("the asset is larger than its recorded size");
+    // The extension alone is not trusted: bytes that aren't that image type are only described.
+    if (!startsWith(bytes, IMAGE_MAGIC[mediaType])) return description();
     return { content: [{ type: "image", data: toBase64(bytes), mimeType: mediaType }] };
   }
   const { bytes, complete } = await readUpTo(fileResponse.body, TEXT_READ_BYTES);
@@ -320,7 +336,7 @@ export function registerAssetTools(
     "read_file",
     {
       description:
-        "Read a file asset back: text files as text (truncated beyond 150,000 characters), PNG/JPEG/GIF/WebP images up to 5 MiB as images, anything else as a one-line description.",
+        "Read a file asset back: text files as text (truncated beyond 150,000 characters), PNG/JPEG/GIF/WebP images up to 3.75 MiB as images, anything else as a one-line description.",
       inputSchema: z.object({
         graph: graphArg,
         assetUuid: z

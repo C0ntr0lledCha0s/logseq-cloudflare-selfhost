@@ -520,7 +520,7 @@ The connector is an optional second Worker, `logseq-connector`, at its own hostn
 - **It holds your graph tokens.** You connect each graph once by pasting a PAT into the connector's `/graphs` page. Claude never sees a token: it names graphs by an alias you choose.
 - **It calls the sync server privately**, over a Cloudflare service binding (`SYNC`) to `logseq-sync`, not over the public hostname.
 - **Its tools are generated** from the sync server's OpenAPI document at `UPSTREAM_REF`, so upstream bumps keep them current.
-- **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants and a small D1 database for the connected graphs. One person's use stays well inside KV's free daily allowances.
+- **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants and a small D1 database for the connected graphs. One person's use stays well inside KV's free daily allowances. The file tools on large inputs are *(not yet verified)* against the Free plan's CPU time per request (11.8).
 
 **Status.** The connector is built and tested in CI, but it hasn't been used on a real account yet. Anything below marked *(not yet verified)* is still to be confirmed against a real deploy and recorded in `docs/spike-results.md`.
 
@@ -662,9 +662,9 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
   - `save_document` saves text (as UTF-8) or base64 bytes, at most 150,000 characters, under a file name whose extension sets the type;
   - `save_file_from_url` downloads a file and saves it. Only `https` on port 443, at most 25 MiB, and only `text/*`, PDF, PNG, JPEG, GIF, WebP, JSON and Office (`application/vnd.openxmlformats-officedocument.*`) files. Private, loopback, link-local and other internal addresses are refused, and each of at most 5 redirects is checked again;
   - both attach the file to a page you name by title or UUID, or to today's journal;
-  - `read_file` reads a file back by its asset block UUID: text as text, PNG, JPEG, GIF and WebP images up to 5 MiB as images, anything else as a one-line description.
+  - `read_file` reads a file back by its asset block UUID: text as text, PNG, JPEG, GIF and WebP images up to 3.75 MiB as images (when the file's first bytes match its extension), anything else as a one-line description.
 
-  Saving and reading files end to end is *(not yet verified)*.
+  Saving and reading files end to end is *(not yet verified)*. So is whether large files, such as a 25 MiB download or a 3.75 MiB image, stay inside the Workers Free plan's CPU time and memory per request *(not yet verified)*.
 - **Flashcards:** Claude tags a block with the `Card` tag, which makes it a flashcard in Logseq's review. That this works through the API is *(not yet verified)*. Reviews stay in Logseq.
 
 **Limits:**

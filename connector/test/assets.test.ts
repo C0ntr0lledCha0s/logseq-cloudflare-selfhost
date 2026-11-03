@@ -4,7 +4,7 @@ import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { SafeFetchError, safeFetch } from "../src/net/safe-fetch";
 import { RESULT_CHAR_LIMIT } from "../src/tools/common";
-import { FILE_TYPES } from "../src/tools/assets";
+import { FILE_TYPES, IMAGE_MAX_BYTES } from "../src/tools/assets";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_TOKEN = "logseq_pat_WorkToken123";
@@ -570,11 +570,12 @@ describe("read_file", () => {
     expect(JSON.parse(onlyText(pdf))).toEqual({ fileName: "contract.pdf", type: "pdf", size: 4096 });
     expect(syncCalls).toHaveLength(1); // metadata only: the bytes are never fetched
 
-    // An image over 5 MiB is described, not returned.
+    // An image over 3.75 MiB is described, not returned.
+    expect(IMAGE_MAX_BYTES).toBe(3_932_160);
     syncCalls = [];
-    serveAsset({ title: "photo", type: "jpg", size: 5 * MIB + 1 }, "x");
+    serveAsset({ title: "photo", type: "jpg", size: IMAGE_MAX_BYTES + 1 }, "x");
     const bigImage = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
-    expect(JSON.parse(onlyText(bigImage))).toEqual({ fileName: "photo.jpg", type: "jpg", size: 5 * MIB + 1 });
+    expect(JSON.parse(onlyText(bigImage))).toEqual({ fileName: "photo.jpg", type: "jpg", size: IMAGE_MAX_BYTES + 1 });
     expect(syncCalls).toHaveLength(1);
 
     // Long text is cut to the result limit, notice included.
@@ -588,6 +589,61 @@ describe("read_file", () => {
     // JSON is text too.
     serveAsset({ title: "data", type: "json", size: 8 }, '{"a":1}');
     expect(onlyText(await callTool("read_file", { graph: "work", assetUuid: ASSET_ID }))).toBe('{"a":1}');
+  });
+
+  it("read_file returns an image only when its first bytes match its extension", async () => {
+    const webp = new Uint8Array([0x52, 0x49, 0x46, 0x46, 9, 9, 9, 9, 0x57, 0x45, 0x42, 0x50, 1, 2]);
+    const images: [string, string, Uint8Array][] = [
+      ["png", "image/png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7])],
+      ["jpg", "image/jpeg", new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2])],
+      ["jpeg", "image/jpeg", new Uint8Array([0xff, 0xd8, 0xff, 0xdb])],
+      ["gif", "image/gif", new TextEncoder().encode("GIF89a...")],
+      ["webp", "image/webp", webp],
+    ];
+    for (const [type, mimeType, bytes] of images) {
+      serveAsset({ title: "pic", type, size: bytes.length }, bytes);
+      const result = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+      expect(result, type).toEqual({ isError: false, content: [{ type: "image", data: base64(bytes), mimeType }] });
+    }
+
+    const png = images[0][2];
+    const mismatches: [string, Uint8Array][] = [
+      ["png", new TextEncoder().encode("<svg xmlns='http://www.w3.org/2000/svg'/>")],
+      ["jpg", png],
+      ["gif", new TextEncoder().encode("GIF")],
+      ["webp", new TextEncoder().encode("RIFF\0\0\0\0WAVEfmt ")],
+      ["png", new Uint8Array(0)],
+    ];
+    for (const [type, bytes] of mismatches) {
+      serveAsset({ title: "pic", type, size: bytes.length }, bytes);
+      const result = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+      expect(result.isError, type).toBe(false);
+      expect(JSON.parse(onlyText(result)), type).toEqual({ fileName: `pic.${type}`, type, size: bytes.length });
+    }
+  });
+
+  it("read_file base64-encodes a multi-chunk image at the size limit exactly", async () => {
+    const bytes = new Uint8Array(IMAGE_MAX_BYTES);
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = (i * 31 + 7) & 0xff;
+    bytes.set([0xff, 0xd8, 0xff], 0);
+    // Several chunks, so the bytes reach the encoder through readUpTo's copy.
+    const chunk = 64 * 1024;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let at = 0; at < bytes.length; at += chunk) controller.enqueue(bytes.slice(at, at + chunk));
+        controller.close();
+      },
+    });
+    serveAsset({ title: "big", type: "jpg", size: bytes.length }, body);
+    const result = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+    expect(result.isError).toBe(false);
+    const image = result.content[0] as { type: string; data: string; mimeType: string };
+    expect(image.type).toBe("image");
+    expect(image.mimeType).toBe("image/jpeg");
+    expect(image.data).toHaveLength(5 * MIB);
+    let binary = "";
+    for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+    expect(image.data === btoa(binary)).toBe(true);
   });
 
   it("read_file fetches signed URL through SYNC not public fetch", async () => {
