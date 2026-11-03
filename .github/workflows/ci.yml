@@ -91,6 +91,30 @@ jobs:
             (cd "$worker_dir" && "$wrangler" deploy --dry-run --outdir "$RUNNER_TEMP/dry-run-$plan")
           done
 
+      - name: Build, test and dry-run deploy the connector
+        run: |
+          scripts/vendor-upstream-api.sh .upstream
+          npm --prefix connector ci
+          npm --prefix connector test
+          npm --prefix connector run typecheck
+          node connector/scripts/check-tools-manifest.mjs
+          placeholder="$RUNNER_TEMP/connector-tofu-output.json"
+          echo '{"connector_oauth_kv_id":{"value":"00000000000000000000000000000000"},"connector_d1_id":{"value":"00000000-0000-0000-0000-000000000000"}}' > "$placeholder"
+          settings="$RUNNER_TEMP/connector-settings.json"
+          node -e '
+            const fs = require("fs");
+            const settings = JSON.parse(fs.readFileSync("config/settings.json", "utf8"));
+            settings.connector.enabled = true;
+            fs.writeFileSync(process.argv[1], JSON.stringify(settings));
+          ' "$settings"
+          node scripts/render-connector-wrangler.mjs \
+            --template connector/wrangler.template.jsonc \
+            --settings "$settings" \
+            --tofu-outputs "$placeholder" \
+            --out connector/wrangler.json \
+            --hostname mcp.example.com
+          (cd connector && node_modules/.bin/wrangler deploy --dry-run --outdir "$RUNNER_TEMP/dry-run-connector")
+
       - name: OpenTofu format and validate
         env:
           TF_VAR_tofu_encryption_passphrase: ci-dummy-passphrase-not-a-secret

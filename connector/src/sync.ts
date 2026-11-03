@@ -13,6 +13,8 @@ export interface SyncRequest {
   json?: unknown;
   body?: BodyInit;
   headers?: Record<string, string>;
+  /** Send the PAT as a bearer token (default). False for routes that authorize otherwise, e.g. signed asset URLs. */
+  auth?: boolean;
 }
 
 /** A non-2xx answer from the sync server. `message` is the body's `error` field; never a token. */
@@ -68,7 +70,7 @@ export async function syncFetch(env: Env, pat: string, req: SyncRequest): Promis
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(req.json);
   }
-  headers.set("Authorization", `Bearer ${pat}`);
+  if (req.auth !== false) headers.set("Authorization", `Bearer ${pat}`);
   const response = await env.SYNC.fetch(new Request(url, { method: req.method, headers, body }));
   if (!response.ok) throw await syncErrorFrom(response);
   return response;

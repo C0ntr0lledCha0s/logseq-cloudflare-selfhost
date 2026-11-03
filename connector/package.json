@@ -7,7 +7,9 @@
   "scripts": {
     "test": "vitest run",
     "types": "wrangler types --config wrangler.test.jsonc --no-include-runtime --strict-vars=false",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:manifest": "node scripts/check-tools-manifest.mjs",
+    "update:manifest": "node scripts/check-tools-manifest.mjs --write"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "1.2.4",
