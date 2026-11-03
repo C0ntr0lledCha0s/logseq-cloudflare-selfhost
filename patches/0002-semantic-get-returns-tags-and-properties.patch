@@ -1,0 +1,203 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 176a0f64c7..bdbd9d52a8 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1,6 +1,7 @@
+ (ns logseq.db-sync.worker.handler.semantic
+   (:require [clojure.string :as string]
+             [datascript.core :as d]
++            [datascript.impl.entity :as de]
+             [logseq.common.util :as common-util]
+             [logseq.common.util.date-time :as date-time-util]
+             [logseq.common.util.page-ref :as page-ref]
+@@ -16,6 +17,7 @@
+             [logseq.db.frontend.content :as db-content]
+             [logseq.db.frontend.db :as db-db]
+             [logseq.db.frontend.entity-util :as entity-util]
++            [logseq.db.frontend.property :as db-property]
+             [logseq.db.frontend.property.type :as db-property-type]
+             [logseq.outliner.core :as outliner-core]
+             [logseq.outliner.page :as outliner-page]
+@@ -97,6 +99,38 @@
+    :size (:logseq.property.asset/size entity)
+    :checksum (:logseq.property.asset/checksum entity)})
+ 
++;; getPage and getBlock also return the entity's tags and its user and library property values
++;; (e.g. schema.property/genre). Built-in logseq.* properties and DB attributes are left out.
++(defn- property-value-response
++  "Text and number values (value blocks) become their content. References to pages, nodes and
++  choices become {uuid title ident?}."
++  [value]
++  (cond
++    (not (de/entity? value)) value
++    (and (:logseq.property/created-from-property value) (not (:block/closed-value-property value)))
++    (db-property/property-value-content value)
++    :else (cond-> {:uuid (uuid-string (:block/uuid value))
++                   :title (db-property/property-value-content value)}
++            (:db/ident value) (assoc :ident (entity-ident value)))))
++
++(defn- entity-properties-response [db entity]
++  (->> (db-property/properties entity)
++       (remove (fn [[k _]] (db-property/internal-property? k)))
++       (sort-by (fn [[k _]] (str k)))
++       (mapv (fn [[k v]]
++               (let [property (d/entity db k)]
++                 {:ident (str (namespace k) "/" (name k))
++                  :title (:block/title property)
++                  :type (some-> (:logseq.property/type property) name)
++                  :value (if (set? v)
++                           (mapv property-value-response (sort-by #(or (:block/order %) (:db/id %)) v))
++                           (property-value-response v))})))))
++
++(defn- block-detail-response [db entity]
++  (cond-> (block-response entity)
++    (seq (:block/tags entity)) (assoc :tags (mapv tag-response (sort-by :db/id (:block/tags entity))))
++    true (assoc :properties (entity-properties-response db entity))))
++
+ (defn- entities-by-avet [db attribute & [value]]
+   (->> (if (some? value)
+          (d/datoms db :avet attribute value)
+@@ -637,7 +671,7 @@
+ 
+     :semantic/pages-get
+     (if-let [page (find-visible-entity db (:page-id path-params))]
+-      (if (page? page) (http/json-response nil (block-response page)) (http/not-found))
++      (if (page? page) (http/json-response nil (block-detail-response db page)) (http/not-found))
+       (http/not-found))
+ 
+     :semantic/pages-update
+@@ -666,7 +700,7 @@
+ 
+     :semantic/blocks-get
+     (if-let [block (find-visible-entity db (:block-id path-params))]
+-      (http/json-response nil (block-response block))
++      (http/json-response nil (block-detail-response db block))
+       (http/not-found))
+ 
+     :semantic/blocks-update
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 66ea36d9f4..bb6fa2d213 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -89,10 +89,10 @@
+    "createPage" ["Create a page" "Creates a page block with the supplied title."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+-   "getPage" ["Get a page" "Returns one page block by UUID without loading its block tree."]
++   "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree."]
+-   "getBlock" ["Get a block" "Returns one block or page by UUID without loading an unbounded tree."]
++   "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and user and library property values, without loading an unbounded tree."]
+    "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID."]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+@@ -312,9 +312,9 @@
+                   "listAssets"
+                   (list-response :assets "AssetResponse" "A cursor page of asset blocks")
+                   "searchGraph" (list-response :results "SearchResultResponse" "A cursor page of search results")
+-                  "getPage" (entity-response "PageResponse" "A page")
++                  "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+-                  "getBlock" (entity-response "BlockResponse" "A block")
++                  "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
+                   "updateBlock" (entity-response "BlockResponse" "The updated block")
+                   "getTag" (entity-response "TagResponse" "A tag")
+                   "updateTag" (entity-response "TagResponse" "The updated tag")
+@@ -359,7 +359,19 @@
+                                            :page-id {:type "string"}
+                                            :children {:type "array"
+                                                       :items {:$ref "#/components/schemas/BlockResponse"}}}}
++              :EntityProperty {:type "object" :required ["ident" "value"]
++                               :properties {:ident {:type "string"}
++                                            :title {:type "string"}
++                                            :type {:type "string"}
++                                            :value {:description "A scalar, a {uuid, title, ident?} reference, or an array of them for many-valued properties"}}}
++              :BlockDetailResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
++                                            {:type "object"
++                                             :properties {:tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
++                                                          :properties {:type "array"
++                                                                       :description "User and library property values. Built-in logseq.* properties are omitted."
++                                                                       :items {:$ref "#/components/schemas/EntityProperty"}}}}]}
+               :PageResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}]}
++              :PageDetailResponse {:allOf [{:$ref "#/components/schemas/BlockDetailResponse"}]}
+               :TagResponse {:type "object" :required ["uuid" "title"]
+                             :properties {:uuid {:type "string"}
+                                          :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 5fd3c7fc34..89d198b116 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -17,6 +17,7 @@
+             [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.ws :as ws]
+             [logseq.db.frontend.schema :as db-schema]
++            [logseq.db.sqlite.build :as sqlite-build]
+             [logseq.db.sqlite.export :as sqlite-export]
+             [logseq.outliner.core :as outliner-core]
+             [logseq.outliner.page :as outliner-page]
+@@ -835,6 +836,64 @@
+                               (is false (str error))
+                               (done)))))))))
+ 
++(deftest semantic-get-page-and-block-return-tags-and-properties-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (storage/init-schema! sql)
++             (let [conn (sqlite-export/create-conn)
++                   author-id (random-uuid)
++                   page-id (random-uuid)
++                   block-id (random-uuid)
++                   fantasy-id (random-uuid)
++                   mystery-id (random-uuid)
++                   {:keys [init-tx block-props-tx]}
++                   (sqlite-build/build-blocks-tx
++                     {:properties {:user.property/genre {:logseq.property/type :default
++                                                         :db/cardinality :db.cardinality/many
++                                                         :build/closed-values [{:value "Fantasy" :uuid fantasy-id}
++                                                                               {:value "Mystery" :uuid mystery-id}]}
++                                   :user.property/author {:logseq.property/type :node}
++                                   :user.property/pages {:logseq.property/type :number}}
++                      :classes {:user.class/Book {}}
++                      :pages-and-blocks
++                      [{:page {:block/title "Brandon Sanderson" :block/uuid author-id :build/keep-uuid? true}}
++                       {:page {:block/title "Sunlit Man" :block/uuid page-id :build/keep-uuid? true
++                               :build/tags [:user.class/Book]
++                               :build/properties {:user.property/genre #{[:block/uuid fantasy-id]}
++                                                  :user.property/author [:block/uuid author-id]
++                                                  :user.property/pages 400}}
++                        :blocks [{:block/title "A note" :block/uuid block-id :build/keep-uuid? true
++                                  :build/properties {:user.property/genre #{[:block/uuid mystery-id]}}}]}]})
++                   _ (d/transact! conn init-tx)
++                   _ (d/transact! conn block-props-tx)
++                   self #js {:sql sql :conn conn :schema-ready true}]
++               (-> (p/let [page-response (sync-handler/handle-http
++                                          self (semantic-json-request (str "/semantic/pages/" page-id "?graph-id=graph-1") "GET" nil))
++                            page-body (json-body page-response)
++                            block-response (sync-handler/handle-http
++                                            self (semantic-json-request (str "/semantic/blocks/" block-id "?graph-id=graph-1") "GET" nil))
++                            block-body (json-body block-response)
++                            by-ident (fn [body] (into {} (map (juxt :ident identity)) (:properties body)))
++                            page-props (by-ident page-body)]
++                     (is (= [200 200] [(.-status page-response) (.-status block-response)]))
++                     (is (= "Sunlit Man" (:title page-body)))
++                     (is (some #(= "user.class/Book" (:ident %)) (:tags page-body)) "page tags include Book")
++                     (is (= #{"user.property/author" "user.property/genre" "user.property/pages"} (set (keys page-props)))
++                         "only user properties, no built-ins")
++                     (is (= [{:uuid (str fantasy-id) :title "Fantasy"}] (get-in page-props ["user.property/genre" :value]))
++                         "choices are returned as references")
++                     (is (= {:uuid (str author-id) :title "Brandon Sanderson"}
++                            (get-in page-props ["user.property/author" :value])))
++                     (is (= "node" (get-in page-props ["user.property/author" :type])))
++                     (is (= 400 (get-in page-props ["user.property/pages" :value])))
++                     (is (= ["Mystery"] (mapv :title (get-in (by-ident block-body) ["user.property/genre" :value]))))
++                     (is (= (str page-id) (:page-id block-body))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error]
++                              (is false (str error))
++                              (done)))))))))
++
+ (deftest semantic-set-block-property-resolves-class-values-test
+   (async done
+          (with-memory-sql-async
