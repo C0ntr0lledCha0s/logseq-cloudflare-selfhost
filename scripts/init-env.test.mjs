@@ -303,9 +303,8 @@ test("--add-missing with nothing missing leaves the file alone", { timeout: 6000
     const r = await run(dir, ["--add-missing", "--push"], { PATH: `${bin}:${process.env.PATH}` });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), full);
-    assert.match(r.stdout, /nothing to add/);
-    const secretCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((c) => c.argv[0] === "secret");
-    assert.equal(secretCalls.length, 0);
+    assert.match(r.stdout, /nothing missing/);
+    assert.equal(existsSync(log), false, "gh must not be called when nothing is missing");
   });
 });
 
@@ -390,5 +389,67 @@ test("rejects unknown arguments", { timeout: 60000 }, async () => {
     const r = await run(dir, ["--nope"]);
     assert.equal(r.status, 2);
     assert.match(r.stderr, /usage: init-env.sh \[--add-missing\] \[--push\]/);
+  });
+});
+
+function stubFailingOpenssl(dir) {
+  const bin = join(dir, "badbin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "openssl"), "#!/bin/sh\nexit 1\n");
+  chmodSync(join(bin, "openssl"), 0o755);
+  return bin;
+}
+
+test("fresh run fails and writes nothing when key generation fails", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const bin = stubFailingOpenssl(dir);
+    const r = await run(dir, [], { PATH: `${bin}:${process.env.PATH}` });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /openssl rand failed/);
+    assert.equal(existsSync(join(dir, ".env.local")), false);
+  });
+});
+
+test("--add-missing fails and leaves the file unchanged when key generation fails", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, EXISTING);
+    const bin = stubFailingOpenssl(dir);
+    const r = await run(dir, ["--add-missing"], { ...CONNECTOR_INPUTS, PATH: `${bin}:${process.env.PATH}` });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /openssl rand failed/);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), EXISTING);
+  });
+});
+
+test("--add-missing treats `export NAME=` and indented `NAME=` lines as present", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const existing = `${SIX_ORIGINAL.map((l) => `export ${l}`).join("\n")}\n  CONNECTOR_HOSTNAME=mcp.example.com\nexport GITHUB_CLIENT_ID=abc\n`;
+    writeExisting(dir, existing);
+    const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const after = readFileSync(join(dir, ".env.local"), "utf8");
+    assert.ok(after.startsWith(existing));
+    const added = after.slice(existing.length).split("\n").filter((l) => /^[A-Z_]+=/.test(l)).map((l) => l.split("=")[0]);
+    assert.deepEqual(added, ["GITHUB_CLIENT_SECRET", "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY"]);
+  });
+});
+
+test("--add-missing treats an empty `export NAME=` line as present-but-empty", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const existing = `${SIX_ORIGINAL.join("\n")}\nexport GITHUB_CLIENT_ID=\n`;
+    writeExisting(dir, existing);
+    const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /GITHUB_CLIENT_ID is present but empty/);
+  });
+});
+
+test("--add-missing no-terminal message lists only the unset inputs", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, EXISTING);
+    const r = await run(dir, ["--add-missing"], { CONNECTOR_HOSTNAME: "mcp.example.com", GITHUB_CLIENT_ID: "abc" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /no terminal: export GITHUB_CLIENT_SECRET, OWNER_GITHUB_USER_ID\n/);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), EXISTING);
   });
 });

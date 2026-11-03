@@ -78,9 +78,10 @@ generated_names="ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN TOFU_ENCRYPTION_PASSPHRAS
 add_names=""
 if [ "$add_missing" = 1 ]; then
   for name in $original_names $connector_names; do
-    if ! grep -q "^$name=" "$env_file"; then
+    # `NAME=`, `export NAME=` and an indented `NAME=` all count as present.
+    if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?$name=" "$env_file"; then
       add_names="$add_names $name"
-    elif grep -q "^$name=$" "$env_file"; then
+    elif grep -Eq "^[[:space:]]*(export[[:space:]]+)?$name=$" "$env_file"; then
       echo "init-env: $name is present but empty in $env_file; fill it by hand (--add-missing never rewrites lines)" >&2
       exit 1
     fi
@@ -100,11 +101,14 @@ done
 if [ ! -t 0 ]; then
   unset_inputs=""
   for name in $need_inputs; do
-    [ -n "${!name:-}" ] || unset_inputs=1
+    [ -n "${!name:-}" ] || unset_inputs="$unset_inputs $name"
   done
   if [ -n "$unset_inputs" ]; then
+    # A fresh run keeps listing all three inputs; --add-missing lists only the unset ones.
+    listed="$need_inputs"
+    [ "$add_missing" != 1 ] || listed="$unset_inputs"
     list=""
-    for name in $need_inputs; do list="$list, $name"; done
+    for name in $listed; do list="$list, $name"; done
     echo "init-env: no terminal: export ${list#, }" >&2
     exit 1
   fi
@@ -162,21 +166,31 @@ for name in $need_inputs; do
 done
 
 for name in $generated_names; do
-  case "$add_names " in *" $name "*) printf -v "$name" '%s' "$(openssl rand -hex 32)" ;; esac
+  case "$add_names " in
+    *" $name "*)
+      key="$(openssl rand -hex 32)" || key=""
+      [[ "$key" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "init-env: openssl rand failed; nothing was written" >&2
+        exit 1
+      }
+      printf -v "$name" '%s' "$key"
+      ;;
+  esac
 done
 
 umask 077
 if [ "$add_missing" = 1 ]; then
   if [ -z "${add_names// /}" ]; then
-    echo "init-env: nothing to add; $env_file already has every name"
+    echo "init-env: nothing missing; $env_file already has every name"
+    exit 0
   else
     # One append, so a failure cannot leave a half-written block. Existing bytes stay as they are.
     block=""
     [ -z "$(tail -c1 "$env_file")" ] || block=$'\n'
     block="$block"$'\n# --- added by scripts/init-env.sh --add-missing ---\n'
     for name in $add_names; do block="$block$name=${!name}"$'\n'; done
-    printf '%s' "$block" >>"$env_file"
     chmod 600 "$env_file"
+    printf '%s' "$block" >>"$env_file"
     added="${add_names# }"
     echo "Appended to $env_file (mode 600): ${added// /, }"
   fi
