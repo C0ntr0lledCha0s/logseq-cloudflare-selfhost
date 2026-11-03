@@ -6,6 +6,7 @@ import {
   type ConsentDescription,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
+import { readForm } from "../form";
 import { escapeHtml, htmlPage } from "../html";
 import {
   type GitHubFetch,
@@ -121,7 +122,8 @@ async function showConsent(request: Request, env: DefaultEnv): Promise<Response>
 
 /** POST /authorize: on approval, save the request and send the browser to GitHub. */
 async function submitConsent(request: Request, env: DefaultEnv): Promise<Response> {
-  const form = await request.formData();
+  const form = await readForm(request);
+  if (!form) return badRequestPage("The consent form is incomplete.");
   const handle = form.get("handle");
   if (typeof handle !== "string") return badRequestPage("The consent form is incomplete.");
   try {
@@ -136,7 +138,7 @@ async function submitConsent(request: Request, env: DefaultEnv): Promise<Respons
       headers: approved.headers,
     });
     const location = githubAuthorizeUrl(env, {
-      redirectUri: githubCallbackUrl(request),
+      redirectUri: githubCallbackUrl(env),
       state,
       codeChallenge: pkce.challenge,
     });
@@ -169,7 +171,7 @@ async function finishAuthorization(request: Request, env: DefaultEnv, githubFetc
   try {
     user = await fetchGitHubUser(githubFetch, env, {
       code,
-      redirectUri: githubCallbackUrl(request),
+      redirectUri: githubCallbackUrl(env),
       codeVerifier: data.verifier,
     });
   } catch (error) {
@@ -195,7 +197,7 @@ async function startLogin(request: Request, env: DefaultEnv): Promise<Response> 
   const pkce = await createPkce();
   const { state, setCookie } = await beginLogin(env, pkce.verifier);
   const location = githubAuthorizeUrl(env, {
-    redirectUri: githubCallbackUrl(request),
+    redirectUri: githubCallbackUrl(env),
     state,
     codeChallenge: pkce.challenge,
   });
@@ -220,7 +222,7 @@ async function finishLoginCallback(
   try {
     user = await fetchGitHubUser(githubFetch, env, {
       code,
-      redirectUri: githubCallbackUrl(request),
+      redirectUri: githubCallbackUrl(env),
       codeVerifier: verifier,
     });
   } catch (error) {

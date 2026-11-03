@@ -3,7 +3,7 @@ import type { GitHubFetch } from "./auth/github";
 import { isAllowedRedirectUri } from "./auth/redirect-uris";
 import { type DefaultEnv, authRoute } from "./auth/routes";
 import { csrfToken, requireOwnerSession } from "./auth/session";
-import { ConfigError, checkConfig } from "./config";
+import { ConfigError, checkConfig, connectorHostname } from "./config";
 import { escapeHtml, htmlPage } from "./html";
 import { mcpApiHandler } from "./mcp";
 
@@ -26,7 +26,6 @@ function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
   return {
     async fetch(request, env) {
       const url = new URL(request.url);
-      if (url.pathname === "/health" && request.method === "GET") return Response.json({ ok: true });
       if (url.pathname === "/graphs" && request.method === "GET") return graphsPage(request, env);
       const auth = authRoute(request, env, githubFetch);
       if (auth) return auth;
@@ -36,8 +35,8 @@ function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
 }
 
 /**
- * The provider options for one hostname. `resource` must be the exact `https://<host>/mcp` URL the
- * client reaches, and the provider takes it as a fixed string, so there is one provider per host.
+ * The provider options for the connector's hostname. `resource` must be the exact
+ * `https://<host>/mcp` URL the client reaches, and the provider takes it as a fixed string.
  */
 export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthProviderOptions<Env> {
   return {
@@ -66,7 +65,8 @@ export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthPr
 
 /** The Worker, with GitHub reached through `githubFetch` (stubbed in tests). */
 export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): ExportedHandler<Env> {
-  const providers = new Map<string, OAuthProvider<Env>>();
+  // Built from CONNECTOR_HOSTNAME on first use. The env is fixed per deploy, so this is one provider.
+  let pinned: { host: string; provider: OAuthProvider<Env> } | undefined;
   return {
     async fetch(request, env, ctx) {
       try {
@@ -76,14 +76,12 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
         console.error(`connector misconfigured: ${error.message}`);
         return new Response("Server misconfigured", { status: 500 });
       }
-      // Cloudflare routes only the configured hostname here, so this holds one entry in practice.
-      const host = new URL(request.url).host;
-      let provider = providers.get(host);
-      if (!provider) {
-        provider = new OAuthProvider(providerOptions(host, githubFetch));
-        providers.set(host, provider);
-      }
-      return provider.fetch(request, env, ctx);
+      const url = new URL(request.url);
+      if (url.pathname === "/health" && request.method === "GET") return Response.json({ ok: true });
+      const host = connectorHostname(env);
+      if (url.host !== host) return new Response("Misdirected request", { status: 421 });
+      if (pinned?.host !== host) pinned = { host, provider: new OAuthProvider(providerOptions(host, githubFetch)) };
+      return pinned.provider.fetch(request, env, ctx);
     },
   };
 }

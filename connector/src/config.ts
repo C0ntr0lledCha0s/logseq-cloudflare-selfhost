@@ -3,6 +3,8 @@ export class ConfigError extends Error {}
 
 const POSITIVE_INTEGER = /^[1-9][0-9]*$/;
 const HEX_32_BYTES = /^[0-9a-fA-F]{64}$/;
+/** Lowercase FQDN with at least two labels; no scheme, port, path or trailing dot. */
+const LOWERCASE_FQDN = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /** The owner's numeric GitHub user ID. Throws unless OWNER_GITHUB_USER_ID is a positive integer. */
 export function ownerGithubUserId(env: Env): number {
@@ -14,7 +16,19 @@ export function ownerGithubUserId(env: Env): number {
   return id;
 }
 
-/** Checks every secret the auth routes need, so a misconfigured deploy fails closed on every request. */
+/** The one hostname this connector serves. Throws unless CONNECTOR_HOSTNAME is a lowercase FQDN. */
+export function connectorHostname(env: Env): string {
+  if (!isHostname(env.CONNECTOR_HOSTNAME)) {
+    throw new ConfigError("CONNECTOR_HOSTNAME must be a lowercase fully qualified hostname");
+  }
+  return env.CONNECTOR_HOSTNAME;
+}
+
+function isHostname(value: unknown): value is string {
+  return typeof value === "string" && LOWERCASE_FQDN.test(value);
+}
+
+/** Checks every secret the connector needs, so a misconfigured deploy fails closed on every request. */
 export function checkConfig(env: Env): void {
   ownerGithubUserId(env);
   const invalid: string[] = [];
@@ -23,5 +37,7 @@ export function checkConfig(env: Env): void {
   if (typeof env.COOKIE_ENCRYPTION_KEY !== "string" || !HEX_32_BYTES.test(env.COOKIE_ENCRYPTION_KEY)) {
     invalid.push("COOKIE_ENCRYPTION_KEY");
   }
+  if (typeof env.GRAPH_TOKEN_KEY !== "string" || !HEX_32_BYTES.test(env.GRAPH_TOKEN_KEY)) invalid.push("GRAPH_TOKEN_KEY");
+  if (!isHostname(env.CONNECTOR_HOSTNAME)) invalid.push("CONNECTOR_HOSTNAME");
   if (invalid.length > 0) throw new ConfigError(`invalid connector secrets: ${invalid.join(", ")}`);
 }

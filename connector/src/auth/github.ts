@@ -1,4 +1,4 @@
-import { ownerGithubUserId } from "../config";
+import { connectorHostname, ownerGithubUserId } from "../config";
 
 /** The `fetch` used for GitHub calls; injected so tests can stub github.com and api.github.com. */
 export type GitHubFetch = (url: string, init?: RequestInit) => Promise<Response>;
@@ -22,9 +22,9 @@ export function isOwner(githubUserId: number, env: Env): boolean {
   return Number.isSafeInteger(githubUserId) && githubUserId === owner;
 }
 
-/** The GitHub sign-in callback on this host. */
-export function githubCallbackUrl(request: Request): string {
-  return `https://${new URL(request.url).host}/callback`;
+/** The GitHub sign-in callback: `https://<CONNECTOR_HOSTNAME>/callback`. */
+export function githubCallbackUrl(env: Env): string {
+  return `https://${connectorHostname(env)}/callback`;
 }
 
 /** Where to send the browser to sign in with GitHub. No scope: only the public profile is read. */
@@ -42,13 +42,32 @@ export function githubAuthorizeUrl(
   return url.toString();
 }
 
+/**
+ * One GitHub call and its JSON body. A network error, a non-2xx status or a body that is not JSON
+ * becomes a `GitHubSignInError` that says which step failed and carries nothing GitHub sent.
+ */
+async function githubJson(githubFetch: GitHubFetch, step: string, url: string, init: RequestInit): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await githubFetch(url, init);
+  } catch {
+    throw new GitHubSignInError(`GitHub ${step} failed`);
+  }
+  if (!response.ok) throw new GitHubSignInError(`GitHub ${step} failed`);
+  try {
+    return await response.json();
+  } catch {
+    throw new GitHubSignInError(`GitHub ${step} returned an unreadable body`);
+  }
+}
+
 /** Exchanges GitHub's code (with the PKCE verifier) and returns who signed in. */
 export async function fetchGitHubUser(
   githubFetch: GitHubFetch,
   env: Env,
   options: { code: string; redirectUri: string; codeVerifier: string },
 ): Promise<GitHubUser> {
-  const tokenResponse = await githubFetch(TOKEN_URL, {
+  const tokenBody = (await githubJson(githubFetch, "token exchange", TOKEN_URL, {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -62,22 +81,19 @@ export async function fetchGitHubUser(
       redirect_uri: options.redirectUri,
       code_verifier: options.codeVerifier,
     }).toString(),
-  });
-  if (!tokenResponse.ok) throw new GitHubSignInError("GitHub token exchange failed");
-  const token = ((await tokenResponse.json()) as { access_token?: unknown }).access_token;
+  })) as { access_token?: unknown } | null;
+  const token = tokenBody?.access_token;
   if (typeof token !== "string" || token === "") throw new GitHubSignInError("GitHub token exchange failed");
 
-  const userResponse = await githubFetch(USER_URL, {
+  const user = (await githubJson(githubFetch, "user lookup", USER_URL, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "User-Agent": USER_AGENT,
       "X-GitHub-Api-Version": "2022-11-28",
     },
-  });
-  if (!userResponse.ok) throw new GitHubSignInError("GitHub user lookup failed");
-  const user = (await userResponse.json()) as { id?: unknown; login?: unknown };
-  if (typeof user.id !== "number" || !Number.isSafeInteger(user.id) || user.id <= 0) {
+  })) as { id?: unknown; login?: unknown } | null;
+  if (!user || typeof user.id !== "number" || !Number.isSafeInteger(user.id) || user.id <= 0) {
     throw new GitHubSignInError("GitHub user lookup returned no id");
   }
   if (typeof user.login !== "string" || user.login === "") {

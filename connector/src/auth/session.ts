@@ -1,4 +1,5 @@
 import { aesKeyFromHex, fromBase64url } from "../crypto";
+import { readForm } from "../form";
 import { base64url, isOwner } from "./github";
 
 /** The wizard's own sign-in. Separate from OAuth grants: an MCP token never opens the wizard. */
@@ -106,11 +107,7 @@ export function csrfToken(session: OwnerSession): string {
 
 /** True when the form's `csrf` field matches this session's token. Reads a clone of the body. */
 export async function checkCsrf(request: Request, session: OwnerSession): Promise<boolean> {
-  const contentType = request.headers.get("Content-Type") ?? "";
-  if (!contentType.startsWith("application/x-www-form-urlencoded") && !contentType.startsWith("multipart/form-data")) {
-    return false;
-  }
-  const submitted = (await request.clone().formData()).get("csrf");
+  const submitted = (await readForm(request.clone()))?.get("csrf");
   return typeof submitted === "string" && timingSafeEqual(submitted, session.csrf);
 }
 

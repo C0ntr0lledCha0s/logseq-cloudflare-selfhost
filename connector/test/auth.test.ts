@@ -53,15 +53,19 @@ class Jar {
   }
 }
 
-function harness(user = { id: OWNER_ID, login: "owner" }, envOverride: Partial<Env> = {}) {
+function harness(
+  user = { id: OWNER_ID, login: "owner" },
+  envOverride: Partial<Env> = {},
+  githubFetch?: (url: string, init?: RequestInit) => Promise<Response>,
+) {
   const github = stubGitHub(user);
-  const worker = createConnector({ githubFetch: github.githubFetch });
+  const worker = createConnector({ githubFetch: githubFetch ?? github.githubFetch });
   const testEnv = { ...env, ...envOverride } as Env;
   const jar = new Jar();
-  async function call(path: string, init: RequestInit = {}, useJar = true): Promise<Response> {
+  async function call(path: string, init: RequestInit = {}, useJar = true, origin = ORIGIN): Promise<Response> {
     const headers = new Headers(init.headers);
     if (useJar && jar.header()) headers.set("Cookie", jar.header());
-    const request = new Request(`${ORIGIN}${path}`, { ...init, headers, redirect: "manual" });
+    const request = new Request(`${origin}${path}`, { ...init, headers, redirect: "manual" });
     const ctx = createExecutionContext();
     const res = await worker.fetch!(request as Request<unknown, IncomingRequestCfProperties>, testEnv, ctx);
     await waitOnExecutionContext(ctx);
@@ -164,6 +168,31 @@ describe("protected resource", () => {
     expect(body.token_endpoint).toBe(`${ORIGIN}/token`);
     expect(body.registration_endpoint).toBe(`${ORIGIN}/register`);
     expect(body.client_id_metadata_document_supported).toBe(true);
+  });
+
+  it("a request for any other host gets 421 and nothing else happens", async () => {
+    const { call } = harness();
+    for (const [path, init] of [
+      ["/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }],
+      ["/.well-known/oauth-protected-resource/mcp", {}],
+      ["/login", {}],
+      ["/graphs", {}],
+      ["/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }],
+    ] as const) {
+      const res = await call(path, init, false, "https://other.example.com");
+      expect(res.status, path).toBe(421);
+      expect(res.headers.get("Location"), path).toBeNull();
+      expect(res.headers.getSetCookie(), path).toEqual([]);
+    }
+    // A different port on the right hostname is a different host too.
+    expect((await call("/graphs", {}, false, "https://mcp.example.com:8443")).status).toBe(421);
+  });
+
+  it("GET /health answers for any host", async () => {
+    const { call } = harness();
+    const res = await call("/health", {}, false, "https://other.example.com");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
   });
 
   it("GET /health still answers", async () => {
@@ -348,6 +377,50 @@ describe("GitHub sign-in for MCP authorization", () => {
     expect(await res.text()).not.toContain("bad_verification_code");
   });
 
+  it("a non-JSON GitHub response gives a clean 502 and logs nothing from it", async () => {
+    const leak = "<html>secret-github-body</html>";
+    const h = harness(undefined, {}, async () => new Response(leak, { status: 200 }));
+    const { githubUrl } = await startAuthorization(h);
+    const spies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m));
+    try {
+      const res = await h.call(
+        `/callback?${new URLSearchParams({ code: "good-code", state: githubUrl.searchParams.get("state")! })}`,
+      );
+      expect(res.status).toBe(502);
+      expect(res.headers.get("Location")).toBeNull();
+      expect(await res.text()).not.toContain("secret-github-body");
+      const logged = spies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
+      expect(logged.join("\n")).not.toContain("secret-github-body");
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
+  });
+
+  it("a GitHub network error gives a clean 502", async () => {
+    const h = harness(undefined, {}, async () => {
+      throw new TypeError("network down: secret-network-detail");
+    });
+    const { githubUrl } = await startAuthorization(h);
+    const res = await h.call(
+      `/callback?${new URLSearchParams({ code: "good-code", state: githubUrl.searchParams.get("state")! })}`,
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).not.toContain("secret-network-detail");
+  });
+
+  it("a non-form POST /authorize is a 400 bad request page", async () => {
+    const { call } = harness();
+    for (const init of [
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handle: "x" }) },
+      { method: "POST", body: "handle=x" , headers: { "Content-Type": "text/plain" } },
+      { method: "POST" },
+    ]) {
+      const res = await call("/authorize", init);
+      expect(res.status).toBe(400);
+      expect(res.headers.get("Content-Type")).toContain("text/html");
+    }
+  });
+
   it("GitHub error at the callback returns access_denied to the client", async () => {
     const h = harness();
     const { githubUrl } = await startAuthorization(h);
@@ -383,6 +456,35 @@ describe("owner allow-list", () => {
         const text = await res.text();
         expect(text).not.toContain(bad);
         expect(text).not.toContain("OWNER_GITHUB_USER_ID");
+      }
+    }
+  });
+});
+
+describe("connector config", () => {
+  it("an invalid CONNECTOR_HOSTNAME or GRAPH_TOKEN_KEY fails closed with a generic 500", async () => {
+    const cases: [keyof Env, string][] = [
+      ["CONNECTOR_HOSTNAME", ""],
+      ["CONNECTOR_HOSTNAME", "MCP.example.com"],
+      ["CONNECTOR_HOSTNAME", "https://mcp.example.com"],
+      ["CONNECTOR_HOSTNAME", "mcp.example.com/"],
+      ["CONNECTOR_HOSTNAME", "mcp.example.com:443"],
+      ["CONNECTOR_HOSTNAME", "mcp.example.com."],
+      ["CONNECTOR_HOSTNAME", "localhost"],
+      ["CONNECTOR_HOSTNAME", "-mcp.example.com"],
+      ["CONNECTOR_HOSTNAME", "mcp..example.com"],
+      ["GRAPH_TOKEN_KEY", ""],
+      ["GRAPH_TOKEN_KEY", "00".repeat(31)],
+      ["GRAPH_TOKEN_KEY", "zz".repeat(32)],
+    ];
+    for (const [name, bad] of cases) {
+      const h = harness(undefined, { [name]: bad });
+      for (const path of ["/login", "/graphs", "/mcp"]) {
+        const res = await h.call(path, {}, false);
+        expect(res.status, `${name}=${bad} ${path}`).toBe(500);
+        const text = await res.text();
+        expect(text).not.toContain(name);
+        if (bad !== "") expect(text).not.toContain(bad);
       }
     }
   });

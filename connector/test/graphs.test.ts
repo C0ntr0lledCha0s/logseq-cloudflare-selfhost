@@ -82,6 +82,17 @@ describe("GraphStore", () => {
     await expect(s.token("work")).rejects.toThrow();
   });
 
+  it("a ciphertext copied onto another graph's row does not decrypt (graph id is bound as AAD)", async () => {
+    const s = store();
+    await s.add({ ...BASE, alias: "a", graphId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", token: "logseq_pat_tokenA" });
+    await s.add({ ...BASE, alias: "b", graphId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", token: "logseq_pat_tokenB" });
+    await env.DB.exec(
+      "UPDATE graphs SET token_ct = (SELECT token_ct FROM graphs WHERE alias = 'a'), token_iv = (SELECT token_iv FROM graphs WHERE alias = 'a') WHERE alias = 'b'",
+    );
+    expect(await s.token("a")).toBe("logseq_pat_tokenA");
+    await expect(s.token("b")).rejects.toThrow();
+  });
+
   it("constructor throws unless the key is 64 hex characters", () => {
     for (const bad of ["", "abcd", "zz".repeat(32), "00".repeat(31), "00".repeat(33)]) {
       expect(() => new GraphStore(env.DB, bad)).toThrow("GRAPH_TOKEN_KEY");
