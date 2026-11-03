@@ -519,7 +519,7 @@ The connector is an optional second Worker, `logseq-connector`, at its own hostn
 - **You sign in with GitHub**, and only your own GitHub account is accepted.
 - **It holds your graph tokens.** You connect each graph once by pasting a PAT into the connector's `/graphs` page. Claude never sees a token: it names graphs by an alias you choose.
 - **It calls the sync server privately**, over a Cloudflare service binding (`SYNC`) to `logseq-sync`, not over the public hostname.
-- **Its tools are generated** from the sync server's OpenAPI document at `UPSTREAM_REF`, so upstream bumps keep them current.
+- **Its tools are generated** from the sync server's OpenAPI document at `UPSTREAM_REF`. When an upstream bump adds, removes or changes an operation, CI flags it: run `npm --prefix connector run update:manifest` and commit the result.
 - **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants and a small D1 database for the connected graphs. One person's use stays well inside KV's free daily allowances. The file tools on large inputs are *(not yet verified)* against the Free plan's CPU time per request (11.8).
 
 **Status.** The connector is built and tested in CI, but it hasn't been used on a real account yet. Anything below marked *(not yet verified)* is still to be confirmed against a real deploy and recorded in `docs/spike-results.md`.
@@ -679,7 +679,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 - **Tokens are encrypted.** Each PAT is stored in the connector's D1 database with AES-GCM under `GRAPH_TOKEN_KEY`. No tool returns a token, and the wizard never shows one again. Treat `GRAPH_TOKEN_KEY` like the tokens themselves.
 - **Only unencrypted graphs.** The wizard refuses end-to-end encrypted graphs. Everything in section 3 about unencrypted graphs applies, and the connector is one more piece of deployed code that can read them.
 - **Narrow access per graph.** Connect a graph read-only, with a `read` token, when Claude only needs to read it.
-- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames.
+- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames. Workers Logs (observability, on for the connector) also record each request's URL and metadata, privately in your Cloudflare dashboard.
 - **Not backed up.** `backup.yml` doesn't back up the connector's D1 database. It holds only aliases, graph IDs, modes and encrypted tokens, and tokens can be re-issued in Logseq. D1 Time Travel covers accidents.
 - **Key rotation** (section 9): rotating `GRAPH_TOKEN_KEY` makes every stored token unreadable, so you must replace the token for each graph. Rotating `COOKIE_ENCRYPTION_KEY` signs you out of the wizard.
 - **Firewall rules.** If you put WAF, rate-limiting or bot rules in front of the connector's hostname, allow Anthropic's egress range `160.79.104.0/21`. claude.ai and Claude Code cloud sessions reach the connector from there.
@@ -694,7 +694,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | `unknown graph 'x' — call list_graphs for the connected aliases` | No graph is connected under that alias: it was renamed or disconnected, or never connected. Check `/graphs`. |
 | Every tool fails for every graph after rotating `GRAPH_TOKEN_KEY` | The stored tokens can't be decrypted any more. Replace each graph's token at `/graphs` (11.7). |
 | `421 Misdirected request` | The request reached the connector on a hostname other than `CONNECTOR_HOSTNAME`. Use exactly `https://<CONNECTOR_HOSTNAME>/mcp`, and check that the secret matches the custom domain. |
-| `500 Server misconfigured` | A connector secret is missing or malformed. The Worker log says which: `connector misconfigured: invalid connector secrets: …`. `CONNECTOR_HOSTNAME` must be lowercase, the two keys must be 64 hex characters and `OWNER_GITHUB_USER_ID` must be numeric. Fix the secret and redeploy. |
+| `500 Server misconfigured` | A connector secret is missing or malformed. The Worker log says which: `connector misconfigured: invalid connector secrets: …`. `CONNECTOR_HOSTNAME` must be lowercase, the two keys must be 64 hex characters and `OWNER_GITHUB_USER_ID` must be a positive integer (no leading zeros). Fix the secret and redeploy. |
 | "This GitHub account is not allowed to use this connector." | You signed in with another GitHub account, or `OWNER_GITHUB_USER_ID` is wrong. Check it with `gh api user -q .id`. |
 | Smoke test `FAIL oauth-metadata: 000` | The custom domain's certificate is still being issued after the first deploy. Wait a few minutes and re-run `scripts/smoke-connector.sh https://mcp.example.com`. |
 | Smoke test `FAIL oauth-metadata` with `421`, `500` or `resource` | `421` or `resource`: the URL you tested isn't `CONNECTOR_HOSTNAME`. `500`: see "Server misconfigured" above. |
