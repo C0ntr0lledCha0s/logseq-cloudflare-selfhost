@@ -132,15 +132,17 @@ The optional connector's values aren't asked for here. You add them later with `
 | `DB_SYNC_ADMIN_TOKEN` | Admin header token. It bypasses graph access checks, and backups use it. | Generated |
 | `TOFU_ENCRYPTION_PASSPHRASE` | Encrypts the OpenTofu state and plans. | Generated |
 | `SMOKE_PAT` | Optional. Leave it empty until you have a PAT (section 4). | Later |
+| `CONNECTOR_ENABLED` | `false` until you turn the connector on (section 11). | Template |
 
 Manual fallback: `cp .env.local.example .env.local && chmod 600 .env.local`, then fill it in, using `openssl rand -hex 32` for each generated value. **If you hand-edit a value containing `$`, single-quote it** (`NAME='va$lue'`), otherwise the shell expands it when the file is sourced. Generated hex values are safe as they are.
 
-Load it into each new shell that runs the commands below. OpenTofu reads its two inputs from `TF_VAR_*`:
+Load it into each new shell that runs the commands below. OpenTofu reads its three inputs from `TF_VAR_*`:
 
 ```bash
 set -a && . ./.env.local && set +a
 export TF_VAR_cloudflare_account_id="$CLOUDFLARE_ACCOUNT_ID" \
-       TF_VAR_tofu_encryption_passphrase="$TOFU_ENCRYPTION_PASSPHRASE"
+       TF_VAR_tofu_encryption_passphrase="$TOFU_ENCRYPTION_PASSPHRASE" \
+       TF_VAR_connector_enabled="${CONNECTOR_ENABLED:-false}"
 ```
 
 ### 1.5 Fetch and build upstream
@@ -224,6 +226,8 @@ Then add the secrets:
 | `OWNER_GITHUB_USER_ID` | Only with the connector |
 | `COOKIE_ENCRYPTION_KEY` | Only with the connector |
 | `GRAPH_TOKEN_KEY` | Only with the connector |
+
+**One setting is a variable, not a secret.** `CONNECTOR_ENABLED` turns the optional connector on (section 11). Leave it unset for now: unset means off.
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
@@ -581,15 +585,24 @@ The two GitHub names change on the way because GitHub forbids secret names that 
 
 ### 11.5 Turn it on
 
-`config/settings.json` has `"connector": {"enabled": false, …}`. While it is `false`, CI still builds and tests the connector, but OpenTofu and the deploy skip it.
+The connector is switched by `CONNECTOR_ENABLED`, a GitHub Actions **variable** (not a secret), so a fork turns it on without changing a committed file. `true` turns it on; unset, empty or `false` means off; any other value fails the deploy. While it's off, CI still builds and tests the connector, but OpenTofu and the deploy skip it.
 
-**Enable it only after** the GitHub OAuth app exists (11.2), the token has the KV permission (11.3) and the six secrets are in the `production` environment (11.4). Then set `"enabled": true` in a PR and merge it. The deploy:
+**Turn it on only after** the GitHub OAuth app exists (11.2), the token has the KV permission (11.3) and the six secrets are in the `production` environment (11.4). Then set the variable and run the deploy:
+
+```bash
+gh variable set CONNECTOR_ENABLED --env production --body true
+gh workflow run deploy.yml
+```
+
+A variable set in **Settings → Secrets and variables → Actions → Variables**, for the whole repository, works too. An environment variable wins over a repository one. Also set `CONNECTOR_ENABLED=true` in `.env.local`, so local OpenTofu runs agree with Actions (see "Turning it off" below for why that matters).
+
+The deploy:
 
 1. creates the KV namespace `logseq-connector-oauth` and the D1 database `logseq-connector` (`tofu apply`);
 2. deploys the sync server as before;
 3. runs `scripts/deploy-connector.sh`, which renders the connector's config (`scripts/render-connector-wrangler.mjs`), applies its D1 migrations, runs `wrangler deploy` (which also attaches the custom domain), sets the Worker secrets with `wrangler secret bulk`, and runs `scripts/smoke-connector.sh https://$CONNECTOR_HOSTNAME`.
 
-With the flag on, every connector secret is required. A missing one fails the deploy, for example with `GITHUB_CLIENT_ID: parameter null or not set`. A passing smoke test prints:
+With the connector on, every connector secret is required. A missing one fails the deploy, for example with `GITHUB_CLIENT_ID: parameter null or not set`. A passing smoke test prints:
 
 ```
 ok oauth-metadata
@@ -597,7 +610,7 @@ ok mcp-unauthenticated
 ok wizard-requires-login
 ```
 
-You can also deploy the connector from your machine, but only once the `"enabled": true` change is on `main`: while `main` still says `false`, its next deploy would plan to destroy the resources and fail on `prevent_destroy` (see "Turning it off" below). With `.env.local` loaded as in 1.4, step 1.5 done, and the plan and apply from 1.7 re-run so the connector's KV namespace and D1 database exist:
+You can also deploy the connector from your machine, with `CONNECTOR_ENABLED=true` in `.env.local`, loaded as in 1.4, step 1.5 done, and the plan and apply from 1.7 re-run so the connector's KV namespace and D1 database exist. Set the GitHub variable first: while it's off, the next Actions deploy would plan to destroy the resources and fail on `prevent_destroy`.
 
 ```bash
 scripts/vendor-upstream-api.sh .upstream
@@ -607,7 +620,7 @@ scripts/with-r2-credentials.sh mise exec -- scripts/deploy-connector.sh
 
 Calls from the connector to the sync server go over the service binding. That a binding reaches `logseq-sync`, which has `workers_dev = false` and only a custom domain, is *(not yet verified)*.
 
-**Turning it off again needs manual teardown.** Setting `"enabled": false` after the resources exist makes OpenTofu plan to destroy the KV namespace and D1 database. `prevent_destroy` refuses that, which fails the whole deploy, the sync server's included. To turn it off, first remove the two resources from the OpenTofu state, then merge the `"enabled": false` PR straight away (a deploy in between would try to create them again):
+**Turning it off again needs manual teardown.** Once the resources exist, any OpenTofu run with the connector off (the variable unset or `false` in Actions, or `CONNECTOR_ENABLED` missing or `false` in your shell) plans to destroy the KV namespace and D1 database. `prevent_destroy` refuses that, which fails the whole deploy, the sync server's included. To turn it off, first remove the two resources from the OpenTofu state, then set the variable to `false` straight away (a deploy in between would try to create them again), and set `CONNECTOR_ENABLED=false` in `.env.local`:
 
 ```bash
 scripts/with-r2-credentials.sh mise exec -- tofu -chdir=infra state rm \
@@ -700,7 +713,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | Smoke test `FAIL oauth-metadata` with `421`, `500` or `resource` | `421` or `resource`: the URL you tested isn't `CONNECTOR_HOSTNAME`. `500`: see "Server misconfigured" above. |
 | Deploy fails with `GITHUB_CLIENT_ID: parameter null or not set` (or another connector name) | The connector is enabled but a secret is missing from the `production` environment. If the name is missing from `.env.local` too, `scripts/init-env.sh --add-missing --push` adds and pushes it. Otherwise push it with the 1.8 loop: `--add-missing` only pushes names it adds. Remember the `CONNECTOR_GITHUB_*` names. |
 | Creating `cloudflare_workers_kv_namespace.connector_oauth` fails with an authentication or permission error | The Cloudflare token lacks **Workers KV Storage** Write + Read (11.3). |
-| `tofu apply` fails with `Instance cannot be destroyed` after setting `"enabled": false` | `prevent_destroy` protects the connector's KV namespace and D1 database. Follow "Turning it off" in 11.5. |
+| `tofu apply` fails with `Instance cannot be destroyed` for the connector's KV namespace or D1 database | OpenTofu ran with the connector off while its resources exist. If you meant it to be on, set the `CONNECTOR_ENABLED` variable (Actions) or `CONNECTOR_ENABLED=true` in `.env.local` and `TF_VAR_connector_enabled` (local, 1.4), and re-run. To turn it off, follow "Turning it off" in 11.5. |
+| Deploy fails at **Read connector setting** with `The CONNECTOR_ENABLED variable must be true or false` | The variable holds something else, such as `True` or `yes`. Set it to exactly `true` or `false`, or delete it for off. |
 
 ## Backlog
 

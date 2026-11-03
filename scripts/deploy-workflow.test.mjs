@@ -32,23 +32,35 @@ function runBlock(name) {
   return body.join("\n");
 }
 
-/** Runs the "Read connector setting" step against `settings` as GitHub would (bash -e). */
-function readSetting(settings) {
+/** Runs the "Read connector setting" step with the CONNECTOR_ENABLED variable set to `value`, as GitHub would (bash -e). */
+function readSetting(value) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-workflow-"));
   try {
-    mkdirSync(join(dir, "config"));
-    writeFileSync(join(dir, "config", "settings.json"), JSON.stringify(settings));
     const output = join(dir, "github-output");
+    const env = join(dir, "github-env");
     writeFileSync(output, "");
+    writeFileSync(env, "");
     const r = spawnSync("bash", ["-e", "-c", runBlock("Read connector setting")], {
       cwd: dir,
-      env: { ...process.env, GITHUB_OUTPUT: output },
+      env: { ...process.env, CONNECTOR_ENABLED: value, GITHUB_OUTPUT: output, GITHUB_ENV: env },
       encoding: "utf8",
     });
-    return { status: r.status, stderr: r.stderr, output: readFileSync(output, "utf8") };
+    return {
+      status: r.status,
+      stdout: r.stdout,
+      output: readFileSync(output, "utf8"),
+      env: readFileSync(env, "utf8"),
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** The index of the step named `name` among the deploy job's steps. */
+function stepIndex(name) {
+  const at = workflow.split("\n").filter((line) => line.startsWith("      - ")).indexOf(`      - name: ${name}`);
+  assert.notEqual(at, -1, `step ${name} not found`);
+  return at;
 }
 
 test("the connector steps run only when the setting step says enabled", () => {
@@ -58,11 +70,19 @@ test("the connector steps run only when the setting step says enabled", () => {
   }
 });
 
-test("the setting step outputs enabled=true or enabled=false from settings.json", () => {
-  for (const enabled of [true, false]) {
-    const r = readSetting({ connector: { enabled } });
-    assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.output, `enabled=${enabled}\n`);
+test("the setting step reads the CONNECTOR_ENABLED variable and runs before OpenTofu", () => {
+  assert.ok(step("Read connector setting").includes("          CONNECTOR_ENABLED: ${{ vars.CONNECTOR_ENABLED }}"));
+  for (const later of ["Tofu init", "Tofu apply", "Deploy connector"]) {
+    assert.ok(stepIndex("Read connector setting") < stepIndex(later), later);
+  }
+});
+
+test("the setting step passes true or false to the later steps, with unset meaning false", () => {
+  for (const [value, enabled] of [["true", "true"], ["false", "false"], ["", "false"]]) {
+    const r = readSetting(value);
+    assert.equal(r.status, 0, r.stdout);
+    assert.equal(r.output, `enabled=${enabled}\n`, JSON.stringify(value));
+    assert.equal(r.env, `CONNECTOR_ENABLED=${enabled}\nTF_VAR_connector_enabled=${enabled}\n`, JSON.stringify(value));
   }
 });
 
@@ -70,11 +90,13 @@ test("the setting step reads no secrets", () => {
   assert.ok(!step("Read connector setting").some((line) => line.includes("secrets.")));
 });
 
-test("the setting step fails on a missing or non-boolean enabled", () => {
-  for (const settings of [{ connector: { enabled: "true" } }, { connector: {} }, {}]) {
-    const r = readSetting(settings);
-    assert.notEqual(r.status, 0, JSON.stringify(settings));
-    assert.equal(r.output, "", JSON.stringify(settings));
+test("the setting step fails on a value other than true or false", () => {
+  for (const value of ["yes", "TRUE", "1", "true "]) {
+    const r = readSetting(value);
+    assert.notEqual(r.status, 0, JSON.stringify(value));
+    assert.match(r.stdout, /::error::The CONNECTOR_ENABLED variable must be true or false/);
+    assert.equal(r.output, "", JSON.stringify(value));
+    assert.equal(r.env, "", JSON.stringify(value));
   }
 });
 

@@ -13,10 +13,7 @@ const template = readFileSync(
 const baseSettings = JSON.parse(
   readFileSync(join(root, "config", "settings.json"), "utf8"),
 );
-const settings = {
-  ...baseSettings,
-  connector: { ...baseSettings.connector, enabled: true },
-};
+const settings = baseSettings;
 const hostname = "mcp.example.com";
 const tofuOutputs = {
   connector_oauth_kv_id: "11111111111111111111111111111111",
@@ -54,17 +51,7 @@ test("renders hostname, bindings and no workers.dev", () => {
   assert.equal(out.observability.enabled, true);
 });
 
-test("throws when connector disabled", () => {
-  assert.throws(
-    () =>
-      renderConnectorWrangler({
-        template,
-        settings: { ...settings, connector: { ...settings.connector, enabled: false } },
-        hostname,
-        tofuOutputs,
-      }),
-    /connector.*enabled/,
-  );
+test("throws when the connector settings are missing", () => {
   assert.throws(
     () =>
       renderConnectorWrangler({

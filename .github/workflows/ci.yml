@@ -100,16 +100,9 @@ jobs:
           node connector/scripts/check-tools-manifest.mjs
           placeholder="$RUNNER_TEMP/connector-tofu-output.json"
           echo '{"connector_oauth_kv_id":{"value":"00000000000000000000000000000000"},"connector_d1_id":{"value":"00000000-0000-0000-0000-000000000000"}}' > "$placeholder"
-          settings="$RUNNER_TEMP/connector-settings.json"
-          node -e '
-            const fs = require("fs");
-            const settings = JSON.parse(fs.readFileSync("config/settings.json", "utf8"));
-            settings.connector.enabled = true;
-            fs.writeFileSync(process.argv[1], JSON.stringify(settings));
-          ' "$settings"
           node scripts/render-connector-wrangler.mjs \
             --template connector/wrangler.template.jsonc \
-            --settings "$settings" \
+            --settings config/settings.json \
             --tofu-outputs "$placeholder" \
             --out connector/wrangler.json \
             --hostname mcp.example.com

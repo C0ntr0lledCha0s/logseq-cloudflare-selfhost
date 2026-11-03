@@ -2,4 +2,4 @@
  "d1DatabaseName":"logseq-sync-index","assetsBucket":"logseq-sync-assets","backupsBucket":"logseq-sync-backups",
  "backupRetentionDays":90,
  "rateLimitNamespaces":{"SEMANTIC_READ_RATE_LIMITER":"1001","SEMANTIC_WRITE_RATE_LIMITER":"1002"},
- "connector":{"enabled":true,"workerName":"logseq-connector","d1DatabaseName":"logseq-connector"}}
+ "connector":{"workerName":"logseq-connector","d1DatabaseName":"logseq-connector"}}
