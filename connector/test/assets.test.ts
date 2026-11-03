@@ -202,9 +202,8 @@ describe("save_document", () => {
       if (url.pathname === `/api/v1/graphs/${WORK_ID}/search`) {
         return Response.json({
           results: [
-            { uuid: "55555555-5555-4555-8555-555555555555", kind: "page", title: "Standup notes", resource: "blocks" },
-            { uuid: "66666666-6666-4666-8666-666666666666", kind: "block", title: "standup", resource: "blocks" },
-            { uuid: PAGE_ID, kind: "page", title: "Standup", resource: "blocks" },
+            { uuid: "55555555-5555-4555-8555-555555555555", kind: "page", title: "Standup notes", resource: "pages" },
+            { uuid: PAGE_ID, kind: "page", title: "Standup", resource: "pages" },
           ],
         });
       }
@@ -217,6 +216,7 @@ describe("save_document", () => {
       `POST /api/v1/graphs/${WORK_ID}/assets`,
     ]);
     expect(syncCalls[0].url.searchParams.get("q")).toBe("standup");
+    expect(syncCalls[0].url.searchParams.get("types")).toBe("pages");
     expect(syncCalls[1].url.searchParams.get("page-id")).toBe(PAGE_ID);
 
     // No exact page title: refused before any upload.
@@ -230,7 +230,7 @@ describe("save_document", () => {
   it("save_document refuses a page title that several pages share, or that the search cannot exhaust", async () => {
     acceptUploads();
     const upload = syncHandler;
-    const page = (uuid: string, title: string) => ({ uuid, kind: "page", title, resource: "blocks" });
+    const page = (uuid: string, title: string) => ({ uuid, kind: "page", title, resource: "pages" });
     const OTHER_PAGE = "77777777-7777-4777-8777-777777777777";
 
     // Two pages share the title (DB graphs allow it), on different search pages.
