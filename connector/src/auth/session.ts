@@ -1,3 +1,4 @@
+import { aesKeyFromHex, fromBase64url } from "../crypto";
 import { base64url, isOwner } from "./github";
 
 /** The wizard's own sign-in. Separate from OAuth grants: an MCP token never opens the wizard. */
@@ -30,17 +31,8 @@ function readCookie(request: Request, name: string): string | undefined {
   return undefined;
 }
 
-async function cookieKey(env: Env): Promise<CryptoKey> {
-  const hex = env.COOKIE_ENCRYPTION_KEY;
-  const raw = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) raw[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
-}
-
-function fromBase64url(value: string): Uint8Array {
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (value.length % 4)) % 4);
-  const binary = atob(padded);
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+function cookieKey(env: Env): Promise<CryptoKey> {
+  return aesKeyFromHex(env.COOKIE_ENCRYPTION_KEY, "COOKIE_ENCRYPTION_KEY");
 }
 
 /** AES-GCM with the purpose as associated data, so a login cookie can never pass as a session. */
