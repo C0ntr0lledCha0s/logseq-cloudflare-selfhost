@@ -12,6 +12,7 @@ export const CONNECTOR_HELP = [
   "Create tasks and action items with create_task, never as TODO text.",
   "Add to today's journal with capture_to_today.",
   "Make flashcards by tagging each card block with the Card tag.",
+  "Save files with save_document (text or base64) or save_file_from_url (a public https link), and read them back with read_file.",
   "List tools are paginated: pass the returned next-cursor as cursor to get the next page.",
 ].join(" ");
 

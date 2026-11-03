@@ -149,6 +149,9 @@ describe("tool list", () => {
       "list_assets",
       "list_graphs",
       "connector_help",
+      "save_document",
+      "save_file_from_url",
+      "read_file",
     ]) {
       expect(names).toContain(name);
     }
@@ -177,7 +180,11 @@ describe("tool list", () => {
   });
 
   it("every GET tool readOnlyHint true, every DELETE destructiveHint true", async () => {
-    const methods = new Map(committedManifest.map((e) => [e.name, e.method]));
+    // Hand-written tools have no method; these two write to the graph, like a POST.
+    const handwrittenWrites = new Set(["save_document", "save_file_from_url"]);
+    const methods = new Map(
+      committedManifest.map((e) => [e.name, e.method ?? (handwrittenWrites.has(e.name) ? "POST" : null)]),
+    );
     const tools = await listTools();
     let gets = 0;
     let deletes = 0;

@@ -145,6 +145,21 @@
     "path": "/api/v1/graphs/{graph-id}/block-moves"
   },
   {
+    "name": "read_file",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "save_document",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "save_file_from_url",
+    "method": null,
+    "path": null
+  },
+  {
     "name": "search_graph",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/search"

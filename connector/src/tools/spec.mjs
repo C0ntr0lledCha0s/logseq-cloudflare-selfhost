@@ -16,11 +16,11 @@ import { resolveOpenApiRefs } from "../../vendor/semantic_api_tools.mjs";
 export const ALIAS_PATTERN = "^[a-z0-9][a-z0-9-]{0,39}$";
 export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 /** Tools registered by hand rather than from the spec; listed here so the manifest covers them. */
-export const HANDWRITTEN_TOOLS = ["connector_help", "list_graphs"];
+export const HANDWRITTEN_TOOLS = ["connector_help", "list_graphs", "read_file", "save_document", "save_file_from_url"];
 
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
-/** Replaced by hand-written tools (assets, list_graphs). `/e2ee/` paths are dropped too. */
+/** Replaced by hand-written tools (read_file, save_*, list_graphs). `/e2ee/` paths are dropped too. */
 const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs"]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);

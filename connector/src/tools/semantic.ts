@@ -3,7 +3,7 @@ import { z } from "zod";
 import { registerSemanticApiTools } from "../../vendor/semantic_api_tools.mjs";
 import { connectorHostname } from "../config";
 import type { ResolvedGraph } from "../graphs";
-import { SyncError, syncFetch } from "../sync";
+import { SyncError, type SyncRequest, syncFetch } from "../sync";
 import { ToolError, aliasArg, runTool } from "./common";
 import { ALIAS_PATTERN, type GraphOperation, type OpenApiSpec, graphOperations, transformSpec } from "./spec.mjs";
 
@@ -75,6 +75,30 @@ function queryParams(query: Record<string, unknown> | undefined): Record<string,
   return out;
 }
 
+/**
+ * The graph behind `alias` for one tool call. Throws `ToolError` for an unknown alias, and for a
+ * write on a read-only graph, before anything reaches the sync server.
+ */
+export async function resolveGraph(access: GraphAccess, alias: string, write: boolean): Promise<ResolvedGraph> {
+  const graph = await access.resolve(alias);
+  if (!graph) {
+    throw new ToolError(`unknown graph '${alias}' — call list_graphs for the connected aliases`, "unknown-graph");
+  }
+  if (graph.mode !== "read" && graph.mode !== "write") throw new Error(`graph '${alias}' has an invalid mode`);
+  if (graph.mode === "read" && write) throw new ToolError(`graph '${alias}' is read-only`, "read-only");
+  return graph;
+}
+
+/** `syncFetch` for a tool call on `alias`: a sync server error becomes a `ToolError` with clear text. */
+export async function graphFetch(access: GraphAccess, alias: string, pat: string, req: SyncRequest): Promise<Response> {
+  try {
+    return await syncFetch(access.env, pat, req);
+  } catch (error) {
+    if (!(error instanceof SyncError)) throw error;
+    throw new ToolError(syncErrorText(error, alias, connectorHostname(access.env)), `http-${error.status}`);
+  }
+}
+
 async function request(access: GraphAccess, req: UpstreamRequest): Promise<unknown> {
   const match = GRAPH_PATH.exec(req.path);
   // Upstream builds the path from the transformed spec, and the input schema enforces the alias pattern.
@@ -88,25 +112,13 @@ async function request(access: GraphAccess, req: UpstreamRequest): Promise<unkno
       throw new ToolError("path arguments may not be '.' or '..'", "refused");
     }
   }
-  const graph = await access.resolve(alias);
-  if (!graph) {
-    throw new ToolError(`unknown graph '${alias}' — call list_graphs for the connected aliases`, "unknown-graph");
-  }
-  if (graph.mode !== "read" && graph.mode !== "write") throw new Error(`graph '${alias}' has an invalid mode`);
-  if (graph.mode === "read" && req.method !== "GET") throw new ToolError(`graph '${alias}' is read-only`, "read-only");
-
-  let response: Response;
-  try {
-    response = await syncFetch(access.env, graph.pat, {
-      method: req.method,
-      path: `/api/v1/graphs/${encodeURIComponent(graph.graphId)}${rest}`,
-      query: queryParams(req.query),
-      json: req.body,
-    });
-  } catch (error) {
-    if (!(error instanceof SyncError)) throw error;
-    throw new ToolError(syncErrorText(error, alias, connectorHostname(access.env)), `http-${error.status}`);
-  }
+  const graph = await resolveGraph(access, alias, req.method !== "GET");
+  const response = await graphFetch(access, alias, graph.pat, {
+    method: req.method,
+    path: `/api/v1/graphs/${encodeURIComponent(graph.graphId)}${rest}`,
+    query: queryParams(req.query),
+    json: req.body,
+  });
   const text = await response.text();
   return text === "" ? null : JSON.parse(text);
 }
