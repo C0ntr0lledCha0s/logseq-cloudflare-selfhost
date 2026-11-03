@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,4 +76,48 @@ test("the setting step fails on a missing or non-boolean enabled", () => {
     assert.notEqual(r.status, 0, JSON.stringify(settings));
     assert.equal(r.output, "", JSON.stringify(settings));
   }
+});
+
+/**
+ * Runs the "Mask the D1 and connector ids" step as GitHub would (bash -e), with a stub wrapper that
+ * prints its own ::add-mask:: lines to stdout like the real one does in Actions, and a stub tofu that
+ * prints `outputs` as `tofu output -json` would.
+ */
+function runMaskStep(outputs) {
+  const dir = mkdtempSync(join(tmpdir(), "deploy-workflow-"));
+  try {
+    mkdirSync(join(dir, "scripts"));
+    mkdirSync(join(dir, "bin"));
+    const wrapper = join(dir, "scripts", "with-r2-credentials.sh");
+    writeFileSync(wrapper, '#!/usr/bin/env bash\necho "::add-mask::r2-secret"\nexec "$@"\n');
+    chmodSync(wrapper, 0o755);
+    const tofu = join(dir, "bin", "tofu");
+    writeFileSync(tofu, `#!/usr/bin/env bash\nprintf '%s' '${JSON.stringify(outputs)}'\n`);
+    chmodSync(tofu, 0o755);
+    const r = spawnSync("bash", ["-e", "-c", runBlock("Mask the D1 and connector ids")], {
+      cwd: dir,
+      env: { ...process.env, PATH: `${join(dir, "bin")}:${process.env.PATH}`, RUNNER_TEMP: dir },
+      encoding: "utf8",
+    });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("the mask step masks every id and keeps the wrapper's own mask lines out of the JSON", () => {
+  const r = runMaskStep({
+    d1_database_id: { value: "d1-id" },
+    connector_oauth_kv_id: { value: "kv-id" },
+    connector_d1_id: { value: "connector-d1-id" },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  for (const value of ["r2-secret", "d1-id", "kv-id", "connector-d1-id"]) {
+    assert.ok(r.stdout.split("\n").includes(`::add-mask::${value}`), value);
+  }
+});
+
+test("the mask step passes on a first-ever run with no outputs", () => {
+  const r = runMaskStep({});
+  assert.equal(r.status, 0, r.stderr);
 });
