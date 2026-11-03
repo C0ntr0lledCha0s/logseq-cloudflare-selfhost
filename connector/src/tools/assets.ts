@@ -116,11 +116,13 @@ async function pageIdFor(access: GraphAccess, alias: string, graph: ResolvedGrap
     cursor = body["next-cursor"];
     if (cursor === undefined) break;
   }
-  if (matches.size === 1) return [...matches][0];
+  // DB graphs allow several pages with one title, so a single match counts only once the search is
+  // exhausted: another could sit beyond the last page read.
   if (matches.size > 1) throw new ToolError(`several pages are titled '${page}' — pass the page's UUID`, "refused");
   if (cursor !== undefined) {
     throw new ToolError(`too many search results to find page '${page}' — pass the page's UUID`, "refused");
   }
+  if (matches.size === 1) return [...matches][0];
   throw new ToolError(
     `no page titled '${page}' in graph '${alias}' — pass an existing page title or its UUID`,
     "refused",
@@ -205,13 +207,15 @@ async function readFile(access: GraphAccess, alias: string, assetUuid: string): 
   if (!isImage && !isText) return textResult(JSON.stringify({ fileName, type: meta.type, size: meta.size }));
 
   // The signed URL's origin is whatever the sync server saw (sync.internal over the binding); only its
-  // path and query are used, and they go over SYNC, never the public Internet.
+  // path and query are used, and they go over SYNC, never the public Internet. The signature is the
+  // authorization, so the PAT is not sent.
   const signed = new URL(meta.url);
   if (!signed.pathname.startsWith("/assets/")) throw new Error("getAsset answered with an unexpected URL path");
   const fileResponse = await graphFetch(access, alias, graph.pat, {
     method: "GET",
     path: signed.pathname,
     query: Object.fromEntries(signed.searchParams),
+    auth: false,
   });
   if (isImage) {
     const { bytes, complete } = await readUpTo(fileResponse.body, IMAGE_MAX_BYTES);

@@ -37,6 +37,8 @@ export interface FetchedFile {
 }
 
 export const MAX_REDIRECTS = 5;
+/** Each hop, body included, must finish within this. */
+export const HOP_TIMEOUT_MS = 45_000;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const BLOCKED_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa"];
 
@@ -82,6 +84,7 @@ function blockedIPv4([a, b, c]: IPv4): boolean {
     (a === 172 && (b & 0xf0) === 16) || // RFC 1918
     (a === 192 && b === 168) || // RFC 1918
     (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF protocol assignments, TEST-NET-1
+    (a === 192 && b === 88 && c === 99) || // deprecated 6to4 relay anycast
     (a === 198 && (b & 0xfe) === 18) || // benchmarking
     (a === 198 && b === 51 && c === 100) || // TEST-NET-2
     (a === 203 && b === 0 && c === 113) || // TEST-NET-3
@@ -97,6 +100,7 @@ function blockedIPv6(g: number[]): boolean {
   const zeroUntil = (n: number) => g.slice(0, n).every((x) => x === 0);
   if (zeroUntil(6)) return blockedIPv4(embeddedIPv4(g[6], g[7])); // ::, ::1 and IPv4-compatible
   if (zeroUntil(5) && g[5] === 0xffff) return blockedIPv4(embeddedIPv4(g[6], g[7])); // IPv4-mapped
+  if (zeroUntil(4) && g[4] === 0xffff && g[5] === 0) return blockedIPv4(embeddedIPv4(g[6], g[7])); // IPv4-translated
   if (g[0] === 0x64 && g[1] === 0xff9b) {
     // NAT64: the well-known /96 embeds an IPv4 address; the local-use 64:ff9b:1::/48 is never public.
     return g.slice(2, 6).every((x) => x === 0) ? blockedIPv4(embeddedIPv4(g[6], g[7])) : true;
@@ -106,7 +110,9 @@ function blockedIPv6(g: number[]): boolean {
     (g[0] & 0xfe00) === 0xfc00 || // unique local fc00::/7
     (g[0] & 0xff80) === 0xfe80 || // link-local fe80::/10 and deprecated site-local fec0::/10
     (g[0] & 0xff00) === 0xff00 || // multicast
-    (g[0] === 0x2001 && g[1] === 0x0db8) // documentation
+    (g[0] === 0x2001 && g[1] === 0x0db8) || // documentation
+    (g[0] === 0x2001 && g[1] === 0) || // Teredo 2001::/32, which tunnels to an obfuscated IPv4 address
+    (g[0] === 0x0100 && g[1] === 0 && g[2] === 0 && g[3] === 0) // discard-only 100::/64
   );
 }
 
@@ -196,14 +202,28 @@ export async function readUpTo(
   return { bytes, complete };
 }
 
+/** A network, TLS, timeout or policy failure as a message for Claude, never naming the host. */
+function unreachable(error: unknown): SafeFetchError {
+  if (error instanceof SafeFetchError) return error;
+  if (error instanceof Error && error.name === "TimeoutError") return new SafeFetchError("the URL timed out");
+  // Includes refusals by global_fetch_strictly_public; their messages may name the host, so none is echoed.
+  return new SafeFetchError("the URL could not be reached");
+}
+
 /**
  * Fetches `rawUrl` with the checks above, following redirects by hand, and reads its body up to
- * `maxBytes`. Throws `SafeFetchError` with a message for Claude on any refusal.
+ * `maxBytes`. Each hop has `HOP_TIMEOUT_MS`. Throws `SafeFetchError` with a message for Claude on any
+ * refusal or failure.
  */
 export async function safeFetch(rawUrl: string, options: SafeFetchOptions): Promise<FetchedFile> {
   let url = parseUrl(rawUrl);
   for (let redirects = 0; ; redirects += 1) {
-    const response = await fetch(url, { method: "GET", redirect: "manual" });
+    let response: Response;
+    try {
+      response = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(HOP_TIMEOUT_MS) });
+    } catch (error) {
+      throw unreachable(error);
+    }
     if (REDIRECT_STATUSES.has(response.status)) {
       await response.body?.cancel();
       if (redirects === MAX_REDIRECTS) throw new SafeFetchError(`more than ${MAX_REDIRECTS} redirects`);
@@ -212,28 +232,36 @@ export async function safeFetch(rawUrl: string, options: SafeFetchOptions): Prom
       url = parseUrl(location, url);
       continue;
     }
-    if (response.status !== 200) {
-      await response.body?.cancel();
-      throw new SafeFetchError(`the URL answered HTTP ${response.status}`);
+    try {
+      return await readResponse(response, url, options);
+    } catch (error) {
+      throw unreachable(error);
     }
-    const contentType = response.headers.get("Content-Type");
-    if (contentType === null) {
-      await response.body?.cancel();
-      throw new SafeFetchError("the response has no content type");
-    }
-    const mediaType = mediaTypeOf(contentType);
-    if (!typeAllowed(mediaType, options.allowTypes)) {
-      await response.body?.cancel();
-      throw new SafeFetchError(`content type ${mediaType} is not allowed`);
-    }
-    const tooLarge = `the file is larger than ${options.maxBytes} bytes`;
-    const declared = response.headers.get("Content-Length");
-    if (declared !== null && Number(declared) > options.maxBytes) {
-      await response.body?.cancel();
-      throw new SafeFetchError(tooLarge);
-    }
-    const { bytes, complete } = await readUpTo(response.body, options.maxBytes);
-    if (!complete) throw new SafeFetchError(tooLarge);
-    return { bytes, mediaType, url };
   }
+}
+
+async function readResponse(response: Response, url: URL, options: SafeFetchOptions): Promise<FetchedFile> {
+  if (response.status !== 200) {
+    await response.body?.cancel();
+    throw new SafeFetchError(`the URL answered HTTP ${response.status}`);
+  }
+  const contentType = response.headers.get("Content-Type");
+  if (contentType === null) {
+    await response.body?.cancel();
+    throw new SafeFetchError("the response has no content type");
+  }
+  const mediaType = mediaTypeOf(contentType);
+  if (!typeAllowed(mediaType, options.allowTypes)) {
+    await response.body?.cancel();
+    throw new SafeFetchError(`content type ${mediaType} is not allowed`);
+  }
+  const tooLarge = `the file is larger than ${options.maxBytes} bytes`;
+  const declared = response.headers.get("Content-Length");
+  if (declared !== null && Number(declared) > options.maxBytes) {
+    await response.body?.cancel();
+    throw new SafeFetchError(tooLarge);
+  }
+  const { bytes, complete } = await readUpTo(response.body, options.maxBytes);
+  if (!complete) throw new SafeFetchError(tooLarge);
+  return { bytes, mediaType, url };
 }

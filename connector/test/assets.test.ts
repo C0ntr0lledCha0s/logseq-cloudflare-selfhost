@@ -227,6 +227,43 @@ describe("save_document", () => {
     expect(syncCalls.map((c) => c.method)).toEqual(["GET"]);
   });
 
+  it("save_document refuses a page title that several pages share, or that the search cannot exhaust", async () => {
+    acceptUploads();
+    const upload = syncHandler;
+    const page = (uuid: string, title: string) => ({ uuid, kind: "page", title, resource: "blocks" });
+    const OTHER_PAGE = "77777777-7777-4777-8777-777777777777";
+
+    // Two pages share the title (DB graphs allow it), on different search pages.
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname !== `/api/v1/graphs/${WORK_ID}/search`) return upload(request);
+      return url.searchParams.get("cursor") === null
+        ? Response.json({ results: [page(PAGE_ID, "Standup")], "next-cursor": "c1" })
+        : Response.json({ results: [page(OTHER_PAGE, "standup")] });
+    };
+    const several = await callTool("save_document", { graph: "work", fileName: "a.md", text: "a", page: "Standup" });
+    expect(several.isError).toBe(true);
+    expect(onlyText(several)).toBe("several pages are titled 'Standup' — pass the page's UUID");
+    expect(syncCalls.map((c) => c.method)).toEqual(["GET", "GET"]);
+    expect(syncCalls[1].url.searchParams.get("cursor")).toBe("c1");
+
+    // One exact match, but the search still has more pages after the fifth: another match could follow.
+    syncCalls = [];
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname !== `/api/v1/graphs/${WORK_ID}/search`) return upload(request);
+      const n = Number(url.searchParams.get("cursor") ?? "0");
+      return Response.json({
+        results: n === 0 ? [page(PAGE_ID, "Standup")] : [page(`${n}`, "Standup notes")],
+        "next-cursor": String(n + 1),
+      });
+    };
+    const tooMany = await callTool("save_document", { graph: "work", fileName: "a.md", text: "a", page: "Standup" });
+    expect(tooMany.isError).toBe(true);
+    expect(onlyText(tooMany)).toBe("too many search results to find page 'Standup' — pass the page's UUID");
+    expect(syncCalls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "GET", "GET"]);
+  });
+
   it("save_document rejects both or neither of text/base64 and oversize input", async () => {
     const both = await callTool("save_document", { graph: "work", fileName: "a.md", text: "a", base64: "YQ==" });
     expect(both.isError).toBe(true);
@@ -299,6 +336,11 @@ describe("safeFetch", () => {
       "https://[::ffff:a9fe:a9fe]/",
       "https://[::127.0.0.1]/",
       "https://[64:ff9b::a00:1]/",
+      // IPv4-translated, Teredo, discard-only, and the 6to4 relay anycast range.
+      "https://[::ffff:0:127.0.0.1]/",
+      "https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/",
+      "https://[100::1]/",
+      "https://192.88.99.1/",
       // Userinfo, non-standard ports, internal and single-label names.
       "https://user:pass@files.example.com/a.pdf",
       "https://files.example.com@127.0.0.1/a.pdf",
@@ -410,6 +452,38 @@ describe("safeFetch", () => {
 
     fetchSpy.mockResolvedValueOnce(new Response("gone", { status: 404, headers: { "Content-Type": "text/plain" } }));
     await expect(safeFetch("https://files.example.com/f", options)).rejects.toThrow("the URL answered HTTP 404");
+  });
+
+  it("safeFetch times out each hop and reports network failures without naming the host", async () => {
+    fetchSpy.mockReset();
+    fetchSpy.mockRejectedValueOnce(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    await expect(safeFetch("https://files.example.com/slow.pdf", options)).rejects.toThrow(
+      new SafeFetchError("the URL timed out"),
+    );
+    const init = fetchSpy.mock.calls[0][1];
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+
+    for (const failure of [
+      new TypeError("Network connection lost to files.example.com"),
+      new Error("TLS handshake with files.example.com failed"),
+      new TypeError("fetch to files.example.com refused: not a public address"),
+    ]) {
+      fetchSpy.mockRejectedValueOnce(failure);
+      const error = await safeFetch("https://files.example.com/a.pdf", options).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(SafeFetchError);
+      expect((error as Error).message).toBe("the URL could not be reached");
+    }
+
+    // A failure while reading the body is mapped the same way.
+    const broken = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new TypeError("connection reset by files.example.com"));
+      },
+    });
+    fetchSpy.mockResolvedValueOnce(new Response(broken, { headers: { "Content-Type": "application/pdf" } }));
+    await expect(safeFetch("https://files.example.com/a.pdf", options)).rejects.toThrow(
+      new SafeFetchError("the URL could not be reached"),
+    );
   });
 });
 
@@ -529,7 +603,8 @@ describe("read_file", () => {
       `GET https://sync.internal/api/v1/graphs/${NOTES_ID}/assets/${ASSET_ID}`,
       `GET https://sync.internal${SIGNED}.md?expires=1999999999&signature=abcd`,
     ]);
-    expect(syncCalls.map((c) => c.auth)).toEqual([`Bearer ${NOTES_TOKEN}`, `Bearer ${NOTES_TOKEN}`]);
+    // The PAT goes to getAsset only; the signed route is authorized by its signature.
+    expect(syncCalls.map((c) => c.auth)).toEqual([`Bearer ${NOTES_TOKEN}`, null]);
     expect(fetchSpy).not.toHaveBeenCalled();
 
     // A malformed asset UUID never reaches the sync server.
@@ -537,5 +612,43 @@ describe("read_file", () => {
     const bad = await callTool("read_file", { graph: "work", assetUuid: "../pages" });
     expect(bad.isError).toBe(true);
     expect(syncCalls).toHaveLength(0);
+  });
+});
+
+describe("logging", () => {
+  it("file tools log only tool, alias, status and duration — no PAT, URL or hostname", async () => {
+    acceptUploads();
+    await callTool("save_document", { graph: "work", fileName: "a.md", text: "secret text", page: PAGE_ID });
+    fetchSpy.mockResolvedValueOnce(new Response("x", { headers: { "Content-Type": "text/plain" } }));
+    await callTool("save_file_from_url", { graph: "work", url: "https://files.example.com/private/a.txt" });
+    await callTool("save_file_from_url", { graph: "work", url: "https://127.0.0.1/a.txt" });
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname.startsWith("/api/")) {
+        return Response.json({
+          uuid: ASSET_ID,
+          title: "a",
+          type: "txt",
+          size: 1,
+          checksum: "0".repeat(64),
+          url: `https://sync.internal/assets/${WORK_ID}/${ASSET_ID}.txt?expires=1&signature=ab`,
+        });
+      }
+      return new Response("x");
+    };
+    await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+
+    const lines = consoleSpies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
+    expect(lines.map((line) => line.replace(/ms=\d+$/, "ms=N"))).toEqual([
+      "tool save_document graph=work status=ok ms=N",
+      "tool save_file_from_url graph=work status=ok ms=N",
+      "tool save_file_from_url graph=work status=refused ms=N",
+      "tool read_file graph=work status=ok ms=N",
+    ]);
+    for (const line of lines) {
+      for (const leak of [WORK_TOKEN, "logseq_pat_", "https://", "example.com", "127.0.0.1", "sync.internal", "secret"]) {
+        expect(line).not.toContain(leak);
+      }
+    }
   });
 });
