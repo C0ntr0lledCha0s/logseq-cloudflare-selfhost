@@ -41,7 +41,7 @@ fi
 echo
 echo "## New D1 migrations"
 echo
-added="$(git -C "$upstream_dir" diff --name-only --diff-filter=A "$old" "$new" -- "$migrations_path")"
+added="$(git -C "$upstream_dir" diff --name-only --no-renames --diff-filter=A "$old" "$new" -- "$migrations_path")"
 if [ -n "$added" ]; then
   while IFS= read -r file; do
     echo "- \`${file#"$migrations_path"}\`"

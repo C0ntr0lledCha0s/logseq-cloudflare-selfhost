@@ -33,8 +33,17 @@ date_dir="$(date -u +%F)"
 # wrangler is run from a scratch dir so no wrangler.toml is picked up.
 cd "$out"
 
-put() { # <local-file> <key under date dir>
-  "$WRANGLER" r2 object put "$backups_bucket/$date_dir/$2" --file "$1" --remote >> "$log" 2>&1
+export RCLONE_CONFIG_R2_TYPE=s3
+export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+export RCLONE_CONFIG_R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+
+# Dated data lives under daily/<date>/ (the only prefix the lifecycle rule expires).
+# rclone copyto has no per-object size cap, unlike `wrangler r2 object put`.
+dated_prefix="r2:$backups_bucket/daily/$date_dir"
+put() { # <local-file> <key under the dated prefix>
+  rclone copyto "$1" "$dated_prefix/$2" >> "$log" 2>&1
 }
 
 # 1. D1 export first, uploaded before anything else can fail.
@@ -84,23 +93,26 @@ printf '%s' "$mapping" | node -e '
 ' > "$index_file"
 put "$index_file" graphs/index.json || graphs_status=fail
 
-# 3. Assets mirror.
+# 3. Assets mirror. Deleted or overwritten files are moved into the dated area, so a
+# deletion in the live bucket never removes the only copy.
 assets_status=ok
-export RCLONE_CONFIG_R2_TYPE=s3
-export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-export RCLONE_CONFIG_R2_ENDPOINT="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
-rclone sync "r2:$assets_bucket" "r2:$backups_bucket/assets" >> "$log" 2>&1 || assets_status=fail
+rclone sync "r2:$assets_bucket" "r2:$backups_bucket/assets" \
+  --backup-dir "$dated_prefix/assets-deleted" >> "$log" 2>&1 || assets_status=fail
 
-# 4. Summary.
+# 4. Summary, then upload the log (private bucket only) so failures can be diagnosed.
 if [ "$graphs_status" = fail ]; then
   graphs_summary="fail"
 else
   graphs_summary="$graphs_ok/$graphs_total"
 fi
-echo "backup: d1=$d1_status graphs=$graphs_summary assets=$assets_status"
+summary="backup: d1=$d1_status graphs=$graphs_summary assets=$assets_status"
+echo "$summary" >> "$log"
+log_status=ok
+put "$log" backup.log || log_status=fail
+echo "$summary log=$log_status"
+
 if [ "$d1_status" = ok ] && [ "$graphs_status" = ok ] && [ "$graphs_ok" -eq "$graphs_total" ] && [ "$assets_status" = ok ]; then
   exit 0
 fi
+echo "backup failed; see $backups_bucket/daily/$date_dir/backup.log"
 exit 1

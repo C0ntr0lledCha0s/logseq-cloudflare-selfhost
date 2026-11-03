@@ -38,10 +38,10 @@ resource "cloudflare_r2_bucket_lifecycle" "backups" {
   bucket_name = cloudflare_r2_bucket.backups.name
 
   rules = [{
-    id      = "expire-backups"
+    id      = "expire-dated-backups"
     enabled = true
     conditions = {
-      prefix = ""
+      prefix = "daily/"
     }
     delete_objects_transition = {
       condition = {

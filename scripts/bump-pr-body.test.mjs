@@ -36,9 +36,9 @@ before(() => {
 
 after(() => rmSync(repo, { recursive: true, force: true }));
 
-function run(ciResult) {
+function run(ciResult, to = newSha) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(script, [oldSha, newSha, ciResult, repo], {
+    const child = spawn(script, [oldSha, to, ciResult, repo], {
       cwd: root,
       env: {
         ...process.env,
@@ -63,6 +63,15 @@ test("lists new migrations", { timeout: 60000 }, async () => {
   assert.doesNotMatch(r.stdout, /0007_a\.sql/);
   assert.match(r.stdout, /CI: ✅ passed/);
   assert.match(r.stdout, /add migration 0008/);
+});
+
+test("lists a renamed migration as new", { timeout: 60000 }, async () => {
+  const dir = "deps/db-sync/worker/migrations";
+  git("mv", `${dir}/0007_a.sql`, `${dir}/0009_renamed.sql`);
+  git("commit", "-q", "-m", "rename migration");
+  const r = await run("success", git("rev-parse", "HEAD"));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /0009_renamed\.sql/);
 });
 
 test("marks failed CI", { timeout: 60000 }, async () => {
