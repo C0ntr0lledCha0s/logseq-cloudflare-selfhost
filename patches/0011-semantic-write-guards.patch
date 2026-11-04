@@ -1,0 +1,725 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index dc22ab5a7a..d98166ef10 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -754,15 +754,139 @@
+        :transform-tx-meta (fn [_] @metadata))
+       @result)))
+ 
+-(defn- handle-pages [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
++;; createPage and createTag refuse a title that a visible page, journal, tag or property already
++;; holds, compared as Logseq's :block/name (sanitized, lower-cased). The outliner keeps tag and
++;; property titles case-sensitive, but [[links]], page lookups by name and inline-tag resolution go
++;; through :block/name, so #Movie and #movie would be ambiguous there. Recycled pages don't count:
++;; creating one again restores it, as in the editor. E2EE names are ciphertext and can't be compared.
++(defn- title-holder-kind [entity]
++  (if (ldb/journal? entity) "journal" (block-kind entity)))
++
++(defn- title-holders [db title]
++  (->> (d/datoms db :avet :block/name (common-util/page-name-sanity-lc (outliner-page/sanitize-title title)))
++       (map #(d/entity db (:e %)))
++       (remove entity-util/hidden?)
++       (filter #(or (page? %) (tag? %) (property? %)))
++       (sort-by :db/id)))
++
++(defn- title-taken-response [title holders]
++  (http/json-response
++   nil
++   {:error (str "title \"" title "\" is already used by "
++                (string/join ", " (map #(str (title-holder-kind %) " \"" (:block/title %) "\" ("
++                                             (:block/uuid %) ")")
++                                       holders))
++                "; nothing was created. Use the existing one or choose another title.")
++    :existing (mapv #(hash-map :uuid (uuid-string (:block/uuid %))
++                               :kind (title-holder-kind %)
++                               :title (:block/title %))
++                    holders)}
++   409))
++
++;; deletePage, deleteTag and deleteProperty refuse to lose references, holders, child tags or
++;; values unless the matching acknowledge-* query flag is true; dry-run=true reports the counts.
++(def ^:private loss-acknowledgements
++  [[:holders "acknowledge-holders" "holder" "holders"]
++   [:child-tags "acknowledge-child-tags" "child tag" "child tags"]
++   [:references "acknowledge-references" "reference" "references"]
++   [:values "acknowledge-values" "value" "values"]])
++
++(def ^:private delete-flags
++  (conj (mapv second loss-acknowledgements) "dry-run"))
++
++(defn- flag-param [^js url flag]
++  (case (.get (.-searchParams url) flag)
++    nil false
++    "false" false
++    "true" true
++    ::invalid))
++
++(defn- visible-entity-ids [db datoms]
++  (into #{} (comp (map :e) (remove #(entity-util/hidden? (d/entity db %)))) datoms))
++
++(defn- referrer-ids
++  "Visible entities, other than `entity` and its own blocks, that link to it (:block/refs, which
++  also covers inline tags), embed it, alias it, or hold it as a user or library property value."
++  [db entity]
++  (let [id (:db/id entity)
++        attributes (into [:block/refs :block/link :block/alias]
++                         (comp (filter #(= :db.type/ref (:db/valueType %)))
++                               (map :db/ident)
++                               (remove db-property/internal-property?))
++                         (db-db/get-all-properties db))]
++    (->> (visible-entity-ids db (mapcat #(d/datoms db :avet % id) attributes))
++         (remove #(or (= id %) (= id (:db/id (:block/page (d/entity db %))))))
++         set)))
++
++(defn- delete-impact [db kind entity]
++  (let [id (:db/id entity)]
++    (case kind
++      "page" {:references (count (referrer-ids db entity))}
++      "tag" (let [holders (visible-entity-ids db (d/datoms db :avet :block/tags id))
++                  children (visible-entity-ids db (d/datoms db :avet :logseq.property.class/extends id))]
++              {:holders (count holders)
++               :child-tags (count children)
++               :references (count (remove (into holders children) (referrer-ids db entity)))})
++      "property" {:values (count (visible-entity-ids db (d/datoms db :avet (:db/ident entity))))})))
++
++(defn- join-and [items]
++  (if (< (count items) 2)
++    (first items)
++    (str (string/join ", " (butlast items)) " and " (last items))))
++
++(defn- loss-message [kind entity impact requires]
++  (let [losses (keep (fn [[k flag singular plural]]
++                       (when (some #{flag} requires)
++                         (let [n (get impact k)]
++                           [(str n " " (if (= 1 n) singular plural)) (str flag "=true")])))
++                     loss-acknowledgements)]
++    (str kind " \"" (:block/title entity) "\" (" (:block/uuid entity) ") has "
++         (join-and (map first losses)) "; nothing was deleted. Pass "
++         (join-and (map second losses))
++         " to delete it anyway, or dry-run=true to preview what would be lost.")))
++
++(defn- delete-node!
++  "Deletes a page, tag or property through Logseq's page deletion rules once every loss it causes
++  is acknowledged."
++  [{:keys [^js self ^js url conn db]} entity]
++  (let [flags (into {} (map (juxt identity #(flag-param url %))) delete-flags)
++        invalid (some #(when (= ::invalid (get flags %)) %) delete-flags)
++        kind (block-kind entity)
++        impact (delete-impact db kind entity)
++        requires (into [] (keep (fn [[k flag]]
++                                  (when (and (pos? (get impact k 0)) (not (get flags flag)))
++                                    flag)))
++                       loss-acknowledgements)]
++    (cond
++      invalid (http/bad-request (str invalid " must be true or false"))
++      (ldb/built-in? entity) (http/bad-request (str "built-in " kind " cannot be deleted"))
++      (get flags "dry-run") (http/json-response nil (merge {:dry-run true
++                                                            :uuid (uuid-string (:block/uuid entity))
++                                                            :kind kind
++                                                            :title (:block/title entity)}
++                                                           impact
++                                                           {:requires requires}))
++      (seq requires) (http/json-response nil (merge {:error (loss-message kind entity impact requires)}
++                                                    impact
++                                                    {:requires requires})
++                                         409)
++      (outliner-page/delete! conn (:block/uuid entity)) (do (broadcast-change! self)
++                                                            (js/Response. nil #js {:status 204}))
++      :else (http/bad-request (str kind " cannot be deleted")))))
++
++(defn- handle-pages [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+     :semantic/pages-list
+     (paginated-response url :blocks (list-pages db) block-response)
+ 
+     :semantic/pages-create
+-    (p/let [body (body-clj request)]
+-      (if-not (non-blank-string? (:title body))
+-        (http/bad-request "missing title")
++    (p/let [body (body-clj request)
++            holders (when (and (not e2ee?) (non-blank-string? (:title body)))
++                      (title-holders db (:title body)))]
++      (cond
++        (not (non-blank-string? (:title body))) (http/bad-request "missing title")
++        (seq holders) (title-taken-response (:title body) holders)
++        :else
+         (let [[title page-id] (authored-write! conn creator outliner-page/create! (:title body)
+                                                      {:encrypted-title? e2ee? :encrypted-name (:name body)})]
+           (broadcast-change! self)
+@@ -810,10 +934,7 @@
+     (if-let [page (find-entity db (:page-id path-params))]
+       (if-not (page? page)
+         (http/bad-request "block is not a page")
+-        (do
+-          (outliner-page/delete! conn (:block/uuid page))
+-          (broadcast-change! self)
+-          (js/Response. nil #js {:status 204})))
++        (delete-node! context page))
+       (http/not-found))))
+ 
+ (defn- move-destination
+@@ -856,12 +977,15 @@
+ 
+     :semantic/blocks-delete
+     (if-let [block (find-entity db (:block-id path-params))]
+-      (do
+-        (if (page? block)
+-          (outliner-page/delete! conn (:block/uuid block))
+-          (outliner-core/delete-blocks! conn [block] {}))
+-        (broadcast-change! self)
+-        (js/Response. nil #js {:status 204}))
++      ;; Pages, tags and properties go through their own deletes, which guard what they'd lose.
++      (case (block-kind block)
++        "page" (http/bad-request "block is a page: delete it with deletePage")
++        "tag" (http/bad-request "block is a tag: delete it with deleteTag")
++        "property" (http/bad-request "block is a property: delete it with deleteProperty")
++        (do
++          (outliner-core/delete-blocks! conn [block] {})
++          (broadcast-change! self)
++          (js/Response. nil #js {:status 204})))
+       (http/not-found))
+ 
+     :semantic/blocks-move
+@@ -980,7 +1104,7 @@
+           (broadcast-change! self)
+           (http/json-response nil {:deleted (count resolved)}))))))
+ 
+-(defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
++(defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+     :semantic/capture
+@@ -998,9 +1122,13 @@
+     (paginated-response url :tags (entities-by-avet db :block/tags :logseq.class/Tag) tag-response)
+ 
+     :semantic/tags-create
+-    (p/let [body (body-clj request)]
+-      (if-not (non-blank-string? (:title body))
+-        (http/bad-request "missing title")
++    (p/let [body (body-clj request)
++            holders (when (and (not e2ee?) (non-blank-string? (:title body)))
++                      (title-holders db (:title body)))]
++      (cond
++        (not (non-blank-string? (:title body))) (http/bad-request "missing title")
++        (seq holders) (title-taken-response (:title body) holders)
++        :else
+         (let [[title tag-id] (authored-write! conn creator outliner-page/create! (:title body)
+                                                      {:class? true
+                                                       :encrypted-title? e2ee? :encrypted-name (:name body)})]
+@@ -1034,10 +1162,7 @@
+     (if-let [tag (find-entity db (:tag-id path-params))]
+       (if-not (tag? tag)
+         (http/not-found)
+-        (do
+-          (outliner-page/delete! conn (:block/uuid tag))
+-          (broadcast-change! self)
+-          (js/Response. nil #js {:status 204})))
++        (delete-node! context tag))
+       (http/not-found))))
+ 
+ (defn- handle-tasks [{:keys [^js self request ^js url conn db handler e2ee? creator]}]
+@@ -1184,7 +1309,7 @@
+       (http/not-found))))
+ 
+ (defn- handle-properties-and-search
+-  [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
++  [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+     :semantic/properties-list
+@@ -1226,11 +1351,7 @@
+     (if-let [property (resolve-property db (:property-id path-params))]
+       (if-not (property? property)
+         (http/not-found)
+-        (if (outliner-page/delete! conn (:block/uuid property))
+-          (do
+-            (broadcast-change! self)
+-            (js/Response. nil #js {:status 204}))
+-          (http/bad-request "property cannot be deleted")))
++        (delete-node! context property))
+       (http/not-found))
+ 
+     :semantic/search
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 018a10dac0..2e278cf3f9 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -88,16 +88,16 @@
+ (def ^:private operation-docs
+   {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+-   "createPage" ["Create a page" "Creates a page block with the supplied title."]
++   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and user and library block properties as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+-   "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree."]
++   "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and user and library property values, without loading an unbounded tree."]
+    "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID."]
+-   "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation."]
++   "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+    "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block."]
+    "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block."]
+@@ -109,16 +109,16 @@
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+-   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title."]
++   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
+    "getTag" ["Get a tag" "Returns one tag by UUID."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+    "updateTag" ["Update a tag" "Renames one tag identified by UUID."]
+-   "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules."]
++   "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+    "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+    "getProperty" ["Get a property definition" "Returns one property definition by UUID."]
+    "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
+-   "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules."]
++   "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+@@ -189,6 +189,24 @@
+     :description "Use base64 when the caller cannot transfer raw bytes. The server decodes this transport as a stream before writing to R2. On E2EE graphs, base64-encode the complete encrypted Transit package; size and checksum still describe the plaintext file."
+     :schema {:type "string" :enum ["base64"]}}])
+ 
++(defn- delete-flag-parameter [flag description]
++  {:name flag :in "query" :schema {:type "boolean"} :description description})
++
++(def ^:private dry-run-parameter
++  (delete-flag-parameter "dry-run" "When true, delete nothing and return the counts of what the delete would remove, with the acknowledge-* flags it still needs."))
++
++(def ^:private acknowledge-references-parameter
++  (delete-flag-parameter "acknowledge-references" "Set true to delete even though other blocks or pages link to it, embed it, alias it or hold it as a property value. Omitted or false, a delete with references is refused."))
++
++(def ^:private delete-parameters
++  {"deletePage" [acknowledge-references-parameter dry-run-parameter]
++   "deleteTag" [(delete-flag-parameter "acknowledge-holders" "Set true to delete even though nodes hold the tag; they lose it. Omitted or false, a delete with holders is refused.")
++                (delete-flag-parameter "acknowledge-child-tags" "Set true to delete even though other tags extend it; they extend Root instead. Omitted or false, a delete with child tags is refused.")
++                acknowledge-references-parameter
++                dry-run-parameter]
++   "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
++                     dry-run-parameter]})
++
+ (def ^:private encrypted-name-schema
+   {:type "string"
+    :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
+@@ -267,6 +285,8 @@
+     (into time-filter-parameters)
+     (= "createAsset" operation-id)
+     (into asset-upload-parameters)
++    (contains? delete-parameters operation-id)
++    (into (get delete-parameters operation-id))
+     (= "listGraphs" operation-id)
+     (into [{:name "name" :in "query" :schema {:type "string"}
+             :description "Exact graph name, matched case-insensitively."}])
+@@ -333,10 +353,16 @@
+           "409" {:description "Unavailable for E2EE graphs"}
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
+-           "createPage" {"201" (entity-response "PageResponse" "The created page")}
++           "createPage" {"201" (entity-response "PageResponse" "The created page")
++                         "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+            "insertBlockChildren" {"201" {:description "The inserted block trees"}}
+            "insertBlockTree" {"201" {:description "The inserted block trees"}}
+-           "createTag" {"201" (entity-response "TagResponse" "The created tag")}
++           "createTag" {"201" (entity-response "TagResponse" "The created tag")
++                        "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
++           ("deletePage" "deleteTag" "deleteProperty")
++           {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
++            "204" {:description "Deleted"}
++            "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
+            "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
+            "createTask"
+            {"201" (entity-response "TaskResponse" "The created DB Task object")}
+@@ -344,12 +370,39 @@
+            {"201" (entity-response "AssetResponse" "The created asset block")}
+            {})))
+ 
++;; createPage, createTag and the guarded deletes answer with these bodies.
++(def ^:private write-guard-schemas
++  (ordered-map
++   :TitleConflict {:type "object" :required ["error" "existing"]
++                   :properties {:error {:type "string"}
++                                :existing {:type "array"
++                                           :description "The pages, journals, tags and properties already using the title."
++                                           :items {:type "object" :required ["uuid" "kind" "title"]
++                                                   :properties {:uuid {:type "string"}
++                                                                :kind {:enum ["page" "journal" "tag" "property"]}
++                                                                :title {:type "string"}}}}}}
++   :DeleteImpact {:type "object" :required ["requires"]
++                  :properties {:dry-run {:type "boolean"}
++                               :uuid {:type "string"}
++                               :kind {:enum ["page" "tag" "property"]}
++                               :title {:type "string"}
++                               :references {:type "integer"
++                                            :description "Pages and tags: other blocks and pages that link to it, embed it, alias it or hold it as a property value (for a tag, besides its holders and child tags)."}
++                               :holders {:type "integer" :description "Tags: nodes tagged with it."}
++                               :child-tags {:type "integer" :description "Tags: tags that extend it."}
++                               :values {:type "integer" :description "Properties: nodes holding a value for it."}
++                               :requires {:type "array" :items {:type "string"}
++                                          :description "The acknowledge-* flags the delete still needs; empty when it would proceed."}}}
++   :DeleteRefusal {:allOf [{:$ref "#/components/schemas/DeleteImpact"}
++                           {:type "object" :required ["error"]
++                            :properties {:error {:type "string"}}}]}))
++
+ (defn openapi-document [issuer]
+   {:openapi "3.1.0"
+    :info {:title "Logseq Server API" :version "1.0.0"}
+    :servers [{:url "/"}]
+    :components
+-   {:schemas (ordered-map
++   {:schemas (into (ordered-map
+               :BlockTree {:type "object" :required ["title"]
+                           :properties {:uuid {:type "string" :format "uuid"
+                                               :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
+@@ -436,6 +489,7 @@
+               {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
+                :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
+                        {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
++              write-guard-schemas)
+     :securitySchemes
+     {:oauth {:type "oauth2"
+              :flows {:authorizationCode
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
+new file mode 100644
+index 0000000000..607b864da7
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
+@@ -0,0 +1,307 @@
++(ns logseq.db-sync.semantic-write-guards-test
++  "createPage and createTag refuse a title an existing page, tag or property holds; deletePage,
++  deleteTag and deleteProperty refuse to lose references, holders, child tags or values without an
++  acknowledgement, and preview the loss with dry-run."
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.frontend.entity-util :as entity-util]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(def ^:private sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
++
++(defn- with-memory-sql-async [f]
++  (let [db (new sqlite ":memory:" nil)
++        sql #js {:_db db
++                 :transaction (fn [f] ((.transaction db f)))
++                 :exec (fn [sql-str & args]
++                         (let [stmt (.prepare db sql-str)]
++                           (if (string/starts-with? (-> sql-str string/trim string/lower-case) "select")
++                             (.apply (.-all ^js stmt) stmt (to-array args))
++                             (do (.apply (.-run ^js stmt) stmt (to-array args)) nil))))
++                 :close (fn [] (.close db))}]
++    (-> (f sql)
++        (p/finally #(.close sql)))))
++
++(defn- semantic-json-request [path method body]
++  (js/Request. (str "http://localhost" path)
++               (clj->js (cond-> {:method method
++                                 :headers {"content-type" "application/json"}}
++                          body (assoc :body (js/JSON.stringify (clj->js body)))))))
++
++(defn- with-graph
++  "Runs `run` against a fresh built-in DB graph. `call` sends one semantic API request through the
++  real HTTP handler and resolves to [status body]; `query` is appended to the path's query string."
++  [done run]
++  (-> (with-memory-sql-async
++        (fn [sql]
++          (storage/init-schema! sql)
++          (let [conn (sqlite-export/create-conn)
++                self #js {:sql sql :conn conn :schema-ready true}
++                call (fn call
++                       ([method path] (call method path nil nil))
++                       ([method path body] (call method path body nil))
++                       ([method path body query]
++                        (p/let [response (sync-handler/handle-http
++                                          self
++                                          (semantic-json-request
++                                           (str "/semantic" path "?graph-id=graph-1" (when query (str "&" query)))
++                                           method body))
++                                text (.text response)]
++                          [(.-status response)
++                           (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))])))]
++            (run {:conn conn :call call}))))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- entity [conn id]
++  (d/entity @conn [:block/uuid (uuid id)]))
++
++(defn- named [conn page-name]
++  (->> (d/datoms @conn :avet :block/name page-name)
++       (map #(d/entity @conn (:e %)))
++       (remove entity-util/hidden?)))
++
++(deftest create-page-refuses-a-title-an-existing-page-holds-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[status created] (call "POST" "/pages" {:title "Project Alpha"})
++                _ (is (= 201 status))
++                id (:uuid created)
++                [lower-status lower] (call "POST" "/pages" {:title "project alpha"})
++                [bracket-status _] (call "POST" "/pages" {:title "[[Project Alpha]]"})
++                [tag-status tag-body] (call "POST" "/tags" {:title "PROJECT ALPHA"})]
++          (testing "a case-insensitive match refuses and names the page"
++            (is (= 409 lower-status))
++            (is (string/includes? (:error lower) id))
++            (is (string/includes? (:error lower) "page \"Project Alpha\""))
++            (is (= {:uuid id :kind "page" :title "Project Alpha"} (first (:existing lower)))))
++          (testing "the title is compared as Logseq stores it, without [[ ]]"
++            (is (= 409 bracket-status)))
++          (testing "createTag refuses rather than converting the page into a tag"
++            (is (= 409 tag-status))
++            (is (string/includes? (:error tag-body) id))
++            (is (not (ldb/class? (entity conn id)))))
++          (is (= 1 (count (named conn "project alpha"))) "nothing was written"))))))
++
++(deftest create-refuses-titles-held-by-tags-properties-and-journals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ movie] (call "POST" "/tags" {:title "Movie"})
++                [tag-status tag-body] (call "POST" "/tags" {:title "movie"})
++                [page-status page-body] (call "POST" "/pages" {:title "MOVIE"})
++                [_ genre] (call "POST" "/properties" {:title "Genre"})
++                [property-status property-body] (call "POST" "/pages" {:title "genre"})
++                [built-in-status built-in-body] (call "POST" "/tags" {:title "task"})
++                [_ captured] (call "POST" "/capture" {:blocks [{:title "Today"}]})
++                journal (entity conn (:page-id captured))
++                [journal-status journal-body] (call "POST" "/pages" {:title (:block/title journal)})
++                [fresh-status _] (call "POST" "/tags" {:title "Movie night"})]
++          (testing "a tag differing only in case is the same title"
++            (is (= 409 tag-status))
++            (is (string/includes? (:error tag-body) (str "tag \"Movie\" (" (:uuid movie) ")")))
++            (is (= 409 page-status))
++            (is (= 1 (count (named conn "movie")))))
++          (testing "a property holds its title"
++            (is (= 409 property-status))
++            (is (string/includes? (:error property-body) (str "property \"Genre\" (" (:uuid genre) ")"))))
++          (testing "built-in tags hold their titles"
++            (is (= 409 built-in-status))
++            (is (string/includes? (:error built-in-body) "tag \"Task\"")))
++          (testing "a journal holds its title"
++            (is (= 409 journal-status))
++            (is (string/includes? (:error journal-body) (str "journal \"" (:block/title journal) "\""))))
++          (is (= 201 fresh-status) "a free title is still created"))))))
++
++(deftest create-page-restores-a-recycled-page-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ created] (call "POST" "/pages" {:title "Scratch"})
++                [delete-status _] (call "DELETE" (str "/pages/" (:uuid created)))
++                _ (is (= 204 delete-status))
++                _ (is (entity-util/hidden? (entity conn (:uuid created))))
++                [again-status again] (call "DELETE" (str "/pages/" (:uuid created)))
++                _ (is (= [400 "page cannot be deleted"] [again-status (:error again)])
++                      "deleting a recycled page again fails instead of answering 204")
++                [status body] (call "POST" "/pages" {:title "Scratch"})]
++          (is (= 201 status) "a page in the Recycle bin does not hold its title")
++          (is (= (:uuid created) (:uuid body)) "Logseq restores it, as in the editor")
++          (is (not (entity-util/hidden? (entity conn (:uuid created))))))))))
++
++(deftest delete-page-with-references-needs-acknowledgement-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ target] (call "POST" "/pages" {:title "Target"})
++                [_ source] (call "POST" "/pages" {:title "Source"})
++                [_ related] (call "POST" "/properties" {:title "Related" :type "node"})
++                [_ inserted] (call "POST" "/block-trees" {:target-id (:uuid source)
++                                                          :blocks [{:title "See [[Target]]"}
++                                                                   {:title "Holds a value"}]})
++                [_ _] (call "POST" "/block-trees" {:target-id (:uuid target)
++                                                   :blocks [{:title "Self link to [[Target]]"}]})
++                [set-status _] (call "PUT" (str "/blocks/" (get-in inserted [:blocks 1 :uuid])
++                                                "/properties/" (:uuid related))
++                                     {:value (:uuid target)})
++                _ (is (= 200 set-status))
++                path (str "/pages/" (:uuid target))
++                [refused-status refused] (call "DELETE" path)
++                [false-status _] (call "DELETE" path nil "acknowledge-references=false")
++                [invalid-status invalid] (call "DELETE" path nil "acknowledge-references=yes")
++                [dry-status dry] (call "DELETE" path nil "dry-run=true")
++                _ (testing "refused deletes and dry runs write nothing"
++                    (is (not (entity-util/hidden? (entity conn (:uuid target)))))
++                    (is (string/includes? (:block/raw-title (entity conn (get-in inserted [:blocks 0 :uuid])))
++                                          (:uuid target))))
++                [status _] (call "DELETE" path nil "acknowledge-references=true")]
++          (testing "references are blocks elsewhere that link to the page or hold it as a property value"
++            (is (= 409 refused-status))
++            (is (string/includes? (:error refused) "2 references"))
++            (is (string/includes? (:error refused) "acknowledge-references=true"))
++            (is (= 2 (:references refused)))
++            (is (= ["acknowledge-references"] (:requires refused))))
++          (is (= 409 false-status))
++          (is (= 400 invalid-status))
++          (is (= "acknowledge-references must be true or false" (:error invalid)))
++          (testing "dry-run reports what would be lost"
++            (is (= 200 dry-status))
++            (is (= {:dry-run true :uuid (:uuid target) :kind "page" :title "Target"
++                    :references 2 :requires ["acknowledge-references"]}
++                   dry)))
++          (testing "with the acknowledgement the delete proceeds"
++            (is (= 204 status))
++            (is (entity-util/hidden? (entity conn (:uuid target))))))))))
++
++(deftest delete-unreferenced-page-proceeds-without-acknowledgement-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ page] (call "POST" "/pages" {:title "Lonely"})
++                _ (call "POST" "/block-trees" {:target-id (:uuid page) :blocks [{:title "Body"}]})
++                [dry-status dry] (call "DELETE" (str "/pages/" (:uuid page)) nil "dry-run=true")
++                [status _] (call "DELETE" (str "/pages/" (:uuid page)))]
++          (is (= 200 dry-status))
++          (is (= {:references 0 :requires []} (select-keys dry [:references :requires])))
++          (is (= 204 status))
++          (is (entity-util/hidden? (entity conn (:uuid page)))))))))
++
++(deftest delete-tag-guards-holders-child-tags-and-references-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ animal] (call "POST" "/tags" {:title "Animal"})
++                [_ dog] (call "POST" "/tags" {:title "Dog"})
++                _ (outliner-property/set-block-property! conn [:block/uuid (uuid (:uuid dog))]
++                                                         :logseq.property.class/extends
++                                                         (:db/id (entity conn (:uuid animal))))
++                [_ page] (call "POST" "/pages" {:title "Zoo"})
++                [_ inserted] (call "POST" "/block-trees" {:target-id (:uuid page)
++                                                          :blocks [{:title "Rex #Animal"}
++                                                                   {:title "About [[Animal]]"}]})
++                _ (is (= #{(uuid (:uuid animal))}
++                         (set (map :block/uuid (:block/tags (entity conn (get-in inserted [:blocks 0 :uuid]))))))
++                      "the inline tag makes the block a holder")
++                path (str "/tags/" (:uuid animal))
++                [refused-status refused] (call "DELETE" path)
++                [partial-status partial] (call "DELETE" path nil "acknowledge-holders=true&acknowledge-references=true")
++                [dry-status dry] (call "DELETE" path nil "dry-run=true")
++                _ (is (some? (entity conn (:uuid animal))) "refused deletes and dry runs write nothing")
++                [status _] (call "DELETE" path nil (str "acknowledge-holders=true&acknowledge-child-tags=true"
++                                                        "&acknowledge-references=true"))]
++          (testing "holders, child tags and other references are counted separately"
++            (is (= 409 refused-status))
++            (is (= {:holders 1 :child-tags 1 :references 1}
++                   (select-keys refused [:holders :child-tags :references])))
++            (is (= ["acknowledge-holders" "acknowledge-child-tags" "acknowledge-references"] (:requires refused)))
++            (is (string/includes? (:error refused) "1 holder"))
++            (is (string/includes? (:error refused) "1 child tag"))
++            (is (string/includes? (:error refused) "1 reference")))
++          (testing "every count needs its own acknowledgement"
++            (is (= 409 partial-status))
++            (is (= ["acknowledge-child-tags"] (:requires partial))))
++          (is (= 200 dry-status))
++          (is (= {:dry-run true :uuid (:uuid animal) :kind "tag" :title "Animal"
++                  :holders 1 :child-tags 1 :references 1
++                  :requires ["acknowledge-holders" "acknowledge-child-tags" "acknowledge-references"]}
++                 dry))
++          (testing "with every acknowledgement the delete proceeds"
++            (is (= 204 status))
++            (is (nil? (entity conn (:uuid animal))))
++            (is (= #{:logseq.class/Root}
++                   (set (map :db/ident (:logseq.property.class/extends (entity conn (:uuid dog))))))
++                "Logseq re-parents the child tag to Root")))))))
++
++(deftest delete-property-with-values-needs-acknowledgement-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ mood] (call "POST" "/properties" {:title "Mood"})
++                [_ unused] (call "POST" "/properties" {:title "Unused"})
++                [_ page] (call "POST" "/pages" {:title "Diary"})
++                [_ inserted] (call "POST" "/block-trees" {:target-id (:uuid page)
++                                                          :blocks [{:title "Monday"} {:title "Tuesday"}]})
++                _ (p/doseq [block (:blocks inserted)]
++                    (call "PUT" (str "/blocks/" (:uuid block) "/properties/" (:uuid mood)) {:value "calm"}))
++                path (str "/properties/" (:uuid mood))
++                [refused-status refused] (call "DELETE" path)
++                [dry-status dry] (call "DELETE" path nil "dry-run=true")
++                _ (is (some? (entity conn (:uuid mood))) "refused deletes and dry runs write nothing")
++                [status _] (call "DELETE" path nil "acknowledge-values=true")
++                [unused-status _] (call "DELETE" (str "/properties/" (:uuid unused)))]
++          (is (= 409 refused-status))
++          (is (= 2 (:values refused)))
++          (is (string/includes? (:error refused) "2 values"))
++          (is (string/includes? (:error refused) "acknowledge-values=true"))
++          (is (= 200 dry-status))
++          (is (= {:dry-run true :uuid (:uuid mood) :kind "property" :title "Mood"
++                  :values 2 :requires ["acknowledge-values"]}
++                 dry))
++          (is (= 204 status))
++          (is (nil? (entity conn (:uuid mood))))
++          (is (= 204 unused-status) "a property without values needs no acknowledgement"))))))
++
++(deftest delete-block-refuses-pages-tags-and-properties-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [[_ page] (call "POST" "/pages" {:title "Kept"})
++                [_ tag] (call "POST" "/tags" {:title "Kept tag"})
++                [_ property] (call "POST" "/properties" {:title "Kept property"})
++                [page-status page-body] (call "DELETE" (str "/blocks/" (:uuid page)))
++                [tag-status tag-body] (call "DELETE" (str "/blocks/" (:uuid tag)))
++                [property-status property-body] (call "DELETE" (str "/blocks/" (:uuid property)))]
++          (is (= [400 400 400] [page-status tag-status property-status]))
++          (is (= "block is a page: delete it with deletePage" (:error page-body)))
++          (is (= "block is a tag: delete it with deleteTag" (:error tag-body)))
++          (is (= "block is a property: delete it with deleteProperty" (:error property-body)))
++          (is (not-any? #(entity-util/hidden? (entity conn (:uuid %))) [page tag property])))))))
++
++(deftest openapi-documents-write-guards-test
++  (let [paths (:paths (semantic-routes/openapi-document "https://issuer.example"))
++        query-flags (fn [path]
++                      (->> (get-in paths [path :delete :parameters])
++                           (filter #(= "query" (:in %)))
++                           (map (juxt :name (comp :type :schema)))
++                           (into {})))]
++    (is (= {"acknowledge-references" "boolean" "dry-run" "boolean"}
++           (query-flags "/api/v1/graphs/{graph-id}/pages/{page-id}")))
++    (is (= {"acknowledge-holders" "boolean" "acknowledge-child-tags" "boolean"
++            "acknowledge-references" "boolean" "dry-run" "boolean"}
++           (query-flags "/api/v1/graphs/{graph-id}/tags/{tag-id}")))
++    (is (= {"acknowledge-values" "boolean" "dry-run" "boolean"}
++           (query-flags "/api/v1/graphs/{graph-id}/properties/{property-id}")))
++    (doseq [path ["/api/v1/graphs/{graph-id}/pages" "/api/v1/graphs/{graph-id}/tags"]]
++      (is (= "#/components/schemas/TitleConflict"
++             (get-in paths [path :post :responses "409" :content "application/json" :schema :$ref]))))
++    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
++                          "no need to search before creating"))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 14f862b95d..57d9b57c02 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -10,6 +10,7 @@
+             [logseq.db-sync.node-config-test]
+             [logseq.db-sync.node-server-test]
+             [logseq.db-sync.normalize-test]
++            [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-auth-test]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 48d7fcf428..68dc00aead 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -348,6 +348,7 @@
+              (let [self #js {:sql sql :conn (storage/open-conn sql) :schema-ready true}
+                    page-id (random-uuid)
+                    _ (d/transact! (.-conn self) [{:db/ident :logseq.class/Page}
++                                                  {:db/ident :logseq.class/Property}
+                                                   {:block/uuid page-id :block/name "inbox" :block/title "Inbox"
+                                                    :block/tags :logseq.class/Page}])
+                    calls (atom [])

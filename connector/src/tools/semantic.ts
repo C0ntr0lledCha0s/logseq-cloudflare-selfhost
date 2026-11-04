@@ -59,7 +59,9 @@ function syncErrorText(error: SyncError, alias: string, host: string): string {
     return `token for graph '${alias}' expired or lacks permission — reconnect it at https://${host}/graphs`;
   }
   if (error.status === 429) return `rate limited — retry after ${error.retryAfter ?? DEFAULT_RETRY_AFTER_S} s`;
-  if (error.status === 400) return error.message;
+  // 409 is a refusal the caller can act on, e.g. a title already in use or a delete that needs an
+  // acknowledge-* flag; the server's message says what to do.
+  if (error.status === 400 || error.status === 409) return error.message;
   return `sync server error (HTTP ${error.status}): ${error.message}`;
 }
 
