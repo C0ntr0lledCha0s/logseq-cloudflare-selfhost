@@ -1,0 +1,784 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+new file mode 100644
+index 0000000000..a019c3b9f1
+--- /dev/null
++++ b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+@@ -0,0 +1,224 @@
++(ns logseq.db-sync.worker.graph-insights
++  "Read-only aggregations behind the semantic API's getPageBacklinks, getGraphHealth and
++  listKnowledgeIndex: how a page is used, grouped by relation; graph-health checks; and the
++  pages of a knowledge-base index. Every function takes an immutable db and returns entities;
++  the semantic handler shapes the responses.
++
++  These read the whole graph, so filters read datoms rather than entity attributes: an
++  entity lookup costs tens of microseconds, which adds up to seconds over a few thousand
++  pages and their blocks."
++  (:require [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db.frontend.class :as db-class]))
++
++(def default-summary-prefix
++  "A page's summary is its first top-level block when that block starts with this text."
++  "**Summary:**")
++
++(defn- attr-value
++  "The value of a cardinality-one attribute, from its datom."
++  [db e attr]
++  (:v (first (d/datoms db :eavt e attr))))
++
++(defn stored-title
++  "The title as stored, with links as [[uuid]]."
++  [db e]
++  (attr-value db e :block/title))
++
++(defn- hidden-id?
++  "As entity-util/hidden?: the entity or one of its parents is hidden or in the recycle bin."
++  [db e]
++  (loop [e e
++         seen #{}]
++    (cond
++      (or (nil? e) (contains? seen e)) false
++      (or (attr-value db e :logseq.property/hide?) (attr-value db e :logseq.property/deleted-at)) true
++      :else (recur (attr-value db e :block/parent) (conj seen e)))))
++
++(defn- visible-ids [db datoms]
++  (->> datoms (map :e) (remove #(hidden-id? db %))))
++
++(defn- tagged-ids [db class-ident]
++  (visible-ids db (d/datoms db :avet :block/tags (d/entid db class-ident))))
++
++(defn- built-in-id? [db e]
++  (true? (attr-value db e :logseq.property/built-in?)))
++
++(defn- entities [db ids]
++  (map #(d/entity db %) ids))
++
++;; Usage of a page
++;; ===============
++
++(defn ref-property-idents
++  "Visible properties whose values reference entities, so a value can be a page. Tags are
++  their own relation."
++  [db]
++  (->> (tagged-ids db :logseq.class/Property)
++       (keep #(attr-value db % :db/ident))
++       (filter #(= :db.type/ref (get-in (:schema db) [% :db/valueType])))
++       (remove #{:block/tags})
++       vec))
++
++(defn- value-block-property
++  "The property a block stores one text value of; such a block belongs to its parent."
++  [db e]
++  (when-not (attr-value db e :block/closed-value-property)
++    (attr-value db e :logseq.property/created-from-property)))
++
++(defn page-usage
++  "How `page` is used, by relation:
++  - :references  blocks and pages whose own text links it as [[page]];
++  - :tagged      entities tagged with it (only classes have them);
++  - :property-values  {:property :holder} pairs where a property of the holder has the page as
++                 its value, or a text value that links it;
++  - :other       entities Logseq records as referencing it for another reason, such as using it
++                 as a property key or a date property pointing at a journal.
++  :total counts distinct entities across all relations. `ref-properties` is `ref-property-idents`."
++  [db page ref-properties]
++  (let [page-id (:db/id page)
++        ;; A `#[[uuid]]` inline tag is a tag, not a text link.
++        link-re (re-pattern (str "(?:^|[^#])\\[\\[" (:block/uuid page) "\\]\\]"))
++        links? #(some->> (stored-title db %) (re-find link-re))
++        ref-ids (visible-ids db (d/datoms db :avet :block/refs page-id))
++        tagged (visible-ids db (d/datoms db :avet :block/tags page-id))
++        direct-values (for [ident ref-properties
++                            holder (visible-ids db (d/datoms db :avet ident page-id))]
++                        [(d/entid db ident) holder])
++        text-value? #(and (value-block-property db %) (links? %))
++        text-values (for [block ref-ids
++                          :when (text-value? block)
++                          :let [holder (attr-value db block :block/parent)]
++                          :when (not (hidden-id? db holder))]
++                      [(value-block-property db block) holder])
++        property-values (distinct (concat direct-values text-values))
++        references (filter #(and (not (value-block-property db %)) (links? %)) ref-ids)
++        explained (into #{} (concat references tagged (map second property-values)))
++        other (remove #(or (contains? explained %) (text-value? %)) ref-ids)]
++    {:references (entities db references)
++     :tagged (entities db tagged)
++     :property-values (map (fn [[property holder]] {:property (d/entity db property) :holder (d/entity db holder)})
++                           property-values)
++     :other (entities db other)
++     :total (count (into explained other))}))
++
++;; Pages, classes and summaries
++;; ============================
++
++(defn- user-page-ids
++  "Non-journal pages people wrote: no built-in pages and no author pages the server creates."
++  [db]
++  (->> (tagged-ids db :logseq.class/Page)
++       (remove #(built-in-id? db %))
++       (remove #(attr-value db % :logseq.property.user/name))))
++
++(defn user-pages [db]
++  (entities db (user-page-ids db)))
++
++(defn first-top-level-block
++  "The page's first top-level block by order, as an entity id. Property value blocks and child
++  pages (which have no :block/page) are not part of the page's body."
++  [db page]
++  (->> (d/datoms db :avet :block/parent (:db/id page))
++       (map (fn [{:keys [e]}] [(attr-value db e :block/order) e]))
++       (sort-by first)
++       (some (fn [[_ e]]
++               (when (and (attr-value db e :block/page)
++                          (nil? (attr-value db e :logseq.property/created-from-property))
++                          (not (hidden-id? db e)))
++                 e)))))
++
++(defn- summary-block
++  "The page's first top-level block when its text starts with `prefix` and goes on after it."
++  [db page prefix]
++  (when-let [block (first-top-level-block db page)]
++    (let [text (or (stored-title db block) "")]
++      (when (and (string/starts-with? text prefix)
++                 (not (string/blank? (subs text (count prefix)))))
++        block))))
++
++(defn page-summary
++  "The text after `prefix` in the page's first top-level block, with links shown as titles; nil
++  when that block does not start with `prefix` or has nothing after it."
++  [db page prefix]
++  (when-let [block (summary-block db page prefix)]
++    (let [title (:block/title (d/entity db block))]
++      (string/trim (if (string/starts-with? title prefix) (subs title (count prefix)) title)))))
++
++(def ^:private structural-classes #{:logseq.class/Page :logseq.class/Root})
++
++(defn- page-tag-ids
++  "The page's tags other than the Page class every page has."
++  [db page]
++  (let [structural (set (map #(d/entid db %) structural-classes))]
++    (->> (d/datoms db :eavt (:db/id page) :block/tags)
++         (map :v)
++         (remove structural)
++         sort)))
++
++(defn page-tags [db page]
++  (entities db (page-tag-ids db page)))
++
++(defn class-lineage-fn
++  "A function from a class id to the class followed by every class it extends, without Page and
++  Root Tag. Memoized: build one per request."
++  [db]
++  (memoize (fn [class-id]
++             (let [class (d/entity db class-id)]
++               (->> (cons class (db-class/get-class-extends class))
++                    (remove #(contains? structural-classes (:db/ident %)))
++                    (distinct)
++                    vec)))))
++
++(defn page-classes
++  "The page's tags, each followed by the classes it extends."
++  [db lineage page]
++  (distinct (mapcat lineage (page-tag-ids db page))))
++
++(defn knowledge-index-pages
++  "User pages for the knowledge index: none tagged with, or with a tag extending, a class whose
++  title is in `excluded-titles` (lower-case)."
++  [db lineage excluded-titles]
++  (remove (fn [page]
++            (some #(contains? excluded-titles (string/lower-case (:block/title %)))
++                  (page-classes db lineage page)))
++          (user-pages db)))
++
++;; Health checks
++;; =============
++
++(defn orphan-tags
++  "User classes nothing is tagged with and no class extends."
++  [db]
++  (->> (tagged-ids db :logseq.class/Tag)
++       (remove #(built-in-id? db %))
++       (remove (fn [class-id]
++                 (or (seq (visible-ids db (d/datoms db :avet :block/tags class-id)))
++                     (seq (visible-ids db (d/datoms db :avet :logseq.property.class/extends class-id))))))
++       (entities db)))
++
++(defn orphan-properties
++  "User properties no entity has a value for."
++  [db]
++  (->> (tagged-ids db :logseq.class/Property)
++       (remove #(built-in-id? db %))
++       (filter #(empty? (d/datoms db :aevt (attr-value db % :db/ident))))
++       (entities db)))
++
++(defn duplicate-titles
++  "Pages, journals, tags and properties whose stored titles are equal ignoring case, as groups of
++  two or more entities. Groups made only of built-in entities are left out."
++  [db]
++  (->> [:logseq.class/Page :logseq.class/Journal :logseq.class/Tag :logseq.class/Property]
++       (mapcat #(tagged-ids db %))
++       (distinct)
++       (group-by #(string/lower-case (or (stored-title db %) "")))
++       (vals)
++       (filter #(and (> (count %) 1) (not-every? (fn [e] (built-in-id? db e)) %)))
++       (map #(entities db (sort %)))))
++
++(defn pages-without-summary [db prefix]
++  (remove #(summary-block db % prefix) (user-pages db)))
++
++(defn pages-without-tags [db]
++  (filter #(empty? (page-tag-ids db %)) (user-pages db)))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 92f563ae0e..2b6b8b3c1c 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -10,6 +10,7 @@
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.storage :as storage]
+             [logseq.db-sync.worker.asset-link :as asset-link]
++            [logseq.db-sync.worker.graph-insights :as graph-insights]
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
+             [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
+             [logseq.db-sync.worker.http :as http]
+@@ -1749,6 +1750,143 @@
+                                     :count (reduce + (map (comp tree-count :blocks) inserted))}
+                                    dry-run? 201))))))))
+ 
++;; getPageBacklinks, getGraphHealth and listKnowledgeIndex read the whole graph through
++;; graph-insights. They read titles and text, so they refuse E2EE graphs like getPageOutline.
++
++(defn- page-ref-response [page]
++  (cond-> {:uuid (uuid-string (:block/uuid page))
++           :kind (block-kind page)
++           :title (:block/title page)}
++    (:block/updated-at page) (assoc :updated-at (:block/updated-at page))))
++
++(defn- holder-response [entity]
++  (cond-> (select-keys (block-response entity) [:uuid :kind :title :page-id])
++    (:block/page entity) (assoc :page-title (:block/title (:block/page entity)))))
++
++(defn- recent-first
++  "Most recently updated first. Each key is read once, not on every comparison."
++  ([entities] (recent-first identity entities))
++  ([entity-fn items]
++   (->> items
++        (map (fn [item]
++               (let [entity (entity-fn item)]
++                 [[(- (or (:block/updated-at entity) 0)) (- (:db/id entity))] item])))
++        (sort-by first)
++        (map second))))
++
++(defn- usage-group [entities limit response-fn]
++  {:count (count entities)
++   :items (mapv response-fn (take limit entities))})
++
++(defn- page-backlinks-response [db page limit]
++  (let [{:keys [references tagged property-values other total]}
++        (graph-insights/page-usage db page (graph-insights/ref-property-idents db))]
++    {:page (page-ref-response page)
++     :total total
++     :references (usage-group (recent-first references) limit holder-response)
++     :tagged (usage-group (recent-first tagged) limit holder-response)
++     :property-values (usage-group (recent-first :holder property-values)
++                                   limit
++                                   (fn [{:keys [property holder]}]
++                                     (assoc (holder-response holder)
++                                            :property {:uuid (uuid-string (:block/uuid property))
++                                                       :ident (entity-ident property)
++                                                       :title (:block/title property)})))
++     :other (usage-group (recent-first other) limit holder-response)}))
++
++(defn- title-key [db entity]
++  [(string/lower-case (or (graph-insights/stored-title db (:db/id entity)) "")) (uuid-string (:block/uuid entity))])
++
++(defn- paginate-by
++  "One page of `items` in `key-fn` order after `cursor`, a key-fn value. Each key is computed
++  once: a title read renders its links, which is too slow to repeat inside a sort."
++  [key-fn items limit cursor]
++  (let [keyed (sort-by first (map (juxt key-fn identity) items))
++        remaining (cond->> keyed
++                    cursor (drop-while #(not (pos? (compare (first %) cursor)))))
++        selected (vec (take (inc limit) remaining))
++        page (vec (take limit selected))]
++    (cond-> {:items (mapv second page) :count (count keyed)}
++      (> (count selected) limit) (assoc :next-cursor (encode-cursor (first (last page)))))))
++
++(def ^:private health-checks
++  ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"])
++
++(defn- comma-list [^js url param]
++  (let [raw (.get (.-searchParams url) param)]
++    (when (seq raw) (vec (distinct (string/split raw #","))))))
++
++(defn- health-check [db check {:keys [prefix time-filters limit cursor]}]
++  (let [by-title (fn [entities] (paginate-by (partial title-key db) entities limit cursor))
++        pages-check (fn [pages]
++                      (update (by-title (filter #(after-time-filters? % time-filters) pages))
++                              :items #(mapv page-ref-response %)))
++        duplicate-key (fn [group] [(string/lower-case (or (:block/title (first group)) "")) ""])]
++    (case check
++      "orphan-tags" (update (by-title (graph-insights/orphan-tags db)) :items #(mapv tag-response %))
++      "orphan-properties" (update (by-title (graph-insights/orphan-properties db)) :items #(mapv property-response %))
++      "duplicate-titles" (update (paginate-by duplicate-key (graph-insights/duplicate-titles db) limit cursor)
++                                 :items #(mapv (fn [group]
++                                                 {:title (:block/title (first group))
++                                                  :entities (mapv page-ref-response group)})
++                                               %))
++      "pages-without-summary" (pages-check (graph-insights/pages-without-summary db prefix))
++      "pages-without-tags" (pages-check (graph-insights/pages-without-tags db)))))
++
++(defn- knowledge-index-entry [db {:keys [ref-properties lineage prefix]} page]
++  (let [summary (graph-insights/page-summary db page prefix)]
++    (cond-> {:uuid (uuid-string (:block/uuid page))
++             :title (:block/title page)
++             :tags (mapv tag-response (graph-insights/page-tags db page))
++             :classes (mapv :block/title (graph-insights/page-classes db lineage page))
++             :reference-count (:total (graph-insights/page-usage db page ref-properties))
++             :created-at (:block/created-at page)
++             :updated-at (:block/updated-at page)}
++      summary (assoc :summary summary))))
++
++(defn- handle-insights [{:keys [^js url db handler path-params e2ee?]}]
++  (let [{:keys [limit raw-cursor cursor]} (pagination-options url)
++        prefix (or (.get (.-searchParams url) "summary-prefix") graph-insights/default-summary-prefix)]
++    (cond
++      e2ee? (http/error-response "graph insights are unavailable for E2EE graphs" 409)
++      (nil? limit) (http/bad-request "invalid limit")
++      (and raw-cursor (nil? cursor)) (http/bad-request "invalid cursor")
++      (string/blank? prefix) (http/bad-request "invalid summary-prefix")
++      :else
++      (case handler
++        :semantic/pages-backlinks
++        (let [page (find-visible-entity db (:page-id path-params))]
++          (if (entity-util/page? page)
++            (http/json-response nil (page-backlinks-response db page limit))
++            (http/not-found)))
++
++        :semantic/graph-health
++        (let [checks (or (comma-list url "checks") health-checks)
++              time-filters (time-filter-options url)]
++          (cond
++            (not-every? (set health-checks) checks) (http/bad-request "invalid checks")
++            (and cursor (not= 1 (count checks))) (http/bad-request "cursor needs exactly one check")
++            (:invalid? time-filters) (http/bad-request "invalid time filter")
++            :else
++            (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor}]
++              (http/json-response nil {:checks (into {} (map (fn [check] [check (health-check db check options)]))
++                                                     checks)}))))
++
++        :semantic/knowledge-index
++        (let [excluded (set (map string/lower-case (comma-list url "exclude-tags")))
++              lineage (graph-insights/class-lineage-fn db)
++              options {:ref-properties (graph-insights/ref-property-idents db)
++                       :lineage lineage
++                       :prefix prefix}
++              {:keys [items next-cursor]} (paginate-by (partial title-key db)
++                                                       (graph-insights/knowledge-index-pages db lineage excluded)
++                                                       limit cursor)]
++          (http/json-response nil (cond-> {:pages (mapv #(knowledge-index-entry db options %) items)}
++                                    next-cursor (assoc :next-cursor next-cursor))))))))
++
++(def ^:private insight-handlers
++  #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
++
+ (def ^:private page-handlers
+   #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
+     :semantic/pages-references :semantic/pages-get
+@@ -1840,6 +1978,7 @@
+     (contains? asset-handlers handler) (handle-assets context)
+     (contains? property-and-search-handlers handler) (handle-properties-and-search context)
+     (contains? bulk-handlers handler) (handle-bulk context)
++    (contains? insight-handlers handler) (handle-insights context)
+     :else (http/not-found)))
+ 
+ (defn handle [{:keys [^js self route ^js url] :as context}]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 8503a71785..8793fd72de 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -16,6 +16,12 @@
+     :handler :semantic/pages-outline :operation-id "getPageOutline" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id/references" :internal-path "/semantic/pages/:page-id/references"
+     :handler :semantic/pages-references :operation-id "listPageReferences" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id/backlinks" :internal-path "/semantic/pages/:page-id/backlinks"
++    :handler :semantic/pages-backlinks :operation-id "getPageBacklinks" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/health" :internal-path "/semantic/health"
++    :handler :semantic/graph-health :operation-id "getGraphHealth" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/knowledge-index" :internal-path "/semantic/knowledge-index"
++    :handler :semantic/knowledge-index :operation-id "listKnowledgeIndex" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
+     :handler :semantic/pages-delete :operation-id "deletePage" :scope "logseq/write" :rate-class :write}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
+@@ -100,6 +106,9 @@
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and user and library block properties as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
++   "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order: orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix) and pages-without-tags (non-journal user pages with no tag). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
+@@ -219,6 +228,10 @@
+    "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
+                      dry-run-parameter]})
+ 
++(def ^:private summary-prefix-parameter
++  {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
++   :description "Text a page's first top-level block starts with when it is the page's summary."})
++
+ (def ^:private encrypted-name-schema
+   {:type "string"
+    :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
+@@ -327,6 +340,23 @@
+     (into asset-upload-parameters)
+     (contains? delete-parameters operation-id)
+     (into (get delete-parameters operation-id))
++    (= "getPageBacklinks" operation-id)
++    (into [{:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
++            :description "Most items listed per relation. Counts are always complete."}])
++    (= "getGraphHealth" operation-id)
++    (into (concat [{:name "checks" :in "query" :schema {:type "string"}
++                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags. Defaults to all; any other value is rejected."}
++                   {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
++                    :description "Most items listed per check. Counts are always complete."}
++                   {:name "cursor" :in "query" :schema {:type "string"}
++                    :description "A check's next-cursor; pass that check alone in checks."}
++                   summary-prefix-parameter]
++                  time-filter-parameters))
++    (= "listKnowledgeIndex" operation-id)
++    (into (concat pagination-parameters
++                  [{:name "exclude-tags" :in "query" :schema {:type "string"}
++                    :description "Comma-separated tag titles, matched ignoring case. Pages tagged with one, or with a tag that extends one, are left out."}
++                   summary-prefix-parameter]))
+     (= "listGraphs" operation-id)
+     (into [{:name "name" :in "query" :schema {:type "string"}
+             :description "Exact graph name, matched case-insensitively."}])
+@@ -384,6 +414,10 @@
+                   "listAssets"
+                   (list-response :assets "AssetResponse" "A cursor page of asset blocks")
+                   "searchGraph" (list-response :results "SearchResultResponse" "A cursor page of search results")
++                  "getPageBacklinks" (entity-response "PageBacklinksResponse" "A page's usage grouped by relation")
++                  "getGraphHealth" (entity-response "GraphHealthResponse" "Counts and items for each check run")
++                  "listKnowledgeIndex"
++                  (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
+                   "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+@@ -525,6 +559,53 @@
+                                               :properties {:markdown {:type "string"}
+                                                            :block-count {:type "integer"}
+                                                            :truncated {:type "boolean"}}}]}
++               :PageRef {:type "object" :required ["uuid" "kind" "title"]
++                         :properties {:uuid {:type "string"}
++                                      :kind {:type "string"}
++                                      :title {:type "string"}
++                                      :updated-at {:type "integer"}}}
++               :UsageHolder {:type "object" :required ["uuid" "kind" "title"]
++                             :properties {:uuid {:type "string"}
++                                          :kind {:type "string"}
++                                          :title {:type "string"}
++                                          :page-id {:type "string"}
++                                          :page-title {:type "string"}
++                                          :property {:type "object"
++                                                     :description "The property whose value points at the page (property-values only)."
++                                                     :properties {:uuid {:type "string"}
++                                                                  :ident {:type "string"}
++                                                                  :title {:type "string"}}}}}
++               :UsageGroup {:type "object" :required ["count" "items"]
++                            :properties {:count {:type "integer"}
++                                         :items {:type "array" :items {:$ref "#/components/schemas/UsageHolder"}}}}
++               :PageBacklinksResponse {:type "object"
++                                       :required ["page" "total" "references" "tagged" "property-values" "other"]
++                                       :properties {:page {:$ref "#/components/schemas/PageRef"}
++                                                    :total {:type "integer"}
++                                                    :references {:$ref "#/components/schemas/UsageGroup"}
++                                                    :tagged {:$ref "#/components/schemas/UsageGroup"}
++                                                    :property-values {:$ref "#/components/schemas/UsageGroup"}
++                                                    :other {:$ref "#/components/schemas/UsageGroup"}}}
++               :HealthCheckResult {:type "object" :required ["count" "items"]
++                                   :properties {:count {:type "integer"}
++                                                :items {:type "array"
++                                                        :description "Tags for orphan-tags, property definitions for orphan-properties, {title, entities} groups for duplicate-titles, and pages for the page checks."
++                                                        :items {}}
++                                                :next-cursor {:type "string"}}}
++               :GraphHealthResponse {:type "object" :required ["checks"]
++                                     :properties {:checks {:type "object"
++                                                           :description "One result per check run, keyed by check name."
++                                                           :additionalProperties {:$ref "#/components/schemas/HealthCheckResult"}}}}
++               :KnowledgeIndexEntry {:type "object" :required ["uuid" "title" "tags" "classes" "reference-count"]
++                                     :properties {:uuid {:type "string"}
++                                                  :title {:type "string"}
++                                                  :tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
++                                                  :classes {:type "array" :items {:type "string"}
++                                                            :description "Titles of the page's tags, each followed by the classes it extends."}
++                                                  :summary {:type "string"}
++                                                  :reference-count {:type "integer"}
++                                                  :created-at {:type "integer"}
++                                                  :updated-at {:type "integer"}}}
+                :TagResponse {:type "object" :required ["uuid" "title"]
+                              :properties {:uuid {:type "string"}
+                                           :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+new file mode 100644
+index 0000000000..7a23de6e29
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+@@ -0,0 +1,245 @@
++(ns logseq.db-sync.semantic-index-health-test
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.build :as sqlite-build]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.pipeline :as outliner-pipeline]
++            [promesa.core :as p]))
++
++(def sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
++
++(defn- select-sql? [sql]
++  (string/starts-with? (-> sql string/trim string/lower-case) "select"))
++
++(defn- with-memory-sql-async [f]
++  (let [db (new sqlite ":memory:" nil)
++        sql #js {:_db db
++                 :transaction (fn [f] ((.transaction db f)))
++                 :exec (fn [sql-str & args]
++                         (let [^js stmt (.prepare db sql-str)]
++                           (if (select-sql? sql-str)
++                             (.apply (.-all stmt) stmt (to-array args))
++                             (do (.apply (.-run stmt) stmt (to-array args)) nil))))
++                 :close (fn [] (.close db))}]
++    (-> (f sql)
++        (p/finally #(.close sql)))))
++
++(defn- semantic-json-request [path method body]
++  (js/Request. (str "http://localhost" path)
++               (clj->js (cond-> {:method method
++                                 :headers {"content-type" "application/json"}}
++                          body (assoc :body (js/JSON.stringify (clj->js body)))))))
++
++(defn- json-body [response]
++  (p/let [text (.text response)]
++    (js->clj (js/JSON.parse text) :keywordize-keys true)))
++
++(defn- rebuild-refs!
++  "Gives every block the :block/refs Logseq's pipeline would: text links, tags and property values."
++  [conn]
++  (let [db @conn
++        refs-fn (outliner-pipeline/db-rebuild-block-refs-fn db)]
++    (d/transact! conn (->> (d/datoms db :avet :block/uuid)
++                           (keep (fn [datom]
++                                   (let [refs (refs-fn (d/entity db (:e datom)))]
++                                     (when (seq refs) {:db/id (:e datom) :block/refs refs}))))
++                           vec))))
++
++(def ^:private ids
++  {:acme (random-uuid) :roadmap (random-uuid) :meeting (random-uuid) :notes (random-uuid)
++   :secret (random-uuid) :project-page (random-uuid)
++   :roadmap-summary (random-uuid) :meeting-block (random-uuid)})
++
++(defn- seeded-graph
++  "Acme (a Company, which extends Organization) is linked from Roadmap's summary and a Meeting
++  block, is Roadmap's client, and is mentioned in Notes page's text property value."
++  []
++  (let [conn (sqlite-export/create-conn)
++        {:keys [acme roadmap meeting notes secret project-page roadmap-summary meeting-block]} ids
++        {:keys [init-tx block-props-tx]}
++        (sqlite-build/build-blocks-tx
++         {:properties {:user.property/client {:logseq.property/type :node}
++                       :user.property/notes {:logseq.property/type :default}
++                       :user.property/unused {:logseq.property/type :default}}
++          :classes {:user.class/Organization {}
++                    :user.class/Company {:build/class-extends [:user.class/Organization]}
++                    :user.class/Project {}
++                    :user.class/Private {}
++                    :user.class/Dormant {}}
++          :pages-and-blocks
++          [{:page {:block/title "Acme" :block/uuid acme :build/keep-uuid? true
++                   :build/tags [:user.class/Company]}
++            :blocks [{:block/title "**Summary:** A client."}
++                     {:block/title "Second block"}]}
++           {:page {:block/title "Roadmap" :block/uuid roadmap :build/keep-uuid? true
++                   :build/tags [:user.class/Project]
++                   :build/properties {:user.property/client [:block/uuid acme]}}
++            :blocks [{:block/title (str "**Summary:** Plan for [[" acme "]].")
++                      :block/uuid roadmap-summary :build/keep-uuid? true}]}
++           {:page {:block/title "Meeting" :block/uuid meeting :build/keep-uuid? true}
++            :blocks [{:block/title (str "Discussed [[" acme "]]")
++                      :block/uuid meeting-block :build/keep-uuid? true}]}
++           {:page {:block/title "Notes page" :block/uuid notes :build/keep-uuid? true
++                   :build/properties {:user.property/notes (str "about [[" acme "]]")}}
++            :blocks [{:block/title "No summary here"}]}
++           {:page {:block/title "Secret" :block/uuid secret :build/keep-uuid? true
++                   :build/tags [:user.class/Private]}
++            :blocks [{:block/title "**Summary:** Not for the index."}]}
++           {:page {:block/title "Project" :block/uuid project-page :build/keep-uuid? true}}
++           {:page {:build/journal 20261104}
++            :blocks [{:block/title (str "Journal note on [[" acme "]]")}]}]})]
++    (d/transact! conn init-tx)
++    (d/transact! conn block-props-tx)
++    (rebuild-refs! conn)
++    conn))
++
++(defn- run-requests [sql conn paths]
++  (storage/init-schema! sql)
++  (let [self #js {:sql sql :conn conn :schema-ready true}]
++    (p/all (map (fn [path]
++                  (p/let [response (sync-handler/handle-http self (semantic-json-request path "GET" nil))
++                          body (json-body response)]
++                    {:status (.-status response) :body body}))
++                paths))))
++
++(defn- titles [items] (set (map :title items)))
++
++(deftest semantic-page-backlinks-group-references-by-relation-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (let [conn (seeded-graph)
++                   company-id (:block/uuid (d/entity @conn :user.class/Company))
++                   {:keys [acme roadmap notes roadmap-summary meeting-block]} ids]
++               (-> (p/let [[acme-response company-response limited not-found]
++                           (run-requests sql conn
++                                         [(str "/semantic/pages/" acme "/backlinks?graph-id=graph-1")
++                                          (str "/semantic/pages/" company-id "/backlinks?graph-id=graph-1")
++                                          (str "/semantic/pages/" acme "/backlinks?graph-id=graph-1&limit=1")
++                                          (str "/semantic/pages/" (random-uuid) "/backlinks?graph-id=graph-1")])
++                           body (:body acme-response)]
++                     (is (= 200 (:status acme-response)))
++                     (is (= {:uuid (str acme) :kind "page" :title "Acme"}
++                            (select-keys (:page body) [:uuid :kind :title])))
++                     (is (= 3 (get-in body [:references :count])) "summary block, meeting block, journal block")
++                     (is (contains? (set (map :uuid (get-in body [:references :items]))) (str roadmap-summary)))
++                     (is (contains? (set (map :uuid (get-in body [:references :items]))) (str meeting-block)))
++                     (is (= "Meeting" (:page-title (first (filter #(= (str meeting-block) (:uuid %))
++                                                                  (get-in body [:references :items]))))))
++                     (is (= 0 (get-in body [:tagged :count])))
++                     (is (= 2 (get-in body [:property-values :count])))
++                     (is (= #{[(str roadmap) "user.property/client"] [(str notes) "user.property/notes"]}
++                            (set (map (juxt :uuid (comp :ident :property)) (get-in body [:property-values :items]))))
++                         "a text property value that links the page counts for the page that holds it")
++                     (is (= 5 (:total body)))
++                     (is (= ["Acme"] (map :title (get-in company-response [:body :tagged :items]))))
++                     (is (= 1 (get-in company-response [:body :tagged :count])))
++                     (is (= 1 (count (get-in limited [:body :references :items]))))
++                     (is (= 3 (get-in limited [:body :references :count])) "counts stay complete under a limit")
++                     (is (= 404 (:status not-found))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error] (is false (str error)) (done)))))))))
++
++(deftest semantic-graph-health-reports-orphans-duplicates-and-page-gaps-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (let [conn (seeded-graph)]
++               (-> (p/let [[all first-page bad-check bad-cursor e2ee recent blank-prefix]
++                           (run-requests sql conn
++                                         ["/semantic/health?graph-id=graph-1"
++                                          "/semantic/health?graph-id=graph-1&checks=pages-without-summary&limit=2"
++                                          "/semantic/health?graph-id=graph-1&checks=orphan-tags,bogus"
++                                          "/semantic/health?graph-id=graph-1&checks=orphan-tags,orphan-properties&cursor=abc"
++                                          "/semantic/health?graph-id=graph-1&graph-e2ee=true"
++                                          (str "/semantic/health?graph-id=graph-1&checks=pages-without-tags&updated-after="
++                                               (+ (js/Date.now) 60000))
++                                          "/semantic/health?graph-id=graph-1&summary-prefix="])
++                           cursor (get-in first-page [:body :checks :pages-without-summary :next-cursor])
++                           [second-page] (run-requests sql conn
++                                                       [(str "/semantic/health?graph-id=graph-1&checks=pages-without-summary&limit=2&cursor="
++                                                             (js/encodeURIComponent cursor))])
++                           checks (get-in all [:body :checks])]
++                     (is (= 200 (:status all)))
++                     (is (= #{:orphan-tags :orphan-properties :duplicate-titles :pages-without-summary :pages-without-tags}
++                            (set (keys checks))))
++                     (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))
++                         "classes with holders or subclasses are not orphans; built-in classes are left out")
++                     (is (= ["user.property/unused"] (map :ident (get-in checks [:orphan-properties :items]))))
++                     (is (= 1 (get-in checks [:duplicate-titles :count])))
++                     (is (= "project" (string/lower-case (:title (first (get-in checks [:duplicate-titles :items]))))))
++                     (is (= #{"page" "tag"} (set (map :kind (:entities (first (get-in checks [:duplicate-titles :items])))))))
++                     (is (= #{"Meeting" "Notes page" "Project"} (titles (get-in checks [:pages-without-summary :items])))
++                         "journals, tagged-private pages with a summary and property value blocks do not count")
++                     (is (= 3 (get-in checks [:pages-without-summary :count])))
++                     (is (= #{"Meeting" "Notes page" "Project"} (titles (get-in checks [:pages-without-tags :items]))))
++                     (is (= ["Meeting" "Notes page"] (map :title (get-in first-page [:body :checks :pages-without-summary :items]))))
++                     (is (= [:pages-without-summary] (keys (get-in first-page [:body :checks]))))
++                     (is (string? cursor))
++                     (is (= ["Project"] (map :title (get-in second-page [:body :checks :pages-without-summary :items]))))
++                     (is (nil? (get-in second-page [:body :checks :pages-without-summary :next-cursor])))
++                     (is (= 0 (get-in recent [:body :checks :pages-without-tags :count])) "updated-after narrows page checks")
++                     (is (= [400 400 409 400] (map :status [bad-check bad-cursor e2ee blank-prefix]))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error] (is false (str error)) (done)))))))))
++
++(deftest semantic-knowledge-index-lists-summarised-pages-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (let [conn (seeded-graph)
++                   {:keys [acme]} ids]
++               (-> (p/let [[index unfiltered first-page e2ee]
++                           (run-requests sql conn
++                                         ["/semantic/knowledge-index?graph-id=graph-1&exclude-tags=private&limit=200"
++                                          "/semantic/knowledge-index?graph-id=graph-1&limit=200"
++                                          "/semantic/knowledge-index?graph-id=graph-1&exclude-tags=Private&limit=2"
++                                          "/semantic/knowledge-index?graph-id=graph-1&graph-e2ee=true"])
++                           cursor (get-in first-page [:body :next-cursor])
++                           [second-page] (run-requests sql conn
++                                                       [(str "/semantic/knowledge-index?graph-id=graph-1&exclude-tags=Private&limit=2&cursor="
++                                                             (js/encodeURIComponent cursor))])
++                           pages (get-in index [:body :pages])
++                           by-title (into {} (map (juxt :title identity)) pages)
++                           entry (get by-title "Acme")]
++                     (is (= 200 (:status index)))
++                     (is (= ["Acme" "Meeting" "Notes page" "Project" "Roadmap"] (map :title pages))
++                         "journals, built-in pages and pages tagged with an excluded tag are left out")
++                     (is (contains? (titles (get-in unfiltered [:body :pages])) "Secret"))
++                     (is (= (str acme) (:uuid entry)))
++                     (is (= ["Company"] (map :title (:tags entry))))
++                     (is (= ["Company" "Organization"] (:classes entry)) "a class's ancestors follow its own title")
++                     (is (= "A client." (:summary entry)))
++                     (is (= "Plan for [[Acme]]." (:summary (get by-title "Roadmap"))) "summaries show links as titles")
++                     (is (not (contains? (get by-title "Meeting") :summary)))
++                     (is (= 5 (:reference-count entry)))
++                     (is (number? (:updated-at entry)))
++                     (is (= ["Acme" "Meeting"] (map :title (get-in first-page [:body :pages]))))
++                     (is (= ["Notes page" "Project"] (map :title (get-in second-page [:body :pages]))))
++                     (is (= 409 (:status e2ee))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error] (is false (str error)) (done)))))))))
++
++(deftest semantic-insight-operations-are-documented-read-routes-test
++  (let [paths (:paths (semantic-routes/openapi-document "https://issuer.example"))
++        operation (fn [path] (get-in paths [path :get]))
++        parameter-names (fn [path] (set (map :name (:parameters (operation path)))))]
++    (is (= "getPageBacklinks" (:operationId (operation "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks"))))
++    (is (= #{"graph-id" "page-id" "limit"} (parameter-names "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks")))
++    (is (= "getGraphHealth" (:operationId (operation "/api/v1/graphs/{graph-id}/health"))))
++    (is (= #{"graph-id" "checks" "limit" "cursor" "summary-prefix" "created-after" "updated-after"}
++           (parameter-names "/api/v1/graphs/{graph-id}/health")))
++    (is (= "listKnowledgeIndex" (:operationId (operation "/api/v1/graphs/{graph-id}/knowledge-index"))))
++    (is (= #{"graph-id" "limit" "cursor" "exclude-tags" "summary-prefix"}
++           (parameter-names "/api/v1/graphs/{graph-id}/knowledge-index")))
++    (is (every? #(= [{:oauth ["logseq/read"]}] (:security (operation %)))
++                ["/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks"
++                 "/api/v1/graphs/{graph-id}/health"
++                 "/api/v1/graphs/{graph-id}/knowledge-index"]))
++    (is (= {:method "GET" :handler :semantic/knowledge-index}
++           (select-keys (semantic-routes/match-internal "GET" "/semantic/knowledge-index") [:method :handler])))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index e488116458..bfc8d782c5 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -12,6 +12,7 @@
+             [logseq.db-sync.semantic-bulk-test]
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
++            [logseq.db-sync.semantic-index-health-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-auth-test]

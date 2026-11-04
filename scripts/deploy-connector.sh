@@ -77,7 +77,7 @@ if [ "${GITHUB_ACTIONS:-}" = true ]; then
   # Mask the KV and D1 ids so wrangler output can never print them in the public run log.
   node -e '
     const out = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-    for (const key of ["connector_oauth_kv_id", "connector_d1_id"]) {
+    for (const key of ["connector_oauth_kv_id", "connector_kb_index_kv_id", "connector_d1_id"]) {
       const value = out[key]?.value;
       if (typeof value !== "string" || value === "") { console.error("missing tofu output: " + key); process.exit(1); }
       console.log("::add-mask::" + value);

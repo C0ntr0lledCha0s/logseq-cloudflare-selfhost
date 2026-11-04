@@ -7,6 +7,7 @@ import { GraphStore } from "./graphs";
 import { registerAssetTools } from "./tools/assets";
 import { logTool } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
+import { KB_INDEX_WRITE_TOOLS, markKbIndexDirty, registerKbIndexTool } from "./tools/kb-index";
 import { type GraphAccess, type GraphTool, buildGraphTools, registerGraphTools } from "./tools/semantic";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 
@@ -46,16 +47,30 @@ async function touch(store: GraphStore, tool: string, alias: string): Promise<vo
   }
 }
 
+/** Marks the alias's kb_index cache dirty; a failure is logged and never reaches the tool result. */
+async function markDirty(env: Env, tool: string, alias: string): Promise<void> {
+  const started = Date.now();
+  try {
+    await markKbIndexDirty(env, alias);
+  } catch {
+    logTool(tool, alias, "kb-index-dirty-failed", started);
+  }
+}
+
 /** The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are now. */
 export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler {
   const { store, access, graphTools } = isolateTools(env);
-  const onSuccess = (tool: string, alias: string) => ctx.waitUntil(touch(store, tool, alias));
+  const onSuccess = (tool: string, alias: string) => {
+    ctx.waitUntil(touch(store, tool, alias));
+    if (KB_INDEX_WRITE_TOOLS.has(tool)) ctx.waitUntil(markDirty(env, tool, alias));
+  };
   return createMcpHandler(
     () => {
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
       registerHandwrittenTools(server, env, store);
       registerGraphTools(server, graphTools, onSuccess);
       registerAssetTools(server, access, onSuccess);
+      registerKbIndexTool(server, access, onSuccess);
       return server;
     },
     // The Worker already answers 421 for any host but CONNECTOR_HOSTNAME (src/index.ts).

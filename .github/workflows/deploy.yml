@@ -105,7 +105,7 @@ jobs:
           scripts/with-r2-credentials.sh sh -c 'tofu -chdir=infra output -json > "$1"' sh "$RUNNER_TEMP/tofu-output.json"
           node -e '
             const out = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-            for (const key of ["d1_database_id", "connector_oauth_kv_id", "connector_d1_id"]) {
+            for (const key of ["d1_database_id", "connector_oauth_kv_id", "connector_kb_index_kv_id", "connector_d1_id"]) {
               // The connector ids are null when the connector is disabled.
               if (out[key]?.value) console.log("::add-mask::" + out[key].value);
             }

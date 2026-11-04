@@ -90,9 +90,19 @@
     "path": "/api/v1/graphs/{graph-id}/blocks"
   },
   {
+    "name": "get_graph_health",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/health"
+  },
+  {
     "name": "get_page",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+  },
+  {
+    "name": "get_page_backlinks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks"
   },
   {
     "name": "get_page_outline",
@@ -118,6 +128,11 @@
     "name": "insert_block_tree",
     "method": "POST",
     "path": "/api/v1/graphs/{graph-id}/block-trees"
+  },
+  {
+    "name": "kb_index",
+    "method": null,
+    "path": null
   },
   {
     "name": "list_assets",
