@@ -326,6 +326,14 @@ describe("errors", () => {
     expect(result.text).toBe("title is required");
   });
 
+  it("409 maps to the server's message", async () => {
+    const message = 'title "Inbox" is already used by page "Inbox" (p1); nothing was created.';
+    syncHandler = () => Response.json({ error: message, existing: [] }, { status: 409 });
+    const result = await callTool("create_page", { graph: "work", body: { title: "Inbox" } });
+    expect(result.isError).toBe(true);
+    expect(result.text).toBe(message);
+  });
+
   it("a failing touch does not mask the tool result", async () => {
     syncHandler = () => Response.json({ ok: true });
     // The store's D1 answers every query except the last-used update.
@@ -393,7 +401,17 @@ describe("hand-written tools", () => {
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);
-    for (const phrase of ["list_graphs", "insert_block_tree", "[[Page]]", "create_task", "capture_to_today", "Card"]) {
+    for (const phrase of [
+      "list_graphs",
+      "insert_block_tree",
+      "[[Page]]",
+      "create_task",
+      "capture_to_today",
+      "Card",
+      "without searching first",
+      "acknowledge-",
+      "dry-run",
+    ]) {
       expect(result.text).toContain(phrase);
     }
   });

@@ -110,6 +110,14 @@ e2ee helpers.
   value to resolve to a **text block** entity (uuid/ident/title) — a bare string
   fails resolution (400) or validation. `node`-type props take entity refs.
 - Deletes return `204` with empty body. Errors: `{"error": "..."}` (400/403/404/409/429/500).
+- `createPage`/`createTag` return `409` with `{"error","existing":[{uuid,kind,title}]}`
+  when a page, journal, tag or property already uses the title (case-insensitive);
+  nothing is written.
+- `deletePage`/`deleteTag`/`deleteProperty` return `409` with the counts and
+  `"requires":[flags]` while references, holders, child tags or values would be
+  lost. Pass the named query flags (`acknowledge-references=true`,
+  `acknowledge-holders`, `acknowledge-child-tags`, `acknowledge-values`) to delete
+  anyway; `dry-run=true` returns the counts (200) without deleting.
 - Pagination: list ops return `{"<plural>": [...], "cursor"?}`.
 
 ## MCP endpoint
