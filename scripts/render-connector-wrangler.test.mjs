@@ -17,6 +17,7 @@ const settings = baseSettings;
 const hostname = "mcp.example.com";
 const tofuOutputs = {
   connector_oauth_kv_id: "11111111111111111111111111111111",
+  connector_kb_index_kv_id: "22222222222222222222222222222222",
   connector_d1_id: "00000000-0000-0000-0000-000000000000",
 };
 
@@ -35,6 +36,7 @@ test("renders hostname, bindings and no workers.dev", () => {
   assert.deepEqual(out.services[0], { binding: "SYNC", service: "logseq-sync" });
   assert.deepEqual(out.kv_namespaces, [
     { binding: "OAUTH_KV", id: tofuOutputs.connector_oauth_kv_id },
+    { binding: "KB_INDEX_KV", id: tofuOutputs.connector_kb_index_kv_id },
   ]);
   assert.equal(out.kv_namespaces[0].binding, "OAUTH_KV");
   assert.deepEqual(out.d1_databases, [
@@ -49,6 +51,7 @@ test("renders hostname, bindings and no workers.dev", () => {
   assert.ok(out.compatibility_flags.includes("nodejs_compat"));
   assert.equal(out.main, "src/index.ts");
   assert.equal(out.observability.enabled, true);
+  assert.deepEqual(out.triggers, { crons: ["0 * * * *"] });
 });
 
 test("throws when the connector settings are missing", () => {
@@ -68,6 +71,10 @@ test("throws on missing kv/d1 id or hostname", () => {
   assert.throws(
     () => render({ tofuOutputs: { ...tofuOutputs, connector_oauth_kv_id: "" } }),
     /missing connector_oauth_kv_id/,
+  );
+  assert.throws(
+    () => render({ tofuOutputs: { ...tofuOutputs, connector_kb_index_kv_id: undefined } }),
+    /missing connector_kb_index_kv_id/,
   );
   assert.throws(
     () => render({ tofuOutputs: { ...tofuOutputs, connector_d1_id: undefined } }),

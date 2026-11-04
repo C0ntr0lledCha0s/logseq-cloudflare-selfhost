@@ -4,6 +4,7 @@ import { isAllowedRedirectUri } from "./auth/redirect-uris";
 import { type DefaultEnv, authRoute } from "./auth/routes";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
 import { mcpApiHandler } from "./mcp";
+import { refreshAllKbIndexes } from "./tools/kb-index";
 import { wizardRoute } from "./wizard/routes";
 
 function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
@@ -64,6 +65,11 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
       if (url.host !== host) return new Response("Misdirected request", { status: 421 });
       if (pinned?.host !== host) pinned = { host, provider: new OAuthProvider(providerOptions(host, githubFetch)) };
       return pinned.provider.fetch(request, env, ctx);
+    },
+    /** The hourly cron in wrangler.template.jsonc: rebuilds every graph's kb_index cache. */
+    async scheduled(_controller, env) {
+      checkConfig(env);
+      await refreshAllKbIndexes(env);
     },
   };
 }

@@ -79,6 +79,7 @@ export function renderConnectorWrangler({ template, settings, hostname, tofuOutp
   cfg.routes = [{ pattern: must(hostname, "hostname"), custom_domain: true }];
   cfg.kv_namespaces = [
     { binding: "OAUTH_KV", id: must(tofuOutputs?.connector_oauth_kv_id, "connector_oauth_kv_id") },
+    { binding: "KB_INDEX_KV", id: must(tofuOutputs?.connector_kb_index_kv_id, "connector_kb_index_kv_id") },
   ];
   cfg.d1_databases = [
     {
@@ -121,6 +122,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     hostname: values.hostname,
     tofuOutputs: {
       connector_oauth_kv_id: tofu.connector_oauth_kv_id?.value,
+      connector_kb_index_kv_id: tofu.connector_kb_index_kv_id?.value,
       connector_d1_id: tofu.connector_d1_id?.value,
     },
   });

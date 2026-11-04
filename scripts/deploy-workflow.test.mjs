@@ -131,10 +131,11 @@ test("the mask step masks every id and keeps the wrapper's own mask lines out of
   const r = runMaskStep({
     d1_database_id: { value: "d1-id" },
     connector_oauth_kv_id: { value: "kv-id" },
+    connector_kb_index_kv_id: { value: "kb-index-kv-id" },
     connector_d1_id: { value: "connector-d1-id" },
   });
   assert.equal(r.status, 0, r.stderr);
-  for (const value of ["r2-secret", "d1-id", "kv-id", "connector-d1-id"]) {
+  for (const value of ["r2-secret", "d1-id", "kv-id", "kb-index-kv-id", "connector-d1-id"]) {
     assert.ok(r.stdout.split("\n").includes(`::add-mask::${value}`), value);
   }
 });
