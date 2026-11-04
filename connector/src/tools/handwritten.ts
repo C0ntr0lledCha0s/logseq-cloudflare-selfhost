@@ -19,7 +19,7 @@ export const CONNECTOR_HELP = [
   "Link pages by writing [[Page]] in titles and block text (people, projects, topics).",
   "create_page and create_tag refuse a title that a page, journal, tag or property already uses (ignoring case) and name it with its UUID, so create without searching first and use the named one when refused.",
   "delete_page, delete_tag and delete_property refuse while the delete would lose references, tag holders, child tags or property values, and say which acknowledge-* flag to pass; pass dry-run to see the counts first, and only acknowledge a loss the user agreed to.",
-  "Tag a block with an existing tag by writing #Tag or #[[Multi Word Tag]] in its title. A name that is not an existing tag stays plain text, so create the tag first with create_tag.",
+  "Tag a block with an existing tag by writing #Tag or #[[Multi Word Tag]] in its title. Any other # that Logseq would read as a tag, such as an issue number or an unknown name, is stored escaped (\\#) so it stays text, and the write's response lists those tags under escaped; create the tag first with create_tag if you want it. refresh_refs applies the same handling to blocks written before it existed.",
   "Create tasks and action items with create_task, never as TODO text.",
   "Add to today's journal with capture_to_today.",
   "Make flashcards by tagging each card block with the Card tag.",
