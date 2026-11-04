@@ -1,0 +1,134 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 68d38a8412..2479e6e512 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -593,14 +593,28 @@
+                (or (not= property-ident :block/tags) (entity-util/class? entity)))
+       (:db/id entity))))
+ 
++(defn- free-text-value?
++  "A plain string for a text (default-type) property without fixed choices. The outliner stores it
++  in a new value block, as the editor does, so it is never looked up by title: text that happens to
++  match a page title is still text. A UUID string keeps referencing an existing value. E2EE graphs
++  need client-encrypted values, so plaintext is never accepted there."
++  [property value e2ee?]
++  (and (not e2ee?)
++       (= :default (get property :logseq.property/type :default))
++       (empty? (:block/_closed-value-property property))
++       (non-blank-string? value)
++       (not (common-util/uuid-string? value))))
++
+ (defn- prepare-ref-property-value [db property-ident value e2ee?]
+   (let [property (d/entity db property-ident)]
+-    (or (resolve-ref-entity db property-ident value)
+-        (when (and (not e2ee?)
+-                   (= :url (:logseq.property/type property))
+-                   (empty? (:block/_closed-value-property property))
+-                   (db-property-type/url? value))
+-          value))))
++    (if (free-text-value? property value e2ee?)
++      value
++      (or (resolve-ref-entity db property-ident value)
++          (when (and (not e2ee?)
++                     (= :url (:logseq.property/type property))
++                     (empty? (:block/_closed-value-property property))
++                     (db-property-type/url? value))
++            value)))))
+ 
+ (defn- prepare-property-value [db property-ident value e2ee?]
+   (let [property (d/entity db property-ident)]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 2d13a988fa..018a10dac0 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -433,7 +433,7 @@
+                                                    :scheduled {:type "integer"}
+                                                    :deadline {:type "integer"}}}]}
+               :PropertyValue
+-              {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Encrypted graphs require existing entity selectors for URL properties. Scalar properties accept their JSON scalar value."
++              {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
+                :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
+                        {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
+     :securitySchemes
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index c640556ce7..8bd00e8ee2 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -3713,7 +3713,7 @@
+                           (is false (str error))
+                           (done)))))))
+ 
+-(defn- with-url-property-test [cardinality run]
++(defn- with-typed-property-test [property-type cardinality run]
+   (with-memory-sql-async
+     (fn [sql]
+       (storage/init-schema! sql)
+@@ -3721,9 +3721,9 @@
+             page-id (random-uuid)
+             block-ids (vec (repeatedly 2 random-uuid))
+             property (outliner-property/upsert-property!
+-                      conn nil {:logseq.property/type :url
++                      conn nil {:logseq.property/type property-type
+                                 :db/cardinality cardinality}
+-                      {:property-name "API URL"})
++                      {:property-name (str "API " (name property-type))})
+             _ (d/transact! conn
+                            (into [{:block/uuid page-id :block/name "url-test" :block/title "URL test"
+                                    :block/tags :logseq.class/Page
+@@ -3746,7 +3746,10 @@
+                                  "/semantic/block-properties/batch-set")
+                                "?graph-id=graph-1" (when encrypted? "&graph-e2ee=true"))
+                           method body)))]
+-        (run {:conn conn :property property :block-ids block-ids :request request})))))
++        (run {:conn conn :property property :page-id page-id :block-ids block-ids :request request})))))
++
++(defn- with-url-property-test [cardinality run]
++  (with-typed-property-test :url cardinality run))
+ 
+ (defn- run-url-property-test! [done cardinality run]
+   (-> (with-url-property-test cardinality run)
+@@ -3941,3 +3944,44 @@
+             (is (= 200 (.-status update-response)))
+             (is (= #{decision-id} (tags-of (ids 2))))
+             (is (= (str "Now a " (ref-of decision-id)) (title-of (ids 2))))))))))
++
++(defn- run-text-property-test! [done cardinality run]
++  (-> (with-typed-property-test :default cardinality run)
++      (p/then (fn [] (done)))
++      (p/catch (fn [error] (is false (str error)) (done)))))
++
++(deftest semantic-text-property-accepts-free-text-test
++  (async done
++    (run-text-property-test! done :db.cardinality/one
++      (fn [{:keys [conn property page-id block-ids request]}]
++        (let [value #(get (d/entity @conn [:block/uuid (first block-ids)]) (:db/ident property))]
++          (p/let [text-response (request "PUT" {:value "Quarterly planning notes"} false)
++                  _ (is (= 200 (.-status text-response)))
++                  first-value (value)
++                  _ (is (= "Quarterly planning notes" (:block/title first-value)))
++                  _ (is (= (:db/id property) (:db/id (:logseq.property/created-from-property first-value))))
++                  page-title-response (request "PUT" {:value "URL test"} false)
++                  _ (is (= 200 (.-status page-title-response)))
++                  _ (is (= "URL test" (:block/title (value))))
++                  _ (is (not= page-id (:block/uuid (value)))
++                        "text matching a page title is stored as text, not as a link to that page")
++                  uuid-response (request "PUT" {:value (str (:block/uuid first-value))} false)
++                  _ (is (= 200 (.-status uuid-response)))
++                  _ (is (= (:block/uuid first-value) (:block/uuid (value)))
++                        "a UUID still references an existing value")
++                  missing-uuid (request "PUT" {:value (str (random-uuid))} false)
++                  _ (is (= 400 (.-status missing-uuid)))
++                  encrypted (request "PUT" {:value "Plaintext in an encrypted graph"} true)]
++            (is (= 400 (.-status encrypted)) "E2EE graphs still need an existing entity")))))))
++
++(deftest semantic-text-property-batch-accepts-string-arrays-test
++  (async done
++    (run-text-property-test! done :db.cardinality/many
++      (fn [{:keys [conn property block-ids request]}]
++        (let [entry {:block-id (str (first block-ids))
++                     :property-id (str (:block/uuid property))
++                     :value ["alpha" "beta"]}
++              titles #(set (map :block/title (get (d/entity @conn [:block/uuid (first block-ids)]) (:db/ident property))))]
++          (p/let [response (request "POST" {:entries [entry]} false)]
++            (is (= 200 (.-status response)))
++            (is (= #{"alpha" "beta"} (titles)))))))))
