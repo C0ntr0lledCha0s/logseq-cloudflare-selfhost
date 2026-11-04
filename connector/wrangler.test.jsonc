@@ -5,7 +5,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-11",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" },
+    { "binding": "KB_INDEX_KV", "id": "11111111111111111111111111111111" }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

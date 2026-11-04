@@ -5,6 +5,16 @@
     "path": "/api/v1/graphs/{graph-id}/block-properties/batch-delete"
   },
   {
+    "name": "batch_insert_block_trees",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-trees/batch"
+  },
+  {
+    "name": "batch_move_blocks",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-moves/batch"
+  },
+  {
     "name": "batch_set_block_property",
     "method": "POST",
     "path": "/api/v1/graphs/{graph-id}/block-properties/batch-set"
@@ -50,6 +60,11 @@
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
   },
   {
+    "name": "delete_blocks",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/blocks"
+  },
+  {
     "name": "delete_page",
     "method": "DELETE",
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
@@ -70,9 +85,24 @@
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
   },
   {
+    "name": "get_blocks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/blocks"
+  },
+  {
+    "name": "get_graph_health",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/health"
+  },
+  {
     "name": "get_page",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+  },
+  {
+    "name": "get_page_backlinks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks"
   },
   {
     "name": "get_page_outline",
@@ -98,6 +128,11 @@
     "name": "insert_block_tree",
     "method": "POST",
     "path": "/api/v1/graphs/{graph-id}/block-trees"
+  },
+  {
+    "name": "kb_index",
+    "method": null,
+    "path": null
   },
   {
     "name": "list_assets",
@@ -168,6 +203,16 @@
     "name": "search_graph",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/search"
+  },
+  {
+    "name": "semantic_index_status",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "semantic_search",
+    "method": null,
+    "path": null
   },
   {
     "name": "set_block_property",

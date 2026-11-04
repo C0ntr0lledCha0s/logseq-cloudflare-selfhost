@@ -131,10 +131,11 @@ test("the mask step masks every id and keeps the wrapper's own mask lines out of
   const r = runMaskStep({
     d1_database_id: { value: "d1-id" },
     connector_oauth_kv_id: { value: "kv-id" },
+    connector_kb_index_kv_id: { value: "kb-index-kv-id" },
     connector_d1_id: { value: "connector-d1-id" },
   });
   assert.equal(r.status, 0, r.stderr);
-  for (const value of ["r2-secret", "d1-id", "kv-id", "connector-d1-id"]) {
+  for (const value of ["r2-secret", "d1-id", "kv-id", "kb-index-kv-id", "connector-d1-id"]) {
     assert.ok(r.stdout.split("\n").includes(`::add-mask::${value}`), value);
   }
 });
@@ -142,4 +143,49 @@ test("the mask step masks every id and keeps the wrapper's own mask lines out of
 test("the mask step passes on a first-ever run with no outputs", () => {
   const r = runMaskStep({});
   assert.equal(r.status, 0, r.stderr);
+});
+
+/** Runs the "Read semantic search setting" step with the variable and CONNECTOR_ENABLED (from the earlier step's GITHUB_ENV). */
+function readSemanticSetting(value, connectorEnabled) {
+  const dir = mkdtempSync(join(tmpdir(), "deploy-workflow-"));
+  try {
+    const env = join(dir, "github-env");
+    writeFileSync(env, "");
+    const r = spawnSync("bash", ["-e", "-c", runBlock("Read semantic search setting")], {
+      cwd: dir,
+      env: { ...process.env, SEMANTIC_SEARCH_ENABLED: value, CONNECTOR_ENABLED: connectorEnabled, GITHUB_ENV: env },
+      encoding: "utf8",
+    });
+    return { status: r.status, stdout: r.stdout, env: readFileSync(env, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("the semantic search step reads its variable after the connector setting and before OpenTofu", () => {
+  assert.ok(step("Read semantic search setting").includes("          SEMANTIC_SEARCH_ENABLED: ${{ vars.SEMANTIC_SEARCH_ENABLED }}"));
+  assert.ok(stepIndex("Read connector setting") < stepIndex("Read semantic search setting"));
+  assert.ok(stepIndex("Read semantic search setting") < stepIndex("Tofu init"));
+  assert.ok(!step("Read semantic search setting").some((line) => line.includes("secrets.")));
+});
+
+test("the semantic search step passes true or false on, with unset meaning false", () => {
+  for (const [value, connector, enabled] of [["true", "true", "true"], ["false", "true", "false"], ["", "true", "false"], ["", "false", "false"], ["false", "false", "false"]]) {
+    const r = readSemanticSetting(value, connector);
+    assert.equal(r.status, 0, r.stdout);
+    assert.equal(r.env, `SEMANTIC_SEARCH_ENABLED=${enabled}\n`, JSON.stringify([value, connector]));
+  }
+});
+
+test("the semantic search step fails on another value or without the connector", () => {
+  for (const value of ["yes", "TRUE", "1"]) {
+    const r = readSemanticSetting(value, "true");
+    assert.notEqual(r.status, 0, value);
+    assert.match(r.stdout, /::error::The SEMANTIC_SEARCH_ENABLED variable must be true or false/);
+    assert.equal(r.env, "");
+  }
+  const r = readSemanticSetting("true", "false");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stdout, /::error::SEMANTIC_SEARCH_ENABLED=true needs CONNECTOR_ENABLED=true/);
+  assert.equal(r.env, "");
 });

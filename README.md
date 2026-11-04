@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies ten small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies fourteen small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -37,6 +37,10 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Order keys that don't collide.** Some outliner writes, such as property value blocks and new pages, take the next order key after a process-wide maximum. Clients seed that maximum from the graph when they load it; upstream's Worker never does, so API writes can reuse an order key a sibling already holds, and a client later moves one of the blocks. `patches/0008-seed-order-key-for-server-writes.patch` seeds it from the graph on every semantic API request. It also fixes `get-max-order`, which returned another attribute's value on a graph with no ordered blocks.
 - **Moves that land where they say.** Upstream's `moveBlocks` maps `before` and `after` to outliner options that address the target's children, so `before` made the block the target's first child and `after` its last child (or first, when it had none). `patches/0009-semantic-move-before-after.patch` makes `after` the target's next sibling and `before` its previous sibling (the first child of its parent when it has none), and refuses `before` and `after` on a page.
 - **Page blocks without property values.** A page's text and URL property values are stored as blocks under the page, and upstream's `listPageBlocks` returned them among the page's top-level blocks, although the outline and block children leave them out. `patches/0010-semantic-page-blocks-skip-property-values.patch` leaves them out of `listPageBlocks` too; they stay readable by UUID.
+- **Writes that don't duplicate or destroy by surprise.** Upstream's `createPage` and `createTag` accept a title another page, tag or property already has, so a case variant becomes a second page and `createTag` silently turns a same-named page into a tag; its `deletePage`, `deleteTag` and `deleteProperty` act at once, however much links to what they delete. `patches/0011-semantic-write-guards.patch` refuses a title already used by a page, journal, tag or property, compared ignoring case as Logseq compares page names, with a 409 that names each one's kind, title and UUID; a page in the Recycle bin is restored instead, and E2EE graphs aren't checked. The three deletes refuse with a 409 while they would lose references, tag holders, child tags or property values, unless the matching `acknowledge-references`, `acknowledge-holders`, `acknowledge-child-tags` or `acknowledge-values` query flag is `true`, and `dry-run=true` returns the counts without deleting. `deleteBlock` refuses pages, tags and properties, so the guards can't be bypassed.
+- **Bulk operations.** Upstream reads, deletes and moves one item (or one target) per call, so routine work such as tagging a dozen people or filling several pages runs into the limit of 20 writes per minute. `patches/0012-semantic-bulk-operations.patch` adds `getBlocks` (up to 100 blocks or pages by UUID, with tags and properties, optionally with their trees as outlines), `deleteBlocks` (up to 100 blocks), `batchMoveBlocks` (up to 100 moves, each to its own target) and `batchInsertBlockTrees` (block trees and properties for several pages, naming a page by title creates it). Block tree nodes take a `properties` object, so a block gets its tags and property values as it is inserted. Each bulk write is one request, checks every entry first, and applies all of them or none; `dry-run` reports what would change without changing anything. `verbose=false` makes insert responses just the new blocks' UUIDs and a count.
+- **Backlinks by relation, graph health and a knowledge index.** Upstream's `listPageReferences` is one flat list, and no operation reads the graph as a whole. `patches/0013-semantic-backlinks-health-knowledge-index.patch` adds three read operations, all refused on E2EE graphs. `getPageBacklinks` groups everything that points at a page, tag or property into text links, tagged objects, property values and other references, with a complete count for each. `getGraphHealth` lists tags and properties nothing uses, titles that collide ignoring case, and pages whose first block isn't a `**Summary:**` block or that have no tag, a page of each at a time. `listKnowledgeIndex` pages through the non-journal pages people wrote, with their tags and the classes those extend, summary, reference count and last update, and leaves out pages with an excluded tag. The connector's `kb_index` is built on it (11.8). On a synthetic graph of 3,000 pages and 30,000 blocks, each call took under half a second in a Node test run.
+- **A change feed for a search index.** The API has no way to list the blocks that changed since a point, or to notice deletes. `patches/0014-semantic-block-changes-feed.patch` adds `listBlockChanges`: every content block with its page title, breadcrumb and tags, or, given an earlier response's `t` and `epoch`, only what changed since, read from the sync tx log, plus the UUIDs that went away. The connector's optional semantic search (11.11) uses it; it isn't a connector tool.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
@@ -53,6 +57,8 @@ Your graph content is not sent to Logseq. The patched server no longer calls `ap
 |---|---|---|
 | Workers Free (default) | $0 within the free allowances | Verified working, including the REST API and its rate limiters. Daily caps include 100k Worker requests, 100k D1 row writes and 5M D1 row reads. The front Worker gets 10 ms CPU per request. In testing, the median request used 2.6 ms and the slowest 1% used up to 92 ms, but Cloudflare didn't reject them. Larger imports may hit the limit (see Troubleshooting). D1 Time Travel covers 7 days. |
 | Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s) and enables MCP (Worker Loader). D1 Time Travel covers 30 days. |
+
+The connector's optional semantic search (11.11) runs on Free for graphs up to about 13,000 indexed blocks (the Free plan stores 5M Vectorize dimensions). A larger graph needs Workers Paid, where it adds under $0.01/month.
 
 R2 is billed separately. It has a monthly free tier, but Cloudflare asks for a payment method before you can enable it. Check Cloudflare's current pricing pages for the exact allowances.
 
@@ -102,6 +108,7 @@ This one account-owned token is the only Cloudflare credential. Create it under 
 - **Why Workers Admin.** It replaces the legacy "Workers Scripts Edit" permission. You need Admin rather than Editor because the first deploy creates the Worker. Scope it to all Workers, because custom domains don't support per-Worker roles.
 - **Why two policies.** A token with only the zone policy gives D1 and R2 nothing, and every call fails with `10000: Authentication error`.
 - **Workers KV Storage** is only used by the optional connector (section 11), for its OAuth store. Add it before you enable the connector; a token without it can't create the KV namespace.
+- **Vectorize** Write + Read is only used by the connector's optional semantic search (11.11), to create its index and deploy the binding.
 - **DNS Write** was granted in the verified setup. It may not be needed, but that hasn't been proven either way.
 
 You don't create separate R2 S3 keys. `scripts/with-r2-credentials.sh` derives them from this token: the access key ID is the token's ID, and the secret is the SHA-256 of the token value. It exports them only to the command it wraps. There are no `R2_*` or `AWS_*` secrets anywhere.
@@ -533,7 +540,7 @@ The connector is an optional second Worker, `logseq-connector`, at its own hostn
 - **It holds your graph tokens.** You connect each graph once by pasting a PAT into the connector's `/graphs` page. Claude never sees a token: it names graphs by an alias you choose.
 - **It calls the sync server privately**, over a Cloudflare service binding (`SYNC`) to `logseq-sync`, not over the public hostname.
 - **Its tools are generated** from the sync server's OpenAPI document at `UPSTREAM_REF`. When an upstream bump adds, removes or changes an operation, CI flags it: run `npm --prefix connector run update:manifest` and commit the result.
-- **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants and a small D1 database for the connected graphs. One person's use stays well inside KV's free daily allowances. Whether the file tools stay inside the Free plan's CPU time per request on large inputs hasn't been measured (11.8).
+- **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants, a KV namespace caching each graph's `kb_index`, a small D1 database for the connected graphs and an hourly cron trigger that rebuilds the cache. One person's use stays well inside KV's free daily allowances. The file tools on large inputs, and `kb_index` on a graph of thousands of pages, are *(not yet verified)* against the Free plan's CPU time per request (11.8).
 
 **Status.** The connector is deployed and in use: claude.ai, Claude Code cloud sessions and a local Claude Code have each signed in and read and written a graph. `docs/spike-results.md` records what was checked. Two things are still unmeasured: CPU time for the file tools on large inputs, and how claude.ai treats the tools' annotations (11.6, 11.8).
 
@@ -564,7 +571,7 @@ gh api user -q .id
 
 ### 11.3 Add the KV permission to the Cloudflare token
 
-Edit the token from 1.1 and add **Workers KV Storage** Write + Read to its account policy. The connector's OAuth grants live in KV, and OpenTofu creates the namespace with this token. Editing the policies doesn't change the token's value.
+Edit the token from 1.1 and add **Workers KV Storage** Write + Read to its account policy. The connector's OAuth grants and its `kb_index` cache live in KV, and OpenTofu creates both namespaces with this token. Editing the policies doesn't change the token's value.
 
 ### 11.4 Add the connector's secrets
 
@@ -607,9 +614,9 @@ A variable set in **Settings → Secrets and variables → Actions → Variables
 
 The deploy:
 
-1. creates the KV namespace `logseq-connector-oauth` and the D1 database `logseq-connector` (`tofu apply`);
+1. creates the KV namespaces `logseq-connector-oauth` and `logseq-connector-kb-index` and the D1 database `logseq-connector` (`tofu apply`). An install that enabled the connector before `kb_index` existed gets the second namespace on its next deploy, with no manual step;
 2. deploys the sync server as before;
-3. runs `scripts/deploy-connector.sh`, which renders the connector's config (`scripts/render-connector-wrangler.mjs`), applies its D1 migrations, runs `wrangler deploy` (which also attaches the custom domain), sets the Worker secrets with `wrangler secret bulk`, and runs `scripts/smoke-connector.sh https://$CONNECTOR_HOSTNAME`.
+3. runs `scripts/deploy-connector.sh`, which renders the connector's config (`scripts/render-connector-wrangler.mjs`), applies its D1 migrations, runs `wrangler deploy` (which also attaches the custom domain and the hourly cron trigger), sets the Worker secrets with `wrangler secret bulk`, and runs `scripts/smoke-connector.sh https://$CONNECTOR_HOSTNAME`.
 
 With the connector on, every connector secret is required. A missing one fails the deploy, for example with `GITHUB_CLIENT_ID: parameter null or not set`. A passing smoke test prints:
 
@@ -636,7 +643,7 @@ scripts/with-r2-credentials.sh mise exec -- tofu -chdir=infra state rm \
   'cloudflare_workers_kv_namespace.connector_oauth[0]' 'cloudflare_d1_database.connector[0]'
 ```
 
-Then delete the `logseq-connector` Worker, the KV namespace `logseq-connector-oauth` and the D1 database `logseq-connector` in the Cloudflare dashboard, remove the connector in claude.ai, and revoke the graph tokens in Logseq. This path hasn't been exercised yet.
+The `kb_index` cache namespace `logseq-connector-kb-index` has no `prevent_destroy`: the next run with the connector off deletes it. Then delete the `logseq-connector` Worker, the KV namespace `logseq-connector-oauth` and the D1 database `logseq-connector` in the Cloudflare dashboard, remove the connector in claude.ai, and revoke the graph tokens in Logseq. This path hasn't been exercised yet.
 
 ### 11.6 Add it to claude.ai and Claude Code
 
@@ -678,8 +685,16 @@ The token is stored encrypted and never shown again. The list shows each graph's
 Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 - **`list_graphs`** lists the connected graphs: alias, Logseq name, mode and expiry status. Nothing secret.
-- **`connector_help`** gives Claude the conventions for well-formed Logseq content: `insert_block_tree` for whole notes, `[[Page]]` links, `create_task` for tasks, `capture_to_today` for the journal.
-- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `get_page_outline`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`), blocks (`get_block`, `update_block`, `delete_block`, `insert_block_children`, `insert_block_tree`, `move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `search_graph` and `list_assets`. `connector/tools-manifest.json` has the full list.
+- **`connector_help`** gives Claude the conventions for well-formed Logseq content: `kb_index` first for broad topics, `insert_block_tree` for whole notes, the batch tools for work across many blocks or pages, `[[Page]]` links, `create_task` for tasks, `capture_to_today` for the journal, and a `**Summary:**` first block on new pages.
+- **`kb_index`** returns a graph's knowledge-base index in one call: every non-journal page, grouped into Project, Organization, Person, Area, Resource and Other, with its tags, summary, reference count, last update and UUID, most referenced first. Arguments: `tag` keeps pages tagged with that class or a class extending it (ignoring case), `limit` caps each group (default 25, at most 100; group counts stay complete) and `refresh: true` rebuilds now.
+  - **Grouping.** A page goes to the first group, in that order, that one of its tags or any class they extend names, ignoring case and spaces. Organization also takes `Organisation`, and Resource also takes schema.org's `CreativeWork` (articles, books, documents, guides, web sites). Anything else, such as `Business Meeting` (an Event), and untagged pages go to Other, with their tags shown.
+  - **Left out:** journals, built-in pages, tags and properties, and every page tagged `private` (any capitalisation) or with a tag that extends it. The server drops them, so they never reach the cache. Create a `Private` tag and tag a page with it to keep the page out.
+  - **Summary:** the text after `**Summary:**` in the page's first top-level block (property values don't count), with links shown as titles, cut to 240 characters.
+  - **Cache.** The index comes from the sync server's `listKnowledgeIndex`, 200 pages a request, and is cached per alias in the `KB_INDEX_KV` namespace. The cron rebuilds every graph's index hourly. `create_page`, `update_page`, `delete_page`, `update_tag` and `delete_tag` through the connector mark it dirty, so the next call rebuilds it. A call also rebuilds a cache older than two hours, or one built for another graph under the same alias. Other edits, such as a new summary, show after the next hourly rebuild. The first line of every answer says when the index was built.
+- **`get_page_backlinks`** shows how a page, tag or property is used: links in text, objects tagged with it, property values pointing at it (with the property) and other references, each with a complete count and up to `limit` of the most recently updated.
+- **`get_graph_health`**, for a weekly review, returns counts and the first items of five checks: `orphan-tags`, `orphan-properties`, `duplicate-titles`, `pages-without-summary` and `pages-without-tags`. `updated-after` narrows the page checks to recent pages, and `checks` with one check plus its `next-cursor` pages through it.
+- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `get_page_outline`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`, `get_page_backlinks`), blocks (`get_block`, `get_blocks`, `update_block`, `delete_block`, `delete_blocks`, `insert_block_children`, `insert_block_tree`, `batch_insert_block_trees`, `move_blocks`, `batch_move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `search_graph`, `get_graph_health` and `list_assets`. `listKnowledgeIndex` has no tool of its own: `kb_index` uses it. `connector/tools-manifest.json` has the full list.
+- **With semantic search on (11.11):** `semantic_search` finds blocks by meaning and by title at once, and `semantic_index_status` says how much of a graph is indexed.
 - **Files:**
   - `save_document` saves text (as UTF-8) or base64 bytes, at most 150,000 characters, under a file name whose extension sets the type;
   - `save_file_from_url` downloads a file and saves it. Only `https` on port 443, at most 25 MiB, and only `text/*`, PDF, PNG, JPEG, GIF, WebP, JSON and Office (`application/vnd.openxmlformats-officedocument.*`) files. Private, loopback, link-local and other internal addresses are refused, and each of at most 5 redirects is checked again;
@@ -693,7 +708,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 - **Read-only graphs refuse every write tool** before anything reaches the sync server.
 - **Results are capped at about 150,000 characters**, claude.ai's limit, and longer results end with a truncation notice. List tools are paginated: Claude passes the returned cursor to get the next page.
-- **The sync server's rate limits apply:** 120 reads and 20 writes per minute. That's why `insert_block_tree`, one call for a whole block tree, matters for meeting notes.
+- **The sync server's rate limits apply:** 120 reads and 20 writes per minute. A call counts once however much it does, which is why the batch tools matter: `insert_block_tree` writes a whole block tree, with each block's properties, and `batch_insert_block_trees`, `batch_set_block_property`, `delete_blocks`, `batch_move_blocks` and `get_blocks` handle up to 100 items in one call.
+- **Insert tools answer with UUIDs only.** The connector defaults `verbose` to false on `insert_block_tree`, `insert_block_children`, `capture_to_today` and `batch_insert_block_trees`, so their results are the new blocks' UUIDs and a count rather than an echo of the titles Claude just sent. Claude passes `verbose: true` when it wants the titles back.
 
 ### 11.9 Security model
 
@@ -701,8 +717,9 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 - **Tokens are encrypted.** Each PAT is stored in the connector's D1 database with AES-GCM under `GRAPH_TOKEN_KEY`. No tool returns a token, and the wizard never shows one again. Treat `GRAPH_TOKEN_KEY` like the tokens themselves.
 - **Only unencrypted graphs.** The wizard refuses end-to-end encrypted graphs. Everything in section 3 about unencrypted graphs applies, and the connector is one more piece of deployed code that can read them.
 - **Narrow access per graph.** Connect a graph read-only, with a `read` token, when Claude only needs to read it.
-- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames. Workers Logs (observability, on for the connector) also record each request's URL and metadata, privately in your Cloudflare dashboard.
-- **Not backed up.** `backup.yml` doesn't back up the connector's D1 database. It holds only aliases, graph IDs, modes and encrypted tokens, and tokens can be re-issued in Logseq. D1 Time Travel covers accidents.
+- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames. The hourly `kb_index` rebuild logs one line per graph, such as `kb-index graph=work status=ok pages=812 ms=1530`. Workers Logs (observability, on for the connector) also record each request's URL and metadata, privately in your Cloudflare dashboard.
+- **The `kb_index` cache holds page content.** `KB_INDEX_KV` stores each graph's page titles, tags, summaries and UUIDs, unencrypted like the graph itself, for up to 7 days after the last rebuild. Pages tagged `private` are never fetched. Disconnecting a graph doesn't delete its cache entry; it expires.
+- **Not backed up.** `backup.yml` doesn't back up the connector's D1 database or the `kb_index` cache, which is rebuilt from the graphs. It holds only aliases, graph IDs, modes and encrypted tokens, and tokens can be re-issued in Logseq. D1 Time Travel covers accidents.
 - **Key rotation** (section 9): rotating `GRAPH_TOKEN_KEY` makes every stored token unreadable, so you must replace the token for each graph. Rotating `COOKIE_ENCRYPTION_KEY` signs you out of the wizard.
 - **Firewall rules.** If you put WAF, rate-limiting or bot rules in front of the connector's hostname, allow Anthropic's egress range `160.79.104.0/21`. claude.ai and Claude Code cloud sessions reach the connector from there.
 
@@ -711,7 +728,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | Symptom | Cause and fix |
 |---|---|
 | `token for graph 'x' expired or lacks permission — reconnect it at https://mcp.example.com/graphs` | The sync server answered 401 or 403: the token expired, was revoked, or its permission doesn't cover the call. Create a new token in Logseq and use **Replace token** at `/graphs`. |
-| `rate limited — retry after N s` | The sync server's limit of 120 reads or 20 writes per minute. Wait, and batch writes with `insert_block_tree`. |
+| `rate limited — retry after N s` | The sync server's limit of 120 reads or 20 writes per minute. Wait, and batch writes with `insert_block_tree` and the other batch tools. |
 | `graph 'x' is read-only` | The graph is connected read-only. Switch it to read-write under **Edit** at `/graphs`. That needs a `both` token: if its token is `read`, replace it with a `both` token first. |
 | `unknown graph 'x' — call list_graphs for the connected aliases` | No graph is connected under that alias: it was renamed or disconnected, or never connected. Check `/graphs`. |
 | Every tool fails for every graph after rotating `GRAPH_TOKEN_KEY` | The stored tokens can't be decrypted any more. Replace each graph's token at `/graphs` (11.7). |
@@ -724,7 +741,41 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | Deploy fails with `GITHUB_CLIENT_ID: parameter null or not set` (or another connector name) | The connector is enabled but a secret is missing from the `production` environment. If the name is missing from `.env.local` too, `scripts/init-env.sh --add-missing --push` adds and pushes it. Otherwise push it with the 1.8 loop: `--add-missing` only pushes names it adds. Remember the `CONNECTOR_GITHUB_*` names. |
 | Creating `cloudflare_workers_kv_namespace.connector_oauth` fails with an authentication or permission error | The Cloudflare token lacks **Workers KV Storage** Write + Read (11.3). |
 | `tofu apply` fails with `Instance cannot be destroyed` for the connector's KV namespace or D1 database | OpenTofu ran with the connector off while its resources exist. If you meant it to be on, set the `CONNECTOR_ENABLED` variable (Actions) or `CONNECTOR_ENABLED=true` in `.env.local` and `TF_VAR_connector_enabled` (local, 1.4), and re-run. To turn it off, follow "Turning it off" in 11.5. |
+| The cron run fails with `kb index refresh failed for N of M graphs` | The `kb-index graph=… status=…` lines before it name the graph: `http-401` or `http-403` means its token expired (replace it at `/graphs`). The other graphs were still rebuilt. |
+| `kb_index` answers `the knowledge index of 'x' has more than 20000 pages` | The connector refuses to cache a graph that large. Use `search_graph` and `list_pages` instead. |
 | Deploy fails at **Read connector setting** with `The CONNECTOR_ENABLED variable must be true or false` | The variable holds something else, such as `True` or `yes`. Set it to exactly `true` or `false`, or delete it for off. |
+
+### 11.11 Semantic search (optional)
+
+`search_graph` only matches the exact words of a title. Semantic search adds `semantic_search`, which also finds blocks by meaning ("what did we decide about pricing?"), and `semantic_index_status`. The design, with its sources and limits, is `docs/superpowers/specs/2026-11-04-semantic-search-design.md`.
+
+- **How it works.** A second cron trigger on the connector runs every minute, next to the hourly `kb_index` one. Each run reads up to two pages of 50 changed blocks from the sync server (`listBlockChanges`, patch 0014), embeds each block as `page title > breadcrumb > block text` with Workers AI (`@cf/baai/bge-small-en-v1.5`, 384 dimensions), and stores the vectors in a Vectorize index, one namespace per graph. Only blocks whose text changed are embedded again. `semantic_search` embeds the question, takes the nearest blocks, runs `search_graph` with the same words, and merges the two lists by reciprocal rank fusion.
+- **Private blocks stay out.** A block tagged `private` (any case), or under a block or page tagged `private`, is never embedded, and is removed from the index when it gets the tag. Encrypted graphs are never indexed. Block text, page titles, breadcrumbs and tags are stored in the connector's D1 database and Vectorize, in your account; disconnecting a graph deletes them on the next runs.
+- **It's off until you turn it on.** Without the `AI` and `VECTORIZE` bindings the connector has no semantic tools and no indexer cron (the hourly `kb_index` cron runs either way).
+- **Size and cost.** Building the index of a 13,000-block graph takes about two hours; changes after that show up within a minute or two. On Workers Free the index holds at most 13,000 blocks (`connector.semanticSearch.maxVectors` in `config/settings.json`); beyond that `semantic_index_status` says `full`. On Workers Paid, raise `maxVectors` (a 50,000-block graph costs under $0.01/month in Vectorize storage; embedding stays inside the free 10,000 neurons a day). Whether two pages a minute fit the Free plan's 10 ms CPU per cron run is *(not yet verified)*.
+
+To turn it on, with the connector already on (11.5):
+
+1. Add **Vectorize** Write + Read to the Cloudflare token's account policy (1.1).
+2. Set the variable and deploy:
+
+   ```bash
+   gh variable set SEMANTIC_SEARCH_ENABLED --env production --body true
+   gh workflow run deploy.yml
+   ```
+
+   Also set `SEMANTIC_SEARCH_ENABLED=true` in `.env.local` for local connector deploys. The deploy creates the Vectorize index named in `connector.semanticSearch.vectorizeIndexName` (384 dimensions, cosine) if it doesn't exist, and fails if an index with that name has another shape. OpenTofu can't manage it: the Cloudflare provider has no Vectorize resource.
+3. In claude.ai, call `semantic_index_status` for a graph until it says `ready`.
+
+**Turning it off.** Set the variable to `false` and deploy: the tools and the every-minute indexer cron go away. The index and the `semantic_blocks` and `semantic_state` rows stay; delete them with `npx wrangler vectorize delete logseq-connector-blocks` and `npx wrangler d1 execute logseq-connector --remote --command "DELETE FROM semantic_blocks; DELETE FROM semantic_state;"`.
+
+| Symptom | Cause and fix |
+|---|---|
+| `semantic_index_status` says `full` | The index holds `maxVectors` blocks. On Workers Paid, raise `connector.semanticSearch.maxVectors`; on Free, tag pages you don't need searched `private`. |
+| Status `error` with `Workers AI embedding failed` | Usually the free 10,000 neurons a day are used up. It resumes after midnight UTC. |
+| Status `error` with `token for graph ... expired` | Replace the graph's token (11.7). |
+| Deploy fails with `Vectorize index ... has N dimensions` | An index with that name was created with another shape. Delete it (`npx wrangler vectorize delete logseq-connector-blocks`), delete the `semantic_*` rows, and deploy again. |
+| Deploy fails with `reading Vectorize index ... Authentication error` | The token lacks Vectorize Write + Read (step 1). |
 
 ## Backlog
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ const script = join(root, "scripts", "deploy-connector.sh");
 const SECRET_NAMES = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
   "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY", "CONNECTOR_HOSTNAME", "CONNECTOR_ENABLED",
+  "SEMANTIC_SEARCH_ENABLED",
 ];
 
 async function runWith(connector, env = {}) {
@@ -126,4 +127,40 @@ test("valid connector inputs pass the checks and reach tofu", { timeout: 60000 }
   assert.equal(r.status, 1);
   assert.equal(r.tofuCalled, true);
   assert.doesNotMatch(r.stderr, /CONNECTOR_HOSTNAME|OWNER_GITHUB_USER_ID/);
+});
+
+test("a SEMANTIC_SEARCH_ENABLED other than true or false fails before tofu", { timeout: 60000 }, async () => {
+  for (const enabled of ["yes", "TRUE", "1"]) {
+    const r = await runWithTofuStub({ SEMANTIC_SEARCH_ENABLED: enabled });
+    assert.equal(r.status, 1, enabled);
+    assert.match(r.stderr, /SEMANTIC_SEARCH_ENABLED must be true or false/, enabled);
+    assert.equal(r.tofuCalled, false, enabled);
+  }
+});
+
+test("SEMANTIC_SEARCH_ENABLED true, false or unset passes the checks and reaches tofu", { timeout: 60000 }, async () => {
+  for (const enabled of ["true", "false", ""]) {
+    const r = await runWithTofuStub({ SEMANTIC_SEARCH_ENABLED: enabled });
+    assert.equal(r.tofuCalled, true, JSON.stringify(enabled));
+    assert.doesNotMatch(r.stderr, /SEMANTIC_SEARCH_ENABLED/);
+  }
+});
+
+test("a disabled connector ignores SEMANTIC_SEARCH_ENABLED", { timeout: 60000 }, async () => {
+  const r = await runWith(CONNECTOR, { CONNECTOR_ENABLED: "false", SEMANTIC_SEARCH_ENABLED: "true" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(r.stdout.trim(), "connector disabled");
+});
+
+test("the deploy passes the semantic search switch to the renderer", () => {
+  const body = readFileSync(script, "utf8");
+  assert.match(body, /--semantic-search "\$semantic_search"/);
+});
+
+test("with semantic search on, the deploy creates the Vectorize index before deploying", () => {
+  const body = readFileSync(script, "utf8");
+  const ensure = body.indexOf('node scripts/ensure-vectorize-index.mjs --settings "$settings"');
+  assert.notEqual(ensure, -1);
+  assert.ok(ensure < body.indexOf('"$wrangler" deploy'));
+  assert.match(body, /if \[ "\$semantic_search" = true \]; then\n  node scripts\/ensure-vectorize-index\.mjs/);
 });

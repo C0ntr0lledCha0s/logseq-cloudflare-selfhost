@@ -18,6 +18,11 @@ output "connector_oauth_kv_id" {
   value     = one(cloudflare_workers_kv_namespace.connector_oauth[*].id)
 }
 
+output "connector_kb_index_kv_id" {
+  sensitive = true
+  value     = one(cloudflare_workers_kv_namespace.connector_kb_index[*].id)
+}
+
 output "connector_d1_id" {
   sensitive = true
   value     = one(cloudflare_d1_database.connector[*].id)

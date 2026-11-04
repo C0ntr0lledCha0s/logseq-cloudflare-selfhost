@@ -6,4 +6,5 @@
   // global_fetch_strictly_public is required for CIMD client metadata fetches.
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "observability": { "enabled": true }
+  // Cron triggers are rendered too: see connector/src/crons.ts.
 }

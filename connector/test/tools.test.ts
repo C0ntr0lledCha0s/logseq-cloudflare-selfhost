@@ -5,7 +5,7 @@ import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
-import { type OpenApiSpec, buildManifest, checkManifest } from "../src/tools/spec.mjs";
+import { type OpenApiSpec, SEMANTIC_TOOLS, buildManifest, checkManifest } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_TOKEN = "logseq_pat_WorkToken123";
@@ -131,10 +131,14 @@ describe("tool list", () => {
       "delete_page",
       "list_page_blocks",
       "get_block",
+      "get_blocks",
       "update_block",
+      "delete_blocks",
       "insert_block_tree",
       "insert_block_children",
       "move_blocks",
+      "batch_move_blocks",
+      "batch_insert_block_trees",
       "set_block_property",
       "batch_set_block_property",
       "capture_to_today",
@@ -174,9 +178,9 @@ describe("tool list", () => {
     }
   });
 
-  it("matches the committed tools-manifest.json", async () => {
+  it("matches the committed tools-manifest.json, less the semantic search tools while those are off", async () => {
     const names = (await listTools()).map((t) => t.name).sort();
-    expect(names).toEqual(committedManifest.map((e) => e.name));
+    expect(names).toEqual(committedManifest.map((e) => e.name).filter((n) => !SEMANTIC_TOOLS.includes(n)));
   });
 
   it("every GET tool readOnlyHint true, every DELETE destructiveHint true", async () => {
@@ -275,11 +279,52 @@ describe("routing", () => {
     expect(syncRequests).toHaveLength(0);
   });
 
+  it("bulk tools: get_blocks reads with ids, delete_blocks sends its body with DELETE", async () => {
+    syncHandler = () => Response.json({ blocks: [], missing: [] });
+    const read = await callTool("get_blocks", { graph: "notes", ids: "b1,b2", view: "outline" });
+    expect(read.isError).toBe(false);
+    expect(syncRequests[0].method).toBe("GET");
+    expect(syncRequests[0].url).toBe(`https://sync.internal/api/v1/graphs/${NOTES_ID}/blocks?ids=b1%2Cb2&view=outline`);
+
+    syncRequests = [];
+    syncHandler = () => Response.json({ deleted: 2, "total-removed": 3, "dry-run": true });
+    const deleted = await callTool("delete_blocks", { graph: "work", body: { "block-ids": ["b1", "b2"], "dry-run": true } });
+    expect(deleted.isError).toBe(false);
+    expect(syncRequests).toHaveLength(1);
+    expect(syncRequests[0].method).toBe("DELETE");
+    expect(syncRequests[0].url).toBe(`https://sync.internal/api/v1/graphs/${WORK_ID}/blocks`);
+    expect(JSON.parse(syncRequests[0].body)).toEqual({ "block-ids": ["b1", "b2"], "dry-run": true });
+
+    const tools = await listTools();
+    expect(tools.find((t) => t.name === "delete_blocks").annotations.destructiveHint).toBe(true);
+  });
+
+  it("write tools that echo inserted blocks default to verbose=false; verbose: true asks for titles", async () => {
+    syncHandler = () => Response.json({ blocks: [{ uuid: "b1" }], count: 1 }, { status: 201 });
+    const tree = { "target-id": "p1", blocks: [{ title: "Note" }] };
+    const compact = await callTool("insert_block_tree", { graph: "work", body: tree });
+    expect(compact.isError).toBe(false);
+    expect(new URL(syncRequests[0].url).searchParams.get("verbose")).toBe("false");
+
+    syncRequests = [];
+    await callTool("insert_block_tree", { graph: "work", verbose: true, body: tree });
+    expect(new URL(syncRequests[0].url).searchParams.get("verbose")).toBe("true");
+
+    const tools = await listTools();
+    for (const name of ["insert_block_tree", "insert_block_children", "capture_to_today", "batch_insert_block_trees"]) {
+      const verbose = tools.find((t) => t.name === name).inputSchema.properties.verbose;
+      expect(verbose.default, name).toBe(false);
+      expect(verbose.description, name).toContain("Defaults to false here");
+    }
+  });
+
   it("write tool on read-mode graph refused without sync call", async () => {
     for (const [name, args] of [
       ["create_page", { graph: "notes", body: { title: "x" } }],
       ["delete_block", { graph: "notes", "block-id": "b1" }],
       ["set_block_property", { graph: "notes", "block-id": "b1", "property-id": "p1", body: { value: 1 } }],
+      ["delete_blocks", { graph: "notes", body: { "block-ids": ["b1"] } }],
+      ["batch_insert_block_trees", { graph: "notes", body: { entries: [{ page: "P", blocks: [{ title: "x" }] }] } }],
     ] as const) {
       const result = await callTool(name, args);
       expect(result.isError, name).toBe(true);
@@ -324,6 +369,14 @@ describe("errors", () => {
     const result = await callTool("create_page", { graph: "work", body: { title: "" } });
     expect(result.isError).toBe(true);
     expect(result.text).toBe("title is required");
+  });
+
+  it("409 maps to the server's message", async () => {
+    const message = 'title "Inbox" is already used by page "Inbox" (p1); nothing was created.';
+    syncHandler = () => Response.json({ error: message, existing: [] }, { status: 409 });
+    const result = await callTool("create_page", { graph: "work", body: { title: "Inbox" } });
+    expect(result.isError).toBe(true);
+    expect(result.text).toBe(message);
   });
 
   it("a failing touch does not mask the tool result", async () => {
@@ -393,7 +446,22 @@ describe("hand-written tools", () => {
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);
-    for (const phrase of ["list_graphs", "insert_block_tree", "[[Page]]", "create_task", "capture_to_today", "Card"]) {
+    for (const phrase of [
+      "list_graphs",
+      "insert_block_tree",
+      "[[Page]]",
+      "create_task",
+      "capture_to_today",
+      "Card",
+      "without searching first",
+      "acknowledge-",
+      "batch_insert_block_trees",
+      "get_blocks",
+      "delete_blocks",
+      "batch_move_blocks",
+      "verbose",
+      "dry-run",
+    ]) {
       expect(result.text).toContain(phrase);
     }
   });

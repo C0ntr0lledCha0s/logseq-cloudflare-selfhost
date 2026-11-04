@@ -99,13 +99,14 @@ jobs:
           npm --prefix connector run typecheck
           node connector/scripts/check-tools-manifest.mjs
           placeholder="$RUNNER_TEMP/connector-tofu-output.json"
-          echo '{"connector_oauth_kv_id":{"value":"00000000000000000000000000000000"},"connector_d1_id":{"value":"00000000-0000-0000-0000-000000000000"}}' > "$placeholder"
+          echo '{"connector_oauth_kv_id":{"value":"00000000000000000000000000000000"},"connector_kb_index_kv_id":{"value":"11111111111111111111111111111111"},"connector_d1_id":{"value":"00000000-0000-0000-0000-000000000000"}}' > "$placeholder"
           node scripts/render-connector-wrangler.mjs \
             --template connector/wrangler.template.jsonc \
             --settings config/settings.json \
             --tofu-outputs "$placeholder" \
             --out connector/wrangler.json \
-            --hostname mcp.example.com
+            --hostname mcp.example.com \
+            --semantic-search true
           (cd connector && node_modules/.bin/wrangler deploy --dry-run --outdir "$RUNNER_TEMP/dry-run-connector")
 
       - name: OpenTofu format and validate

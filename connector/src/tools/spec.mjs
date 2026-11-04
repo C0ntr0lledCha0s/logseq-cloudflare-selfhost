@@ -16,14 +16,47 @@ import { resolveOpenApiRefs } from "../../vendor/semantic_api_tools.mjs";
 export const ALIAS_PATTERN = "^[a-z0-9][a-z0-9-]{0,39}$";
 export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 /** Tools registered by hand rather than from the spec; listed here so the manifest covers them. */
-export const HANDWRITTEN_TOOLS = ["connector_help", "list_graphs", "read_file", "save_document", "save_file_from_url"];
+export const HANDWRITTEN_TOOLS = [
+  "connector_help",
+  "kb_index",
+  "list_graphs",
+  "read_file",
+  "save_document",
+  "save_file_from_url",
+  "semantic_index_status",
+  "semantic_search",
+];
+/** Hand-written tools registered only when semantic search is configured (src/semantic/config.ts). */
+export const SEMANTIC_TOOLS = ["semantic_index_status", "semantic_search"];
 
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
-/** Replaced by hand-written tools (read_file, save_*, list_graphs). `/e2ee/` paths are dropped too. */
-const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs"]);
+/**
+ * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), or, for listBlockChanges,
+ * the semantic indexer's feed rather than something Claude needs. `/e2ee/` paths are dropped too.
+ */
+const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs", "listKnowledgeIndex", "listBlockChanges"]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
+/**
+ * Write operations that echo the inserted blocks take `verbose`, true by default. The connector
+ * defaults it to false: Claude already has the titles it sent, and only needs the UUIDs back.
+ */
+const COMPACT_NOTE =
+  "Defaults to false here: the result is the inserted blocks' UUIDs, nested as inserted, and a count. Pass true to get their titles back.";
+
+/**
+ * A `verbose` query parameter with the connector's default. The generated tool's input schema
+ * applies it, so a call that leaves `verbose` out sends verbose=false.
+ * @param {OpenApiParameter} param
+ * @returns {OpenApiParameter}
+ */
+function compactByDefault(param) {
+  if (param.name !== "verbose" || param.in !== "query") return param;
+  const schema = /** @type {Record<string, unknown>} */ (param.schema);
+  if (schema?.type !== "boolean") throw new Error("the verbose parameter is not a boolean");
+  return { ...param, schema: { ...schema, default: false }, description: [param.description, COMPACT_NOTE].filter(Boolean).join(" ") };
+}
 
 /**
  * `insertBlockTree` → `insert_block_tree`.
@@ -75,7 +108,8 @@ export function graphOperations(spec) {
 /**
  * The spec handed to upstream's `registerSemanticApiTools`: only the graph operations, each with the
  * `graph-id` path parameter replaced by a required `graph` alias (the path template becomes `{graph}`,
- * so upstream substitutes the alias and the connector maps it back to the graph ID).
+ * so upstream substitutes the alias and the connector maps it back to the graph ID), and `verbose`
+ * defaulting to false.
  * @param {OpenApiSpec} spec
  * @returns {OpenApiSpec}
  */
@@ -90,7 +124,10 @@ export function transformSpec(spec) {
       description: GRAPH_PARAM_DESCRIPTION,
       schema: { type: "string", pattern: ALIAS_PATTERN },
     };
-    const parameters = [graphParam, ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id")];
+    const parameters = [
+      graphParam,
+      ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id").map(compactByDefault),
+    ];
     const aliasPath = path.replace("{graph-id}", "{graph}");
     paths[aliasPath] = { ...paths[aliasPath], [method.toLowerCase()]: { ...operation, parameters } };
   }

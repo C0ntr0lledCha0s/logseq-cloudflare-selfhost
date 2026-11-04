@@ -14,7 +14,14 @@ function must(value, what) {
 const FORBIDDEN_TOP_LEVEL = [
   "kv_namespaces", "d1_databases", "services", "routes", "route",
   "account_id", "workers_dev", "preview_urls", "name",
+  "ai", "vectorize", "triggers",
 ];
+
+/** Rebuilds every graph's kb_index cache; always rendered. Must match connector/src/crons.ts. */
+export const KB_INDEX_CRON = "0 * * * *";
+
+/** The semantic indexer's cron: every minute, each run bounded (design 2026-11-04 §6). Must match connector/src/crons.ts. */
+export const SEMANTIC_CRON = "* * * * *";
 
 // Strip // and /* */ comments and trailing commas from JSONC, leaving string contents intact.
 function stripJsonc(text) {
@@ -65,8 +72,14 @@ function stripTrailingCommas(text) {
   return out;
 }
 
-export function renderConnectorWrangler({ template, settings, hostname, tofuOutputs }) {
+/**
+ * The deploy config. With `semanticSearch` true it adds the Workers AI and Vectorize bindings, the
+ * indexer's cron and the SEMANTIC_MAX_VECTORS cap; with false, none of them, so the connector has no
+ * semantic tools and no cron.
+ */
+export function renderConnectorWrangler({ template, settings, hostname, tofuOutputs, semanticSearch }) {
   const connector = must(settings?.connector, "settings.connector");
+  if (typeof semanticSearch !== "boolean") throw new Error("semanticSearch must be true or false");
 
   const cfg = JSON.parse(stripJsonc(must(template, "template")));
   for (const key of FORBIDDEN_TOP_LEVEL) {
@@ -79,6 +92,7 @@ export function renderConnectorWrangler({ template, settings, hostname, tofuOutp
   cfg.routes = [{ pattern: must(hostname, "hostname"), custom_domain: true }];
   cfg.kv_namespaces = [
     { binding: "OAUTH_KV", id: must(tofuOutputs?.connector_oauth_kv_id, "connector_oauth_kv_id") },
+    { binding: "KB_INDEX_KV", id: must(tofuOutputs?.connector_kb_index_kv_id, "connector_kb_index_kv_id") },
   ];
   cfg.d1_databases = [
     {
@@ -92,6 +106,23 @@ export function renderConnectorWrangler({ template, settings, hostname, tofuOutp
     { binding: "SYNC", service: must(settings.workerName, "settings.workerName") },
   ];
 
+  cfg.triggers = { crons: [KB_INDEX_CRON] };
+
+  if (semanticSearch) {
+    const semantic = must(connector.semanticSearch, "settings.connector.semanticSearch");
+    const maxVectors = semantic.maxVectors;
+    if (!Number.isSafeInteger(maxVectors) || maxVectors < 1) {
+      throw new Error("settings.connector.semanticSearch.maxVectors must be a positive integer");
+    }
+    if (cfg.vars && "SEMANTIC_MAX_VECTORS" in cfg.vars) throw new Error("the template must not set SEMANTIC_MAX_VECTORS");
+    cfg.ai = { binding: "AI" };
+    cfg.vectorize = [
+      { binding: "VECTORIZE", index_name: must(semantic.vectorizeIndexName, "settings.connector.semanticSearch.vectorizeIndexName") },
+    ];
+    cfg.triggers.crons.push(SEMANTIC_CRON);
+    cfg.vars = { ...cfg.vars, SEMANTIC_MAX_VECTORS: String(maxVectors) };
+  }
+
   return `${JSON.stringify(cfg, null, 2)}\n`;
 }
 
@@ -102,13 +133,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       settings: { type: "string" },
       hostname: { type: "string" },
       "tofu-outputs": { type: "string" },
+      "semantic-search": { type: "string" },
       out: { type: "string" },
     },
   });
-  for (const k of ["template", "settings", "hostname", "tofu-outputs", "out"]) {
-    if (!values[k]) {
+  for (const k of ["template", "settings", "hostname", "tofu-outputs", "semantic-search", "out"]) {
+    if (!values[k] || (k === "semantic-search" && !["true", "false"].includes(values[k]))) {
       console.error(
-        "usage: render-connector-wrangler.mjs --template <jsonc> --settings <json> --hostname <host> --tofu-outputs <json> --out <path>",
+        "usage: render-connector-wrangler.mjs --template <jsonc> --settings <json> --hostname <host> --tofu-outputs <json> --semantic-search true|false --out <path>",
       );
       process.exit(2);
     }
@@ -119,8 +151,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     template: readFileSync(values.template, "utf8"),
     settings,
     hostname: values.hostname,
+    semanticSearch: values["semantic-search"] === "true",
     tofuOutputs: {
       connector_oauth_kv_id: tofu.connector_oauth_kv_id?.value,
+      connector_kb_index_kv_id: tofu.connector_kb_index_kv_id?.value,
       connector_d1_id: tofu.connector_d1_id?.value,
     },
   });

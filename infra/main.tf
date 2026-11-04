@@ -67,6 +67,15 @@ resource "cloudflare_workers_kv_namespace" "connector_oauth" {
   }
 }
 
+# The connector's kb_index cache: one rebuildable JSON record per graph alias. Losing it costs
+# one rebuild per graph, so unlike the OAuth namespace it may be destroyed.
+resource "cloudflare_workers_kv_namespace" "connector_kb_index" {
+  count = var.connector_enabled ? 1 : 0
+
+  account_id = var.cloudflare_account_id
+  title      = "logseq-connector-kb-index"
+}
+
 resource "cloudflare_d1_database" "connector" {
   count = var.connector_enabled ? 1 : 0
 
@@ -81,3 +90,7 @@ resource "cloudflare_d1_database" "connector" {
     prevent_destroy = true
   }
 }
+
+# The connector's optional semantic search (SEMANTIC_SEARCH_ENABLED) also uses a Vectorize index,
+# settings.connector.semanticSearch.vectorizeIndexName. The Cloudflare provider has no Vectorize
+# resource, so scripts/ensure-vectorize-index.mjs creates it on deploy, not here.
