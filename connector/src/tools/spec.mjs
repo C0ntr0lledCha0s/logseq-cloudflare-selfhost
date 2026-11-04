@@ -24,6 +24,25 @@ const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
 const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs"]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
+/**
+ * Write operations that echo the inserted blocks take `verbose`, true by default. The connector
+ * defaults it to false: Claude already has the titles it sent, and only needs the UUIDs back.
+ */
+const COMPACT_NOTE =
+  "Defaults to false here: the result is the inserted blocks' UUIDs, nested as inserted, and a count. Pass true to get their titles back.";
+
+/**
+ * A `verbose` query parameter with the connector's default. The generated tool's input schema
+ * applies it, so a call that leaves `verbose` out sends verbose=false.
+ * @param {OpenApiParameter} param
+ * @returns {OpenApiParameter}
+ */
+function compactByDefault(param) {
+  if (param.name !== "verbose" || param.in !== "query") return param;
+  const schema = /** @type {Record<string, unknown>} */ (param.schema);
+  if (schema?.type !== "boolean") throw new Error("the verbose parameter is not a boolean");
+  return { ...param, schema: { ...schema, default: false }, description: [param.description, COMPACT_NOTE].filter(Boolean).join(" ") };
+}
 
 /**
  * `insertBlockTree` → `insert_block_tree`.
@@ -75,7 +94,8 @@ export function graphOperations(spec) {
 /**
  * The spec handed to upstream's `registerSemanticApiTools`: only the graph operations, each with the
  * `graph-id` path parameter replaced by a required `graph` alias (the path template becomes `{graph}`,
- * so upstream substitutes the alias and the connector maps it back to the graph ID).
+ * so upstream substitutes the alias and the connector maps it back to the graph ID), and `verbose`
+ * defaulting to false.
  * @param {OpenApiSpec} spec
  * @returns {OpenApiSpec}
  */
@@ -90,7 +110,10 @@ export function transformSpec(spec) {
       description: GRAPH_PARAM_DESCRIPTION,
       schema: { type: "string", pattern: ALIAS_PATTERN },
     };
-    const parameters = [graphParam, ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id")];
+    const parameters = [
+      graphParam,
+      ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id").map(compactByDefault),
+    ];
     const aliasPath = path.replace("{graph-id}", "{graph}");
     paths[aliasPath] = { ...paths[aliasPath], [method.toLowerCase()]: { ...operation, parameters } };
   }

@@ -5,6 +5,16 @@
     "path": "/api/v1/graphs/{graph-id}/block-properties/batch-delete"
   },
   {
+    "name": "batch_insert_block_trees",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-trees/batch"
+  },
+  {
+    "name": "batch_move_blocks",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/block-moves/batch"
+  },
+  {
     "name": "batch_set_block_property",
     "method": "POST",
     "path": "/api/v1/graphs/{graph-id}/block-properties/batch-set"
@@ -50,6 +60,11 @@
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
   },
   {
+    "name": "delete_blocks",
+    "method": "DELETE",
+    "path": "/api/v1/graphs/{graph-id}/blocks"
+  },
+  {
     "name": "delete_page",
     "method": "DELETE",
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
@@ -68,6 +83,11 @@
     "name": "get_block",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+  },
+  {
+    "name": "get_blocks",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/blocks"
   },
   {
     "name": "get_page",

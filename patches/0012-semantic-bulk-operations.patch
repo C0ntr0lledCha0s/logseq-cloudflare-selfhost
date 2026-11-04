@@ -1,0 +1,1398 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index d98166ef10..92f563ae0e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -340,13 +340,13 @@
+        (remove entity-util/hidden?)
+        (sort-by :block/order)))
+ 
+-(defn- page-outline [db page]
++(defn- page-outline [db page max-blocks]
+   (let [lines (transient [])
+         n (volatile! 0)
+         truncated? (volatile! false)]
+     (letfn [(walk [entity depth]
+               (doseq [block (outline-children db entity)]
+-                (if (>= @n max-outline-blocks)
++                (if (>= @n max-blocks)
+                   (vreset! truncated? true)
+                   (let [indent (apply str (repeat depth "  "))
+                         status (some-> (:logseq.property/status block) :block/title)
+@@ -492,28 +492,6 @@
+       (and (sequential? nodes) (seq nodes)
+            (every? #(valid-node? (:block/uuid target) %) nodes)))))
+ 
+-(defn- tree-block [conn e2ee? node]
+-  (let [id (if-let [value (:uuid node)] (uuid (string/lower-case value)) (random-uuid))]
+-    (if (d/entity @conn [:block/uuid id])
+-      {:block/uuid id}
+-      (assoc (prepare-block-title! conn e2ee? (:title node)) :block/uuid id))))
+-
+-(defn- insert-tree! [conn target nodes position e2ee?]
+-  (let [nodes (vec nodes)
+-        blocks (mapv #(tree-block conn e2ee? %) nodes)
+-        fresh (filterv #(nil? (d/entity @conn [:block/uuid (:block/uuid %)])) blocks)]
+-    (when (seq fresh)
+-      (outliner-core/insert-blocks! conn fresh target
+-                                   {:sibling? false :top? (= position "prepend")
+-                                     :bottom? (not= position "prepend") :keep-uuid? true}))
+-    (mapv (fn [node block]
+-            (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
+-                  children (when (seq (:children node))
+-                             (insert-tree! conn existing (:children node) "append" e2ee?))]
+-              (cond-> {:uuid (str (:block/uuid existing)) :title (:block/title existing)}
+-                (seq children) (assoc :children children))))
+-          nodes blocks)))
+-
+ (defn- today-journal-day []
+   (let [now (js/Date.)]
+     (+ (* (.getFullYear now) 10000) (* (inc (.getMonth now)) 100) (.getDate now))))
+@@ -642,6 +620,135 @@
+         (outliner-property/batch-set-property! conn [block-id] property-ident item {:entity-id? true})))
+     (outliner-property/set-block-property! conn block-id property-ident value)))
+ 
++;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
++;; property UUID, ident or title. They are resolved before anything is written.
++(defn- property-selector
++  "A `properties` object key as the client wrote it: JSON keys arrive keywordized."
++  [k]
++  (subs (str k) 1))
++
++(defn- prepare-properties
++  "Resolves a `properties` object to [[ident value] ...], or {:error reason} for the first key or
++  value that doesn't resolve."
++  [db properties e2ee?]
++  (if-not (and (map? properties) (seq properties))
++    {:error "properties must be a non-empty object"}
++    (reduce (fn [result [k value]]
++              (let [selector (property-selector k)
++                    property (some->> (resolve-property-ident db selector) (d/entity db))
++                    prepared (when (and (property? property) (some? value))
++                               (prepare-property-value db (:db/ident property) value e2ee?))]
++                (cond
++                  (not (property? property)) (reduced {:error (str "property not found: " selector)})
++                  (nil? value) (reduced {:error (str selector ": missing property value")})
++                  (:error prepared) (reduced {:error (str selector ": " (:error prepared))})
++                  :else (update result :properties conj [(:db/ident property) (:value prepared)]))))
++            {:properties []}
++            properties)))
++
++(defn- prepare-tree
++  "Resolves the properties of every node of identity-checked `nodes`, keeping them under
++  ::properties. Returns {:nodes nodes} or {:error reason} prefixed with the node's path."
++  [db nodes e2ee? path]
++  (reduce (fn [result [index node]]
++            (let [node-path (str path "[" index "]")
++                  properties (when (contains? node :properties)
++                               (prepare-properties db (:properties node) e2ee?))
++                  children (when (seq (:children node))
++                             (prepare-tree db (:children node) e2ee? (str node-path ".children")))]
++              (cond
++                (:error properties) (reduced {:error (str node-path ": " (:error properties))})
++                (:error children) (reduced children)
++                :else (update result :nodes conj
++                              (cond-> (dissoc node :properties)
++                                properties (assoc ::properties (:properties properties))
++                                children (assoc :children (:nodes children)))))))
++          {:nodes []}
++          (map-indexed vector nodes)))
++
++(defn- tree-block [conn e2ee? node]
++  (let [id (if-let [value (:uuid node)] (uuid (string/lower-case value)) (random-uuid))]
++    (if (d/entity @conn [:block/uuid id])
++      {:block/uuid id}
++      (assoc (prepare-block-title! conn e2ee? (:title node)) :block/uuid id))))
++
++(defn- insert-tree!
++  "Inserts prepared `nodes` under `target` and sets each new block's properties. A node whose uuid
++  already exists under its parent is reused as it is, title and properties included, so a retried
++  insert is safe."
++  [conn target nodes position e2ee?]
++  (let [nodes (vec nodes)
++        blocks (mapv #(tree-block conn e2ee? %) nodes)
++        fresh (filterv #(nil? (d/entity @conn [:block/uuid (:block/uuid %)])) blocks)
++        fresh-ids (set (map :block/uuid fresh))]
++    (when (seq fresh)
++      (outliner-core/insert-blocks! conn fresh target
++                                   {:sibling? false :top? (= position "prepend")
++                                     :bottom? (not= position "prepend") :keep-uuid? true}))
++    (mapv (fn [node block]
++            (when (contains? fresh-ids (:block/uuid block))
++              (doseq [[property-ident value] (::properties node)]
++                (set-prepared-property! conn (:db/id (d/entity @conn [:block/uuid (:block/uuid block)]))
++                                        property-ident value false)))
++            (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
++                  children (when (seq (:children node))
++                             (insert-tree! conn existing (:children node) "append" e2ee?))]
++              (cond-> {:uuid (str (:block/uuid existing)) :title (:block/title existing)}
++                (seq children) (assoc :children children))))
++          nodes blocks)))
++
++;; Write responses: `verbose=false` drops the titles a caller just sent, leaving the inserted tree's
++;; UUIDs (to address the blocks later) and a count.
++(defn- verbose-option [^js url]
++  (let [raw (.get (.-searchParams url) "verbose")]
++    (cond
++      (or (nil? raw) (= "true" raw)) true
++      (= "false" raw) false
++      :else ::invalid)))
++
++(defn- tree-count [nodes]
++  (reduce + (map #(inc (tree-count (:children %))) nodes)))
++
++(defn- tree-response [nodes verbose?]
++  (if verbose?
++    nodes
++    (mapv #(cond-> {:uuid (:uuid %)}
++             (:children %) (assoc :children (tree-response (:children %) false)))
++          nodes)))
++
++(defn- inserted-response [inserted verbose?]
++  {:blocks (tree-response inserted verbose?) :count (tree-count inserted)})
++
++(def ^:private max-batch-size 100)
++
++(defn- dry-run-option
++  "The body's dry-run flag: false when omitted, ::invalid when not a boolean."
++  [body]
++  (let [value (get body :dry-run false)]
++    (if (boolean? value) value ::invalid)))
++
++(defn- reject! [message]
++  (throw (ex-info message {::rejected message})))
++
++(defn- rejecting
++  "Calls `write`, answering 400 when it is rejected: by `reject!`, or by the outliner refusing a change
++  with a user-facing notification (such as editing a built-in node). Other errors propagate."
++  [write]
++  (try
++    (write)
++    (catch :default error
++      (let [data (ex-data error)]
++        (if-let [message (or (::rejected data)
++                             (when (= :notification (:type data)) (get-in data [:payload :message])))]
++          (http/bad-request message)
++          (throw error))))))
++
++(defn- dry-run-conn
++  "A throwaway copy of the graph: writes to it are validated as real ones are, but never stored."
++  [conn]
++  (doto (ldb/temp-conn-from-db @conn)
++    (swap! dissoc :skip-validate-db?)))
++
+ (defn- task-response [task]
+   (cond-> (block-response task)
+     (:logseq.property/status task)
+@@ -874,6 +981,16 @@
+                                                             (js/Response. nil #js {:status 204}))
+       :else (http/bad-request (str kind " cannot be deleted")))))
+ 
++(defn- atomic-write!
++  "Runs (mutate conn) as one authored transaction and returns its result: all of its changes land,
++  or none do. A dry run applies them to a throwaway copy of the graph instead."
++  [conn creator dry-run? outliner-op mutate]
++  (let [result (volatile! nil)]
++    (authored-write! (if dry-run? (dry-run-conn conn) conn) creator
++                     ldb/batch-transact-with-temp-conn! {:outliner-op outliner-op}
++                     (fn [temp-conn _] (vreset! result (mutate temp-conn))))
++    @result))
++
+ (defn- handle-pages [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+     :semantic/pages-list
+@@ -904,7 +1021,8 @@
+       (cond
+         (not (page? page)) (http/bad-request "block is not a page")
+         e2ee? (http/error-response "page outlines are unavailable for E2EE graphs" 409)
+-        :else (http/json-response nil (merge (block-detail-response db page) (page-outline db page))))
++        :else (http/json-response nil (merge (block-detail-response db page)
++                                             (page-outline db page max-outline-blocks))))
+       (http/not-found))
+ 
+     :semantic/pages-references
+@@ -954,7 +1072,27 @@
+     "first-child" [target {:sibling? false :top? true}]
+     "last-child" [target {:sibling? false :bottom? true}]))
+ 
+-(defn- handle-blocks [{:keys [^js self request conn db handler path-params e2ee? creator]}]
++(defn- insert-tree-response
++  "Inserts identity-checked `nodes` under `target` in one transaction: 400 for a property that
++  doesn't resolve, else 201 with the inserted tree. `extra` joins the response body."
++  ([context target nodes position]
++   (insert-tree-response context target nodes position {}))
++  ([{:keys [^js self ^js url conn db e2ee? creator]} target nodes position extra]
++   (let [verbose? (verbose-option url)
++         prepared (prepare-tree db nodes e2ee? "blocks")]
++     (cond
++       (= ::invalid verbose?) (http/bad-request "verbose must be true or false")
++       (:error prepared) (http/bad-request (:error prepared))
++       :else
++       (rejecting
++        #(let [inserted (atomic-write! conn creator false :insert-blocks
++                                       (fn [tx-conn]
++                                         (insert-tree! tx-conn (d/entity @tx-conn (:db/id target))
++                                                       (:nodes prepared) position e2ee?)))]
++           (broadcast-change! self)
++           (http/json-response nil (merge extra (inserted-response inserted verbose?)) 201)))))))
++
++(defn- handle-blocks [{:keys [^js self request conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+     :semantic/blocks-get
+@@ -1013,18 +1151,14 @@
+       (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
+               (not (valid-tree-identities? db target (:blocks body))))
+         (http/bad-request "invalid target, position, or blocks")
+-        (let [inserted (authored-write! conn creator insert-tree! target (:blocks body) (:position body) e2ee?)]
+-          (broadcast-change! self)
+-          (http/json-response nil {:blocks inserted} 201))))
++        (insert-tree-response context target (:blocks body) (:position body))))
+ 
+     :semantic/blocks-insert-tree
+     (p/let [body (body-clj request)
+             target (find-entity db (:target-id body))]
+       (if (or (nil? target) (not (valid-tree-identities? db target (:blocks body))))
+         (http/bad-request "invalid target or blocks")
+-        (let [inserted (authored-write! conn creator insert-tree! target (:blocks body) (or (:position body) "append") e2ee?)]
+-          (broadcast-change! self)
+-          (http/json-response nil {:blocks inserted} 201))))))
++        (insert-tree-response context target (:blocks body) (or (:position body) "append"))))))
+ 
+ (defn- batch-entries-error
+   "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
+@@ -1114,9 +1248,8 @@
+         (let [today (authored-write! conn creator ensure-today-page!)]
+           (if-not (valid-tree-identities? @conn today (:blocks body))
+             (http/bad-request "invalid capture block identities")
+-            (let [inserted (authored-write! conn creator insert-tree! today (:blocks body) "append" e2ee?)]
+-              (broadcast-change! self)
+-              (http/json-response nil {:page-id (str (:block/uuid today)) :blocks inserted} 201))))))
++            (insert-tree-response (assoc context :db @conn) today (:blocks body) "append"
++                                  {:page-id (str (:block/uuid today))})))))
+ 
+     :semantic/tags-list
+     (paginated-response url :tags (entities-by-avet db :block/tags :logseq.class/Tag) tag-response)
+@@ -1367,6 +1500,255 @@
+                                   search-result-response
+                                   (partial paginate-bounded (partial search-sort-key needle)))))))
+ 
++;; Bulk operations. Each is one request, so one rate-limited write, and applies every change it
++;; was given or none: all inputs are checked first, then the work runs as one transaction. Writes
++;; take `dry-run`, which runs the same work on a throwaway copy of the graph and reports it.
++
++(defn- parse-ids [raw]
++  (when (non-blank-string? raw)
++    (let [ids (mapv string/trim (string/split raw #","))]
++      (when (every? common-util/uuid-string? ids) ids))))
++
++(defn- bulk-read-response [db ids view]
++  (let [entities (map #(find-visible-entity db %) ids)
++        found (remove nil? entities)
++        blocks (if (= "outline" view)
++                 ;; One outline budget for the whole response, as for a single page.
++                 (:blocks (reduce (fn [{:keys [budget] :as result} entity]
++                                    (let [outline (page-outline db entity budget)]
++                                      (-> result
++                                          (update :budget - (:block-count outline))
++                                          (update :blocks conj (merge (block-detail-response db entity) outline)))))
++                                  {:budget max-outline-blocks :blocks []}
++                                  found))
++                 (mapv #(block-detail-response db %) found))]
++    {:blocks blocks
++     :missing (vec (keep (fn [[id entity]] (when (nil? entity) id)) (map vector ids entities)))}))
++
++(def ^:private delete-elsewhere
++  {"page" "is a page; delete pages with deletePage"
++   "tag" "is a tag; delete tags with deleteTag"
++   "property" "is a property; delete properties with deleteProperty"})
++
++(defn- delete-blocks-error [block-ids blocks]
++  (if-not (and (sequential? block-ids) (<= 1 (count block-ids) max-batch-size))
++    (str "block-ids must be an array of 1 to " max-batch-size " UUIDs")
++    (some (fn [[index block]]
++            (when-let [reason (cond
++                                (nil? block) "block not found"
++                                (delete-elsewhere (block-kind block)) (delete-elsewhere (block-kind block))
++                                (some #(= (:db/id block) (:db/id %)) (take index blocks)) "duplicate")]
++              (str "block-ids[" index "]: " reason)))
++          (map-indexed vector blocks))))
++
++(def ^:private move-positions #{"before" "after" "first-child" "last-child"})
++
++(defn- move-error
++  "Why one batch move entry is invalid, given the blocks earlier entries already move; nil when valid."
++  [{:keys [blocks target position]} moved]
++  (or (some (fn [[index block]]
++              (cond
++                (nil? block) (str "block-ids[" index "]: block not found")
++                (contains? moved (:db/id block)) (str "block-ids[" index "] is already moved by an earlier move")
++                (some #(= (:db/id block) (:db/id %)) (take index blocks)) (str "block-ids[" index "] is listed twice")))
++            (map-indexed vector blocks))
++      (cond
++        (nil? target) "target not found"
++        (not (contains? move-positions position)) "position must be before, after, first-child or last-child"
++        (some #(= (:db/id target) (:db/id %)) blocks) "a block cannot move relative to itself"
++        (and (contains? #{"before" "after"} position) (nil? (:block/parent target)))
++        "before and after need a block target, not a page")))
++
++(defn- resolve-moves
++  "Batch move entries as {:moves [{:blocks :target :position}]}, or {:error reason}."
++  [db moves]
++  (if-not (and (sequential? moves) (<= 1 (count moves) max-batch-size))
++    {:error (str "moves must be an array of 1 to " max-batch-size " moves")}
++    (reduce (fn [{:keys [moved] :as result} [index entry]]
++              (let [block-ids (when (map? entry) (:block-ids entry))
++                    move (when (and (sequential? block-ids) (seq block-ids))
++                           {:blocks (mapv #(find-entity db %) block-ids)
++                            :target (find-entity db (:target-id entry))
++                            :position (:position entry)})]
++                (if-let [error (if move (move-error move moved) "block-ids must be a non-empty array")]
++                  (reduced {:error (str "moves[" index "]: " error)})
++                  (-> result
++                      (update :moves conj move)
++                      (update :moved into (map :db/id (:blocks move)))))))
++            {:moves [] :moved #{}}
++            (map-indexed vector moves))))
++
++(defn- move-all!
++  "Applies resolved moves in order, each against the graph as the moves before it left it."
++  [conn moves]
++  (doseq [[index {:keys [blocks target position]}] (map-indexed vector moves)]
++    (let [db @conn
++          blocks (mapv #(d/entity db (:db/id %)) blocks)
++          target (d/entity db (:db/id target))
++          moving (set (map :db/id blocks))
++          inside-moving? (fn [entity] (some moving (map :db/id (ldb/get-block-parents db (:block/uuid entity)))))
++          prefix (str "moves[" index "]: ")]
++      (when-let [nested (first (keep-indexed (fn [j block] (when (inside-moving? block) j)) blocks))]
++        (reject! (str prefix "block-ids[" nested "] is inside another block of this move; move the outer block alone")))
++      (when (inside-moving? target)
++        (reject! (str prefix "a block cannot move into its own children")))
++      (let [[target' opts] (move-destination blocks target position)
++            parent-id (if (contains? #{"before" "after"} position)
++                        (:db/id (:block/parent target))
++                        (:db/id target))]
++        (outliner-core/move-blocks! conn blocks target' opts)
++        ;; The outliner skips moves it refuses (a page under a block, a target it can't take)
++        ;; without an error, so check that every block arrived.
++        (when-not (every? #(= parent-id (:db/id (:block/parent (d/entity @conn (:db/id %))))) blocks)
++          (reject! (str prefix "the blocks could not be placed there")))))))
++
++(defn- tree-uuids [nodes]
++  (mapcat (fn [node]
++            (cond->> (tree-uuids (:children node))
++              (string? (:uuid node)) (cons (string/lower-case (:uuid node)))))
++          nodes))
++
++(defn- insert-entry
++  "One batch insert entry resolved against `db`: {:entry resolved} or {:error reason}."
++  [db e2ee? index entry]
++  (let [prefix (str "entries[" index "]")
++        target (when (contains? entry :target-id) (find-entity db (:target-id entry)))
++        page (:page entry)
++        existing-page (when (and (non-blank-string? page) (not e2ee?)) (ldb/get-page db page))
++        properties (when (contains? entry :properties) (prepare-properties db (:properties entry) e2ee?))
++        error (cond
++                (and (contains? entry :target-id) (contains? entry :page)) "give target-id or page, not both"
++                (contains? entry :target-id) (when (nil? target) "target not found")
++                (not (contains? entry :page)) "give target-id or page"
++                (not (non-blank-string? page)) "page must be a non-blank title"
++                e2ee? "page titles are unavailable for E2EE graphs; create the page and pass target-id"
++                (and existing-page (not (page? existing-page)))
++                (str page " is a " (block-kind existing-page) ", not a page"))
++        error (or error
++                  (cond
++                    (not (contains? #{nil "append" "prepend"} (:position entry)))
++                    "position must be append or prepend"
++                    (not (or (contains? entry :blocks) (contains? entry :properties)))
++                    "give blocks, properties or both"
++                    (and (contains? entry :blocks)
++                         (not (valid-tree-identities? db (or target existing-page) (:blocks entry))))
++                    "invalid blocks"
++                    (:error properties) (:error properties)))
++        tree (when (and (nil? error) (contains? entry :blocks))
++               (prepare-tree db (:blocks entry) e2ee? (str prefix ".blocks")))]
++    (cond
++      error {:error (str prefix ": " error)}
++      (:error tree) tree
++      :else {:entry {:target target
++                     :page page
++                     :position (or (:position entry) "append")
++                     :properties (:properties properties)
++                     :nodes (:nodes tree)}})))
++
++(defn- resolve-insert-entries
++  "Batch insert entries as {:entries [...]}, or {:error reason}. A block uuid may appear only once
++  in the whole batch."
++  [db e2ee? entries]
++  (if-not (and (sequential? entries) (<= 1 (count entries) max-batch-size))
++    {:error (str "entries must be an array of 1 to " max-batch-size " entries")}
++    (reduce (fn [{:keys [uuids] :as result} [index entry]]
++              (let [{:keys [error] :as resolved} (if (map? entry)
++                                                   (insert-entry db e2ee? index entry)
++                                                   {:error (str "entries[" index "]: must be an object")})
++                    entry-uuids (tree-uuids (:blocks entry))]
++                (cond
++                  error (reduced {:error error})
++                  (some uuids entry-uuids)
++                  (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
++                  :else (-> result
++                            (update :entries conj (:entry resolved))
++                            (update :uuids into entry-uuids)))))
++            {:entries [] :uuids #{}}
++            (map-indexed vector entries))))
++
++(defn- insert-entries!
++  "Applies resolved insert entries in order. A `page` entry uses the page with that name, or creates it."
++  [conn e2ee? entries]
++  (mapv (fn [{:keys [target page position properties nodes]}]
++          (let [existing (if target (d/entity @conn (:db/id target)) (ldb/get-page @conn page))
++                target-id (:db/id (or existing
++                                      (let [[_ page-uuid] (outliner-page/create! conn page {})]
++                                        (d/entity @conn [:block/uuid page-uuid]))))]
++            (doseq [[property-ident value] properties]
++              (set-prepared-property! conn target-id property-ident value false))
++            (cond-> {:target-id (str (:block/uuid (d/entity @conn target-id)))
++                     :blocks (if (seq nodes)
++                               (insert-tree! conn (d/entity @conn target-id) nodes position e2ee?)
++                               [])}
++              (nil? existing) (assoc :created true))))
++        entries))
++
++(defn- bulk-write-response
++  "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
++  [body dry-run? status]
++  (if dry-run?
++    (http/json-response nil (assoc body :dry-run true))
++    (http/json-response nil body status)))
++
++(defn- handle-bulk [{:keys [^js self request ^js url conn db handler e2ee? creator]}]
++  (case handler
++    :semantic/blocks-get-many
++    (let [ids (parse-ids (.get (.-searchParams url) "ids"))
++          view (or (.get (.-searchParams url) "view") "summary")]
++      (cond
++        (nil? ids) (http/bad-request "ids must be a comma-separated list of UUIDs")
++        (> (count ids) max-batch-size) (http/bad-request (str "at most " max-batch-size " ids"))
++        (not (apply distinct? (map string/lower-case ids))) (http/bad-request "duplicate id")
++        (not (contains? #{"summary" "outline"} view)) (http/bad-request "view must be summary or outline")
++        (and e2ee? (= "outline" view)) (http/error-response "outlines are unavailable for E2EE graphs" 409)
++        :else (http/json-response nil (bulk-read-response db ids view))))
++
++    :semantic/blocks-delete-many
++    (p/let [body (body-clj request)]
++      (let [block-ids (:block-ids body)
++            blocks (when (sequential? block-ids) (mapv #(find-entity db %) block-ids))
++            dry-run? (dry-run-option body)]
++        (if-let [error (or (delete-blocks-error block-ids blocks)
++                           (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
++          (http/bad-request error)
++          (rejecting
++           #(let [removed (into #{} (mapcat (fn [block]
++                                              (cons (:db/id block) (ldb/get-block-full-children-ids db (:db/id block)))))
++                                blocks)]
++              (atomic-write! conn creator dry-run? :delete-blocks
++                             (fn [tx-conn]
++                               (outliner-core/delete-blocks! tx-conn (mapv (fn [block] (d/entity @tx-conn (:db/id block))) blocks) {})))
++              (when-not dry-run? (broadcast-change! self))
++              (bulk-write-response {:deleted (count blocks) :total-removed (count removed)} dry-run? 200))))))
++
++    :semantic/blocks-batch-move
++    (p/let [body (body-clj request)]
++      (let [{:keys [moves error]} (resolve-moves db (:moves body))
++            dry-run? (dry-run-option body)]
++        (if-let [error (or error (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
++          (http/bad-request error)
++          (rejecting
++           #(do (atomic-write! conn creator dry-run? :move-blocks (fn [tx-conn] (move-all! tx-conn moves)))
++                (when-not dry-run? (broadcast-change! self))
++                (bulk-write-response {:moved (reduce + (map (comp count :blocks) moves))} dry-run? 200))))))
++
++    :semantic/blocks-batch-insert-tree
++    (p/let [body (body-clj request)]
++      (let [{:keys [entries error]} (resolve-insert-entries db e2ee? (:entries body))
++            dry-run? (dry-run-option body)
++            verbose? (verbose-option url)]
++        (if-let [error (or error
++                           (when (= ::invalid dry-run?) "dry-run must be a boolean")
++                           (when (= ::invalid verbose?) "verbose must be true or false"))]
++          (http/bad-request error)
++          (rejecting
++           #(let [inserted (atomic-write! conn creator dry-run? :insert-blocks
++                                          (fn [tx-conn] (insert-entries! tx-conn e2ee? entries)))]
++              (when-not dry-run? (broadcast-change! self))
++              (bulk-write-response {:entries (mapv (fn [entry] (update entry :blocks tree-response verbose?)) inserted)
++                                    :count (reduce + (map (comp tree-count :blocks) inserted))}
++                                   dry-run? 201))))))))
++
+ (def ^:private page-handlers
+   #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
+     :semantic/pages-references :semantic/pages-get
+@@ -1390,6 +1772,10 @@
+ (def ^:private asset-handlers
+   #{:semantic/assets-list :semantic/assets-create :semantic/assets-get})
+ 
++(def ^:private bulk-handlers
++  #{:semantic/blocks-get-many :semantic/blocks-delete-many :semantic/blocks-batch-move
++    :semantic/blocks-batch-insert-tree})
++
+ (def ^:private property-and-search-handlers
+   #{:semantic/properties-list :semantic/properties-create :semantic/properties-get
+     :semantic/properties-update :semantic/properties-delete
+@@ -1406,7 +1792,8 @@
+   #{:semantic/blocks-insert-children :semantic/blocks-insert-tree :semantic/capture})
+ 
+ (def ^:private e2ee-gated-write-handlers
+-  (into e2ee-title-handlers (conj e2ee-tree-handlers :semantic/assets-create)))
++  (into e2ee-title-handlers (conj e2ee-tree-handlers :semantic/assets-create
++                                  :semantic/blocks-batch-insert-tree)))
+ 
+ (def ^:private e2ee-name-handlers
+   #{:semantic/pages-create :semantic/pages-update :semantic/tags-create :semantic/tags-update
+@@ -1433,7 +1820,9 @@
+                                 (:block/name (find-entity db (:block-id path-params))))))
+               [(:name body)])
+             (when (contains? e2ee-tree-handlers handler)
+-              (block-trees-titles (:blocks body))))))))
++              (block-trees-titles (:blocks body)))
++            (when (and (= handler :semantic/blocks-batch-insert-tree) (sequential? (:entries body)))
++              (mapcat #(block-trees-titles (:blocks %)) (filter map? (:entries body)))))))))
+ 
+ (defn- <e2ee-write-response [context handler]
+   (p/let [titles (<e2ee-write-titles context handler)]
+@@ -1450,6 +1839,7 @@
+     (contains? task-handlers handler) (handle-tasks context)
+     (contains? asset-handlers handler) (handle-assets context)
+     (contains? property-and-search-handlers handler) (handle-properties-and-search context)
++    (contains? bulk-handlers handler) (handle-bulk context)
+     :else (http/not-found)))
+ 
+ (defn handle [{:keys [^js self route ^js url] :as context}]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 2e278cf3f9..8503a71785 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -22,6 +22,10 @@
+     :handler :semantic/pages-get :operation-id "getPage" :scope "logseq/read" :rate-class :read}
+    {:method "PATCH" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
+     :handler :semantic/pages-update :operation-id "updatePage" :scope "logseq/write" :rate-class :write}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
++    :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
++   {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
++    :handler :semantic/blocks-delete-many :operation-id "deleteBlocks" :scope "logseq/write" :rate-class :write}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
+     :handler :semantic/blocks-get :operation-id "getBlock" :scope "logseq/read" :rate-class :read}
+    {:method "PATCH" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
+@@ -30,10 +34,14 @@
+     :handler :semantic/blocks-delete :operation-id "deleteBlock" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/block-moves" :internal-path "/semantic/block-moves"
+     :handler :semantic/blocks-move :operation-id "moveBlocks" :scope "logseq/write" :rate-class :write}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/block-moves/batch" :internal-path "/semantic/block-moves/batch"
++    :handler :semantic/blocks-batch-move :operation-id "batchMoveBlocks" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/blocks/:block-id/children" :internal-path "/semantic/blocks/:block-id/children"
+     :handler :semantic/blocks-insert-children :operation-id "insertBlockChildren" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/block-trees" :internal-path "/semantic/block-trees"
+     :handler :semantic/blocks-insert-tree :operation-id "insertBlockTree" :scope "logseq/write" :rate-class :write}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/block-trees/batch" :internal-path "/semantic/block-trees/batch"
++    :handler :semantic/blocks-batch-insert-tree :operation-id "batchInsertBlockTrees" :scope "logseq/write" :rate-class :write}
+    {:method "PUT" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
+     :handler :semantic/blocks-set-property :operation-id "setBlockProperty" :scope "logseq/write" :rate-class :write}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
+@@ -95,17 +103,21 @@
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
++   "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and user and library property values but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
++   "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
++   "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it."]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and user and library property values, without loading an unbounded tree."]
+    "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID."]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+-   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block."]
+-   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block."]
++   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction."]
++   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction."]
+    "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title."]
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+    "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax."]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
+-   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees to its end."]
++   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end."]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+@@ -211,6 +223,10 @@
+   {:type "string"
+    :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
+ 
++(def ^:private dry-run-schema
++  {:type "boolean" :default false
++   :description "Check the request and apply it to a throwaway copy of the graph, reporting the result without changing the graph."})
++
+ (defn- request-schema [operation-id]
+   (case operation-id
+     "createPage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+@@ -221,6 +237,30 @@
+                                            :items {:type "string"}}
+                                :target-id {:type "string"}
+                                :position {:enum ["before" "after" "first-child" "last-child"]}}}
++    "batchMoveBlocks" {:required ["moves"]
++                       :properties {:moves {:type "array" :minItems 1 :maxItems 100
++                                            :items {:type "object" :required ["block-ids" "target-id" "position"]
++                                                    :properties {:block-ids {:type "array" :minItems 1 :uniqueItems true
++                                                                             :items {:type "string"}}
++                                                                 :target-id {:type "string"}
++                                                                 :position {:enum ["before" "after" "first-child" "last-child"]}}}}
++                                    :dry-run dry-run-schema}}
++    "deleteBlocks" {:required ["block-ids"]
++                    :properties {:block-ids {:type "array" :minItems 1 :maxItems 100 :uniqueItems true
++                                             :items {:type "string"}}
++                                 :dry-run dry-run-schema}}
++    "batchInsertBlockTrees"
++    {:required ["entries"]
++     :properties {:entries {:type "array" :minItems 1 :maxItems 100
++                            :items {:type "object"
++                                    :properties {:target-id {:type "string"
++                                                             :description "An existing block or page UUID. Give this or page."}
++                                                 :page {:type "string"
++                                                        :description "A page title: the page with that name, created when there is none. Give this or target-id. Unavailable for E2EE graphs."}
++                                                 :position {:enum ["append" "prepend"] :default "append"}
++                                                 :properties {:$ref "#/components/schemas/PropertyValues"}
++                                                 :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}}
++                  :dry-run dry-run-schema}}
+     "insertBlockChildren" {:required ["position" "blocks"]
+                            :properties {:position {:enum ["append" "prepend"]}
+                                         :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+@@ -294,6 +334,14 @@
+     (into [{:name "q" :in "query" :required true :schema {:type "string"}}
+            {:name "types" :in "query" :schema {:type "string"}
+             :description "Comma-separated result types to include: pages, blocks, tags, properties, assets. Defaults to all; any other value is rejected."}])
++    (= "getBlocks" operation-id)
++    (into [{:name "ids" :in "query" :required true :schema {:type "string"}
++            :description "Comma-separated block or page UUIDs, at most 100."}
++           {:name "view" :in "query" :schema {:enum ["summary" "outline"] :default "summary"}
++            :description "summary: title, tags and properties. outline: also each entity's descendants as a markdown outline."}])
++    (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees"} operation-id)
++    (into [{:name "verbose" :in "query" :schema {:type "boolean" :default true}
++            :description "false returns only the inserted blocks' UUIDs, nested as inserted, and a count, without echoing their titles."}])
+     (= "listTasks" operation-id)
+     (into [{:name "status" :in "query" :schema {:$ref "#/components/schemas/TaskStatusSelector"}}
+            {:name "priority" :in "query" :schema {:$ref "#/components/schemas/TaskPrioritySelector"}}
+@@ -340,6 +388,9 @@
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+                   "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
++                  "getBlocks" (entity-response "BlocksResponse" "The blocks found, in request order, and the UUIDs not found")
++                  "deleteBlocks" (entity-response "DeleteBlocksResponse" "How many blocks were deleted")
++                  "batchMoveBlocks" (entity-response "MoveBlocksResponse" "How many blocks were moved")
+                   "updateBlock" (entity-response "BlockResponse" "The updated block")
+                   "getTag" (entity-response "TagResponse" "A tag")
+                   "updateTag" (entity-response "TagResponse" "The updated tag")
+@@ -355,8 +406,11 @@
+          (case operation-id
+            "createPage" {"201" (entity-response "PageResponse" "The created page")
+                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+-           "insertBlockChildren" {"201" {:description "The inserted block trees"}}
+-           "insertBlockTree" {"201" {:description "The inserted block trees"}}
++           "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
++           "insertBlockTree" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
++           "captureToToday" {"201" (entity-response "InsertedBlocksResponse" "Today's journal page and the inserted block trees")}
++           "batchInsertBlockTrees"
++           {"201" (entity-response "BatchInsertResponse" "Each entry's target and inserted block trees")}
+            "createTag" {"201" (entity-response "TagResponse" "The created tag")
+                         "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+            ("deletePage" "deleteTag" "deleteProperty")
+@@ -397,99 +451,136 @@
+                            {:type "object" :required ["error"]
+                             :properties {:error {:type "string"}}}]}))
+ 
++(def ^:private bulk-schemas
++  "Schemas of block tree properties and of the bulk and insert operations' responses."
++  (ordered-map
++   :PropertyValues {:type "object"
++                    :description "Property values to set on the new block or target, keyed by property UUID, ident or exact title, e.g. {\"Tags\": [\"Person\"], \"Description\": \"text\"}. Values take the same forms as in setBlockProperty; many-valued properties add to the block's values. A block reused by its uuid keeps its properties."
++                    :additionalProperties {:$ref "#/components/schemas/PropertyValue"}}
++   :InsertedBlock {:type "object" :required ["uuid"]
++                   :properties {:uuid {:type "string"}
++                                :title {:type "string" :description "Omitted when verbose is false."}
++                                :children {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}
++   :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
++                            :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}
++                                         :count {:type "integer" :description "Blocks inserted or reused, nested ones included."}
++                                         :page-id {:type "string" :description "captureToToday only: today's journal page."}}}
++   :BatchInsertResponse {:type "object" :required ["entries" "count"]
++                         :properties {:entries {:type "array"
++                                                :items {:type "object" :required ["target-id" "blocks"]
++                                                        :properties {:target-id {:type "string"}
++                                                                     :created {:type "boolean" :description "Present and true when the entry created its page."}
++                                                                     :blocks {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}}
++                                      :count {:type "integer"}
++                                      :dry-run {:type "boolean"}}}
++   :BlocksResponse {:type "object" :required ["blocks" "missing"]
++                    :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockDetailResponse"}}
++                                 :missing {:type "array" :items {:type "string"}}}}
++   :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
++                          :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
++                                       :total-removed {:type "integer" :description "Those blocks and all their descendants."}
++                                       :dry-run {:type "boolean"}}}
++   :MoveBlocksResponse {:type "object" :required ["moved"]
++                        :properties {:moved {:type "integer"}
++                                     :dry-run {:type "boolean"}}}))
++
+ (defn openapi-document [issuer]
+   {:openapi "3.1.0"
+    :info {:title "Logseq Server API" :version "1.0.0"}
+    :servers [{:url "/"}]
+    :components
+-   {:schemas (into (ordered-map
+-              :BlockTree {:type "object" :required ["title"]
+-                          :properties {:uuid {:type "string" :format "uuid"
+-                                              :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
+-                                       :title {:type "string"}
+-                                       :children {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+-              :BlockResponse {:type "object" :required ["uuid" "kind" "title"]
+-                              :properties {:uuid {:type "string"}
+-                                           :kind {:type "string"}
+-                                           :title {:type "string"}
+-                                           :order {:type "string"}
+-                                           :parent-id {:type "string"}
+-                                           :page-id {:type "string"}
+-                                           :children {:type "array"
+-                                                      :items {:$ref "#/components/schemas/BlockResponse"}}}}
+-              :EntityProperty {:type "object" :required ["ident" "value"]
+-                               :properties {:ident {:type "string"}
++   {:schemas (into
++             (into
++              (ordered-map
++               :BlockTree {:type "object" :required ["title"]
++                           :properties {:uuid {:type "string" :format "uuid"
++                                               :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
++                                        :title {:type "string"}
++                                        :properties {:$ref "#/components/schemas/PropertyValues"}
++                                        :children {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
++               :BlockResponse {:type "object" :required ["uuid" "kind" "title"]
++                               :properties {:uuid {:type "string"}
++                                            :kind {:type "string"}
+                                             :title {:type "string"}
+-                                            :type {:type "string"}
+-                                            :value {:description "A scalar, a {uuid, title, ident?} reference, or an array of them for many-valued properties"}}}
+-              :BlockDetailResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
+-                                            {:type "object"
+-                                             :properties {:tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
+-                                                          :properties {:type "array"
+-                                                                       :description "User and library property values. Built-in logseq.* properties are omitted."
+-                                                                       :items {:$ref "#/components/schemas/EntityProperty"}}}}]}
+-              :PageResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}]}
+-              :PageDetailResponse {:allOf [{:$ref "#/components/schemas/BlockDetailResponse"}]}
+-              :PageOutlineResponse {:allOf [{:$ref "#/components/schemas/PageDetailResponse"}
+-                                            {:type "object" :required ["markdown" "block-count" "truncated"]
+-                                             :properties {:markdown {:type "string"}
+-                                                          :block-count {:type "integer"}
+-                                                          :truncated {:type "boolean"}}}]}
+-              :TagResponse {:type "object" :required ["uuid" "title"]
+-                            :properties {:uuid {:type "string"}
+-                                         :title {:type "string"}
+-                                         :ident {:type "string"}}}
+-              :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
+-                                     :properties {:uuid {:type "string"}
+-                                                  :title {:type "string"}
+-                                                  :resource {:enum ["pages" "blocks" "tags" "properties" "assets"]}}}
+-              :EntitySelector {:type "string"
+-                               :description "An existing entity UUID, qualified ident, or exact title."}
+-              :TaskStatusSelector
+-              {:description "A built-in status alias or any user-extensible Status property choice selected by UUID, ident, or exact title."
+-               :anyOf [{:type "string" :enum ["todo" "doing" "in-review" "done" "canceled" "backlog"]}
+-                       {:$ref "#/components/schemas/EntitySelector"}]}
+-              :TaskPrioritySelector
+-              {:description "A built-in priority alias or any user-extensible Priority property choice selected by UUID, ident, or exact title."
+-               :anyOf [{:type "string" :enum ["low" "medium" "high" "urgent"]}
+-                       {:$ref "#/components/schemas/EntitySelector"}]}
+-              :PropertyChoice {:type "object" :required ["uuid" "title"]
++                                            :order {:type "string"}
++                                            :parent-id {:type "string"}
++                                            :page-id {:type "string"}
++                                            :children {:type "array"
++                                                       :items {:$ref "#/components/schemas/BlockResponse"}}}}
++               :EntityProperty {:type "object" :required ["ident" "value"]
++                                :properties {:ident {:type "string"}
++                                             :title {:type "string"}
++                                             :type {:type "string"}
++                                             :value {:description "A scalar, a {uuid, title, ident?} reference, or an array of them for many-valued properties"}}}
++               :BlockDetailResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
++                                             {:type "object"
++                                              :properties {:tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
++                                                           :properties {:type "array"
++                                                                        :description "User and library property values. Built-in logseq.* properties are omitted."
++                                                                        :items {:$ref "#/components/schemas/EntityProperty"}}}}]}
++               :PageResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}]}
++               :PageDetailResponse {:allOf [{:$ref "#/components/schemas/BlockDetailResponse"}]}
++               :PageOutlineResponse {:allOf [{:$ref "#/components/schemas/PageDetailResponse"}
++                                             {:type "object" :required ["markdown" "block-count" "truncated"]
++                                              :properties {:markdown {:type "string"}
++                                                           :block-count {:type "integer"}
++                                                           :truncated {:type "boolean"}}}]}
++               :TagResponse {:type "object" :required ["uuid" "title"]
++                             :properties {:uuid {:type "string"}
++                                          :title {:type "string"}
++                                          :ident {:type "string"}}}
++               :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
++                                      :properties {:uuid {:type "string"}
++                                                   :title {:type "string"}
++                                                   :resource {:enum ["pages" "blocks" "tags" "properties" "assets"]}}}
++               :EntitySelector {:type "string"
++                                :description "An existing entity UUID, qualified ident, or exact title."}
++               :TaskStatusSelector
++               {:description "A built-in status alias or any user-extensible Status property choice selected by UUID, ident, or exact title."
++                :anyOf [{:type "string" :enum ["todo" "doing" "in-review" "done" "canceled" "backlog"]}
++                        {:$ref "#/components/schemas/EntitySelector"}]}
++               :TaskPrioritySelector
++               {:description "A built-in priority alias or any user-extensible Priority property choice selected by UUID, ident, or exact title."
++                :anyOf [{:type "string" :enum ["low" "medium" "high" "urgent"]}
++                        {:$ref "#/components/schemas/EntitySelector"}]}
++               :PropertyChoice {:type "object" :required ["uuid" "title"]
++                                :properties {:uuid {:type "string"}
++                                             :ident {:type "string"}
++                                             :title {:type "string"}
++                                             :value {}}}
++               :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
++                                  :properties {:uuid {:type "string"}
++                                               :ident {:type "string"}
++                                               :title {:type "string"}
++                                               :type {:type "string"}
++                                               :cardinality {:type "string"}
++                                               :choices {:type "array"
++                                                         :description "The current user-extensible choices for this property."
++                                                         :items {:$ref "#/components/schemas/PropertyChoice"}}}}
++               :PropertyType {:type "string"
++                              :enum ["default" "number" "date" "datetime" "checkbox" "url" "node" "asset"
++                                     "map" "json" "string"]}
++               :AssetResponse {:type "object" :required ["uuid" "title" "type" "size" "checksum"]
+                                :properties {:uuid {:type "string"}
+-                                            :ident {:type "string"}
+                                             :title {:type "string"}
+-                                            :value {}}}
+-              :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
+-                                 :properties {:uuid {:type "string"}
+-                                              :ident {:type "string"}
+-                                              :title {:type "string"}
+-                                              :type {:type "string"}
+-                                              :cardinality {:type "string"}
+-                                              :choices {:type "array"
+-                                                        :description "The current user-extensible choices for this property."
+-                                                        :items {:$ref "#/components/schemas/PropertyChoice"}}}}
+-              :PropertyType {:type "string"
+-                             :enum ["default" "number" "date" "datetime" "checkbox" "url" "node" "asset"
+-                                    "map" "json" "string"]}
+-              :AssetResponse {:type "object" :required ["uuid" "title" "type" "size" "checksum"]
+-                              :properties {:uuid {:type "string"}
+-                                           :title {:type "string"}
+-                                           :type {:type "string"}
+-                                           :size {:type "integer" :minimum 0 :maximum 104857600}
+-                                           :checksum {:type "string" :pattern "^[0-9a-f]{64}$"}
+-                                           :url {:type "string" :format "uri"}
+-                                           :expires-at {:type "integer"}}}
+-              :TaskResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
+-                                     {:type "object"
+-                                      :required ["status"]
+-                                      :properties {:status {:$ref "#/components/schemas/PropertyChoice"}
+-                                                   :priority {:$ref "#/components/schemas/PropertyChoice"}
+-                                                   :scheduled {:type "integer"}
+-                                                   :deadline {:type "integer"}}}]}
+-              :PropertyValue
+-              {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
+-               :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
+-                       {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
++                                            :type {:type "string"}
++                                            :size {:type "integer" :minimum 0 :maximum 104857600}
++                                            :checksum {:type "string" :pattern "^[0-9a-f]{64}$"}
++                                            :url {:type "string" :format "uri"}
++                                            :expires-at {:type "integer"}}}
++               :TaskResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
++                                      {:type "object"
++                                       :required ["status"]
++                                       :properties {:status {:$ref "#/components/schemas/PropertyChoice"}
++                                                    :priority {:$ref "#/components/schemas/PropertyChoice"}
++                                                    :scheduled {:type "integer"}
++                                                    :deadline {:type "integer"}}}]}
++               :PropertyValue
++               {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
++                :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
++                        {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
+               write-guard-schemas)
++             bulk-schemas)
+     :securitySchemes
+     {:oauth {:type "oauth2"
+              :flows {:authorizationCode
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+new file mode 100644
+index 0000000000..9eb913f2e3
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+@@ -0,0 +1,453 @@
++(ns logseq.db-sync.semantic-bulk-test
++  "Bulk reads, deletes, moves and inserts in the semantic API: each runs as one request (one
++  rate-limited write) and applies all of its changes or none."
++  (:require [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.common :as common]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.auth :as auth]
++            [logseq.db-sync.worker.dispatch :as dispatch]
++            [logseq.db-sync.worker.handler.index :as index-handler]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- with-graph
++  "A DB graph with a page `Bulk`, an `Organization` tag and a `Blurb` text property."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              page-id (random-uuid)
++              org-id (random-uuid)
++              _ (d/transact! conn [{:block/uuid page-id :block/name "bulk" :block/title "Bulk"
++                                    :block/tags :logseq.class/Page
++                                    :block/created-at 1 :block/updated-at 1}
++                                   {:db/ident :user.class/Organization :block/uuid org-id
++                                    :block/name "organization" :block/title "Organization"
++                                    :block/tags :logseq.class/Tag}])
++              description (outliner-property/upsert-property!
++                           conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                           {:property-name "Blurb"})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self :page-id page-id :org-id org-id :description description}))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- entity [conn id]
++  (d/entity @conn [:block/uuid (if (string? id) (uuid id) id)]))
++
++(defn- tag-ids [conn id]
++  (set (map :block/uuid (:block/tags (entity conn id)))))
++
++(defn- description-of [conn description id]
++  (:block/title (get (entity conn id) (:db/ident description))))
++
++(defn- titles-under [conn id]
++  (->> (:block/_parent (entity conn id))
++       (sort-by :block/order)
++       (mapv :block/title)))
++
++(defn- tree-keys
++  "Every key used anywhere in a response tree."
++  [nodes]
++  (set (mapcat (fn [node] (concat (keys node) (tree-keys (:children node)))) nodes)))
++
++(deftest get-blocks-reads-many-entities-in-one-call-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id org-id]}]
++        (let [[a b c] (repeatedly 3 random-uuid)
++              missing (random-uuid)
++              ids-path (fn [& ids] (str "/semantic/blocks?ids=" (string/join "," ids)))]
++          (p/let [_ (request! self "POST" "/semantic/block-trees"
++                              {:target-id (str page-id)
++                               :blocks [{:uuid (str a) :title "Acme #Organization"
++                                         :properties {"Blurb" "Makes anvils"}
++                                         :children [{:uuid (str b) :title "Child"}]}
++                                        {:uuid (str c) :title "Other"}]})
++                  summary (request! self "GET" (ids-path c missing a page-id) nil)
++                  outline (request! self "GET" (str (ids-path a page-id) "&view=outline") nil)
++                  errors (p/all (map #(request! self "GET" % nil)
++                                     ["/semantic/blocks"
++                                      (ids-path "not-a-uuid")
++                                      (ids-path a (string/upper-case (str a)))
++                                      (apply ids-path (repeatedly 101 random-uuid))
++                                      (str (ids-path a) "&view=tree")]))
++                  e2ee-outline (request! self "GET" (str (ids-path a) "&view=outline&graph-e2ee=true") nil)]
++            (is (= 200 (:status summary)))
++            (is (= (mapv str [c a page-id]) (mapv :uuid (get-in summary [:body :blocks])))
++                "found entities come back in request order")
++            (is (= [(str missing)] (get-in summary [:body :missing])))
++            (let [[other acme page] (get-in summary [:body :blocks])]
++              (is (= "Other" (:title other)))
++              (is (= [(str org-id)] (mapv :uuid (:tags acme))))
++              (is (= ["Makes anvils"] (mapv :value (:properties acme))))
++              (is (= "page" (:kind page)))
++              (is (not-any? :children [other acme page]) "the summary view loads no block trees")
++              (is (not-any? :markdown [other acme page])))
++            (is (= 200 (:status outline)))
++            (let [[acme page] (get-in outline [:body :blocks])]
++              (is (= "- Child" (:markdown acme)))
++              (is (= 1 (:block-count acme)))
++              (is (false? (:truncated acme)))
++              (is (string/includes? (:markdown page) "  - Child"))
++              (is (string/includes? (:markdown page) "- Other")))
++            (is (= [400 400 400 400 400] (mapv :status errors)))
++            (is (= ["ids must be a comma-separated list of UUIDs"
++                    "ids must be a comma-separated list of UUIDs"
++                    "duplicate id"
++                    "at most 100 ids"
++                    "view must be summary or outline"]
++                   (mapv #(get-in % [:body :error]) errors)))
++            (is (= 409 (:status e2ee-outline)) "outlines need plaintext titles")
++            (is (some? (entity conn b)))))))))
++
++(deftest batch-set-tags-ten-pages-in-one-call-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self org-id]}]
++        (let [page-ids (vec (repeatedly 10 random-uuid))
++              _ (d/transact! conn (map-indexed (fn [index id]
++                                                 {:block/uuid id :block/name (str "person " index)
++                                                  :block/title (str "Person " index)
++                                                  :block/tags :logseq.class/Page
++                                                  :block/created-at 1 :block/updated-at 1})
++                                               page-ids))]
++          (p/let [response (request! self "POST" "/semantic/block-properties/batch-set"
++                                     {:entries (mapv (fn [id] {:block-id (str id) :property-id "Tags"
++                                                               :value "Organization"})
++                                                     page-ids)})]
++            (is (= 200 (:status response)))
++            (is (= {:updated 10} (:body response)))
++            (is (every? #(contains? (tag-ids conn %) org-id) page-ids))))))))
++
++(deftest insert-block-tree-sets-properties-on-new-blocks-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id org-id description]}]
++        (let [[person note good bad] (repeatedly 4 random-uuid)
++              ident (subs (str (:db/ident description)) 1)]
++          (p/let [response (request! self "POST" "/semantic/block-trees"
++                                     {:target-id (str page-id)
++                                      :blocks [{:uuid (str person) :title "Jane Doe"
++                                                :properties {"Tags" ["Organization"] "Blurb" "Engineer"}
++                                                :children [{:uuid (str note) :title "Met at a conference"
++                                                            :properties {ident "First contact"}}]}]})
++                  _ (is (= 201 (:status response)))
++                  _ (is (= #{org-id} (tag-ids conn person)))
++                  _ (is (= "Engineer" (description-of conn description person)))
++                  _ (is (= "First contact" (description-of conn description note)) "a property ident works as the key")
++                  rejected (request! self "POST" "/semantic/block-trees"
++                                     {:target-id (str page-id)
++                                      :blocks [{:uuid (str good) :title "Good" :properties {"Blurb" "fine"}}
++                                               {:uuid (str bad) :title "Bad"
++                                                :children [{:title "Nested" :properties {"No Such Property" 1}}]}]})
++                  bad-value (request! self "POST" "/semantic/block-trees"
++                                      {:target-id (str page-id)
++                                       :blocks [{:uuid (str good) :title "Good" :properties {"Tags" "No Such Tag"}}]})
++                  replay (request! self "POST" "/semantic/block-trees"
++                                   {:target-id (str page-id)
++                                    :blocks [{:uuid (str person) :title "Jane Doe"
++                                              :properties {"Blurb" "Changed on replay"}}]})]
++            (is (= [400 "blocks[1].children[0]: property not found: No Such Property"]
++                   [(:status rejected) (get-in rejected [:body :error])]))
++            (is (= 400 (:status bad-value)))
++            (is (string/starts-with? (get-in bad-value [:body :error]) "blocks[0]: Tags: property value must resolve"))
++            (is (nil? (entity conn good)) "a rejected tree writes none of its blocks")
++            (is (= 201 (:status replay)))
++            (is (= "Engineer" (description-of conn description person))
++                "a block reused on replay keeps its properties, as it keeps its title")))))))
++
++(deftest write-responses-can-be-reduced-to-uuids-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (let [tree {:target-id (str page-id)
++                    :blocks [{:title "Parent" :children [{:title "Child"}]} {:title "Sibling"}]}]
++          (p/let [full (request! self "POST" "/semantic/block-trees" tree)
++                  compact (request! self "POST" "/semantic/block-trees?verbose=false" tree)
++                  children (request! self "POST" (str "/semantic/blocks/" page-id "/children?verbose=false")
++                                     {:position "append" :blocks [{:title "One"} {:title "Two"}]})
++                  capture (request! self "POST" "/semantic/capture?verbose=false" {:blocks [{:title "Captured"}]})
++                  invalid (request! self "POST" "/semantic/block-trees?verbose=no" tree)]
++            (is (= 201 (:status full)))
++            (is (= 3 (get-in full [:body :count])))
++            (is (= ["Parent" "Sibling"] (mapv :title (get-in full [:body :blocks]))) "verbose is the default")
++            (is (= 201 (:status compact)))
++            (is (= 3 (get-in compact [:body :count])))
++            (is (= #{:uuid :children} (tree-keys (get-in compact [:body :blocks]))))
++            (is (= "Child" (:block/title (entity conn (get-in compact [:body :blocks 0 :children 0 :uuid])))))
++            (is (= [201 2 #{:uuid}] [(:status children) (get-in children [:body :count])
++                                     (tree-keys (get-in children [:body :blocks]))]))
++            (is (= 201 (:status capture)))
++            (is (= #{:page-id :blocks :count} (set (keys (:body capture)))))
++            (is (= #{:uuid} (tree-keys (get-in capture [:body :blocks]))))
++            (is (= [400 "verbose must be true or false"] [(:status invalid) (get-in invalid [:body :error])]))))))))
++
++(deftest batch-insert-builds-several-org-pages-in-one-call-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id org-id description]}]
++        (p/let [response (request! self "POST" "/semantic/block-trees/batch?verbose=false"
++                                   {:entries [{:page "Acme Ltd"
++                                               :properties {"Tags" ["Organization"] "Blurb" "Anvil maker"}
++                                               :blocks [{:title "Contacts"
++                                                         :children [{:title "Wile E." :properties {"Blurb" "Buyer"}}]}]}
++                                              {:page "Globex" :properties {"Tags" "Organization"}}
++                                              {:target-id (str page-id) :position "prepend"
++                                               :blocks [{:title "Index of organizations"}]}]})
++                body (:body response)
++                acme (ldb/get-page @conn "Acme Ltd")
++                globex (ldb/get-page @conn "Globex")
++                acme-titles (titles-under conn (:block/uuid acme))
++                again (request! self "POST" "/semantic/block-trees/batch"
++                                {:entries [{:page "acme ltd" :blocks [{:title "Second visit"}]}]})]
++          (is (= 201 (:status response)))
++          (is (= 3 (:count body)))
++          (is (= [(str (:block/uuid acme)) (str (:block/uuid globex)) (str page-id)]
++                 (mapv :target-id (:entries body))))
++          (is (= [true true nil] (mapv :created (:entries body))))
++          (is (= #{:uuid :children} (tree-keys (mapcat :blocks (:entries body)))))
++          (is (contains? (tag-ids conn (:block/uuid acme)) org-id))
++          (is (contains? (tag-ids conn (:block/uuid globex)) org-id))
++          (is (= "Anvil maker" (description-of conn description (:block/uuid acme))))
++          (is (= ["Contacts"] acme-titles))
++          (let [contacts (first (:block/_parent acme))
++                wile (first (:block/_parent contacts))]
++            (is (= "Wile E." (:block/title wile)))
++            (is (= "Buyer" (description-of conn description (:block/uuid wile)))))
++          (is (= "Index of organizations" (first (titles-under conn page-id))))
++          (is (= 201 (:status again)))
++          (is (nil? (get-in again [:body :entries 0 :created])) "an existing page is reused, matched by name")
++          (is (= ["Contacts" "Second visit"] (titles-under conn (:block/uuid acme))))
++          (is (= ["Second visit"] (mapv :title (get-in again [:body :entries 0 :blocks])))))))))
++
++(deftest batch-insert-validates-every-entry-and-supports-dry-run-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (let [reused (random-uuid)
++              error-of (fn [body]
++                         (p/let [{:keys [status body]} (request! self "POST" "/semantic/block-trees/batch" body)]
++                           [status (:error body)]))]
++          (p/let [errors (p/all (map error-of
++                                     [{:entries []}
++                                      {:entries [{:target-id (str page-id) :page "Both" :blocks [{:title "x"}]}]}
++                                      {:entries [{:blocks [{:title "x"}]}]}
++                                      {:entries [{:page "New Page" :blocks [{:title "x"}]}
++                                                 {:target-id (str (random-uuid)) :blocks [{:title "y"}]}]}
++                                      {:entries [{:page "New Page" :blocks [{:title "x"}]}
++                                                 {:target-id (str page-id)
++                                                  :blocks [{:title "y" :children [{:title "z" :properties {"Nope" 1}}]}]}]}
++                                      {:entries [{:page "Organization" :blocks [{:title "x"}]}]}
++                                      {:entries [{:page "New Page"}]}
++                                      {:entries [{:page "New Page" :position "middle" :blocks [{:title "x"}]}]}
++                                      {:entries [{:page "New Page" :blocks [{:uuid (str reused) :title "x"}]}
++                                                 {:target-id (str page-id) :blocks [{:uuid (str reused) :title "x"}]}]}
++                                      {:entries [{:page "New Page" :blocks [{:title "x"}]}] :dry-run "yes"}]))
++                  dry (request! self "POST" "/semantic/block-trees/batch"
++                                {:dry-run true
++                                 :entries [{:page "Dry Page" :properties {"Blurb" "not stored"}
++                                            :blocks [{:title "Dry block"}]}
++                                           {:target-id (str page-id) :blocks [{:title "Also dry"}]}]})]
++            (is (= [[400 "entries must be an array of 1 to 100 entries"]
++                    [400 "entries[0]: give target-id or page, not both"]
++                    [400 "entries[0]: give target-id or page"]
++                    [400 "entries[1]: target not found"]
++                    [400 "entries[1].blocks[0].children[0]: property not found: Nope"]
++                    [400 "entries[0]: Organization is a tag, not a page"]
++                    [400 "entries[0]: give blocks, properties or both"]
++                    [400 "entries[0]: position must be append or prepend"]
++                    [400 "entries[1]: a block uuid is used more than once in the batch"]
++                    [400 "dry-run must be a boolean"]]
++                   errors))
++            (is (nil? (ldb/get-page @conn "New Page")) "a rejected batch creates nothing, not even earlier entries")
++            (is (= 200 (:status dry)))
++            (is (true? (get-in dry [:body :dry-run])))
++            (is (= [true nil] (mapv :created (get-in dry [:body :entries]))))
++            (is (= 2 (get-in dry [:body :count])))
++            (is (nil? (ldb/get-page @conn "Dry Page")) "a dry run writes nothing")
++            (is (empty? (titles-under conn page-id)))))))))
++
++(deftest delete-blocks-removes-several-blocks-atomically-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (let [[a a1 a2 b c d] (repeatedly 6 random-uuid)
++              delete! (fn [body] (request! self "DELETE" "/semantic/blocks" body))]
++          (p/let [_ (request! self "POST" "/semantic/block-trees"
++                              {:target-id (str page-id)
++                               :blocks [{:uuid (str a) :title "A"
++                                         :children [{:uuid (str a1) :title "A1"} {:uuid (str a2) :title "A2"}]}
++                                        {:uuid (str b) :title "B"} {:uuid (str c) :title "C"} {:uuid (str d) :title "D"}]})
++                  dry (delete! {:block-ids [(str a) (str b)] :dry-run true})
++                  _ (is (= [200 {:deleted 2 :total-removed 4 :dry-run true}] [(:status dry) (:body dry)]))
++                  _ (is (= ["A" "B" "C" "D"] (titles-under conn page-id)) "a dry run deletes nothing")
++                  errors (p/all (map delete!
++                                     [{:block-ids []}
++                                      {:block-ids [(str c) (str page-id)]}
++                                      {:block-ids [(str c) (str (random-uuid))]}
++                                      {:block-ids [(str c) (str c)]}
++                                      {:block-ids (mapv str (repeatedly 101 random-uuid))}]))
++                  _ (is (= [[400 "block-ids must be an array of 1 to 100 UUIDs"]
++                            [400 "block-ids[1]: is a page; delete pages with deletePage"]
++                            [400 "block-ids[1]: block not found"]
++                            [400 "block-ids[1]: duplicate"]
++                            [400 "block-ids must be an array of 1 to 100 UUIDs"]]
++                           (mapv (juxt :status (comp :error :body)) errors)))
++                  _ (is (some? (entity conn c)) "a rejected delete removes nothing")
++                  real (delete! {:block-ids [(str a) (str b) (str c)]})]
++            (is (= [200 {:deleted 3 :total-removed 5}] [(:status real) (:body real)]))
++            (is (every? #(nil? (entity conn %)) [a a1 a2 b c]))
++            (is (= ["D"] (titles-under conn page-id)))))))))
++
++(deftest batch-move-blocks-moves-to-several-targets-atomically-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (let [[a b c t t1 x] (repeatedly 6 random-uuid)
++              move! (fn [body] (request! self "POST" "/semantic/block-moves/batch" body))
++              moves [{:block-ids [(str a) (str b)] :target-id (str t) :position "last-child"}
++                     {:block-ids [(str c)] :target-id (str x) :position "after"}]]
++          (p/let [_ (request! self "POST" "/semantic/block-trees"
++                              {:target-id (str page-id)
++                               :blocks [{:uuid (str a) :title "A"} {:uuid (str b) :title "B"} {:uuid (str c) :title "C"}
++                                        {:uuid (str t) :title "T" :children [{:uuid (str t1) :title "T1"}]}]})
++                  _ (request! self "POST" "/semantic/block-trees/batch"
++                              {:entries [{:page "Other" :blocks [{:uuid (str x) :title "X"}]}]})
++                  other-page (ldb/get-page @conn "Other")
++                  dry (move! {:moves moves :dry-run true})
++                  _ (is (= [200 {:moved 3 :dry-run true}] [(:status dry) (:body dry)]))
++                  _ (is (= ["A" "B" "C" "T"] (titles-under conn page-id)) "a dry run moves nothing")
++                  real (move! {:moves moves})
++                  _ (is (= [200 {:moved 3}] [(:status real) (:body real)]))
++                  _ (is (= ["T1" "A" "B"] (titles-under conn t)))
++                  _ (is (= ["X" "C"] (titles-under conn (:block/uuid other-page))))
++                  _ (is (= (:db/id other-page) (:db/id (:block/page (entity conn c)))))
++                  errors (p/all (map move!
++                                     [{:moves []}
++                                      {:moves [{:block-ids [(str a)] :target-id (str page-id) :position "last-child"}
++                                               {:block-ids [(str t)] :target-id (str t1) :position "first-child"}]}
++                                      {:moves [{:block-ids [(str a)] :target-id (str x) :position "after"}
++                                               {:block-ids [(str a)] :target-id (str t1) :position "after"}]}
++                                      {:moves [{:block-ids [(str a) (str x)] :target-id (str x) :position "after"}]}
++                                      {:moves [{:block-ids [(str a)] :target-id (str page-id) :position "after"}]}
++                                      {:moves [{:block-ids [(str (random-uuid))] :target-id (str x) :position "after"}]}
++                                      {:moves [{:block-ids [(str a)] :target-id (str x) :position "below"}]}
++                                      {:moves [{:block-ids [(str t) (str t1)] :target-id (str x) :position "after"}]}]))]
++            (is (= [[400 "moves must be an array of 1 to 100 moves"]
++                    [400 "moves[1]: a block cannot move into its own children"]
++                    [400 "moves[1]: block-ids[0] is already moved by an earlier move"]
++                    [400 "moves[0]: a block cannot move relative to itself"]
++                    [400 "moves[0]: before and after need a block target, not a page"]
++                    [400 "moves[0]: block-ids[0]: block not found"]
++                    [400 "moves[0]: position must be before, after, first-child or last-child"]
++                    [400 "moves[0]: block-ids[1] is inside another block of this move; move the outer block alone"]]
++                   (mapv (juxt :status (comp :error :body)) errors)))
++            (is (= ["T1" "A" "B"] (titles-under conn t))
++                "a rejected batch undoes its earlier moves too")))))))
++
++(defn- <encrypt [key value]
++  (p/let [iv (js/crypto.getRandomValues (js/Uint8Array. 12))
++          payload (.encrypt js/crypto.subtle #js {:name "AES-GCM" :iv iv} key
++                            (.encode (js/TextEncoder.) (ldb/write-transit-str value)))]
++    (ldb/write-transit-str [iv (js/Uint8Array. payload)])))
++
++(defn- <key []
++  (.generateKey js/crypto.subtle #js {:name "AES-GCM" :length 256} true #js ["encrypt" "decrypt"]))
++
++(deftest bulk-writes-on-encrypted-graphs-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (p/let [key (<key)
++                title (<encrypt key "Secret block")
++                path "/semantic/block-trees/batch?graph-e2ee=true"
++                plaintext (request! self "POST" path {:entries [{:target-id (str page-id) :blocks [{:title "Plain"}]}]})
++                page-title (request! self "POST" path {:entries [{:page "Plain page" :blocks [{:title title}]}]})
++                encrypted (request! self "POST" path {:entries [{:target-id (str page-id) :blocks [{:title title}]}]})
++                block-id (get-in encrypted [:body :entries 0 :blocks 0 :uuid])
++                _ (is (= title (:block/raw-title (entity conn block-id))))
++                deleted (request! self "DELETE" "/semantic/blocks?graph-e2ee=true" {:block-ids [block-id]})]
++          (is (= [400 "content must be an encrypted package on e2ee graphs"]
++                 [(:status plaintext) (get-in plaintext [:body :error])]))
++          (is (= [400 "entries[0]: page titles are unavailable for E2EE graphs; create the page and pass target-id"]
++                 [(:status page-title) (get-in page-title [:body :error])]))
++          (is (= 201 (:status encrypted)))
++          (is (= 200 (:status deleted)))
++          (is (nil? (entity conn block-id))))))))
++
++(defn- rate-limiter [calls]
++  #js {:limit (fn [opts]
++                (swap! calls conj (js->clj opts :keywordize-keys true))
++                (p/resolved #js {:success true}))})
++
++(deftest a-bulk-call-counts-as-one-write-test
++  (async done
++    (let [forwarded (atom [])
++          write-calls (atom [])
++          body (js/JSON.stringify (clj->js {:block-ids (mapv str (repeatedly 50 random-uuid))}))
++          request (js/Request. "http://localhost/api/v1/graphs/graph-1/blocks"
++                               #js {:method "DELETE"
++                                    :headers #js {"authorization" "Bearer semantic-token"
++                                                  "content-type" "application/json"}
++                                    :body body})
++          env #js {"DB" #js {}
++                   "LOGSEQ_SYNC_DO" #js {:idFromName (fn [graph-id] graph-id)
++                                         :get (fn [_]
++                                                #js {:fetch (fn [request]
++                                                              (swap! forwarded conj request)
++                                                              (p/resolved (js/Response. "{}" #js {:status 200})))})}
++                   "SEMANTIC_WRITE_RATE_LIMITER" (rate-limiter write-calls)}]
++      (-> (p/with-redefs [auth/auth-claims (fn [_ _] (p/resolved #js {"sub" "user-1" "scope" "logseq/write"}))
++                          index-handler/graph-access-response
++                          (fn [_ _ _] (p/resolved (js/Response. "{}" #js {:status 200})))
++                          common/<d1-all (fn [& _] (p/resolved #js {:results #js [#js {:graph_e2ee 0}]}))]
++            (p/let [response (dispatch/handle-worker-fetch request env)
++                    forwarded-request (first @forwarded)
++                    forwarded-body (.text forwarded-request)]
++              (is (= 200 (.-status response)))
++              (is (= 1 (count @write-calls)) "fifty blocks, one rate-limited write")
++              (is (string/includes? (:key (first @write-calls)) ":deleteBlocks:"))
++              (is (= "DELETE" (.-method forwarded-request)))
++              (is (= "/semantic/blocks" (.-pathname (js/URL. (.-url forwarded-request)))))
++              (is (= body forwarded-body) "the request body reaches the graph's Durable Object")))
++          (p/catch #(is false (str %)))
++          (p/finally done)))))
++
++(deftest openapi-documents-bulk-operations-test
++  (async done
++    (-> (p/let [response (dispatch/handle-worker-fetch (js/Request. "http://localhost/openapi.json") #js {})
++                body (.json response)
++                paths (aget body "paths")
++                op (fn [path method] (aget paths path method))
++                param-names (fn [path method] (set (map #(aget % "name") (aget (op path method) "parameters"))))]
++          (is (= "getBlocks" (aget (op "/api/v1/graphs/{graph-id}/blocks" "get") "operationId")))
++          (is (= "deleteBlocks" (aget (op "/api/v1/graphs/{graph-id}/blocks" "delete") "operationId")))
++          (is (= "batchMoveBlocks" (aget (op "/api/v1/graphs/{graph-id}/block-moves/batch" "post") "operationId")))
++          (is (= "batchInsertBlockTrees" (aget (op "/api/v1/graphs/{graph-id}/block-trees/batch" "post") "operationId")))
++          (is (contains? (param-names "/api/v1/graphs/{graph-id}/blocks" "get") "ids"))
++          (doseq [[path method] [["/api/v1/graphs/{graph-id}/block-trees" "post"]
++                                 ["/api/v1/graphs/{graph-id}/blocks/{block-id}/children" "post"]
++                                 ["/api/v1/graphs/{graph-id}/capture" "post"]
++                                 ["/api/v1/graphs/{graph-id}/block-trees/batch" "post"]]]
++            (is (contains? (param-names path method) "verbose") path))
++          (is (some? (aget body "components" "schemas" "BlockTree" "properties" "properties"))
++              "block tree nodes take properties"))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 57d9b57c02..e488116458 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -9,6 +9,7 @@
+             [logseq.db-sync.node-assets-test]
+             [logseq.db-sync.node-config-test]
+             [logseq.db-sync.node-server-test]
++            [logseq.db-sync.semantic-bulk-test]
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.storage-test]
