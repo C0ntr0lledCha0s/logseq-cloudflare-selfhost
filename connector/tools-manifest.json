@@ -205,6 +205,16 @@
     "path": "/api/v1/graphs/{graph-id}/search"
   },
   {
+    "name": "semantic_index_status",
+    "method": null,
+    "path": null
+  },
+  {
+    "name": "semantic_search",
+    "method": null,
+    "path": null
+  },
+  {
     "name": "set_block_property",
     "method": "PUT",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"

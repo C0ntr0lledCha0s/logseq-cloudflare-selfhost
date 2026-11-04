@@ -1,0 +1,538 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/storage.cljs b/deps/db-sync/src/logseq/db_sync/storage.cljs
+index d68a98d9f4..d5aef35d4f 100644
+--- a/deps/db-sync/src/logseq/db_sync/storage.cljs
++++ b/deps/db-sync/src/logseq/db_sync/storage.cljs
+@@ -139,6 +139,9 @@
+               (some? (aget row "tx_id")) (assoc :tx-id (uuid (aget row "tx_id")))))
+           rows)))
+ 
++(defn tx-count-since [sql since-t]
++  (aget (select-one sql "select count(*) as n from tx_log where t > ?" since-t) "n"))
++
+ (defn- upsert-addr-content! [sql data]
+   (doseq [item data]
+     (common/sql-exec sql
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 2b6b8b3c1c..c092ce3492 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1887,6 +1887,175 @@
+ (def ^:private insight-handlers
+   #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
+ 
++;; listBlockChanges feeds an external search index. Without `since` it lists every content block
++;; in UUID order; with `since` (a graph t from an earlier response) and that response's `epoch`, it
++;; lists the blocks whose indexed text may have changed since then, read from the tx log, plus the
++;; UUIDs that are no longer content blocks. The epoch lives in sync_meta, which a snapshot import
++;; or reset clears, so a client holding an old t learns its position is gone (410) and lists again.
++(def ^:private feed-epoch-key :semantic-feed-epoch)
++(def ^:private max-feed-txs 5000)
++(def ^:private max-feed-changes 20000)
++
++;; Attributes whose change alters the text indexed for the entity's descendants (page title and
++;; breadcrumb) or whether they are indexed at all (tags, hidden, deleted, moved).
++(def ^:private feed-subtree-attrs
++  #{:block/title :block/name :block/parent :block/page :block/tags
++    :logseq.property/hide? :logseq.property/deleted-at})
++
++(defn- feed-epoch! [^js sql]
++  (or (storage/get-meta sql feed-epoch-key)
++      (let [epoch (str (random-uuid))]
++        (storage/set-meta! sql feed-epoch-key epoch)
++        epoch)))
++
++(defn- feed-block?
++  "A content block: not a page, tag, property or asset, not a property value, visible, with text."
++  [entity]
++  (and (some? entity)
++       (= "block" (block-kind entity))
++       (some? (:block/page entity))
++       (nil? (:logseq.property/created-from-property entity))
++       (not (entity-util/hidden? entity))
++       (not (string/blank? (:block/title entity)))))
++
++(defn- feed-text [entity]
++  (or (db-content/recur-replace-uuid-in-block-title entity) ""))
++
++(defn- feed-ancestors
++  "The block's ancestors below its page, outermost first."
++  [block]
++  (let [page-id (:db/id (:block/page block))]
++    (loop [parent (:block/parent block)
++           above ()]
++      (if (or (nil? parent) (= page-id (:db/id parent)))
++        (vec above)
++        (recur (:block/parent parent) (conj above parent))))))
++
++(defn- feed-block-response [block]
++  (let [page (:block/page block)
++        above (feed-ancestors block)]
++    {:uuid (uuid-string (:block/uuid block))
++     :page-id (uuid-string (:block/uuid page))
++     :page-title (:block/title page)
++     :breadcrumb (mapv feed-text above)
++     :text (feed-text block)
++     :tags (->> (concat [page] above [block])
++                (mapcat :block/tags)
++                (keep :block/title)
++                distinct
++                sort
++                vec)
++     :updated-at (:block/updated-at block)}))
++
++(defn- tx-item-uuid [e]
++  (cond
++    (and (vector? e) (= :block/uuid (first e))) (second e)
++    (uuid? e) e
++    (string? e) (parse-uuid e)
++    :else nil))
++
++(defn- touched-entities
++  "uuid -> set of attributes changed on it (:db/retractEntity for a retraction) in the tx log after t."
++  [^js sql since]
++  (reduce (fn [touched {:keys [tx]}]
++            (reduce (fn [touched item]
++                      (let [[op e a] item
++                            id (tx-item-uuid e)
++                            attr (if (= :db/retractEntity op) op a)]
++                        (if (and id attr)
++                          (update touched id (fnil conj #{}) attr)
++                          touched)))
++                    touched
++                    (common/read-transit tx)))
++          {}
++          (storage/fetch-tx-since sql since)))
++
++(defn- subtree-ids
++  "Entity ids of `entity` and everything under it: a page's blocks, or a block's descendants."
++  [db entity]
++  (if (:block/page entity)
++    (loop [pending [entity] ids []]
++      (if-let [e (first pending)]
++        (recur (into (subvec pending 1) (:block/_parent e)) (conj ids (:db/id e)))
++        ids))
++    (cons (:db/id entity) (map :e (d/datoms db :avet :block/page (:db/id entity))))))
++
++(defn- changed-uuids
++  "Every UUID whose indexed text or eligibility may have changed with these tx-log changes."
++  [db touched]
++  (let [ids (mapcat (fn [[id attrs]]
++                      (when-let [entity (d/entity db [:block/uuid id])]
++                        (let [eid (:db/id entity)]
++                          (cond
++                            ;; A renamed entity also changes the text that references or tags it.
++                            (contains? attrs :block/title)
++                            (mapcat #(subtree-ids db (d/entity db %))
++                                    (concat [eid]
++                                            (map :e (d/datoms db :avet :block/refs eid))
++                                            (map :e (d/datoms db :avet :block/tags eid))))
++                            (some feed-subtree-attrs attrs) (subtree-ids db entity)
++                            :else [eid]))))
++                    touched)]
++    (into (set (keys touched))
++          (keep #(:block/uuid (d/entity db %)))
++          ids)))
++
++(defn- feed-page [ids cursor limit]
++  (let [remaining (if cursor (drop-while #(not (pos? (compare (str %) cursor))) ids) ids)
++        selected (vec (take (inc limit) remaining))
++        page (vec (take limit selected))]
++    {:page page
++     :next-cursor (when (> (count selected) limit) (encode-cursor ["uuid" (str (last page))]))}))
++
++(defn- full-feed [db cursor limit]
++  (let [from (some-> cursor parse-uuid)
++        blocks (->> (d/index-range db :block/uuid from nil)
++                    (remove #(= from (:v %)))
++                    (map #(d/entity db (:e %)))
++                    (filter feed-block?)
++                    (take (inc limit))
++                    vec)
++        page (vec (take limit blocks))]
++    {:blocks (mapv feed-block-response page)
++     :removed []
++     :next-cursor (when (> (count blocks) limit)
++                    (encode-cursor ["uuid" (str (:block/uuid (last page)))]))}))
++
++(defn- incremental-feed [db touched cursor limit]
++  (let [ids (sort-by str (changed-uuids db touched))]
++    (when (<= (count ids) max-feed-changes)
++      (let [{:keys [page next-cursor]} (feed-page ids cursor limit)
++            entities (map #(d/entity db [:block/uuid %]) page)]
++        {:blocks (mapv feed-block-response (filter feed-block? entities))
++         :removed (mapv (fn [[id _]] (str id))
++                        (remove (fn [[_ entity]] (feed-block? entity)) (map vector page entities)))
++         :next-cursor next-cursor}))))
++
++(defn- handle-block-changes [{:keys [^js self ^js url db e2ee?]}]
++  (let [sql (.-sql self)
++        params (.-searchParams url)
++        raw-since (.get params "since")
++        raw-epoch (.get params "epoch")
++        since (parse-timestamp raw-since)
++        {:keys [limit raw-cursor cursor]} (pagination-options url)
++        cursor-uuid (when (and (= "uuid" (first cursor)) (parse-uuid (second cursor))) (second cursor))]
++    (cond
++      e2ee? (http/error-response "block changes are unavailable for E2EE graphs" 409)
++      (nil? limit) (http/bad-request "invalid limit")
++      (and raw-cursor (nil? cursor-uuid)) (http/bad-request "invalid cursor")
++      (not= (nil? raw-since) (nil? raw-epoch)) (http/bad-request "since and epoch go together")
++      (= ::invalid since) (http/bad-request "invalid since")
++      :else
++      (let [epoch (feed-epoch! sql)
++            t (storage/get-t sql)
++            feed (cond
++                   (nil? since) (full-feed db cursor-uuid limit)
++                   (or (not= raw-epoch epoch) (> since t) (> (storage/tx-count-since sql since) max-feed-txs)) nil
++                   :else (incremental-feed db (touched-entities sql since) cursor-uuid limit))]
++        (if feed
++          (http/json-response nil (assoc feed :epoch epoch :t t))
++          (http/error-response "changes since that point are no longer available; list again without since" 410))))))
++
+ (def ^:private page-handlers
+   #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
+     :semantic/pages-references :semantic/pages-get
+@@ -1979,6 +2148,7 @@
+     (contains? property-and-search-handlers handler) (handle-properties-and-search context)
+     (contains? bulk-handlers handler) (handle-bulk context)
+     (contains? insight-handlers handler) (handle-insights context)
++    (= :semantic/block-changes handler) (handle-block-changes context)
+     :else (http/not-found)))
+ 
+ (defn handle [{:keys [^js self route ^js url] :as context}]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 8793fd72de..43b3ad2fc7 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -92,6 +92,8 @@
+     :handler :semantic/assets-get :operation-id "getAsset" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/search" :internal-path "/semantic/search"
+     :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/block-changes" :internal-path "/semantic/block-changes"
++    :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/e2ee/public-keys" :internal-path "/e2ee/public-keys"
+     :handler :semantic/e2ee-public-keys :operation-id "getE2eePublicKeys" :scope "logseq/read" :rate-class :read :edge? true}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/encrypt" :internal-path "/e2ee/encrypt"
+@@ -144,6 +146,7 @@
+    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+    "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
++   "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
+    "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
+    "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
+    "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
+@@ -357,6 +360,14 @@
+                   [{:name "exclude-tags" :in "query" :schema {:type "string"}
+                     :description "Comma-separated tag titles, matched ignoring case. Pages tagged with one, or with a tag that extends one, are left out."}
+                    summary-prefix-parameter]))
++    (= "listBlockChanges" operation-id)
++    (into (into pagination-parameters
++                [{:name "since" :in "query"
++                  :description "The t of an earlier response; list only what changed after it. Requires epoch."
++                  :schema {:type "integer" :minimum 0}}
++                 {:name "epoch" :in "query"
++                  :description "The epoch of the response that since came from."
++                  :schema {:type "string"}}]))
+     (= "listGraphs" operation-id)
+     (into [{:name "name" :in "query" :schema {:type "string"}
+             :description "Exact graph name, matched case-insensitively."}])
+@@ -418,6 +429,7 @@
+                   "getGraphHealth" (entity-response "GraphHealthResponse" "Counts and items for each check run")
+                   "listKnowledgeIndex"
+                   (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
++                  "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
+                   "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+@@ -438,6 +450,7 @@
+           "409" {:description "Unavailable for E2EE graphs"}
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
++           "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
+            "createPage" {"201" (entity-response "PageResponse" "The created page")
+                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+            "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
+@@ -614,6 +627,24 @@
+                                       :properties {:uuid {:type "string"}
+                                                    :title {:type "string"}
+                                                    :resource {:enum ["pages" "blocks" "tags" "properties" "assets"]}}}
++               :BlockChange {:type "object"
++                             :required ["uuid" "page-id" "page-title" "breadcrumb" "text" "tags"]
++                             :properties {:uuid {:type "string"}
++                                          :page-id {:type "string"}
++                                          :page-title {:type "string"}
++                                          :breadcrumb {:type "array" :items {:type "string"}}
++                                          :text {:type "string"}
++                                          :tags {:type "array" :items {:type "string"}
++                                                 :description "Titles of the tags on the block, its ancestors and its page."}
++                                          :updated-at {:type "integer"}}}
++               :BlockChangesResponse {:type "object"
++                                      :required ["epoch" "t" "blocks" "removed"]
++                                      :properties {:epoch {:type "string"}
++                                                   :t {:type "integer"
++                                                       :description "The graph's position; pass it as since, with epoch, once every page of this listing is read."}
++                                                   :blocks {:type "array" :items {:$ref "#/components/schemas/BlockChange"}}
++                                                   :removed {:type "array" :items {:type "string"}}
++                                                   :next-cursor {:type "string"}}}
+                :EntitySelector {:type "string"
+                                 :description "An existing entity UUID, qualified ident, or exact title."}
+                :TaskStatusSelector
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs
+new file mode 100644
+index 0000000000..c0537bb414
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs
+@@ -0,0 +1,241 @@
++(ns logseq.db-sync.semantic-block-changes-test
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.common :as common]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [promesa.core :as p]))
++
++(def sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
++
++(defn- with-memory-sql-async [f]
++  (let [db (new sqlite ":memory:" nil)
++        sql #js {:_db db
++                 :transaction (fn [f] ((.transaction db f)))
++                 :exec (fn [sql-str & args]
++                         (let [^js stmt (.prepare db sql-str)]
++                           (if (string/starts-with? (-> sql-str string/trim string/lower-case) "select")
++                             (.apply (.-all stmt) stmt (to-array args))
++                             (do (.apply (.-run stmt) stmt (to-array args)) nil))))
++                 :close (fn [] (.close db))}]
++    (-> (f sql)
++        (p/finally #(.close sql)))))
++
++(defn- changes [self query]
++  (p/let [response (sync-handler/handle-http
++                    self (js/Request. (str "http://localhost/semantic/block-changes?graph-id=graph-1" query)))
++          text (.text response)]
++    {:status (.-status response)
++     :body (js->clj (js/JSON.parse text) :keywordize-keys true)}))
++
++(defn- by-uuid [blocks]
++  (into {} (map (juxt :uuid identity)) blocks))
++
++(defn- async-test [done f]
++  (-> (with-memory-sql-async f)
++      (p/then (fn [] (done)))
++      (p/catch (fn [error]
++                 (is false (str error))
++                 (done)))))
++
++(def ids
++  {:projects (random-uuid) :other (random-uuid) :private-tag (random-uuid)
++   :roadmap (random-uuid) :ship (random-uuid) :details (random-uuid) :hidden (random-uuid)
++   :blank (random-uuid) :value (random-uuid) :notes (random-uuid) :unrelated (random-uuid)})
++
++(defn- ref [k] [:block/uuid (get ids k)])
++
++(defn- seed! [conn]
++  (d/transact! conn [{:db/ident :logseq.class/Page}
++                     {:db/ident :logseq.class/Tag}
++                     {:db/ident :user.property/note}])
++  (d/transact! conn [{:block/uuid (:private-tag ids) :block/name "private" :block/title "Private"
++                      :block/tags :logseq.class/Tag}
++                     {:block/uuid (:projects ids) :block/name "projects" :block/title "Projects"
++                      :block/tags #{:logseq.class/Page}}
++                     {:block/uuid (:other ids) :block/name "other" :block/title "Other"
++                      :block/tags #{:logseq.class/Page}}
++                     {:block/uuid (:notes ids) :block/name "notes" :block/title "Notes"
++                      :block/tags #{:logseq.class/Page [:block/uuid (:private-tag ids)]}}])
++  (d/transact! conn [{:block/uuid (:roadmap ids) :block/title (str "Roadmap for [[" (:other ids) "]]")
++                      :block/refs #{(ref :other)}
++                      :block/page (ref :projects) :block/parent (ref :projects) :block/order "a0"}
++                     {:block/uuid (:ship ids) :block/title "Ship v2"
++                      :block/page (ref :projects) :block/parent (ref :roadmap) :block/order "a0"}
++                     {:block/uuid (:details ids) :block/title "Write the release notes"
++                      :block/page (ref :projects) :block/parent (ref :ship) :block/order "a0"}
++                     {:block/uuid (:hidden ids) :block/title "Hidden"
++                      :logseq.property/hide? true
++                      :block/page (ref :projects) :block/parent (ref :projects) :block/order "a1"}
++                     {:block/uuid (:blank ids) :block/title "  "
++                      :block/page (ref :projects) :block/parent (ref :projects) :block/order "a2"}
++                     {:block/uuid (:value ids) :block/title "A property value"
++                      :logseq.property/created-from-property :user.property/note
++                      :block/page (ref :projects) :block/parent (ref :projects) :block/order "a3"}
++                     {:block/uuid (:unrelated ids) :block/title "Diary entry"
++                      :block/page (ref :notes) :block/parent (ref :notes) :block/order "a0"}]))
++
++(defn- new-self [sql]
++  (storage/init-schema! sql)
++  (let [conn (storage/open-conn sql)]
++    (seed! conn)
++    #js {:sql sql :conn conn :schema-ready true}))
++
++(deftest public-route-maps-to-the-internal-feed-test
++  (let [operation (semantic-routes/match-public "GET" "/api/v1/graphs/graph-1/block-changes")
++        spec (semantic-routes/openapi-document "https://issuer.example.com")
++        get-op (get-in spec [:paths "/api/v1/graphs/{graph-id}/block-changes" :get])]
++    (is (= "listBlockChanges" (:operation-id operation)))
++    (is (= :read (:rate-class operation)))
++    (is (= "logseq/read" (:scope operation)))
++    (is (= :semantic/block-changes (:handler (semantic-routes/match-internal "GET" "/semantic/block-changes"))))
++    (is (= "listBlockChanges" (:operationId get-op)))
++    (is (= #{"graph-id" "limit" "cursor" "since" "epoch"} (set (map :name (:parameters get-op)))))
++    (is (contains? (:responses get-op) "410"))
++    (is (some? (get-in spec [:components :schemas :BlockChangesResponse])))))
++
++(deftest full-listing-returns-content-blocks-with-context-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)]
++              (p/let [{:keys [status body]} (changes self "")
++                      blocks (by-uuid (:blocks body))
++                      roadmap (get blocks (str (:roadmap ids)))
++                      details (get blocks (str (:details ids)))
++                      diary (get blocks (str (:unrelated ids)))]
++                (is (= 200 status) (pr-str body))
++                (is (string? (:epoch body)))
++                (is (= (storage/get-t sql) (:t body)))
++                (is (pos? (:t body)))
++                (is (= [] (:removed body)))
++                (is (nil? (:next-cursor body)))
++                (is (= #{(:roadmap ids) (:ship ids) (:details ids) (:unrelated ids)}
++                       (set (map (comp uuid :uuid) (:blocks body))))
++                    "pages, tags, hidden, blank and property-value blocks are left out")
++                (is (= (sort (map :uuid (:blocks body))) (map :uuid (:blocks body))) "UUID order")
++                (is (= "Roadmap for [[Other]]" (:text roadmap)) "references show titles")
++                (is (= {:page-id (str (:projects ids)) :page-title "Projects" :breadcrumb []}
++                       (select-keys roadmap [:page-id :page-title :breadcrumb])))
++                (is (= ["Roadmap for [[Other]]" "Ship v2"] (:breadcrumb details)))
++                (is (= "Write the release notes" (:text details)))
++                (is (= ["Private"] (:tags diary)) "tags on the page are inherited")
++                (is (= [] (:tags details)))))))))
++
++(deftest full-listing-pages-by-uuid-cursor-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)]
++              (p/let [first-page (changes self "&limit=3")
++                      second-page (changes self (str "&limit=3&cursor="
++                                                     (js/encodeURIComponent (get-in first-page [:body :next-cursor]))))
++                      bad-cursor (changes self "&cursor=not-a-cursor")
++                      bad-limit (changes self "&limit=0")]
++                (is (= 3 (count (get-in first-page [:body :blocks]))))
++                (is (string? (get-in first-page [:body :next-cursor])))
++                (is (= 1 (count (get-in second-page [:body :blocks]))))
++                (is (nil? (get-in second-page [:body :next-cursor])))
++                (is (= 4 (count (distinct (map :uuid (concat (get-in first-page [:body :blocks])
++                                                             (get-in second-page [:body :blocks])))))))
++                (is (= 400 (:status bad-cursor)))
++                (is (= 400 (:status bad-limit)))))))))
++
++(deftest incremental-listing-returns-changed-blocks-and-removals-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)
++                  conn (.-conn self)]
++              (p/let [{start :body} (changes self "")
++                      since (str "&since=" (:t start) "&epoch=" (:epoch start))
++                      unchanged (changes self since)
++                      _ (d/transact! conn [[:db/add [:block/uuid (:ship ids)] :block/title "Ship v3"]])
++                      edited (changes self since)
++                      _ (d/transact! conn [[:db/retractEntity [:block/uuid (:unrelated ids)]]])
++                      deleted (changes self since)]
++                (is (= {:blocks [] :removed []} (select-keys (:body unchanged) [:blocks :removed])))
++                (is (= (:t start) (get-in unchanged [:body :t])))
++                (is (= #{(str (:ship ids)) (str (:details ids))}
++                       (set (map :uuid (get-in edited [:body :blocks]))))
++                    "an edited block and its descendants, whose breadcrumb changed")
++                (is (= ["Roadmap for [[Other]]" "Ship v3"]
++                       (:breadcrumb (get (by-uuid (get-in edited [:body :blocks])) (str (:details ids))))))
++                (is (< (:t start) (get-in edited [:body :t])))
++                (is (= [(str (:unrelated ids))] (get-in deleted [:body :removed])))))))))
++
++(deftest incremental-listing-follows-renamed-titles-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)
++                  conn (.-conn self)]
++              (p/let [{start :body} (changes self "")
++                      since (str "&since=" (:t start) "&epoch=" (:epoch start))
++                      _ (d/transact! conn [[:db/add [:block/uuid (:other ids)] :block/title "Elsewhere"]])
++                      referenced (changes self since)
++                      {mid :body} (changes self "")
++                      _ (d/transact! conn [[:db/add [:block/uuid (:projects ids)] :block/title "Work"]])
++                      page-renamed (changes self (str "&since=" (:t mid) "&epoch=" (:epoch mid)))]
++                (is (= "Roadmap for [[Elsewhere]]"
++                       (:text (get (by-uuid (get-in referenced [:body :blocks])) (str (:roadmap ids)))))
++                    "a block referencing a renamed page is listed with the new title")
++                (is (contains? (set (get-in referenced [:body :removed])) (str (:other ids)))
++                    "the renamed page itself is not a content block")
++                (is (= #{(str (:roadmap ids)) (str (:ship ids)) (str (:details ids))}
++                       (set (map :uuid (get-in page-renamed [:body :blocks])))))
++                (is (every? #(= "Work" (:page-title %)) (get-in page-renamed [:body :blocks])))))))))
++
++(deftest incremental-listing-follows-tags-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)
++                  conn (.-conn self)]
++              (p/let [{start :body} (changes self "")
++                      _ (d/transact! conn [[:db/add [:block/uuid (:roadmap ids)] :block/tags [:block/uuid (:private-tag ids)]]])
++                      tagged (changes self (str "&since=" (:t start) "&epoch=" (:epoch start)))]
++                (is (= #{(str (:roadmap ids)) (str (:ship ids)) (str (:details ids))}
++                       (set (map :uuid (get-in tagged [:body :blocks])))))
++                (is (every? #(= ["Private"] (:tags %)) (get-in tagged [:body :blocks]))
++                    "a tag on a block reaches its descendants")))))))
++
++(deftest incremental-listing-is-gone-after-reset-or-mismatch-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)]
++              (p/let [{start :body} (changes self "")
++                      wrong-epoch (changes self (str "&since=" (:t start) "&epoch=other"))
++                      ahead (changes self (str "&since=" (inc (:t start)) "&epoch=" (:epoch start)))
++                      missing-epoch (changes self (str "&since=" (:t start)))
++                      bad-since (changes self (str "&since=-1&epoch=" (:epoch start)))
++                      _ (common/sql-exec sql "delete from sync_meta")
++                      after-reset (changes self (str "&since=0&epoch=" (:epoch start)))
++                      {relisted :body} (changes self "")]
++                (is (= 410 (:status wrong-epoch)))
++                (is (= 410 (:status ahead)))
++                (is (= 400 (:status missing-epoch)))
++                (is (= 400 (:status bad-since)))
++                (is (= 410 (:status after-reset)) "clearing sync_meta, as an import does, ends the epoch")
++                (is (not= (:epoch start) (:epoch relisted)))))))))
++
++(deftest e2ee-graphs-are-refused-test
++  (async done
++         (async-test
++          done
++          (fn [sql]
++            (let [self (new-self sql)]
++              (p/let [{:keys [status body]} (changes self "&graph-e2ee=true")]
++                (is (= 409 status))
++                (is (= "block changes are unavailable for E2EE graphs" (:error body)))
++                (is (nil? (storage/get-meta sql :semantic-feed-epoch)) "a refused request writes nothing")))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index bfc8d782c5..52e8c469e6 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -13,6 +13,7 @@
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.semantic-index-health-test]
++            [logseq.db-sync.semantic-block-changes-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-auth-test]

@@ -1,0 +1,79 @@
+{
+  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
+  "pages": [
+    {
+      "title": "Car",
+      "blocks": [
+        { "key": "wof", "text": "WOF due on 14 March — book it at the garage" },
+        { "key": "tyres", "text": "Mechanic says the front tyres need replacing soon" },
+        { "key": "rego", "text": "Rego renewal paid online, $120" }
+      ]
+    },
+    {
+      "title": "Project Atlas",
+      "blocks": [
+        {
+          "key": "launch",
+          "text": "Launch moved to Friday 21 November",
+          "children": [{ "key": "launch-why", "text": "Because the payments integration slipped a week" }]
+        },
+        { "key": "pricing", "text": "We agreed to price the starter tier at $15 per month" },
+        { "key": "hiring", "text": "Interviewing two backend engineers next week" },
+        { "key": "outage", "text": "Postmortem: the outage on Tuesday was a bad config deploy" },
+        { "key": "standup", "text": "Standup notes: demo the dashboard to the team" }
+      ]
+    },
+    {
+      "title": "Family",
+      "blocks": [
+        { "key": "school-photos", "text": "Kids' school photos on Thursday" },
+        { "key": "dentist", "text": "Dentist appointment for Mia at 3:30pm" },
+        { "key": "playcentre", "text": "Playcentre roster: my session is Wednesday morning" },
+        {
+          "key": "therapy",
+          "text": "Therapy notes from the session",
+          "tags": ["Private"],
+          "children": [{ "key": "therapy-detail", "text": "Talked about work stress and sleep" }]
+        }
+      ]
+    },
+    {
+      "title": "Holidays",
+      "blocks": [
+        { "key": "flights", "text": "Flights to Queenstown booked for the long weekend" },
+        { "key": "trip-budget", "text": "Trip budget: about $2,000 including the bach" },
+        { "key": "packing", "text": "Packing list: chains, jackets, board games" }
+      ]
+    },
+    {
+      "title": "Passwords",
+      "tags": ["private"],
+      "blocks": [
+        { "key": "bank", "text": "Bank login reminder: the pin is in the safe" },
+        { "key": "wifi", "text": "Wifi password for the bach is on the fridge" }
+      ]
+    },
+    {
+      "title": "Reading",
+      "blocks": [
+        { "key": "book", "text": "Finished The Sunlit Man, start Wind and Truth next" },
+        { "key": "article", "text": "Article on spaced repetition for flashcards" },
+        { "key": "podcast", "text": "Podcast episode about compound interest and saving money" },
+        { "key": "recipe", "text": "Lemon and garlic chicken recipe from the Sunday paper" }
+      ]
+    }
+  ],
+  "questions": [
+    { "q": "When is the car's warrant of fitness due?", "expected": ["wof"] },
+    { "q": "What did we decide about pricing?", "expected": ["pricing"] },
+    { "q": "When does Atlas ship?", "expected": ["launch"] },
+    { "q": "Why did the release slip?", "expected": ["launch-why"] },
+    { "q": "Are we hiring?", "expected": ["hiring"] },
+    { "q": "What caused the incident?", "expected": ["outage"] },
+    { "q": "kids dentist", "expected": ["dentist"] },
+    { "q": "Queenstown", "expected": ["flights"] },
+    { "q": "How much is the holiday going to cost?", "expected": ["trip-budget"] },
+    { "q": "rego", "expected": ["rego"] }
+  ],
+  "private": ["therapy", "therapy-detail", "bank", "wifi"]
+}

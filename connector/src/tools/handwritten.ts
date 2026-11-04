@@ -3,6 +3,7 @@ import { z } from "zod";
 import { connectorHostname } from "../config";
 import { EXPIRY_WARN_DAYS, type GraphRecord, type GraphStore, daysUntilExpiry } from "../graphs";
 import { runTool, textResult } from "./common";
+import { SEMANTIC_HELP } from "./semantic-search";
 
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
@@ -34,8 +35,12 @@ function expiryWarning(graph: GraphRecord, now: number, host: string): string | 
   return `token expires in ${days} ${days === 1 ? "day" : "days"} — replace it at https://${host}/graphs`;
 }
 
-/** `list_graphs` and `connector_help`. Neither calls the sync server or returns anything secret. */
-export function registerHandwrittenTools(server: McpServer, env: Env, store: GraphStore): void {
+/**
+ * `list_graphs` and `connector_help`. Neither calls the sync server or returns anything secret. The
+ * help mentions semantic_search only when it is registered.
+ */
+export function registerHandwrittenTools(server: McpServer, env: Env, store: GraphStore, semantic: boolean): void {
+  const help = semantic ? `${CONNECTOR_HELP} ${SEMANTIC_HELP}` : CONNECTOR_HELP;
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 
   server.registerTool(
@@ -68,6 +73,6 @@ export function registerHandwrittenTools(server: McpServer, env: Env, store: Gra
       inputSchema: z.object({}),
       annotations: readOnly,
     },
-    () => runTool("connector_help", undefined, async () => textResult(CONNECTOR_HELP)),
+    () => runTool("connector_help", undefined, async () => textResult(help)),
   );
 }

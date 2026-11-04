@@ -3,8 +3,13 @@ import type { GitHubFetch } from "./auth/github";
 import { isAllowedRedirectUri } from "./auth/redirect-uris";
 import { type DefaultEnv, authRoute } from "./auth/routes";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
+import { GraphStore } from "./graphs";
 import { mcpApiHandler } from "./mcp";
 import { refreshAllKbIndexes } from "./tools/kb-index";
+import { semanticBindings } from "./semantic/config";
+import { runIndexer } from "./semantic/indexer";
+import { SemanticStore } from "./semantic/store";
+import { KB_INDEX_CRON, SEMANTIC_CRON } from "./crons";
 import { wizardRoute } from "./wizard/routes";
 
 function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
@@ -54,6 +59,7 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
     async fetch(request, env, ctx) {
       try {
         checkConfig(env);
+        semanticBindings(env);
       } catch (error) {
         if (!(error instanceof ConfigError)) throw error;
         console.error(`connector misconfigured: ${error.message}`);
@@ -66,10 +72,23 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
       if (pinned?.host !== host) pinned = { host, provider: new OAuthProvider(providerOptions(host, githubFetch)) };
       return pinned.provider.fetch(request, env, ctx);
     },
-    /** The hourly cron in wrangler.template.jsonc: rebuilds every graph's kb_index cache. */
-    async scheduled(_controller, env) {
+    /** Dispatches on the cron that fired; src/crons.ts lists them. */
+    async scheduled(controller, env) {
       checkConfig(env);
-      await refreshAllKbIndexes(env);
+      switch (controller.cron) {
+        case KB_INDEX_CRON:
+          await refreshAllKbIndexes(env);
+          return;
+        case SEMANTIC_CRON: {
+          // This cron is rendered only with semantic search on, so a run without its bindings is a deploy error.
+          const bindings = semanticBindings(env);
+          if (!bindings) throw new Error("cron fired but semantic search is not configured (AI, VECTORIZE, SEMANTIC_MAX_VECTORS)");
+          await runIndexer({ env, graphs: new GraphStore(env.DB, env.GRAPH_TOKEN_KEY), store: new SemanticStore(env.DB), bindings });
+          return;
+        }
+        default:
+          throw new Error(`unexpected cron "${controller.cron}"`);
+      }
     },
   };
 }

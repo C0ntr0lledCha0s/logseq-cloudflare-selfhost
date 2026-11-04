@@ -9,6 +9,9 @@ import { logTool } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
 import { KB_INDEX_WRITE_TOOLS, markKbIndexDirty, registerKbIndexTool } from "./tools/kb-index";
 import { type GraphAccess, type GraphTool, buildGraphTools, registerGraphTools } from "./tools/semantic";
+import { type SemanticBindings, semanticBindings } from "./semantic/config";
+import { SemanticStore } from "./semantic/store";
+import { registerSemanticTools } from "./tools/semantic-search";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
@@ -18,6 +21,8 @@ interface IsolateTools {
   store: GraphStore;
   access: GraphAccess;
   graphTools: GraphTool[];
+  /** Null while semantic search is off (no AI and VECTORIZE bindings). */
+  semantic: { store: SemanticStore; bindings: SemanticBindings } | null;
 }
 
 /**
@@ -31,7 +36,9 @@ function isolateTools(env: Env): IsolateTools {
   if (!tools) {
     const store = new GraphStore(env.DB, env.GRAPH_TOKEN_KEY);
     const access: GraphAccess = { env, resolve: (alias) => store.resolve(alias) };
-    tools = { store, access, graphTools: buildGraphTools(spec, access) };
+    const bindings = semanticBindings(env);
+    const semantic = bindings ? { store: new SemanticStore(env.DB), bindings } : null;
+    tools = { store, access, graphTools: buildGraphTools(spec, access), semantic };
     isolates.set(env, tools);
   }
   return tools;
@@ -59,7 +66,7 @@ async function markDirty(env: Env, tool: string, alias: string): Promise<void> {
 
 /** The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are now. */
 export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler {
-  const { store, access, graphTools } = isolateTools(env);
+  const { store, access, graphTools, semantic } = isolateTools(env);
   const onSuccess = (tool: string, alias: string) => {
     ctx.waitUntil(touch(store, tool, alias));
     if (KB_INDEX_WRITE_TOOLS.has(tool)) ctx.waitUntil(markDirty(env, tool, alias));
@@ -67,10 +74,11 @@ export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler
   return createMcpHandler(
     () => {
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
-      registerHandwrittenTools(server, env, store);
+      registerHandwrittenTools(server, env, store, semantic !== null);
       registerGraphTools(server, graphTools, onSuccess);
       registerAssetTools(server, access, onSuccess);
       registerKbIndexTool(server, access, onSuccess);
+      if (semantic) registerSemanticTools(server, { access, ...semantic }, onSuccess);
       return server;
     },
     // The Worker already answers 421 for any host but CONNECTOR_HOSTNAME (src/index.ts).
