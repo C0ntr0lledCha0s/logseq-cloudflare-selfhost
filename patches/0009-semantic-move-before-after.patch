@@ -1,0 +1,98 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 96adeee99c..18c5add4c4 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -813,6 +813,23 @@
+           (js/Response. nil #js {:status 204})))
+       (http/not-found))))
+ 
++(defn- move-destination
++  "The outliner target and options that put `blocks` at `position` relative to `target`. The
++  outliner's :top? and :bottom? address the target's children (:bottom? lands after its last
++  child), so a sibling placement must name the block to follow with :sibling? alone."
++  [blocks target position]
++  (case position
++    "after" [target {:sibling? true}]
++    "before" (let [moving (set (map :db/id blocks))]
++               ;; Follow the nearest left sibling that isn't moving; with none, become the first child.
++               (loop [left (ldb/get-left-sibling target)]
++                 (cond
++                   (nil? left) [(:block/parent target) {:sibling? false :top? true}]
++                   (contains? moving (:db/id left)) (recur (ldb/get-left-sibling left))
++                   :else [left {:sibling? true}])))
++    "first-child" [target {:sibling? false :top? true}]
++    "last-child" [target {:sibling? false :bottom? true}]))
++
+ (defn- handle-blocks [{:keys [^js self request conn db handler path-params e2ee? creator]}]
+   (case handler
+ 
+@@ -855,15 +872,13 @@
+               (some #(= (:db/id target) (:db/id %)) blocks)
+               (not (contains? #{"before" "after" "first-child" "last-child"} (:position body))))
+         (http/bad-request "invalid blocks, target, or position")
+-        (let [position (:position body)
+-              opts (case position
+-                     "before" {:sibling? true :top? true}
+-                     "after" {:sibling? true :bottom? true}
+-                     "first-child" {:sibling? false :top? true}
+-                     "last-child" {:sibling? false :bottom? true})]
+-          (outliner-core/move-blocks! conn blocks target opts)
+-          (broadcast-change! self)
+-          (http/json-response nil {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}))))
++        (let [position (:position body)]
++          (if (and (contains? #{"before" "after"} position) (nil? (:block/parent target)))
++            (http/bad-request "before and after need a block target, not a page")
++            (let [[target' opts] (move-destination blocks target position)]
++              (outliner-core/move-blocks! conn blocks target' opts)
++              (broadcast-change! self)
++              (http/json-response nil {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}))))))
+ 
+     :semantic/blocks-insert-children
+     (p/let [body (body-clj request)
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 868d697ef8..84b6f205f5 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -4009,3 +4009,42 @@
+           (is (= 3 (count orders)))
+           (is (= (count orders) (count (distinct orders)))
+               "the new value block gets an order key no sibling already has"))))))
++
++(deftest semantic-move-blocks-places-blocks-where-the-position-says-test
++  (async done
++    (with-tree-identity-test done
++      (fn [{:keys [conn page-id request self]}]
++        (let [[a b b1 c m] (repeatedly 5 random-uuid)
++              titles-under (fn [parent-uuid]
++                             (->> (:block/_parent (d/entity @conn [:block/uuid parent-uuid]))
++                                  (sort-by :block/order)
++                                  (mapv :block/title)))
++              move! (fn [position target]
++                      (p/let [response (sync-handler/handle-http
++                                        self (semantic-json-request "/semantic/block-moves?graph-id=graph-1" "POST"
++                                                                    {:block-ids [(str m)] :target-id (str target)
++                                                                     :position position}))]
++                        (.-status response)))]
++          (p/let [_ (request {:target-id (str page-id)
++                              :blocks [{:uuid (str a) :title "A"}
++                                       {:uuid (str b) :title "B" :children [{:uuid (str b1) :title "B1"}]}
++                                       {:uuid (str c) :title "C"}
++                                       {:uuid (str m) :title "M"}]})
++                  s1 (move! "after" a)
++                  _ (is (= [200 ["A" "M" "B" "C"]] [s1 (titles-under page-id)]) "after makes a next sibling")
++                  s2 (move! "before" a)
++                  _ (is (= [200 ["M" "A" "B" "C"]] [s2 (titles-under page-id)]) "before the first block")
++                  s3 (move! "after" b)
++                  _ (is (= [200 ["A" "B" "M" "C"] ["B1"]] [s3 (titles-under page-id) (titles-under b)])
++                        "after a block with children is still a sibling")
++                  s4 (move! "before" c)
++                  _ (is (= [200 ["A" "B" "M" "C"]] [s4 (titles-under page-id)])
++                        "before the block right after it leaves it in place")
++                  s5 (move! "before" b)
++                  _ (is (= [200 ["A" "M" "B" "C"]] [s5 (titles-under page-id)]))
++                  s6 (move! "first-child" b)
++                  _ (is (= [200 ["M" "B1"]] [s6 (titles-under b)]))
++                  s7 (move! "last-child" b)
++                  _ (is (= [200 ["B1" "M"]] [s7 (titles-under b)]))
++                  s8 (move! "after" page-id)]
++            (is (= 400 s8) "a page has no siblings to move next to")))))))
