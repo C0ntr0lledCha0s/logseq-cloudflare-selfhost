@@ -105,7 +105,8 @@ jobs:
             --settings config/settings.json \
             --tofu-outputs "$placeholder" \
             --out connector/wrangler.json \
-            --hostname mcp.example.com
+            --hostname mcp.example.com \
+            --semantic-search true
           (cd connector && node_modules/.bin/wrangler deploy --dry-run --outdir "$RUNNER_TEMP/dry-run-connector")
 
       - name: OpenTofu format and validate
