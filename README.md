@@ -730,7 +730,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 1. **A publish server** at `publish.example.com`. Mobile has no publish URL setting, and rendered pages load from `asset.logseq.com` and jsdelivr.
 2. **A user allow-list** by Cognito `sub` on all authenticated routes, failing closed.
-3. **Verify the connector on a real account** and record the results in `docs/spike-results.md`: the service binding to a `workers_dev = false` Worker, claude.ai sign-in and a refused second GitHub account, Claude Code cloud sessions inheriting the connector, Card tagging for flashcards, the file tools end to end, and whether annotations change claude.ai's prompting.
+3. **Finish checking the connector** and record the results in `docs/spike-results.md`: that a second GitHub account is refused, whether annotations change claude.ai's prompting, and the file tools' CPU time on large inputs.
 4. **An upstream PR** making the PAT groups configurable, so the patch can be dropped.
 5. **An off-account backup copy.**
 6. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
