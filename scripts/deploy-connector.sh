@@ -3,7 +3,8 @@
 # Does nothing unless CONNECTOR_ENABLED is true. Otherwise deploys the connector Worker.
 # Env: CONNECTOR_ENABLED: true, or false/unset/empty for off (anything else is an error).
 # Env: SEMANTIC_SEARCH_ENABLED: true adds semantic search (Workers AI, the Vectorize index named in
-#      settings.connector.semanticSearch, the indexer's cron); false/unset/empty leaves it out.
+#      settings.connector.semanticSearch, created here on first deploy, and the indexer's cron);
+#      false/unset/empty leaves it out.
 # Env (only when enabled): CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET,
 #      OWNER_GITHUB_USER_ID, COOKIE_ENCRYPTION_KEY, GRAPH_TOKEN_KEY, CONNECTOR_HOSTNAME.
 #      OpenTofu state access env (backend creds, passphrase) must also be set.
@@ -102,6 +103,11 @@ node scripts/render-connector-wrangler.mjs \
   --out "$connector_dir/wrangler.json" \
   --hostname "$CONNECTOR_HOSTNAME" \
   --semantic-search "$semantic_search"
+
+# The VECTORIZE binding only deploys against an existing index, and OpenTofu can't create one.
+if [ "$semantic_search" = true ]; then
+  node scripts/ensure-vectorize-index.mjs --settings "$settings"
+fi
 
 cd "$connector_dir"
 "$wrangler" d1 migrations apply "$d1_name" --remote

@@ -756,22 +756,15 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 To turn it on, with the connector already on (11.5):
 
 1. Add **Vectorize** Write + Read to the Cloudflare token's account policy (1.1).
-2. Create the index once, from `connector/` with `.env.local` loaded:
-
-   ```bash
-   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx wrangler vectorize create logseq-connector-blocks --dimensions=384 --metric=cosine
-   ```
-
-   The name must match `connector.semanticSearch.vectorizeIndexName`. OpenTofu can't manage it: the Cloudflare provider has no Vectorize resource.
-3. Set the variable and deploy:
+2. Set the variable and deploy:
 
    ```bash
    gh variable set SEMANTIC_SEARCH_ENABLED --env production --body true
    gh workflow run deploy.yml
    ```
 
-   Also set `SEMANTIC_SEARCH_ENABLED=true` in `.env.local` for local connector deploys.
-4. In claude.ai, call `semantic_index_status` for a graph until it says `ready`.
+   Also set `SEMANTIC_SEARCH_ENABLED=true` in `.env.local` for local connector deploys. The deploy creates the Vectorize index named in `connector.semanticSearch.vectorizeIndexName` (384 dimensions, cosine) if it doesn't exist, and fails if an index with that name has another shape. OpenTofu can't manage it: the Cloudflare provider has no Vectorize resource.
+3. In claude.ai, call `semantic_index_status` for a graph until it says `ready`.
 
 **Turning it off.** Set the variable to `false` and deploy: the tools and the every-minute indexer cron go away. The index and the `semantic_blocks` and `semantic_state` rows stay; delete them with `npx wrangler vectorize delete logseq-connector-blocks` and `npx wrangler d1 execute logseq-connector --remote --command "DELETE FROM semantic_blocks; DELETE FROM semantic_state;"`.
 
@@ -780,8 +773,8 @@ To turn it on, with the connector already on (11.5):
 | `semantic_index_status` says `full` | The index holds `maxVectors` blocks. On Workers Paid, raise `connector.semanticSearch.maxVectors`; on Free, tag pages you don't need searched `private`. |
 | Status `error` with `Workers AI embedding failed` | Usually the free 10,000 neurons a day are used up. It resumes after midnight UTC. |
 | Status `error` with `token for graph ... expired` | Replace the graph's token (11.7). |
-| Every cron run fails with `the Vectorize index has N dimensions` | The index was created with other dimensions. Delete it, create it again as in step 2, and delete the `semantic_*` rows. |
-| Deploy fails on the `VECTORIZE` binding | The index doesn't exist yet (step 2), or the token lacks Vectorize permission. |
+| Deploy fails with `Vectorize index ... has N dimensions` | An index with that name was created with another shape. Delete it (`npx wrangler vectorize delete logseq-connector-blocks`), delete the `semantic_*` rows, and deploy again. |
+| Deploy fails with `reading Vectorize index ... Authentication error` | The token lacks Vectorize Write + Read (step 1). |
 
 ## Backlog
 

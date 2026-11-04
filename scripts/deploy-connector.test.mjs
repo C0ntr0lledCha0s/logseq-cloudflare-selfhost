@@ -156,3 +156,11 @@ test("the deploy passes the semantic search switch to the renderer", () => {
   const body = readFileSync(script, "utf8");
   assert.match(body, /--semantic-search "\$semantic_search"/);
 });
+
+test("with semantic search on, the deploy creates the Vectorize index before deploying", () => {
+  const body = readFileSync(script, "utf8");
+  const ensure = body.indexOf('node scripts/ensure-vectorize-index.mjs --settings "$settings"');
+  assert.notEqual(ensure, -1);
+  assert.ok(ensure < body.indexOf('"$wrangler" deploy'));
+  assert.match(body, /if \[ "\$semantic_search" = true \]; then\n  node scripts\/ensure-vectorize-index\.mjs/);
+});

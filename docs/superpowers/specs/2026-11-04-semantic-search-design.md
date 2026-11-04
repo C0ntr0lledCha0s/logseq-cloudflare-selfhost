@@ -91,7 +91,7 @@ semantic_search(graph, q) ─┬─ AI.run(q) → VECTORIZE.query(topK 50, names
 | Binding | What | Provisioning |
 |---|---|---|
 | `AI` | Workers AI, `@cf/baai/bge-small-en-v1.5` | none (binding only) |
-| `VECTORIZE` | index `logseq-connector-blocks`, 384 dimensions, cosine | once by hand: `wrangler vectorize create` (no OpenTofu resource) |
+| `VECTORIZE` | index `logseq-connector-blocks`, 384 dimensions, cosine | by the deploy, `scripts/ensure-vectorize-index.mjs` (no OpenTofu resource) |
 | `DB` (existing) | migration `0002_semantic.sql`: `semantic_blocks`, `semantic_state` | applied by the existing deploy |
 | `SEMANTIC_MAX_VECTORS` (var) | cap on stored vectors, from `settings.connector.semanticSearch.maxVectors` | committed setting |
 | cron `* * * * *` | the indexer | rendered |
@@ -145,9 +145,8 @@ Assumption: an average document (page title, breadcrumb, block text) of 40 token
 What the owner provisions, once (README 11.11):
 
 1. Add **Vectorize** Write + Read to the Cloudflare API token's account policy.
-2. `npx wrangler vectorize create logseq-connector-blocks --dimensions=384 --metric=cosine` (from `connector/`, with the token and account in the environment).
-3. On a graph over ~13,000 blocks: subscribe to Workers Paid and raise `connector.semanticSearch.maxVectors` in `config/settings.json`.
-4. `gh variable set SEMANTIC_SEARCH_ENABLED --env production --body true`, then run the deploy.
+2. On a graph over ~13,000 blocks: subscribe to Workers Paid and raise `connector.semanticSearch.maxVectors` in `config/settings.json`.
+3. `gh variable set SEMANTIC_SEARCH_ENABLED --env production --body true`, then run the deploy. It creates the index (384 dimensions, cosine) when it doesn't exist and fails on one with another shape.
 
 ## 10. Failure modes
 
