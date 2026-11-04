@@ -7,7 +7,6 @@ import {
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
 import { readForm } from "../form";
-import { escapeHtml, htmlPage } from "../html";
 import {
   type GitHubFetch,
   GitHubSignInError,
@@ -28,6 +27,7 @@ import {
   finishLogin,
   requireOwnerSession,
 } from "./session";
+import { badRequestPage, consentPage, formExpiredPage, githubFailedPage, notAllowedPage, signedOutPage } from "./views";
 
 /** The env the provider hands its default handler. */
 export type DefaultEnv = Env & { OAUTH_PROVIDER: OAuthHelpers };
@@ -38,54 +38,9 @@ export interface GrantProps {
   login: string;
 }
 
-function notAllowedPage(headers: Headers = new Headers()): Response {
-  return htmlPage(
-    403,
-    "Not allowed",
-    "<p>This GitHub account is not allowed to use this connector.</p>",
-    headers,
-  );
-}
-
-function badRequestPage(message: string, headers: Headers = new Headers()): Response {
-  return htmlPage(400, "Sign-in failed", `<p>${escapeHtml(message)}</p>`, headers);
-}
-
-function githubFailedPage(headers: Headers = new Headers()): Response {
-  return htmlPage(502, "Sign-in failed", "<p>GitHub sign-in failed. Please try again.</p>", headers);
-}
-
 function redirect(location: string, headers: Headers = new Headers()): Response {
   headers.set("Location", location);
   return new Response(null, { status: 302, headers });
-}
-
-function consentPage(details: ConsentDescription, handle: string, headers: Headers): Response {
-  const name = escapeHtml(details.clientName);
-  const origin = details.clientDomain
-    ? `Published by <strong>${escapeHtml(details.clientDomain)}</strong>.`
-    : "This app registered itself; its name is not verified.";
-  const loopback = details.redirectIsLoopback
-    ? "<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>"
-    : "";
-  const scopes =
-    details.scope.length > 0
-      ? `<p>Scopes: ${details.scope.map((s) => `<code>${escapeHtml(s)}</code>`).join(", ")}</p>`
-      : "";
-  return htmlPage(
-    200,
-    `Authorize ${details.clientName}`,
-    `<h1>Allow ${name} to access your Logseq graphs?</h1>
-<p>${origin} Access will be sent to <strong>${escapeHtml(details.redirectHost)}</strong>.</p>
-${loopback}${scopes}
-<p>You will sign in with GitHub next.</p>
-<form method="post" action="/authorize">
-  <input type="hidden" name="handle" value="${escapeHtml(handle)}">
-  <button name="decision" value="approve">Allow</button>
-  <button name="decision" value="deny">Deny</button>
-</form>`,
-    headers,
-  );
 }
 
 /** Errors the consent helpers raise for the user's request rather than for a bug or an outage. */
@@ -245,13 +200,8 @@ async function callback(request: Request, env: DefaultEnv, githubFetch: GitHubFe
 async function logout(request: Request, env: DefaultEnv): Promise<Response> {
   const session = await requireOwnerSession(request, env);
   if (session instanceof Response) return session;
-  if (!(await checkCsrf(request, session))) return htmlPage(403, "Forbidden", "<p>The form has expired. Reload and try again.</p>");
-  return htmlPage(
-    200,
-    "Signed out",
-    '<p>You are signed out. <a href="/login">Sign in again</a></p>',
-    new Headers({ "Set-Cookie": clearSessionCookie(), "Cache-Control": "no-store" }),
-  );
+  if (!(await checkCsrf(request, session))) return formExpiredPage();
+  return signedOutPage(new Headers({ "Set-Cookie": clearSessionCookie(), "Cache-Control": "no-store" }));
 }
 
 /** Routes the auth pages own, or undefined when the path is not one of them. */
