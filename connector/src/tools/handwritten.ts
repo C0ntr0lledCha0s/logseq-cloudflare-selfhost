@@ -7,8 +7,11 @@ import { runTool, textResult } from "./common";
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
   "Address a graph by its alias from list_graphs; graphs marked read-only refuse every write.",
-  "To read a page, use get_page_outline: one call returns its tags, property values and whole block tree as markdown with [[links]] resolved. get_page and get_block return one entity's tags and property values.",
-  "Prefer insert_block_tree for whole notes such as a meeting transcript: it writes a nested block tree in one call, and writes are rate-limited to about 20 per minute, so batch them.",
+  "To read a page, use get_page_outline: one call returns its tags, property values and whole block tree as markdown with [[links]] resolved. get_page and get_block return one entity's tags and property values; get_blocks returns them for up to 100 UUIDs in one call (view outline adds each one's tree).",
+  "Writes are rate-limited to about 20 per minute, and a call counts once however much it writes, so batch: prefer insert_block_tree for whole notes such as a meeting transcript (a nested block tree in one call), batch_insert_block_trees to build or fill several pages in one call (each entry names a page by title, created when missing, or a target-id, with the page's own properties), batch_set_block_property to tag or set properties on many existing blocks, and delete_blocks and batch_move_blocks for up to 100 blocks at a time.",
+  "Give new blocks their tags and properties as you insert them: every block tree node takes properties, e.g. {\"Tags\": [\"Person\"], \"user.property/email\": \"a@example.com\"}, keyed by property ident, UUID or exact title. Prefer idents, since a title can match a built-in property.",
+  "Batch writes apply every entry or none. Pass dry-run: true to check a large delete, move or insert first: it reports what would change and changes nothing.",
+  "Insert tools return only the new blocks' UUIDs and a count; pass verbose: true to get their titles back.",
   "Link pages by writing [[Page]] in titles and block text (people, projects, topics).",
   "create_page and create_tag refuse a title that a page, journal, tag or property already uses (ignoring case) and name it with its UUID, so create without searching first and use the named one when refused.",
   "delete_page, delete_tag and delete_property refuse while the delete would lose references, tag holders, child tags or property values, and say which acknowledge-* flag to pass; pass dry-run to see the counts first, and only acknowledge a loss the user agreed to.",
