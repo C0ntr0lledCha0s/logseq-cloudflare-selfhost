@@ -1,0 +1,106 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 2479e6e512..96adeee99c 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -6,6 +6,7 @@
+             [logseq.common.util.date-time :as date-time-util]
+             [logseq.common.util.page-ref :as page-ref]
+             [logseq.db :as ldb]
++            [logseq.db.common.order :as db-order]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.storage :as storage]
+             [logseq.db-sync.worker.asset-link :as asset-link]
+@@ -1316,6 +1317,11 @@
+   (let [conn (ensure-conn! self)
+         handler (:handler route)
+         db @conn
++        ;; Outliner writes that append (property value blocks, new pages) take the next order key
++        ;; after the process-wide max key. Clients seed it from the graph on load; this Worker
++        ;; must too, or it hands out keys siblings already hold. It only ever increases, so graphs
++        ;; sharing an isolate stay safe.
++        _ (db-order/reset-max-key! (db-order/get-max-order db))
+         ;; The index's graph_e2ee flag is authoritative and reaches the DO via
+         ;; the graph-e2ee param; the in-graph kv is only set at RTC upload, so
+         ;; check both — encrypted either way.
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 8bd00e8ee2..868d697ef8 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -17,6 +17,7 @@
+             [logseq.db-sync.worker.handler.semantic :as semantic-handler]
+             [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.ws :as ws]
++            [logseq.db.common.order :as db-order]
+             [logseq.db.frontend.schema :as db-schema]
+             [logseq.db.sqlite.build :as sqlite-build]
+             [logseq.db.sqlite.export :as sqlite-export]
+@@ -3746,7 +3747,7 @@
+                                  "/semantic/block-properties/batch-set")
+                                "?graph-id=graph-1" (when encrypted? "&graph-e2ee=true"))
+                           method body)))]
+-        (run {:conn conn :property property :page-id page-id :block-ids block-ids :request request})))))
++        (run {:conn conn :self self :property property :page-id page-id :block-ids block-ids :request request})))))
+ 
+ (defn- with-url-property-test [cardinality run]
+   (with-typed-property-test :url cardinality run))
+@@ -3985,3 +3986,26 @@
+           (p/let [response (request "POST" {:entries [entry]} false)]
+             (is (= 200 (.-status response)))
+             (is (= #{"alpha" "beta"} (titles)))))))))
++
++(deftest semantic-writes-never-reuse-an-existing-order-key-test
++  (async done
++    (run-text-property-test! done :db.cardinality/one
++      (fn [{:keys [conn self property page-id]}]
++        ;; A fresh Worker isolate starts with no max order key, while the graph already has
++        ;; blocks ordered "a0" and "a1". The URL-test page holds two such blocks.
++        (reset! db-order/*max-key nil)
++        (p/let [response (sync-handler/handle-http
++                          self
++                          (semantic-json-request
++                           (str "/semantic/blocks/" page-id "/properties/" (:block/uuid property) "?graph-id=graph-1")
++                           "PUT" {:value "Page description"}))
++                _ (is (= 200 (.-status response)))
++                page (d/entity @conn [:block/uuid page-id])
++                ;; Read children from datoms: the entity API leaves property value blocks out of
++                ;; :block/_parent, but they share the order space with the page's other children.
++                orders (map second (d/q '[:find ?child ?order :in $ ?page
++                                          :where [?child :block/parent ?page] [?child :block/order ?order]]
++                                        @conn (:db/id page)))]
++          (is (= 3 (count orders)))
++          (is (= (count orders) (count (distinct orders)))
++              "the new value block gets an order key no sibling already has"))))))
+diff --git a/deps/db/src/logseq/db/common/order.cljs b/deps/db/src/logseq/db/common/order.cljs
+index 5642c92878..38fdbbe5f2 100644
+--- a/deps/db/src/logseq/db/common/order.cljs
++++ b/deps/db/src/logseq/db/common/order.cljs
+@@ -28,7 +28,11 @@
+ 
+ (defn get-max-order
+   [db]
+-  (:v (first (d/rseek-datoms db :avet :block/order))))
++  ;; rseek walks back past the start of the :block/order range, so with no ordered blocks the
++  ;; first datom belongs to another attribute.
++  (let [datom (first (d/rseek-datoms db :avet :block/order))]
++    (when (= :block/order (:a datom))
++      (:v datom))))
+ 
+ (defn gen-n-keys
+   [n start end & {:keys [max-key-atom]
+diff --git a/deps/db/test/logseq/db/common/order_test.cljs b/deps/db/test/logseq/db/common/order_test.cljs
+index 7ce60b98aa..174a233696 100644
+--- a/deps/db/test/logseq/db/common/order_test.cljs
++++ b/deps/db/test/logseq/db/common/order_test.cljs
+@@ -92,3 +92,12 @@
+       (is (empty? second-tx)
+           "Validate/migrate repair does not rewrite orders that are already strings.")
+       (is (= orders-after-first (repaired-child-orders conn))))))
++
++(deftest get-max-order-reads-only-order-datoms
++  (let [conn (d/create-conn {:block/order {:db/index true}
++                             :block/name {:db/index true}})]
++    (d/transact! conn [{:block/name "日本語ページ"}])
++    (is (nil? (db-order/get-max-order @conn))
++        "no ordered blocks means no max order, not another attribute's value")
++    (d/transact! conn [{:block/order "a0"} {:block/order "a1"}])
++    (is (= "a1" (db-order/get-max-order @conn)))))
