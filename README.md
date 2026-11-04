@@ -542,7 +542,7 @@ The connector is an optional second Worker, `logseq-connector`, at its own hostn
 - **Its tools are generated** from the sync server's OpenAPI document at `UPSTREAM_REF`. When an upstream bump adds, removes or changes an operation, CI flags it: run `npm --prefix connector run update:manifest` and commit the result.
 - **It runs on the Workers Free plan.** It adds one Worker, a KV namespace for OAuth grants, a KV namespace caching each graph's `kb_index`, a small D1 database for the connected graphs and an hourly cron trigger that rebuilds the cache. One person's use stays well inside KV's free daily allowances. The file tools on large inputs, and `kb_index` on a graph of thousands of pages, are *(not yet verified)* against the Free plan's CPU time per request (11.8).
 
-**Status.** The connector is built and tested in CI, but it hasn't been used on a real account yet. Anything below marked *(not yet verified)* is still to be confirmed against a real deploy and recorded in `docs/spike-results.md`.
+**Status.** The connector is deployed and in use: claude.ai, Claude Code cloud sessions and a local Claude Code have each signed in and read and written a graph. `docs/spike-results.md` records what was checked. Two things are still unmeasured: CPU time for the file tools on large inputs, and how claude.ai treats the tools' annotations (11.6, 11.8).
 
 ### 11.1 What you need
 
@@ -634,7 +634,7 @@ npm --prefix connector ci
 scripts/with-r2-credentials.sh mise exec -- scripts/deploy-connector.sh
 ```
 
-Calls from the connector to the sync server go over the service binding. That a binding reaches `logseq-sync`, which has `workers_dev = false` and only a custom domain, is *(not yet verified)*.
+Calls from the connector to the sync server go over the service binding. It reaches `logseq-sync` even though `logseq-sync` has `workers_dev = false` and only a custom domain.
 
 **Turning it off again needs manual teardown.** Once the resources exist, any OpenTofu run with the connector off (the variable unset or `false` in Actions, or `CONNECTOR_ENABLED` missing or `false` in your shell) plans to destroy the KV namespace and D1 database. `prevent_destroy` refuses that, which fails the whole deploy, the sync server's included. To turn it off, first remove the two resources from the OpenTofu state, then set the variable to `false` straight away (a deploy in between would try to create them again), and set `CONNECTOR_ENABLED=false` in `.env.local`:
 
@@ -647,18 +647,18 @@ The `kb_index` cache namespace `logseq-connector-kb-index` has no `prevent_destr
 
 ### 11.6 Add it to claude.ai and Claude Code
 
-**claude.ai** *(not yet verified)*:
+**claude.ai**:
 
 1. Open **Settings → Connectors → Add custom connector**.
 2. Give it a name, such as `Logseq`, and the URL `https://mcp.example.com/mcp`. Leave the advanced OAuth client ID and secret empty: the connector lets claude.ai register itself.
 3. Click **Connect**. The connector asks you to allow Claude access to your Logseq graphs, then sends you to GitHub. Sign in with the GitHub account whose ID is in `OWNER_GITHUB_USER_ID`. Any other account gets "This GitHub account is not allowed to use this connector."
 4. Enable the connector in a conversation from its tools menu, then ask "list my Logseq graphs".
 
-Every tool carries MCP annotations: read tools are marked read-only and delete tools destructive. Whether claude.ai uses them to skip or force the approval prompt for a custom connector is *(not yet verified)*. Either way you can set each tool to Always allow, Needs approval or Blocked in the connector's settings.
+Every tool carries MCP annotations: read tools are marked read-only and delete tools destructive. Whether claude.ai uses them to skip or force the approval prompt for a custom connector hasn't been checked. Either way you can set each tool to Always allow, Needs approval or Blocked in the connector's settings.
 
-**Claude Code cloud sessions** inherit your claude.ai connectors *(not yet verified)*. Enable the connector for the session. The traffic goes through Anthropic, so the environment needs no network allow-list, environment variables or skill for it. Section 5 stays available for raw REST access.
+**Claude Code cloud sessions** inherit your claude.ai connectors. Enable the connector for the session. The traffic goes through Anthropic, so the environment needs no network allow-list, environment variables or skill for it. Section 5 stays available for raw REST access.
 
-**Claude Code on your own machine** should also work, because the connector accepts loopback redirect URIs *(not yet verified)*: run `claude mcp add --transport http logseq https://mcp.example.com/mcp`, then `/mcp` in a session to sign in.
+**Claude Code on your own machine** works too, because the connector accepts loopback redirect URIs: run `claude mcp add --transport http logseq https://mcp.example.com/mcp`, then `/mcp` in a session to sign in.
 
 ### 11.7 Connect your graphs
 
@@ -701,8 +701,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
   - both attach the file to a page you name by title or UUID, or to today's journal;
   - `read_file` reads a file back by its asset block UUID: text as text, PNG, JPEG, GIF and WebP images up to 3.75 MiB as images (when the file's first bytes match its extension), anything else as a one-line description.
 
-  Saving and reading files end to end is *(not yet verified)*. So is whether large files, such as a 25 MiB download or a 3.75 MiB image, stay inside the Workers Free plan's CPU time and memory per request *(not yet verified)*.
-- **Flashcards:** Claude tags a block with the `Card` tag, which makes it a flashcard in Logseq's review. That this works through the API is *(not yet verified)*. Reviews stay in Logseq.
+  Saving and reading back small files works. Whether large files, such as a 25 MiB download or a 3.75 MiB image, stay inside the Workers Free plan's CPU time and memory per request hasn't been measured. If one fails with error 1102, switch to the paid plan (section 8).
+- **Flashcards:** Claude tags a block with the `Card` tag, which makes it a flashcard in Logseq's review. Reviews stay in Logseq.
 
 **Limits:**
 
@@ -732,6 +732,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | `graph 'x' is read-only` | The graph is connected read-only. Switch it to read-write under **Edit** at `/graphs`. That needs a `both` token: if its token is `read`, replace it with a `both` token first. |
 | `unknown graph 'x' — call list_graphs for the connected aliases` | No graph is connected under that alias: it was renamed or disconnected, or never connected. Check `/graphs`. |
 | Every tool fails for every graph after rotating `GRAPH_TOKEN_KEY` | The stored tokens can't be decrypted any more. Replace each graph's token at `/graphs` (11.7). |
+| GitHub shows "The `redirect_uri` is not associated with this application" | The OAuth app's **Authorization callback URL** isn't `https://<CONNECTOR_HOSTNAME>/callback`. Fix it in the app's settings on GitHub (11.2); nothing needs redeploying. |
 | `421 Misdirected request` | The request reached the connector on a hostname other than `CONNECTOR_HOSTNAME`. Use exactly `https://<CONNECTOR_HOSTNAME>/mcp`, and check that the secret matches the custom domain. |
 | `500 Server misconfigured` | A connector secret is missing or malformed. The Worker log says which: `connector misconfigured: invalid connector secrets: …`. `CONNECTOR_HOSTNAME` must be lowercase, the two keys must be 64 hex characters and `OWNER_GITHUB_USER_ID` must be a positive integer (no leading zeros). Fix the secret and redeploy. |
 | "This GitHub account is not allowed to use this connector." | You signed in with another GitHub account, or `OWNER_GITHUB_USER_ID` is wrong. Check it with `gh api user -q .id`. |
@@ -780,7 +781,7 @@ To turn it on, with the connector already on (11.5):
 
 1. **A publish server** at `publish.example.com`. Mobile has no publish URL setting, and rendered pages load from `asset.logseq.com` and jsdelivr.
 2. **A user allow-list** by Cognito `sub` on all authenticated routes, failing closed.
-3. **Verify the connector on a real account** and record the results in `docs/spike-results.md`: the service binding to a `workers_dev = false` Worker, claude.ai sign-in and a refused second GitHub account, Claude Code cloud sessions inheriting the connector, Card tagging for flashcards, the file tools end to end, and whether annotations change claude.ai's prompting.
+3. **Finish checking the connector** and record the results in `docs/spike-results.md`: that a second GitHub account is refused, whether annotations change claude.ai's prompting, and the file tools' CPU time on large inputs.
 4. **An upstream PR** making the PAT groups configurable, so the patch can be dropped.
 5. **An off-account backup copy.**
 6. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
