@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies five small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies six small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -32,6 +32,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Pages as readable outlines.** `patches/0003-semantic-page-outline.patch` adds `getPageOutline` (the connector's `get_page_outline`). It returns a page's tags, its property values and its whole block tree as a markdown outline, in one call, with `[[links]]` shown as page titles instead of UUIDs. It refuses E2EE graphs.
 - **Search that finds pages.** Upstream's `searchGraph` returns pages under the `blocks` type, sorted after every block that mentions them, and ignores unknown `types` values. `patches/0004-semantic-search-pages-and-ranking.patch` adds a `pages` type, rejects unknown types with a 400, and ranks an exact title match first, then pages, tags, properties and assets, then blocks.
 - **Batch errors that say what's wrong.** Upstream's `batchSetBlockProperty` and `batchDeleteBlockProperty` answer every rejected batch with `invalid batch property entry`, whether `entries` is missing, isn't an array, or one entry names a block, property or value that doesn't exist. `patches/0005-semantic-batch-property-errors.patch` returns `entries must be a non-empty array` for the first case and `entry <index>: <reason>` for the others. A rejected batch still writes nothing.
+- **Inline tags that tag.** Upstream stores `#Tag` in a block written through the API as plain text, so the block never gets the tag, unlike the same text typed in the editor. `patches/0006-semantic-inline-tags.patch` resolves `#Tag` and `#[[Multi Word Tag]]` in inserted and updated block titles to an existing tag (exact title first, then a unique case-insensitive match) and stores them as the editor does, as `#[[uuid]]` with the tag set on the block. Anything else after a `#`, such as an issue number, a URL fragment or an unknown name, stays plain text, and tags Logseq refuses inline (page, property and other built-in kinds) are skipped.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
