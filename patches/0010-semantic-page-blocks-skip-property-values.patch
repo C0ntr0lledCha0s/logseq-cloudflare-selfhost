@@ -1,0 +1,48 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 18c5add4c4..dc22ab5a7a 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -280,6 +280,9 @@
+   (let [page-id (:db/id page)]
+     (->> (d/datoms db :avet :block/page page-id)
+          (filter #(seq (d/datoms db :eavt (:e %) :block/parent page-id)))
++         ;; A page's property values are blocks under the page too; they belong to its properties,
++         ;; not its body, as in the outline and in block children.
++         (remove #(seq (d/datoms db :eavt (:e %) :logseq.property/created-from-property)))
+          (map #(:e %))
+          (map #(d/pull db [:db/id :block/uuid :block/title :block/order
+                          :block/created-at :block/updated-at
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 84b6f205f5..48d7fcf428 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -4048,3 +4048,29 @@
+                   _ (is (= [200 ["B1" "M"]] [s7 (titles-under b)]))
+                   s8 (move! "after" page-id)]
+             (is (= 400 s8) "a page has no siblings to move next to")))))))
++
++(deftest semantic-list-page-blocks-leaves-out-property-values-test
++  (async done
++    (run-text-property-test! done :db.cardinality/one
++      (fn [{:keys [conn self property page-id request]}]
++        (p/let [set-response (sync-handler/handle-http
++                              self
++                              (semantic-json-request
++                               (str "/semantic/blocks/" page-id "/properties/" (:block/uuid property) "?graph-id=graph-1")
++                               "PUT" {:value "Page description"}))
++                _ (is (= 200 (.-status set-response)))
++                value-block (get (d/entity @conn [:block/uuid page-id]) (:db/ident property))
++                _ (is (= page-id (get-in value-block [:block/parent :block/uuid]))
++                      "the value block sits under the page, alongside its body blocks")
++                list-response (sync-handler/handle-http
++                               self
++                               (semantic-json-request
++                                (str "/semantic/pages/" page-id "/blocks?graph-id=graph-1") "GET" nil))
++                body (json-body list-response)
++                block-response (sync-handler/handle-http
++                                self
++                                (semantic-json-request
++                                 (str "/semantic/blocks/" (:block/uuid value-block) "?graph-id=graph-1") "GET" nil))]
++          (is (= 200 (.-status list-response)))
++          (is (= ["URL block 0" "URL block 1"] (mapv :title (:blocks body))))
++          (is (= 200 (.-status block-response)) "the value block is still readable by UUID"))))))
