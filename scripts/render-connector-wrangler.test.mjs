@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { renderConnectorWrangler } from "./render-connector-wrangler.mjs";
+import { KB_INDEX_CRON, SEMANTIC_CRON, renderConnectorWrangler } from "./render-connector-wrangler.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const template = readFileSync(
@@ -23,7 +23,7 @@ const tofuOutputs = {
 
 function render(over = {}) {
   return JSON.parse(
-    renderConnectorWrangler({ template, settings, hostname, tofuOutputs, ...over }),
+    renderConnectorWrangler({ template, settings, hostname, tofuOutputs, semanticSearch: false, ...over }),
   );
 }
 
@@ -62,6 +62,7 @@ test("throws when the connector settings are missing", () => {
         settings: { ...baseSettings, connector: undefined },
         hostname,
         tofuOutputs,
+        semanticSearch: false,
       }),
     /connector/,
   );
@@ -112,10 +113,83 @@ test("parses JSONC comments and trailing commas without touching strings", () =>
 });
 
 test("refuses a template that already carries account bindings", () => {
-  for (const key of ["kv_namespaces", "d1_databases", "services", "routes", "account_id"]) {
+  for (const key of ["kv_namespaces", "d1_databases", "services", "routes", "account_id", "ai", "vectorize", "triggers"]) {
     assert.throws(
       () => render({ template: JSON.stringify({ [key]: [] }) }),
       new RegExp(`forbidden top-level key: ${key}`),
     );
   }
+});
+
+test("semantic search off renders no AI, Vectorize, indexer cron or cap", () => {
+  const out = render();
+  for (const key of ["ai", "vectorize"]) assert.equal(out[key], undefined, key);
+  assert.deepEqual(out.triggers, { crons: [KB_INDEX_CRON] });
+  assert.equal(out.vars?.SEMANTIC_MAX_VECTORS, undefined);
+});
+
+test("semantic search on adds the AI and Vectorize bindings, the cron and the cap", () => {
+  const out = render({ semanticSearch: true });
+  assert.deepEqual(out.ai, { binding: "AI" });
+  assert.deepEqual(out.vectorize, [{ binding: "VECTORIZE", index_name: "logseq-connector-blocks" }]);
+  assert.deepEqual(out.triggers, { crons: [KB_INDEX_CRON, SEMANTIC_CRON] });
+  assert.equal(SEMANTIC_CRON, "* * * * *");
+  assert.equal(out.vars.SEMANTIC_MAX_VECTORS, "13000");
+  // The rest of the config is as with it off.
+  assert.deepEqual(out.d1_databases, render().d1_databases);
+  assert.deepEqual(out.services, render().services);
+});
+
+test("semantic search keeps template vars and refuses a template that sets the cap", () => {
+  const withVars = `{ "main": "src/index.ts", "vars": { "OTHER": "x" } }`;
+  assert.deepEqual(render({ template: withVars, semanticSearch: true }).vars, { OTHER: "x", SEMANTIC_MAX_VECTORS: "13000" });
+  assert.throws(
+    () => render({ template: `{ "vars": { "SEMANTIC_MAX_VECTORS": "1" } }`, semanticSearch: true }),
+    /must not set SEMANTIC_MAX_VECTORS/,
+  );
+});
+
+test("semantic search on needs its settings, with a positive integer cap", () => {
+  const connector = settings.connector;
+  assert.throws(
+    () => render({ semanticSearch: true, settings: { ...settings, connector: { ...connector, semanticSearch: undefined } } }),
+    /missing settings.connector.semanticSearch/,
+  );
+  assert.throws(
+    () =>
+      render({
+        semanticSearch: true,
+        settings: { ...settings, connector: { ...connector, semanticSearch: { ...connector.semanticSearch, vectorizeIndexName: "" } } },
+      }),
+    /missing settings.connector.semanticSearch.vectorizeIndexName/,
+  );
+  for (const maxVectors of [0, -1, 1.5, "13000", undefined]) {
+    assert.throws(
+      () =>
+        render({
+          semanticSearch: true,
+          settings: { ...settings, connector: { ...connector, semanticSearch: { ...connector.semanticSearch, maxVectors } } },
+        }),
+      /maxVectors must be a positive integer/,
+      String(maxVectors),
+    );
+  }
+  // Off, the settings are not read.
+  assert.doesNotThrow(() => render({ settings: { ...settings, connector: { ...connector, semanticSearch: undefined } } }));
+});
+
+test("semanticSearch must be a boolean", () => {
+  for (const semanticSearch of [undefined, "true", 1]) {
+    assert.throws(() => render({ semanticSearch }), /semanticSearch must be true or false/);
+  }
+});
+
+test("the cap fits the Free plan's 5M stored Vectorize dimensions", () => {
+  assert.ok(settings.connector.semanticSearch.maxVectors * 384 <= 5_000_000);
+});
+
+test("the rendered crons match the ones the connector dispatches on", () => {
+  const source = readFileSync(new URL("../connector/src/crons.ts", import.meta.url), "utf8");
+  const declared = Object.fromEntries([...source.matchAll(/export const (\w+) = "([^"]+)";/g)].map((m) => [m[1], m[2]]));
+  assert.deepEqual(declared, { KB_INDEX_CRON, SEMANTIC_CRON });
 });

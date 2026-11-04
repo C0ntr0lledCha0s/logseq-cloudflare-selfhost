@@ -90,3 +90,7 @@ resource "cloudflare_d1_database" "connector" {
     prevent_destroy = true
   }
 }
+
+# The connector's optional semantic search (SEMANTIC_SEARCH_ENABLED) also uses a Vectorize index,
+# settings.connector.semanticSearch.vectorizeIndexName. The Cloudflare provider has no Vectorize
+# resource, so it is created once with wrangler (README 11.11), not here.

@@ -1,3 +1,4 @@
+import { KB_INDEX_CRON } from "../src/crons";
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { GraphStore } from "../src/graphs";
@@ -308,7 +309,7 @@ describe("cron", () => {
         : serveIndex()(request);
     const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
     const ctx = createExecutionContext();
-    await expect(connector.scheduled!(createScheduledController(), testEnv(), ctx)).rejects.toThrow(
+    await expect(connector.scheduled!(createScheduledController({ cron: KB_INDEX_CRON }), testEnv(), ctx)).rejects.toThrow(
       "kb index refresh failed for 1 of 2 graphs",
     );
     await waitOnExecutionContext(ctx);
@@ -331,7 +332,7 @@ describe("cron", () => {
         : serveIndex()(request);
     const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
     const ctx = createExecutionContext();
-    await connector.scheduled!(createScheduledController(), testEnv(), ctx);
+    await connector.scheduled!(createScheduledController({ cron: KB_INDEX_CRON }), testEnv(), ctx);
     await waitOnExecutionContext(ctx);
     expect(logged().map((l) => l.replace(/ms=\d+/, "ms=N")).sort()).toEqual([
       "kb-index graph=notes status=skipped-e2ee ms=N",
@@ -372,5 +373,14 @@ describe("tool list", () => {
     for (const name of ["kb_index", "get_page_backlinks", "get_graph_health"]) expect(names).toContain(name);
     expect(names).not.toContain("list_knowledge_index");
     expect(tools.find((t) => t.name === "kb_index")?.annotations.readOnlyHint).toBe(true);
+  });
+});
+
+describe("scheduled", () => {
+  it("refuses a cron it doesn't know", async () => {
+    const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
+    await expect(
+      connector.scheduled!(createScheduledController({ cron: "*/5 * * * *" }), testEnv(), createExecutionContext()),
+    ).rejects.toThrow('unexpected cron "*/5 * * * *"');
   });
 });

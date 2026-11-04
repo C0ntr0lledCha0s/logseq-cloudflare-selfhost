@@ -5,7 +5,7 @@ import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
-import { type OpenApiSpec, buildManifest, checkManifest } from "../src/tools/spec.mjs";
+import { type OpenApiSpec, SEMANTIC_TOOLS, buildManifest, checkManifest } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_TOKEN = "logseq_pat_WorkToken123";
@@ -178,9 +178,9 @@ describe("tool list", () => {
     }
   });
 
-  it("matches the committed tools-manifest.json", async () => {
+  it("matches the committed tools-manifest.json, less the semantic search tools while those are off", async () => {
     const names = (await listTools()).map((t) => t.name).sort();
-    expect(names).toEqual(committedManifest.map((e) => e.name));
+    expect(names).toEqual(committedManifest.map((e) => e.name).filter((n) => !SEMANTIC_TOOLS.includes(n)));
   });
 
   it("every GET tool readOnlyHint true, every DELETE destructiveHint true", async () => {

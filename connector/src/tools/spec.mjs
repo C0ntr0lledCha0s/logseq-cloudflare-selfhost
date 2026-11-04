@@ -23,12 +23,19 @@ export const HANDWRITTEN_TOOLS = [
   "read_file",
   "save_document",
   "save_file_from_url",
+  "semantic_index_status",
+  "semantic_search",
 ];
+/** Hand-written tools registered only when semantic search is configured (src/semantic/config.ts). */
+export const SEMANTIC_TOOLS = ["semantic_index_status", "semantic_search"];
 
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
-/** Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index). `/e2ee/` paths are dropped too. */
-const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs", "listKnowledgeIndex"]);
+/**
+ * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), or, for listBlockChanges,
+ * the semantic indexer's feed rather than something Claude needs. `/e2ee/` paths are dropped too.
+ */
+const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs", "listKnowledgeIndex", "listBlockChanges"]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
 /**

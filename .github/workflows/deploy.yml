@@ -82,6 +82,26 @@ jobs:
             echo "TF_VAR_connector_enabled=$enabled"
           } >> "$GITHUB_ENV"
 
+      # SEMANTIC_SEARCH_ENABLED, another GitHub variable (unset means off), adds semantic search to the
+      # connector: Workers AI, a Vectorize index created once by hand, and the indexer's cron (README
+      # 11.11). It needs the connector on. deploy-connector.sh reads the normalised value.
+      - name: Read semantic search setting
+        env:
+          SEMANTIC_SEARCH_ENABLED: ${{ vars.SEMANTIC_SEARCH_ENABLED }}
+        run: |
+          case "${SEMANTIC_SEARCH_ENABLED:-false}" in
+            true | false) enabled="${SEMANTIC_SEARCH_ENABLED:-false}" ;;
+            *)
+              echo "::error::The SEMANTIC_SEARCH_ENABLED variable must be true or false (unset means false)"
+              exit 1
+              ;;
+          esac
+          if [ "$enabled" = true ] && [ "$CONNECTOR_ENABLED" != true ]; then
+            echo "::error::SEMANTIC_SEARCH_ENABLED=true needs CONNECTOR_ENABLED=true"
+            exit 1
+          fi
+          echo "SEMANTIC_SEARCH_ENABLED=$enabled" >> "$GITHUB_ENV"
+
       - name: Tofu init
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

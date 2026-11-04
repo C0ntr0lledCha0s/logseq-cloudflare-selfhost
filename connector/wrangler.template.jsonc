@@ -5,8 +5,6 @@
   "compatibility_date": "2026-07-11",
   // global_fetch_strictly_public is required for CIMD client metadata fetches.
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  "observability": { "enabled": true },
-  // Rebuilds every graph's kb_index cache (KB_INDEX_KV) hourly; src/tools/kb-index.ts treats a
-  // cache older than two periods as stale.
-  "triggers": { "crons": ["0 * * * *"] }
+  "observability": { "enabled": true }
+  // Cron triggers are rendered too: see connector/src/crons.ts.
 }
