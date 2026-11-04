@@ -1,0 +1,200 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 4e4be65541..de822c008e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -177,12 +177,12 @@
+     (cond-> {:items page}
+       more? (assoc :next-cursor (encode-cursor (sort-key (last page)))))))
+ 
+-(defn- paginate-bounded [items limit cursor]
++(defn- paginate-bounded [key-fn items limit cursor]
+   (let [selected (reduce (fn [selected item]
+                            (if (or (nil? cursor)
+-                                   (pos? (compare (sort-key item) cursor)))
++                                   (pos? (compare (key-fn item) cursor)))
+                              (->> (conj selected item)
+-                                  (sort-by sort-key)
++                                  (sort-by key-fn)
+                                   (take (inc limit))
+                                   vec)
+                              selected))
+@@ -191,7 +191,7 @@
+         more? (> (count selected) limit)
+         page (vec (take limit selected))]
+     (cond-> {:items page}
+-      more? (assoc :next-cursor (encode-cursor (sort-key (last page)))))))
++      more? (assoc :next-cursor (encode-cursor (key-fn (last page)))))))
+ 
+ (defn- pagination-options [url]
+   (let [raw-cursor (.get (.-searchParams url) "cursor")]
+@@ -593,20 +593,32 @@
+                      (d/datoms db :eavt choice-id :block/closed-value-property)))
+       choice)))
+ 
++(def ^:private search-types #{"pages" "blocks" "tags" "properties" "assets"})
++
++(defn- search-type [entity]
++  (case (block-kind entity) "page" "pages" "tag" "tags" "property" "properties" "asset" "assets" "blocks"))
++
+ (defn- search-result-response [entity]
+   (let [kind (block-kind entity)
+-        type (case kind "tag" "tags" "property" "properties" "asset" "assets" "blocks")
+         response (case kind
+                    "tag" (tag-response entity)
+                    "property" (property-response entity)
+                    "asset" (asset-response entity)
+                    (block-response entity))]
+-    (assoc response :resource type)))
+-
+-(defn- search-results [db query types]
+-  (let [needle (string/lower-case query)
+-        enabled (if (seq types) (set (string/split types #",")) #{"blocks" "tags" "properties" "assets"})
+-        title-matches (keep (fn [datom]
++    (assoc response :resource (search-type entity))))
++
++(defn- search-sort-key
++  "Ranks an exact title match first, then pages, tags, properties and assets, then blocks;
++  alphabetically by title within each rank. Kept a pair of strings so it encodes as a cursor."
++  [needle entity]
++  (let [title (string/lower-case (or (:block/title entity) ""))
++        rank (cond (= needle title) "0"
++                   (not= "blocks" (search-type entity)) "1"
++                   :else "2")]
++    [(str rank title) (str (:block/uuid entity))]))
++
++(defn- search-results [db needle enabled]
++  (let [title-matches (keep (fn [datom]
+                               (try
+                                 (when (string/includes? (string/lower-case (:v datom)) needle)
+                                   (:e datom))
+@@ -617,10 +629,8 @@
+          (map #(d/entity db %))
+          (remove entity-util/hidden?)
+          (filter (fn [entity]
+-                   (let [kind (block-kind entity)
+-                         type (case kind "tag" "tags" "property" "properties" "asset" "assets" "blocks")]
+-                     (and (contains? enabled type)
+-                          (string/includes? (string/lower-case (or (:block/title entity) "")) needle))))))))
++                   (and (contains? enabled (search-type entity))
++                        (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))))
+ 
+ (defn- request-creator [request e2ee?]
+   (when-let [encoded (.get (.-headers request) "x-logseq-sync-actor")]
+@@ -1128,13 +1138,17 @@
+       (http/not-found))
+ 
+     :semantic/search
+-    (let [query (.get (.-searchParams url) "q")]
+-      (if-not (seq query)
+-        (http/bad-request "missing q")
+-        (paginated-response url :results
+-                            (search-results db query (.get (.-searchParams url) "types"))
+-                            search-result-response
+-                            paginate-bounded)))))
++    (let [query (.get (.-searchParams url) "q")
++          raw-types (.get (.-searchParams url) "types")
++          types (if (seq raw-types) (set (string/split raw-types #",")) search-types)
++          needle (some-> query string/lower-case)]
++      (cond
++        (not (seq query)) (http/bad-request "missing q")
++        (not-every? search-types types) (http/bad-request "invalid types")
++        :else (paginated-response url :results
++                                  (search-results db needle types)
++                                  search-result-response
++                                  (partial paginate-bounded (partial search-sort-key needle)))))))
+ 
+ (def ^:private page-handlers
+   #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index e3f3a43395..2d13a988fa 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -122,7 +122,7 @@
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+-   "searchGraph" ["Search graph resources" "Searches blocks, tags, properties, and assets by title and returns cursor-paginated results."]
++   "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
+    "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
+    "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
+    "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
+@@ -272,7 +272,8 @@
+             :description "Exact graph name, matched case-insensitively."}])
+     (= "searchGraph" operation-id)
+     (into [{:name "q" :in "query" :required true :schema {:type "string"}}
+-           {:name "types" :in "query" :schema {:type "string"}}])
++           {:name "types" :in "query" :schema {:type "string"}
++            :description "Comma-separated result types to include: pages, blocks, tags, properties, assets. Defaults to all; any other value is rejected."}])
+     (= "listTasks" operation-id)
+     (into [{:name "status" :in "query" :schema {:$ref "#/components/schemas/TaskStatusSelector"}}
+            {:name "priority" :in "query" :schema {:$ref "#/components/schemas/TaskPrioritySelector"}}
+@@ -388,7 +389,7 @@
+               :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
+                                      :properties {:uuid {:type "string"}
+                                                   :title {:type "string"}
+-                                                  :resource {:enum ["blocks" "tags" "properties" "assets"]}}}
++                                                  :resource {:enum ["pages" "blocks" "tags" "properties" "assets"]}}}
+               :EntitySelector {:type "string"
+                                :description "An existing entity UUID, qualified ident, or exact title."}
+               :TaskStatusSelector
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 35a3dce179..3400998db7 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -554,7 +554,55 @@
+                            {:block/uuid (random-uuid)
+                             :block/title "Roadmap two"
+                             :block/tags :logseq.class/Page}])
+-        (is (not (vector? (#'semantic-handler/search-results @conn "roadmap" "blocks"))))))))
++        (is (not (vector? (#'semantic-handler/search-results @conn "roadmap" #{"pages"}))))))))
++
++(deftest semantic-search-filters-pages-and-ranks-them-before-blocks-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (storage/init-schema! sql)
++             (let [conn (storage/open-conn sql)
++                   page-id (random-uuid)
++                   other-page-id (random-uuid)
++                   block-id (random-uuid)
++                   _ (d/transact! conn [{:db/ident :logseq.class/Page}
++                                        {:block/uuid page-id
++                                         :block/name "roadmap"
++                                         :block/title "Roadmap"
++                                         :block/tags :logseq.class/Page}
++                                        {:block/uuid other-page-id
++                                         :block/name "roadmap archive"
++                                         :block/title "Roadmap archive"
++                                         :block/tags :logseq.class/Page}
++                                        {:block/uuid block-id
++                                         :block/title "Agree the roadmap"
++                                         :block/page [:block/uuid other-page-id]
++                                         :block/parent [:block/uuid other-page-id]
++                                         :block/order "a0"}])
++                   self #js {:sql sql :conn conn :schema-ready true}
++                   requests [(semantic-json-request "/semantic/search?graph-id=graph-1&q=roadmap" "GET" nil)
++                             (semantic-json-request "/semantic/search?graph-id=graph-1&q=Roadmap&types=pages" "GET" nil)
++                             (semantic-json-request "/semantic/search?graph-id=graph-1&q=roadmap&limit=1" "GET" nil)
++                             (semantic-json-request "/semantic/search?graph-id=graph-1&q=roadmap&types=page" "GET" nil)]]
++               (-> (p/let [responses (p/all (map #(sync-handler/handle-http self %) requests))
++                            bodies (p/all (map json-body responses))
++                            next-response (sync-handler/handle-http
++                                           self
++                                           (semantic-json-request (str "/semantic/search?graph-id=graph-1&q=roadmap&limit=1&cursor="
++                                                                       (js/encodeURIComponent (get-in bodies [2 :next-cursor])))
++                                                                  "GET" nil))
++                            next-body (json-body next-response)]
++                     (is (= [200 200 200 400] (mapv #(.-status %) responses)) (pr-str bodies))
++                     (is (= [[(str page-id) "pages"] [(str other-page-id) "pages"] [(str block-id) "blocks"]]
++                            (mapv (juxt :uuid :resource) (get-in bodies [0 :results]))))
++                     (is (= [(str page-id) (str other-page-id)] (mapv :uuid (get-in bodies [1 :results]))))
++                     (is (= [(str page-id)] (mapv :uuid (get-in bodies [2 :results]))))
++                     (is (= (str other-page-id) (get-in next-body [:results 0 :uuid])))
++                     (is (= "invalid types" (get-in bodies [3 :error]))))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error]
++                              (is false (str error))
++                              (done)))))))))
+ 
+ (deftest semantic-move-blocks-moves-all-addressed-blocks-test
+   (async done

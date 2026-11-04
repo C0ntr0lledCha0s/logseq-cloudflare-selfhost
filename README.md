@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies three small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies four small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -30,6 +30,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **PATs for your own account.** Upstream only lets accounts in Logseq's internal groups create PATs. The patch in `patches/0001-pat-gate-allow-authenticated-users.patch` lets any signed-in account create, list and revoke its own PATs. That is what makes the REST API usable from scripts and agents.
 - **Property values in the REST API.** Upstream's `getPage` and `getBlock` return only a page's or block's title and position. `patches/0002-semantic-get-returns-tags-and-properties.patch` adds its tags and its user and library property values (e.g. `schema.property/genre`), so Claude can read them through the connector. Built-in `logseq.*` properties are left out.
 - **Pages as readable outlines.** `patches/0003-semantic-page-outline.patch` adds `getPageOutline` (the connector's `get_page_outline`). It returns a page's tags, its property values and its whole block tree as a markdown outline, in one call, with `[[links]]` shown as page titles instead of UUIDs. It refuses E2EE graphs.
+- **Search that finds pages.** Upstream's `searchGraph` returns pages under the `blocks` type, sorted after every block that mentions them, and ignores unknown `types` values. `patches/0004-semantic-search-pages-and-ranking.patch` adds a `pages` type, rejects unknown types with a 400, and ranks an exact title match first, then pages, tags, properties and assets, then blocks.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**

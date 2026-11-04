@@ -117,14 +117,14 @@ async function pageIdFor(access: GraphAccess, alias: string, graph: ResolvedGrap
     const response = await graphFetch(access, alias, graph.pat, {
       method: "GET",
       path: graphPath(graph, "/search"),
-      query: { q: page, types: "blocks", limit: 200, ...(cursor === undefined ? {} : { cursor }) },
+      query: { q: page, types: "pages", limit: 200, ...(cursor === undefined ? {} : { cursor }) },
     });
     const body = (await response.json()) as {
-      results: { uuid: string; kind: string; title: string }[];
+      results: { uuid: string; title: string }[];
       "next-cursor"?: string;
     };
     for (const result of body.results) {
-      if (result.kind === "page" && result.title.toLowerCase() === wanted) matches.add(result.uuid);
+      if (result.title.toLowerCase() === wanted) matches.add(result.uuid);
     }
     cursor = body["next-cursor"];
     if (cursor === undefined) break;
