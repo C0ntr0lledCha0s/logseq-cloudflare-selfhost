@@ -94,3 +94,19 @@ The 24 hours covered real use plus a graph import. Data comes from the GraphQL A
 
 - The desktop nightly (`2.0.2-alpha+nightly.20261021`), the web app and the Android nightly APK from the same release all sync against the server built from the pinned upstream commit.
 - No iOS nightly build exists, so iOS is untested. The App Store release predates PATs.
+
+## Connector — first real deploy (2026-11-03)
+
+**Result: pass.** The `deploy.yml` runs for #9 and #10 created the connector's KV namespace and D1 database, deployed `logseq-connector` on its custom domain, and passed the connector smoke test (`oauth-metadata`, `mcp-unauthenticated`, `wizard-requires-login`). Before #9, every deploy since #3 failed at the mask step, before `tofu apply`: the wrapper's `::add-mask::` lines landed in the `tofu output` JSON. #9 fixed that.
+
+| Spike | What was checked | Result |
+|---|---|---|
+| C1: service binding | Tool calls reach `logseq-sync`, which has `workers_dev = false` and only a custom domain, over the `SYNC` binding | Pass |
+| C2: claude.ai | Add the custom connector, sign in with GitHub, list, search and write a graph | Pass |
+| C3: Claude Code cloud session | The claude.ai connector is available in a cloud session and lists the graphs | Pass |
+| Local Claude Code | `claude mcp add --transport http`, then `/mcp` sign-in through a loopback redirect | Pass |
+| C4: flashcards | Blocks Claude tags `Card` appear in Logseq's flashcard review | Pass |
+| C5: file tools | `save_document`, then `read_file` on the saved asset | Pass, on small files. CPU time for large inputs (a 25 MiB download, a 3.75 MiB image) not measured |
+| C6: annotations | Whether claude.ai uses the read-only and destructive hints to skip or force approval | Not checked |
+
+**One setup mistake to note:** the GitHub OAuth app's callback URL must be exactly `https://<CONNECTOR_HOSTNAME>/callback`. A mismatch shows GitHub's "The `redirect_uri` is not associated with this application" page before you sign in.
