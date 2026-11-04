@@ -1,0 +1,151 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index db122f7bc9..68d38a8412 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -14,6 +14,7 @@
+             [logseq.db-sync.worker.http :as http]
+             [logseq.db-sync.worker.ws :as ws]
+             [logseq.db.frontend.asset :as db-asset]
++            [logseq.db.frontend.class :as db-class]
+             [logseq.db.frontend.content :as db-content]
+             [logseq.db.frontend.db :as db-db]
+             [logseq.db.frontend.entity-util :as entity-util]
+@@ -402,19 +403,68 @@
+       {:block/uuid (:block/uuid page)
+        :block/title (:block/title page)})))
+ 
++;; Inline tags follow the editor's boundaries: `#` starts a tag after the line start, whitespace or
++;; `(`, and trailing `,` `.` `)` are punctuation, not part of the name.
++(def ^:private inline-tag-re #"(?:^|[\s(])#(?:\[\[([^\]]+)\]\]|([^\s\[\]()#,]+))")
++
++(defn- inline-tag-names [title]
++  (->> (re-seq inline-tag-re title)
++       (keep (fn [[_ bracketed bare]]
++               (let [name (or bracketed (string/replace bare #"[.)]+$" ""))]
++                 (when-not (or (string/blank? name) (common-util/uuid-string? name))
++                   name))))
++       distinct))
++
++(defn- resolve-inline-class
++  "The one class an inline tag names: an exact title match, else a unique case-insensitive one.
++  Classes Logseq refuses as inline tags (page, property and other built-in kinds) never match."
++  [db name]
++  (let [classes (fn [datoms]
++                  (->> datoms
++                       (map #(d/entity db (:e %)))
++                       (filter tag?)
++                       (remove #(contains? db-class/disallowed-inline-tags (:db/ident %)))))
++        exact (classes (d/datoms db :avet :block/title name))
++        candidates (if (seq exact) exact (classes (d/datoms db :avet :block/name (string/lower-case name))))]
++    (when (= 1 (count candidates))
++      (first candidates))))
++
++(defn- replace-inline-tag [title name id]
++  (let [tag (common-util/escape-regex-chars name)
++        bracketed (common-util/escape-regex-chars (page-ref/->page-ref name))]
++    (string/replace title
++                    (re-pattern (str "(^|[\\s(])#(?:" bracketed "|" tag "(?=[,.)]*(?:$|[\\s)])))"))
++                    (fn [[_ lhs]] (str lhs "#" (page-ref/->page-ref id))))))
++
++(defn- resolve-inline-tags
++  "Rewrites inline tags that name an existing class to `#[[uuid]]`, as the editor stores them,
++  and returns those classes. Any other `#word` (an issue number, a URL fragment, an unknown
++  name) stays plain text."
++  [db title]
++  (reduce (fn [result name]
++            (if-let [class (resolve-inline-class db name)]
++              (-> result
++                  (update :title replace-inline-tag name (:block/uuid class))
++                  (update :classes conj class))
++              result))
++          {:title title :classes []}
++          (inline-tag-names title)))
++
+ (defn- prepare-block-title! [conn e2ee? title]
+   ;; E2EE titles are opaque ciphertext packages — they contain no resolvable
+   ;; [[refs]] (and transit punctuation must never be parsed as refs).
+   (if e2ee?
+     {:block/title title}
+-    (let [refs (->> (page-ref-values title)
++    (let [{:keys [title classes]} (resolve-inline-tags @conn title)
++          refs (->> (page-ref-values title)
+                   (keep #(resolve-page-ref! conn %))
+                   (reduce (fn [result ref]
+                             (assoc result (:block/uuid ref) ref)) {})
+                   vals
+                   vec)]
+-      {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
+-       :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)})))
++      (cond-> {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
++               :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)}
++        (seq classes) (assoc :block/tags (mapv #(vector :block/uuid (:block/uuid %)) (distinct classes)))))))
+ 
+ (defn- valid-tree-identities? [db target nodes]
+   (let [seen (atom #{})
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index bf40e4c53b..c640556ce7 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -3,6 +3,7 @@
+             [cljs.test :refer [async deftest is testing]]
+             [clojure.string :as string]
+             [datascript.core :as d]
++            [logseq.common.util.page-ref :as page-ref]
+             [logseq.db-sync.checksum :as sync-checksum]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
+@@ -3851,7 +3852,7 @@
+                           (sync-handler/handle-http
+                             self (semantic-json-request "/semantic/block-trees?graph-id=graph-1"
+                                                         "POST" body)))]
+-            (run {:conn conn :page-id page-id :request request}))))
++            (run {:conn conn :page-id page-id :request request :self self}))))
+       (p/catch #(is false (str %)))
+       (p/finally done)))
+ 
+@@ -3898,3 +3899,45 @@
+                   (is (nil? (d/entity @conn [:block/uuid other])))
+                   (is (= "First" (:block/title (d/entity @conn [:block/uuid id]))))
+                   (p/recur (next cases)))))))))))
++
++(deftest semantic-inline-tags-resolve-to-existing-classes-test
++  (async done
++    (with-tree-identity-test done
++      (fn [{:keys [conn page-id request self]}]
++        (let [decision-id (random-uuid)
++              meeting-id (random-uuid)
++              _ (d/transact! conn [{:db/ident :user.class/Decision :block/uuid decision-id
++                                    :block/name "decision" :block/title "Decision"
++                                    :block/tags :logseq.class/Tag}
++                                   {:db/ident :user.class/BusinessMeeting :block/uuid meeting-id
++                                    :block/name "business meeting" :block/title "Business Meeting"
++                                    :block/tags :logseq.class/Tag}])
++              ids (vec (repeatedly 5 random-uuid))
++              titles ["Chose Postgres #Decision"
++                      "Notes #[[Business Meeting]] and #Decision."
++                      "Connector #7, see https://example.com/#frag and C# #Unknown"
++                      "Lower case #decision"
++                      "Not inline #Page"]
++              tags-of (fn [id] (set (map :block/uuid (:block/tags (d/entity @conn [:block/uuid id])))))
++              ;; :block/raw-title is the stored text; :block/title renders id refs back as names
++              title-of (fn [id] (:block/raw-title (d/entity @conn [:block/uuid id])))
++              ref-of (fn [id] (str "#" (page-ref/->page-ref id)))]
++          (p/let [response (request {:target-id (str page-id)
++                                     :blocks (mapv (fn [id title] {:uuid (str id) :title title}) ids titles)})
++                  _ (is (= 201 (.-status response)))
++                  _ (is (= #{decision-id} (tags-of (ids 0))))
++                  _ (is (= (str "Chose Postgres " (ref-of decision-id)) (title-of (ids 0))))
++                  _ (is (= #{decision-id meeting-id} (tags-of (ids 1))))
++                  _ (is (= (str "Notes " (ref-of meeting-id) " and " (ref-of decision-id) ".") (title-of (ids 1))))
++                  _ (is (empty? (tags-of (ids 2))) "issue numbers, URL fragments and unknown names stay text")
++                  _ (is (= (titles 2) (title-of (ids 2))))
++                  _ (is (= #{decision-id} (tags-of (ids 3))) "a unique case-insensitive match resolves")
++                  _ (is (empty? (tags-of (ids 4))) "built-in classes Logseq disallows inline are not applied")
++                  _ (is (= (titles 4) (title-of (ids 4))))
++                  update-response (sync-handler/handle-http
++                                   self
++                                   (semantic-json-request (str "/semantic/blocks/" (ids 2) "?graph-id=graph-1")
++                                                          "PATCH" {:title "Now a #Decision"}))]
++            (is (= 200 (.-status update-response)))
++            (is (= #{decision-id} (tags-of (ids 2))))
++            (is (= (str "Now a " (ref-of decision-id)) (title-of (ids 2))))))))))
