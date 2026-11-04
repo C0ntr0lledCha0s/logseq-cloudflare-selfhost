@@ -1,0 +1,135 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index de822c008e..db122f7bc9 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -819,6 +819,19 @@
+           (broadcast-change! self)
+           (http/json-response nil {:blocks inserted} 201))))))
+ 
++(defn- batch-entries-error
++  "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
++  [entries resolved]
++  (if-not (and (sequential? entries) (seq entries))
++    "entries must be a non-empty array"
++    (some (fn [[index {:keys [block property-ident prepared]}]]
++            (when-let [reason (cond
++                                (nil? block) "block not found"
++                                (nil? property-ident) "property not found"
++                                :else (:error prepared))]
++              (str "entry " index ": " reason)))
++          (map-indexed vector resolved))))
++
+ (defn- handle-block-properties [{:keys [^js self request conn db handler path-params e2ee? creator]}]
+   (case handler
+ 
+@@ -849,17 +862,16 @@
+ 
+     :semantic/blocks-batch-set-property
+     (p/let [body (body-clj request)
+-            entries (if (sequential? (:entries body)) (:entries body) [])
+-            resolved (mapv (fn [{:keys [block-id property-id value]}]
+-                             (let [property-ident (resolve-property-ident db property-id)]
+-                               {:block (find-entity db block-id)
+-                                :property-ident property-ident
+-                                :prepared (when property-ident
+-                                            (prepare-property-value db property-ident value e2ee?))})) entries)]
+-      (if (or (not (seq entries))
+-              (some #(or (nil? (:block %)) (nil? (:property-ident %))
+-                         (:error (:prepared %))) resolved))
+-        (http/bad-request "invalid batch property entry")
++            entries (:entries body)
++            resolved (when (sequential? entries)
++                       (mapv (fn [{:keys [block-id property-id value]}]
++                               (let [property-ident (resolve-property-ident db property-id)]
++                                 {:block (find-entity db block-id)
++                                  :property-ident property-ident
++                                  :prepared (when property-ident
++                                              (prepare-property-value db property-ident value e2ee?))})) entries))]
++      (if-let [error (batch-entries-error entries resolved)]
++        (http/bad-request error)
+         (do (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
+              (fn [temp-conn]
+                (doseq [{:keys [block property-ident prepared]} resolved]
+@@ -870,12 +882,13 @@
+ 
+     :semantic/blocks-batch-delete-property
+     (p/let [body (body-clj request)
+-            entries (if (sequential? (:entries body)) (:entries body) [])
+-            resolved (mapv (fn [{:keys [block-id property-id]}]
+-                             {:block (find-entity db block-id)
+-                              :property-ident (resolve-property-ident db property-id)}) entries)]
+-      (if (or (not (seq entries)) (some #(or (nil? (:block %)) (nil? (:property-ident %))) resolved))
+-        (http/bad-request "invalid batch property entry")
++            entries (:entries body)
++            resolved (when (sequential? entries)
++                       (mapv (fn [{:keys [block-id property-id]}]
++                               {:block (find-entity db block-id)
++                                :property-ident (resolve-property-ident db property-id)}) entries))]
++      (if-let [error (batch-entries-error entries resolved)]
++        (http/bad-request error)
+         (do
+           (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
+            (fn [temp-conn]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 3400998db7..bf40e4c53b 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -1091,6 +1091,58 @@
+                               (is false (str error))
+                               (done)))))))))
+ 
++(deftest semantic-batch-property-errors-name-the-entry-and-reason-test
++  (async done
++         (with-memory-sql-async
++           (fn [sql]
++             (storage/init-schema! sql)
++             (let [conn (sqlite-export/create-conn)
++                   page-id (random-uuid)
++                   block-id (random-uuid)
++                   status-id (str (:block/uuid (d/entity @conn :logseq.property/status)))
++                   _ (d/transact! conn
++                                  [{:block/uuid page-id :block/name "page" :block/title "Page"
++                                    :block/tags :logseq.class/Page
++                                    :block/created-at 1 :block/updated-at 1}
++                                   {:block/uuid block-id :block/title "Block"
++                                    :block/page [:block/uuid page-id]
++                                    :block/parent [:block/uuid page-id]
++                                    :block/order "a0"
++                                    :block/created-at 1 :block/updated-at 1}])
++                   self #js {:sql sql :conn conn :schema-ready true}
++                   valid {:block-id (str block-id) :property-id status-id :value "DONE"}
++                   error-for (fn [path body]
++                               (p/let [response (sync-handler/handle-http
++                                                 self (semantic-json-request
++                                                       (str path "?graph-id=graph-1") "POST" body))
++                                       body (json-body response)]
++                                 [(.-status response) (:error body)]))
++                   set-error (partial error-for "/semantic/block-properties/batch-set")
++                   delete-error (partial error-for "/semantic/block-properties/batch-delete")]
++               (-> (p/let [string-entries (set-error {:entries (js/JSON.stringify (clj->js [valid]))})
++                           missing-entries (set-error {})
++                           empty-entries (set-error {:entries []})
++                           missing-block (set-error {:entries [valid (assoc valid :block-id (str (random-uuid)))]})
++                           missing-property (set-error {:entries [(assoc valid :property-id "Missing Property")]})
++                           bad-value (set-error {:entries [(assoc valid :value "Not A Status")]})
++                           delete-string-entries (delete-error {:entries "[]"})
++                           delete-missing-block (delete-error {:entries [(dissoc (assoc valid :block-id (str (random-uuid))) :value)]})]
++                     (is (= [400 "entries must be a non-empty array"] string-entries))
++                     (is (= [400 "entries must be a non-empty array"] missing-entries))
++                     (is (= [400 "entries must be a non-empty array"] empty-entries))
++                     (is (= [400 "entry 1: block not found"] missing-block))
++                     (is (= [400 "entry 0: property not found"] missing-property))
++                     (is (= 400 (first bad-value)))
++                     (is (string/starts-with? (second bad-value) "entry 0: property value must resolve"))
++                     (is (= [400 "entries must be a non-empty array"] delete-string-entries))
++                     (is (= [400 "entry 0: block not found"] delete-missing-block))
++                     (is (nil? (:logseq.property/status (d/entity @conn [:block/uuid block-id])))
++                         "a rejected batch writes nothing, including its valid entries"))
++                   (p/then (fn [] (done)))
++                   (p/catch (fn [error]
++                              (is false (str error))
++                              (done)))))))))
++
+ (deftest semantic-status-property-accepts-built-in-aliases-test
+   (async done
+          (with-memory-sql-async
