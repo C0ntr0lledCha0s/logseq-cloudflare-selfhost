@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Generate .env.local: you supply the Cloudflare API token, the Cloudflare account ID and
 # your sync hostname; the other three secrets are generated with `openssl rand -hex 32`.
+# DB_SYNC_ALLOWED_USERS (who may use the server) starts as `none`, which refuses everyone.
 # Usage: init-env.sh [--add-missing] [--push]   (run from anywhere)
 #   --push         also copy the values into the GitHub `production` environment with
 #                  `gh secret set` (value on stdin only).
 #   --add-missing  for an existing .env.local: append, in one marked block, only the names it
-#                  lacks among the original six plus the optional connector's CONNECTOR_HOSTNAME,
+#                  lacks among the original six, DB_SYNC_ALLOWED_USERS (never generated: your
+#                  Logseq user ID(s), comma-separated, or none; checked with
+#                  `allowed-users.mjs check-format`) plus the optional connector's CONNECTOR_HOSTNAME,
 #                  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET (read silently), OWNER_GITHUB_USER_ID,
 #                  COOKIE_ENCRYPTION_KEY and GRAPH_TOKEN_KEY (the last two generated). Existing
 #                  lines are never rewritten. With --push, only the newly added names are pushed.
@@ -13,8 +16,9 @@
 #                  TOFU_ENCRYPTION_PASSPHRASE, ASSET_LINK_SECRET and DB_SYNC_ADMIN_TOKEN are never
 #                  generated in this mode: if one is missing, nothing is written or pushed (restore it).
 # Input: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, SYNC_HOSTNAME (and, with --add-missing and
-#   when missing, the four connector inputs) are read from the environment when set, otherwise
-#   prompted for on the terminal (the token and the GitHub client secret silently).
+#   when missing, the four connector inputs and DB_SYNC_ALLOWED_USERS) are read from the environment when set, otherwise
+#   prompted for on the terminal (the token and the GitHub client secret silently). A fresh run
+#   takes DB_SYNC_ALLOWED_USERS from the template (`none`), never from the environment.
 # Env (TEST ONLY): INIT_ENV_REPO_ROOT overrides the repo root (where .env.local is written and
 #   .env.local.example is read); honoured only together with INIT_ENV_TEST=1.
 # Never prints secret values and never overwrites an existing .env.local (--add-missing only appends).
@@ -34,7 +38,8 @@ for arg in "$@"; do
   esac
 done
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(dirname "$script_dir")"
 if [ -n "${INIT_ENV_REPO_ROOT:-}" ]; then
   [ "${INIT_ENV_TEST:-}" = "1" ] || {
     echo "init-env: INIT_ENV_REPO_ROOT is test-only and requires INIT_ENV_TEST=1" >&2
@@ -75,11 +80,14 @@ command -v openssl >/dev/null || {
 
 original_names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME"
 connector_names="CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
+# Not a credential and never generated: who may use the server.
+allowed_users_name="DB_SYNC_ALLOWED_USERS"
 generated_names="ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN TOFU_ENCRYPTION_PASSPHRASE COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
-# Names to write, in order. A fresh run writes the original six; --add-missing the absent ones.
+# Names to write, in order. A fresh run writes the original six and DB_SYNC_ALLOWED_USERS;
+# --add-missing the absent ones.
 add_names=""
 if [ "$add_missing" = 1 ]; then
-  for name in $original_names $connector_names; do
+  for name in $original_names $connector_names $allowed_users_name; do
     # `NAME=`, `export NAME=` and an indented `NAME=` all count as present.
     if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?$name=" "$env_file"; then
       add_names="$add_names $name"
@@ -108,7 +116,13 @@ if [ "$add_missing" = 1 ]; then
     exit 1
   fi
 else
-  add_names=" $original_names"
+  add_names=" $original_names $allowed_users_name"
+  # The template carries the value (`none`): the written file and the push use it as it is.
+  DB_SYNC_ALLOWED_USERS="$(sed -n 's/^DB_SYNC_ALLOWED_USERS=//p' "$template")"
+  [ -n "$DB_SYNC_ALLOWED_USERS" ] || {
+    echo "init-env: $template has no DB_SYNC_ALLOWED_USERS= value" >&2
+    exit 1
+  }
 fi
 
 # Inputs to collect: the written names that are not generated, in prompt order.
@@ -117,6 +131,10 @@ for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID SYNC_HOSTNAME CONNECTOR_H
   GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID; do
   case "$add_names " in *" $name "*) need_inputs="$need_inputs $name" ;; esac
 done
+# A fresh run takes DB_SYNC_ALLOWED_USERS from the template; --add-missing asks for it.
+if [ "$add_missing" = 1 ]; then
+  case "$add_names " in *" $allowed_users_name "*) need_inputs="$need_inputs $allowed_users_name" ;; esac
+fi
 
 # Fill any input not already in the environment from the terminal.
 if [ ! -t 0 ]; then
@@ -146,6 +164,7 @@ for name in $need_inputs; do
     GITHUB_CLIENT_ID) read -rp "GitHub OAuth app client ID: " GITHUB_CLIENT_ID ;;
     GITHUB_CLIENT_SECRET) read -rsp "GitHub OAuth app client secret: " GITHUB_CLIENT_SECRET; echo ;;
     OWNER_GITHUB_USER_ID) read -rp "Your numeric GitHub user ID: " OWNER_GITHUB_USER_ID ;;
+    DB_SYNC_ALLOWED_USERS) read -rp "Logseq user ID(s), comma-separated, or none (find yours with scripts/list-users.sh): " DB_SYNC_ALLOWED_USERS ;;
   esac
 done
 
@@ -192,6 +211,18 @@ for name in $need_inputs; do
     OWNER_GITHUB_USER_ID)
       [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
         echo "init-env: OWNER_GITHUB_USER_ID must be a positive integer with no leading zeros (your numeric GitHub user id, not your login)" >&2
+        exit 1
+      }
+      ;;
+    DB_SYNC_ALLOWED_USERS)
+      # Drop whitespace, so a list typed as `a, b` is not split into a command when .env.local is
+      # sourced. The format check below still applies to what is left.
+      value="${value//[[:space:]]/}"
+      DB_SYNC_ALLOWED_USERS="$value"
+      # The same rule the deploy and the Worker apply. The value goes through the environment, never
+      # argv, and its error message gives entry positions, never the entry.
+      check_error="$(DB_SYNC_ALLOWED_USERS="$value" node "$script_dir/allowed-users.mjs" check-format 2>&1 >/dev/null)" || {
+        echo "$check_error" >&2
         exit 1
       }
       ;;
@@ -243,6 +274,7 @@ else
   set +o noclobber
 
   echo "Wrote $env_file (mode 600). Generated ASSET_LINK_SECRET, DB_SYNC_ADMIN_TOKEN and TOFU_ENCRYPTION_PASSPHRASE."
+  echo "The server refuses every user until you list yours in DB_SYNC_ALLOWED_USERS (README section 9)."
 fi
 
 if [ "$push" = 1 ]; then
@@ -293,6 +325,10 @@ case "$add_names " in
     echo "  - Copy GRAPH_TOKEN_KEY and COOKIE_ENCRYPTION_KEY from .env.local into your password manager too."
     ;;
 esac
+# Only when the value written is `none`: a real list needs no next step.
+if [[ "$add_names " == *" $allowed_users_name "* && "${DB_SYNC_ALLOWED_USERS:-}" = "none" ]]; then
+  echo "  - After your first sign-in, run scripts/list-users.sh, then set DB_SYNC_ALLOWED_USERS to your ID (README section 9)."
+fi
 if [ "$push" != 1 ]; then
   echo "  - Copy the values to the GitHub production environment (README 1.8)."
 fi
