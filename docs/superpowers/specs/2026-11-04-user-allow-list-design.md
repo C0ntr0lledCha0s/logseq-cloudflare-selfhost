@@ -83,7 +83,7 @@ Each of these is the designer's call.
 
 ### D1. Enforce inside the sync server, at the two identity functions
 
-A new patch (the next free number in `patches/`) changes `auth.cljs`:
+A new patch, `patches/0016-allowed-users.patch`, changes `auth.cljs`:
 
 - After `auth-claims` has produced claims (verified, or unverified when that flag is on), it returns `nil` unless the claims' `sub` is on the list.
 - `semantic-auth-claims` does the same for the PAT branch, checking the PAT's `user-id`.
@@ -133,11 +133,7 @@ A fresh install, whose `users` table is empty, passes with `none` and gets a pri
 
 On an existing install, the Worker must never serve requests with the new code and no `DB_SYNC_ALLOWED_USERS`. A 401 storm could sign the owner's Logseq clients out. Today `deploy.sh` runs `wrangler deploy` *then* `wrangler secret bulk`; that order has to change for this secret.
 
-The mechanism is the builder's call. The pinned wrangler (4.151.1) supports `wrangler deploy --secrets-file`, which deploys code and secrets together. Prefer it if it keeps secrets that aren't in the file, or put every secret in the file. Other options:
-- set secrets before deploying;
-- upload a version, set the secret on it, then promote it.
-
-It must also work for a first-ever deploy, where the Worker doesn't exist yet.
+**Settled at planning (2026-11-05):** `deploy.sh` runs `wrangler deploy --secrets-file <file>` with all three of its secrets (`ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `DB_SYNC_ALLOWED_USERS`), and the separate `wrangler secret bulk` step goes. The pinned wrangler's (4.151.1) help confirms the file is additive: secrets left out of it are kept, not deleted. Code and secrets arrive as one version, so a first-ever deploy works the same way.
 
 ### D6. Finding your user ID: `scripts/list-users.sh`
 
@@ -151,6 +147,7 @@ It also serves as the audit of who has already used the server.
 Because it prints identifiers and emails, it refuses to run when `GITHUB_ACTIONS=true`. It is never called from a workflow.
 
 - **An existing install** has the owner's row already (the server stores users on first sign-in), so the owner copies their ID from this list.
+- **Without the script:** the Cloudflare dashboard's D1 console (Storage & Databases → D1 → the sync database → Console) runs `SELECT id, email FROM users`, from any browser. The README gives this as the no-install route.
 - **A fresh install** deploys with `none`. The owner signs in once from Logseq, gets refused, and reads their ID from the `db-sync/user-not-allowed` log line (`wrangler tail` or Workers Logs). Then they set the list and redeploy. The README documents both paths.
 
 ### D7. Secrets tooling
@@ -181,11 +178,7 @@ Because it prints identifiers and emails, it refuses to run when `GITHUB_ACTIONS
 
 Those tests get `DB_SYNC_ALLOWED_USERS` added to their env. To keep the patch small, add it through a shared test helper or fixture where one exists, rather than editing every call site.
 
-**CI must run these tests (designer's call):**
-- CI runs a **focused** test command: the db-sync test namespaces this patch touches, such as the auth and dispatch tests and any others it changes, with **all** patches applied.
-- They must pass.
-- If a failure in those namespaces already exists with `0001`–`0010` applied, fix it in the patch that caused it. If upstream itself fails, record that in the PR and exclude only that test, with a comment.
-- The full db-sync suite is **not** required. That's a separate decision.
+**CI must run these tests (settled at planning, 2026-11-05):** CI runs upstream's **full** db-sync suite (`pnpm test` in `deps/db-sync`) with all patches applied, after the build. With `0001`–`0015` it passes today (289 tests, 0 failures, about 33 seconds), and upstream's runner has no namespace filter, so the full suite is both simpler and cheaper than a focused one.
 
 **Script tests (`node:test`, `npm test`) cover:**
 - the `deploy.sh` value check;
@@ -214,7 +207,7 @@ The owner decided this on 2026-11-05. The connector replaces this endpoint. What
 
 The owner accepts losing these. The connector already returns images to Claude as image content through `read_file`.
 
-- **A small patch to `deps/db-sync/worker/entry.mjs`,** kept separate from the auth patch, removes the routes `/mcp`, `/mcp/icon.png`, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+- **A small patch, `patches/0017-remove-upstream-mcp.patch`, to `deps/db-sync/worker/entry.mjs`,** kept separate from the auth patch, removes the routes `/mcp`, `/mcp/icon.png`, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
   - Those paths then fall through to the sync worker, which must answer them with its normal not-found response and no MCP work. The builder confirms the status code.
   - Everything else in `entry.mjs` stays as upstream has it.
 - **`render-wrangler.mjs` drops `worker_loaders` on both plans.** The paid plan then differs from Free only in `[limits]`. Nothing else may bind `LOADER`.
