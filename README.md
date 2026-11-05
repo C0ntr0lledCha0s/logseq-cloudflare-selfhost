@@ -62,6 +62,37 @@ The connector's optional semantic search (11.11) runs on Free for graphs up to a
 
 R2 is billed separately. It has a monthly free tier, but Cloudflare asks for a payment method before you can enable it. Check Cloudflare's current pricing pages for the exact allowances.
 
+### Watching your usage
+
+On the Free plan, going over a daily allowance makes requests fail until the allowance resets at 00:00 UTC; nothing is billed. The allowances are account-wide, so the sync server and the connector share them.
+
+**In the dashboard:**
+
+| Where | What it shows |
+|---|---|
+| **Workers & Pages → the Worker → Metrics** | Requests, errors and CPU time per Worker |
+| **Workers & Pages → the Worker → Logs** | Each request and cron run; failures show as "Exception Thrown" |
+| **Storage & Databases → D1 → the database → Metrics** | Rows read and written |
+| **Storage & Databases → KV**, **Vectorize** | Operations, and stored vectors |
+| **AI → Workers AI** | Neurons by model |
+| **Compute → Durable Objects** | Requests, duration and SQLite rows |
+
+**The usage report.** `scripts/usage-report.mjs` reads every Free allowance from Cloudflare's GraphQL Analytics API and prints a table with today's usage, its share of the limit, and a projection to the end of the day. It exits 1 when an allowance is at 70% (`--threshold`) or on course to pass its limit. The `usage` workflow runs it at 03:00, 09:00, 15:00 and 21:00 UTC; a failed run emails you, and the table is on the run's summary page. It only knows the Free plan; on Workers Paid, use **Manage Account → Billing → Billable usage** instead.
+
+To turn it on:
+
+1. Create a second, read-only token under **Manage Account → Account API Tokens → Create Token → Custom token**, with one policy: **Account** → your account → **Account Analytics** Read. Every dataset the report reads (Workers, Durable Objects, D1, KV, Workers AI, Vectorize) is covered by that one permission. Keep it separate from the deploy token, which can change everything.
+2. Store it as the `production` secret `CLOUDFLARE_ANALYTICS_TOKEN`, and set the variable `USAGE_REPORT_ENABLED` to `true`:
+
+   ```bash
+   gh secret set CLOUDFLARE_ANALYTICS_TOKEN --env production   # paste the token at the prompt
+   gh variable set USAGE_REPORT_ENABLED --body true
+   ```
+
+3. Run it once: **Actions → usage → Run workflow**, or `gh workflow run usage.yml`.
+
+To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`.
+
 ## Prerequisites
 
 - **A Cloudflare account** with a zone (`example.com`) already active on it. The sync hostname (`sync.example.com`) must be in that zone and should not already have a DNS record: wrangler creates the record and the certificate.
@@ -242,8 +273,9 @@ Then add the secrets:
 | `OWNER_GITHUB_USER_ID` | Only with the connector |
 | `COOKIE_ENCRYPTION_KEY` | Only with the connector |
 | `GRAPH_TOKEN_KEY` | Only with the connector |
+| `CLOUDFLARE_ANALYTICS_TOKEN` | Only with the usage report ([Watching your usage](#watching-your-usage)) |
 
-**One setting is a variable, not a secret.** `CONNECTOR_ENABLED` turns the optional connector on (section 11). Leave it unset for now: unset means off.
+**Two settings are variables, not secrets.** `CONNECTOR_ENABLED` turns the optional connector on (section 11), and `USAGE_REPORT_ENABLED` the usage report ([Watching your usage](#watching-your-usage)). Leave them unset for now: unset means off.
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
@@ -461,7 +493,7 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
   - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
 - **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials. An asset deleted by accident or by an attacker is no longer in the mirror after the next backup, but it is kept in `daily/<date>/assets-deleted/` for the retention window; restore it from there.
 
-**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop both the daily backup and the weekly bump. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml` and `gh workflow enable bump-upstream.yml`. Check occasionally that the latest runs are recent.
+**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop the daily backup, the weekly bump and the usage report. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml`, `gh workflow enable bump-upstream.yml` and `gh workflow enable usage.yml`. Check occasionally that the latest runs are recent.
 
 **If rclone gets a 403 on its bucket check,** set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. That's the usual fix for R2 tokens that can't list buckets. The verified setup didn't need it, because the token from 1.1 can list buckets.
 
@@ -524,7 +556,8 @@ This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
 | `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
-| Backups or the weekly bump stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` (section 7). |
+| Backups, the weekly bump or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` / `gh workflow enable usage.yml` (section 7). |
+| The usage report fails with `not authorized` | `CLOUDFLARE_ANALYTICS_TOKEN` lacks **Account Analytics** Read, or belongs to another account ([Watching your usage](#watching-your-usage)). |
 | Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
