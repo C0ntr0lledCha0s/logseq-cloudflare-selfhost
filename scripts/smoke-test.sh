@@ -48,12 +48,18 @@ fi
 expect_status openapi 200 "$base/openapi.json"
 expect_status unauthenticated-graphs 401 "$base/api/v1/graphs"
 
+# A token that isn't a JWT must be refused. Keep it to this exact shape: a three-part
+# garbage token makes upstream's JWT decoder throw a 500, which is outside this check.
+expect_status jwt-garbage-refused 401 -H 'Authorization: Bearer not-a-jwt' "$base/api/v1/graphs"
+
 if [ -n "${SMOKE_PAT:-}" ]; then
   # PATs are assumed to contain no '"' or '\' (curl config quoting).
   # The token is fed to curl on stdin so it never appears in the process list.
   code="$(printf 'header = "Authorization: Bearer %s"\n' "$SMOKE_PAT" |
     status -K - "$base/api/v1/graphs")"
   if [ "$code" = 200 ]; then pass pat-graphs; else fail pat-graphs "$code"; fi
+else
+  echo "note: SMOKE_PAT is not set, so the allow-list was not checked end to end"
 fi
 
 # Upstream's /mcp answered anyone without a token; patch 0017 removes it, so the

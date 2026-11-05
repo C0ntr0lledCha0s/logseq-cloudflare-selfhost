@@ -166,6 +166,7 @@ jobs:
           TF_VAR_tofu_encryption_passphrase: ${{ secrets.TOFU_ENCRYPTION_PASSPHRASE }}
           ASSET_LINK_SECRET: ${{ secrets.ASSET_LINK_SECRET }}
           DB_SYNC_ADMIN_TOKEN: ${{ secrets.DB_SYNC_ADMIN_TOKEN }}
+          DB_SYNC_ALLOWED_USERS: ${{ secrets.DB_SYNC_ALLOWED_USERS }}
           SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
         run: scripts/with-r2-credentials.sh scripts/deploy.sh
