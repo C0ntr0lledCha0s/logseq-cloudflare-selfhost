@@ -145,12 +145,15 @@ export class SemanticStore {
     return row ? toState(row) : null;
   }
 
-  /** Stored rows for these block UUIDs, the rows in the UUID range (lo, hi] when given, and the total count. */
+  /**
+   * Stored rows for these block UUIDs, and the rows in the UUID range (lo, hi] when given. Both use
+   * the (graph_id, block_uuid) index, so a run reads only the rows it needs (D1 bills rows read).
+   */
   async lookup(
     graphId: string,
     uuids: string[],
     range: { lo: string | null; hi: string | null } | null,
-  ): Promise<{ rows: StoredBlock[]; inRange: StoredBlock[]; total: number }> {
+  ): Promise<{ rows: StoredBlock[]; inRange: StoredBlock[] }> {
     const statements = [
       this.db
         .prepare(
@@ -158,7 +161,6 @@ export class SemanticStore {
            WHERE graph_id = ? AND block_uuid IN (SELECT value FROM json_each(?))`,
         )
         .bind(graphId, JSON.stringify(uuids)),
-      this.db.prepare("SELECT count(*) AS n FROM semantic_blocks"),
     ];
     if (range) {
       const upper = range.hi === null ? "" : " AND block_uuid <= ?";
@@ -169,12 +171,18 @@ export class SemanticStore {
           .bind(...args),
       );
     }
-    const [rows, count, inRange] = await this.db.batch(statements);
+    const [rows, inRange] = await this.db.batch(statements);
     return {
       rows: (rows.results as BlockRow[]).map(toBlock),
       inRange: inRange ? (inRange.results as BlockRow[]).map(toBlock) : [],
-      total: (count.results[0] as { n: number }).n,
     };
+  }
+
+  /** Vectors stored across all graphs. Reads every row, so call it only when a page adds vectors. */
+  async total(): Promise<number> {
+    const row = await this.db.prepare("SELECT count(*) AS n FROM semantic_blocks").first<{ n: number }>();
+    if (row === null) throw new Error("count(*) returned no row");
+    return row.n;
   }
 
   /** The page's block writes and deletes and the graph's new state, atomically. */
@@ -232,8 +240,16 @@ export class SemanticStore {
         `DELETE FROM semantic_state WHERE graph_id NOT IN (SELECT graph_id FROM graphs)
          AND NOT EXISTS (SELECT 1 FROM semantic_blocks b WHERE b.graph_id = semantic_state.graph_id)`,
       ),
+      // Every graph with stored rows has a state row (lease creates it before any write, and it is
+      // dropped above only once no rows are left), so pick the disconnected graphs from the few state
+      // rows and reach their blocks through the (graph_id, block_uuid) index. Filtering the blocks
+      // directly, or as a JOIN, scans every block on every run (measured on D1: 2 rows read vs 10,100).
       this.db
-        .prepare("SELECT vector_id FROM semantic_blocks WHERE graph_id NOT IN (SELECT graph_id FROM graphs) LIMIT ?")
+        .prepare(
+          `SELECT vector_id FROM semantic_blocks WHERE graph_id IN
+             (SELECT graph_id FROM semantic_state WHERE graph_id NOT IN (SELECT graph_id FROM graphs))
+           LIMIT ?`,
+        )
         .bind(limit),
     ]);
     return (orphans.results as { vector_id: string }[]).map((r) => r.vector_id);

@@ -274,7 +274,7 @@ export class FakeGraph {
         return block ? [this.response(block)] : [];
       }),
       removed: page.filter((id) => !this.content(id)),
-      ...(more ? { "next-cursor": page[page.length - 1] } : {}),
+      "next-cursor": more ? page[page.length - 1] : null,
     });
   }
 
