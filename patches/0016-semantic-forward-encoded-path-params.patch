@@ -1,0 +1,63 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs b/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs
+index 720e2498bc..be6d7bc6ec 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs
+@@ -46,8 +46,10 @@
+ 
+ (defn- forward-semantic-request [request ^js env {:keys [internal-path path-params]} ^js url e2ee? claims]
+   (let [graph-id (:graph-id path-params)
++        ;; The router decoded each parameter; encode it again, or a `/` in a property ident such
++        ;; as logseq.property/status becomes a path segment that no internal route matches.
+         path (reduce-kv (fn [result k value]
+-                          (string/replace result (str ":" (name k)) value))
++                          (string/replace result (str ":" (name k)) (js/encodeURIComponent value)))
+                         internal-path
+                         path-params)
+         target (js/URL. (str (.-origin url) path (.-search url)))]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+index 109efe192a..d4345d2158 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+@@ -10,6 +10,7 @@
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
+             [logseq.db-sync.worker.handler.index :as index-handler]
+             [logseq.db-sync.worker.http :as http]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
+             [promesa.core :as p]))
+ 
+ (defn- ok-json-response []
+@@ -324,6 +325,34 @@
+                           (is false (str error))
+                           (done)))))))
+ 
++(deftest semantic-api-forwards-encoded-path-parameters-test
++  ;; The router decodes path parameters, so a property ident such as logseq.property/status,
++  ;; sent as logseq.property%2Fstatus, must be encoded again in the internal path or its `/`
++  ;; becomes a path segment that no internal route matches.
++  (async done
++         (let [{:keys [request claims]} (semantic-request
++                                         "/api/v1/graphs/graph-1/blocks/block-1/properties/logseq.property%2Fstatus?x=1"
++                                         "logseq/write" "PUT")
++               forwarded (atom [])
++               env #js {"DB" #js {}
++                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
++                        "SEMANTIC_WRITE_RATE_LIMITER" (rate-limiter true (atom []))}]
++           (-> (p/with-redefs [auth/auth-claims (fn [_ _] (p/resolved claims))
++                               index-handler/graph-access-response (fn [_ _ _] (p/resolved (ok-json-response)))
++                               common/<d1-all (fn [& _] (p/resolved #js {:results #js [(graph-row false)]}))]
++                 (p/let [response (dispatch/handle-worker-fetch request env)
++                         url (js/URL. (.-url (first @forwarded)))
++                         path (.-pathname url)]
++                   (is (= 200 (.-status response)))
++                   (is (= "/semantic/blocks/block-1/properties/logseq.property%2Fstatus" path))
++                   (is (= "1" (.get (.-searchParams url) "x")))
++                   (is (= {:block-id "block-1" :property-id "logseq.property/status"}
++                          (:path-params (semantic-routes/match-internal "PUT" path))))))
++               (p/then (fn [] (done)))
++               (p/catch (fn [error]
++                          (is false (str error))
++                          (done)))))))
++
+ (deftest semantic-api-e2ee-edge-ops-require-e2ee-graph-test
+   (async done
+          (let [{:keys [request claims]} (semantic-request "/api/v1/graphs/graph-1/e2ee/encrypt" "logseq/write" "POST")
