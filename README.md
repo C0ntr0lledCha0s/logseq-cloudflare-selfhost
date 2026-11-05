@@ -78,7 +78,7 @@ On the Free plan, going over a daily allowance makes requests fail until the all
 | **AI → Workers AI** | Neurons by model |
 | **Compute → Durable Objects** | Requests, duration and SQLite rows |
 
-**The usage report.** `scripts/usage-report.mjs` reads every Free allowance from Cloudflare's GraphQL Analytics API and prints a table with today's usage, its share of the limit, and a projection to the end of the day. It exits 1 when an allowance is at 70% (`--threshold`) or on course to pass its limit. The `usage` workflow runs it at 03:00, 09:00, 15:00 and 21:00 UTC; a failed run emails you, and the table is on the run's summary page. It only knows the Free plan; on Workers Paid, use **Manage Account → Billing → Billable usage** instead.
+**The usage report.** `scripts/usage-report.mjs` reads every Free allowance from Cloudflare's GraphQL Analytics API and prints a table with today's usage, its share of the limit, and a projection to 00:00 UTC that continues the last hour's rate (so a fix or a new spike shows in the next run). It exits 1 when an allowance is at 70% (`--threshold`) or its projection passes the limit. The `usage` workflow runs it at 03:00, 09:00, 15:00 and 21:00 UTC; a failed run emails you, and the table is on the run's summary page. It only knows the Free plan; on Workers Paid, use **Manage Account → Billing → Billable usage** instead.
 
 To turn it on:
 

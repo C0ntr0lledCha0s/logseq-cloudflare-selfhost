@@ -92,7 +92,7 @@ semantic_search(graph, q) ─┬─ AI.run(q) → VECTORIZE.query(topK 50, names
 |---|---|---|
 | `AI` | Workers AI, `@cf/baai/bge-small-en-v1.5` | none (binding only) |
 | `VECTORIZE` | index `logseq-connector-blocks`, 384 dimensions, cosine | by the deploy, `scripts/ensure-vectorize-index.mjs` (no OpenTofu resource) |
-| `DB` (existing) | migration `0002_semantic.sql`: `semantic_blocks`, `semantic_state` | applied by the existing deploy |
+| `DB` (existing) | migration `0002_semantic.sql`: `semantic_blocks`, `semantic_state`; `0003_semantic_block_counts.sql`: a per-graph block count on `semantic_state`, kept by triggers, for the vector cap and status | applied by the existing deploy |
 | `SEMANTIC_MAX_VECTORS` (var) | cap on stored vectors, from `settings.connector.semanticSearch.maxVectors` | committed setting |
 | cron `* * * * *` | the indexer | rendered |
 

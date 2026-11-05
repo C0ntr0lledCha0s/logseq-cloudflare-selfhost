@@ -178,10 +178,10 @@ export class SemanticStore {
     };
   }
 
-  /** Vectors stored across all graphs. Reads every row, so call it only when a page adds vectors. */
+  /** Vectors stored across all graphs, from the state rows' block counts (migration 0003). */
   async total(): Promise<number> {
-    const row = await this.db.prepare("SELECT count(*) AS n FROM semantic_blocks").first<{ n: number }>();
-    if (row === null) throw new Error("count(*) returned no row");
+    const row = await this.db.prepare("SELECT coalesce(sum(blocks), 0) AS n FROM semantic_state").first<{ n: number }>();
+    if (row === null) throw new Error("sum(blocks) returned no row");
     return row.n;
   }
 
@@ -274,11 +274,12 @@ export class SemanticStore {
     return results.map(toBlock);
   }
 
-  /** Indexed blocks of one graph, and of all graphs. */
+  /** Indexed blocks of one graph (0 before its first run), and of all graphs, from the state rows. */
   async counts(graphId: string): Promise<{ graph: number; total: number }> {
     const row = await this.db
       .prepare(
-        "SELECT (SELECT count(*) FROM semantic_blocks WHERE graph_id = ?) AS graph, (SELECT count(*) FROM semantic_blocks) AS total",
+        `SELECT coalesce((SELECT blocks FROM semantic_state WHERE graph_id = ?), 0) AS graph,
+           (SELECT coalesce(sum(blocks), 0) FROM semantic_state) AS total`,
       )
       .bind(graphId)
       .first<{ graph: number; total: number }>();

@@ -31,24 +31,40 @@ function account(overrides = {}) {
   };
 }
 
-/** A fetch that answers every call with `body` (as JSON) and records the requests. */
-function fakeFetch(body, status = 200) {
+/**
+ * A fetch that records the requests and answers each with `body` (as JSON), or with `recentBody`
+ * when it asks for the recent hour rather than the day.
+ */
+function fakeFetch(body, status = 200, recentBody = body) {
   const calls = [];
   const fetch = async (url, init) => {
-    calls.push({ url, init, body: JSON.parse(init.body) });
-    return new Response(JSON.stringify(body), { status });
+    const request = JSON.parse(init.body);
+    calls.push({ url, init, body: request });
+    const daily = request.variables.start.endsWith("T00:00:00.000Z");
+    return new Response(JSON.stringify(daily ? body : recentBody), { status });
   };
   return { fetch, calls };
 }
 
+/** A GraphQL answer holding `a`. */
+const answer = (a) => ({ data: { viewer: { accounts: [a] } } });
+/** The recent hour: a tenth of the day fixture's daily counts. */
+const recentAccount = () =>
+  account({
+    workers: [{ dimensions: { scriptName: "logseq-sync" }, sum: { requests: 100, errors: 0 } }],
+    d1: [{ sum: { rowsRead: 10_000, rowsWritten: 50 } }],
+  });
+
 const NOON = new Date("2026-11-05T12:00:00Z");
 
-test("periods measure the UTC day and month", () => {
+test("periods measure the UTC day and month and the recent hour", () => {
   const p = periods(NOON);
   assert.equal(p.dayStart.toISOString(), "2026-11-05T00:00:00.000Z");
   assert.equal(p.monthStart.toISOString(), "2026-11-01T00:00:00.000Z");
   assert.equal(p.share.day, 0.5);
   assert.equal(p.share.month, (4 * 24 + 12) / (30 * 24));
+  assert.equal(p.dayLeftHours, 12);
+  assert.deepEqual([p.recent.start.toISOString(), p.recent.end.toISOString()], ["2026-11-05T10:55:00.000Z", "2026-11-05T11:55:00.000Z"]);
 });
 
 test("measure sums each dataset and treats an empty one as no usage", () => {
@@ -61,57 +77,65 @@ test("measure sums each dataset and treats an empty one as no usage", () => {
   assert.equal(usage["vectorize.stored"], 1_939_200);
 });
 
-test("a row alerts at the threshold or when its projection passes the limit", () => {
-  const share = { day: 0.5, month: 0.5 };
-  const byKey = (usage) =>
-    Object.fromEntries(assess({ ...measure(account()), ...usage }, { share, threshold: 0.7 }).map((r) => [r.key, r]));
+const HALF = { share: { day: 0.5, month: 0.5 }, dayLeftHours: 12, threshold: 0.7 };
+const QUIET_HOUR = measure(account({ d1: [{ sum: { rowsRead: 10_000, rowsWritten: 0 } }] }));
+
+test("a daily projection continues the last hour's rate, not the day's average", () => {
+  const byKey = (usage, recent = {}) =>
+    Object.fromEntries(assess({ ...measure(account()), ...usage }, { ...QUIET_HOUR, ...recent }, HALF).map((r) => [r.key, r]));
 
   const quiet = byKey({});
   assert.ok(Object.values(quiet).every((r) => !r.alert));
-  assert.equal(quiet["d1.rowsRead"].projected, 2_000_000);
+  assert.equal(quiet["d1.rowsRead"].projected, 1_000_000 + 12 * 10_000);
   assert.equal(quiet["vectorize.stored"].projected, null);
+  assert.equal(quiet["vectorize.queried"].projected, 130_560, "the month's average");
 
+  // A morning of heavy reads that has since stopped: the day's average would project 5.4M.
+  assert.equal(byKey({ "d1.rowsRead": 2_700_000 })["d1.rowsRead"].alert, false);
+  // A spike in the last hour.
+  assert.equal(byKey({}, { "d1.rowsRead": 400_000 })["d1.rowsRead"].alert, true, "on course for 5.8M");
   assert.equal(byKey({ "d1.rowsRead": 3_500_000 })["d1.rowsRead"].alert, true, "70% used");
-  assert.equal(byKey({ "d1.rowsRead": 2_600_000 })["d1.rowsRead"].alert, true, "on course for 5.2M");
-  assert.equal(byKey({ "d1.rowsRead": 2_500_000 })["d1.rowsRead"].alert, false, "on course for exactly the limit");
+  assert.equal(byKey({ "d1.rowsRead": 4_880_000 })["d1.rowsRead"].alert, true, "on course for exactly the limit is at 98%, past 70%");
   assert.equal(byKey({ "vectorize.stored": 3_500_000 })["vectorize.stored"].alert, true, "a stored total alerts at the threshold");
 });
 
-test("a projection from early in the period is not trusted", () => {
-  const usage = { ...measure(account()), "kv.write": 100 };
-  const early = assess(usage, { share: { day: 0.1, month: 0.1 }, threshold: 0.7 }).find((r) => r.key === "kv.write");
-  assert.equal(early.projected, null);
-  assert.equal(early.alert, false);
-  const later = assess(usage, { share: { day: 0.125, month: 0.125 }, threshold: 0.7 }).find((r) => r.key === "kv.write");
-  assert.equal(later.projected, 800);
+test("the monthly projection waits for an eighth of the month", () => {
+  const usage = { ...measure(account()), "vectorize.queried": 4_000_000 };
+  const row = (month) =>
+    assess(usage, QUIET_HOUR, { ...HALF, share: { day: 0.5, month } }).find((r) => r.key === "vectorize.queried");
+  assert.deepEqual([row(0.1).projected, row(0.1).alert], [null, false]);
+  assert.deepEqual([row(0.125).projected, row(0.125).alert], [32_000_000, true]);
 });
 
 test("a missing measurement is an error, not zero", () => {
   const usage = measure(account());
   delete usage["d1.rowsRead"];
-  assert.throws(() => assess(usage, { share: { day: 0.5, month: 0.5 }, threshold: 0.7 }), /no usage measured for d1\.rowsRead/);
+  assert.throws(() => assess(usage, QUIET_HOUR, HALF), /no usage measured for d1\.rowsRead/);
+  assert.throws(() => assess(measure(account()), usage, HALF), /no usage measured for d1\.rowsRead/);
 });
 
-test("the report queries today in UTC and lists every allowance and Worker", async () => {
-  const { fetch, calls } = fakeFetch({ data: { viewer: { accounts: [account()] } } });
+test("the report queries today and the recent hour in UTC and lists every allowance and Worker", async () => {
+  const { fetch, calls } = fakeFetch(answer(account()), 200, answer(recentAccount()));
   const { report, alert } = await usageReport({ accountId: "acct", token: "tok", now: NOON, threshold: 0.7, fetch });
   assert.equal(alert, false);
   assert.equal(calls[0].init.headers.authorization, "Bearer tok");
-  assert.deepEqual(calls[0].body.variables, {
-    account: "acct",
-    start: "2026-11-05T00:00:00.000Z",
-    end: "2026-11-05T12:00:00.000Z",
-    day: "2026-11-05",
-    monthStart: "2026-11-01",
-  });
+  const day = { account: "acct", day: "2026-11-05", monthStart: "2026-11-01" };
+  assert.deepEqual(
+    calls.map((c) => c.body.variables),
+    [
+      { ...day, start: "2026-11-05T00:00:00.000Z", end: "2026-11-05T12:00:00.000Z" },
+      { ...day, start: "2026-11-05T10:55:00.000Z", end: "2026-11-05T11:55:00.000Z" },
+    ],
+  );
   for (const { label } of FREE_LIMITS) assert.match(report, new RegExp(`\\| ${label.replace(/[()]/g, "\\$&")} \\|`));
-  assert.match(report, /\| ✅ \| D1 rows read \| 1,000,000 today \| 5,000,000 \| 20% \| 2,000,000 \(40%\) \|/);
+  assert.match(report, /\| ✅ \| D1 rows read \| 1,000,000 today \| 5,000,000 \| 20% \| 1,120,000 \(22%\) \|/);
   assert.match(report, /- logseq-connector: 3 of 400 requests\n- logseq-sync: 0 of 600 requests/);
   assert.match(report, /All allowances are within bounds\./);
 });
 
 test("the report names the allowances that alert", async () => {
-  const { fetch } = fakeFetch({ data: { viewer: { accounts: [account({ d1: [{ sum: { rowsRead: 2_600_000, rowsWritten: 0 } }] })] } } });
+  const spike = account({ ...recentAccount(), d1: [{ sum: { rowsRead: 400_000, rowsWritten: 0 } }] });
+  const { fetch } = fakeFetch(answer(account()), 200, answer(spike));
   const { report, alert } = await usageReport({ accountId: "acct", token: "tok", now: NOON, threshold: 0.7, fetch });
   assert.equal(alert, true);
   assert.match(report, /\| ⚠️ \| D1 rows read \|/);
