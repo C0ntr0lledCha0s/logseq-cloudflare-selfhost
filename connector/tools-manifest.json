@@ -190,6 +190,11 @@
     "path": null
   },
   {
+    "name": "refresh_refs",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/refresh-refs"
+  },
+  {
     "name": "save_document",
     "method": null,
     "path": null

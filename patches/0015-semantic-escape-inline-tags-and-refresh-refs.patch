@@ -1,0 +1,485 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index c092ce3492..80383938b7 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1,5 +1,6 @@
+ (ns logseq.db-sync.worker.handler.semantic
+   (:require [clojure.string :as string]
++            [clojure.walk :as walk]
+             [datascript.core :as d]
+             [datascript.impl.entity :as de]
+             [logseq.common.util :as common-util]
+@@ -22,6 +23,7 @@
+             [logseq.db.frontend.entity-util :as entity-util]
+             [logseq.db.frontend.property :as db-property]
+             [logseq.db.frontend.property.type :as db-property-type]
++            [logseq.graph-parser.mldoc :as gp-mldoc]
+             [logseq.outliner.core :as outliner-core]
+             [logseq.outliner.page :as outliner-page]
+             [logseq.outliner.property :as outliner-property]
+@@ -443,8 +445,7 @@
+ 
+ (defn- resolve-inline-tags
+   "Rewrites inline tags that name an existing class to `#[[uuid]]`, as the editor stores them,
+-  and returns those classes. Any other `#word` (an issue number, a URL fragment, an unknown
+-  name) stays plain text."
++  and returns those classes. `escape-unresolved-inline-tags` then escapes any other tag."
+   [db title]
+   (reduce (fn [result name]
+             (if-let [class (resolve-inline-class db name)]
+@@ -455,21 +456,84 @@
+           {:title title :classes []}
+           (inline-tag-names title)))
+ 
+-(defn- prepare-block-title! [conn e2ee? title]
++(def ^:private markdown-config (gp-mldoc/default-config :markdown))
++
++(defn- editor-tags
++  "The inline tags the editor's parser reads in `title`, as mldoc AST nodes in order."
++  [title]
++  (let [found (volatile! [])]
++    (walk/prewalk (fn [node]
++                    (when (and (vector? node) (= "Tag" (first node)))
++                      (vswap! found conj (second node)))
++                    node)
++                  (gp-mldoc/->edn title markdown-config))
++    @found))
++
++(defn- tag-ref? [tag]
++  (let [[[kind value]] tag
++        [ref-kind ref-name] (when (= "Link" kind) (:url value))]
++    (and (= "Page_ref" ref-kind) (common-util/uuid-string? ref-name))))
++
++(defn- tag-text
++  "A tag as written, from its mldoc payload: `#21)`, `#[[Foo Bar]]`."
++  [tag]
++  (apply str "#" (map (fn [[kind value]]
++                        (case kind
++                          "Plain" value
++                          "Link" (:full_text value)
++                          ""))
++                      tag)))
++
++(defn- escape-unresolved-inline-tags
++  "Escapes each `#` the editor would read as a tag, other than a `#[[uuid]]` ref to a resolved
++  class. Unescaped, an issue number or unknown word stays text only until the block's next edit in
++  Logseq, which turns it into a new tag. A `#` counts as a tag start when escaping it removes a tag,
++  so the rule is exactly the editor's: no space is needed before `#`, `)` belongs to the name, and
++  code spans, link labels and URL fragments are left alone. Returns the new title and the tags
++  escaped, as written."
++  [title]
++  (let [tags (fn [s] (frequencies (editor-tags s)))]
++    (if (every? tag-ref? (editor-tags title))
++      {:title title :escaped []}
++      (loop [title title
++             from 0
++             escaped-tags []]
++        (if-let [i (string/index-of title "#" from)]
++          (let [escaped (str (subs title 0 i) "\\" (subs title i))
++                after (tags escaped)
++                removed (keep (fn [[tag n]] (when (< (get after tag 0) n) tag)) (tags title))]
++            (if (and (seq removed) (not-any? tag-ref? removed))
++              (recur escaped (+ i 2) (into escaped-tags (map tag-text) removed))
++              (recur title (inc i) escaped-tags)))
++          {:title title :escaped escaped-tags})))))
++
++(defn- prepare-block-title!
++  "The block attributes for a written title. Tags escaped as text are in the result's metadata as
++  `:escaped`, so the attributes can be saved as they are."
++  [conn e2ee? title]
+   ;; E2EE titles are opaque ciphertext packages — they contain no resolvable
+   ;; [[refs]] (and transit punctuation must never be parsed as refs).
+   (if e2ee?
+     {:block/title title}
+     (let [{:keys [title classes]} (resolve-inline-tags @conn title)
++          {:keys [title escaped]} (escape-unresolved-inline-tags title)
+           refs (->> (page-ref-values title)
+                   (keep #(resolve-page-ref! conn %))
+                   (reduce (fn [result ref]
+                             (assoc result (:block/uuid ref) ref)) {})
+                   vals
+                   vec)]
+-      (cond-> {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
+-               :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)}
+-        (seq classes) (assoc :block/tags (mapv #(vector :block/uuid (:block/uuid %)) (distinct classes)))))))
++      (with-meta
++        (cond-> {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
++                 :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)}
++          (seq classes) (assoc :block/tags (mapv #(vector :block/uuid (:block/uuid %)) (distinct classes))))
++        {:escaped escaped}))))
++
++(defn- with-escaped
++  "Adds the tags a write escaped to its block response."
++  [response prepared]
++  (cond-> response
++    (seq (:escaped (meta prepared))) (assoc :escaped (:escaped (meta prepared)))))
+ 
+ (defn- valid-tree-identities? [db target nodes]
+   (let [seen (atom #{})
+@@ -694,7 +758,7 @@
+             (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
+                   children (when (seq (:children node))
+                              (insert-tree! conn existing (:children node) "append" e2ee?))]
+-              (cond-> {:uuid (str (:block/uuid existing)) :title (:block/title existing)}
++              (cond-> (with-escaped {:uuid (str (:block/uuid existing)) :title (:block/title existing)} block)
+                 (seq children) (assoc :children children))))
+           nodes blocks)))
+ 
+@@ -714,6 +778,8 @@
+   (if verbose?
+     nodes
+     (mapv #(cond-> {:uuid (:uuid %)}
++             ;; What a write escaped is news to the caller, unlike its titles.
++             (:escaped %) (assoc :escaped (:escaped %))
+              (:children %) (assoc :children (tree-response (:children %) false)))
+           nodes)))
+ 
+@@ -1093,6 +1159,64 @@
+            (broadcast-change! self)
+            (http/json-response nil (merge extra (inserted-response inserted verbose?)) 201)))))))
+ 
++(defn- refresh-candidates
++  "Body blocks (not pages or property values) of `page`, or of the whole graph, whose stored title
++  could hold an unresolved `#tag` or `[[link]]`, as [eid title] in eid order."
++  [db page]
++  (->> (if page
++         (d/datoms db :avet :block/page (:db/id page))
++         (d/datoms db :aevt :block/page))
++       (map :e)
++       (remove #(seq (d/datoms db :eavt % :logseq.property/created-from-property)))
++       (keep (fn [e]
++               (let [title (:v (first (d/datoms db :eavt e :block/title)))]
++                 (when (and (string? title)
++                            (or (string/includes? title "#") (string/includes? title "[[")))
++                   [e title]))))
++       (sort-by first)))
++
++(defn- refresh-change
++  "What a write of the block's stored title would change today, prepared against `conn`, or nil."
++  [conn [e title]]
++  (let [prepared (prepare-block-title! conn false title)
++        db @conn
++        block (d/entity db e)
++        existing (set (map :db/id (:block/tags block)))
++        added (->> (:block/tags prepared)
++                   (map #(d/entity db %))
++                   (remove #(contains? existing (:db/id %))))]
++    (when (or (not= title (:block/title prepared)) (seq added))
++      (let [show #(db-content/id-ref->title-ref % (map (fn [ref] (d/entity db ref)) (:block/refs prepared)))]
++        {:e e :title title
++         :response {:uuid (str (:block/uuid block))
++                    :page-id (str (get-in block [:block/page :block/uuid]))
++                    :before (show title)
++                    :after (show (:block/title prepared))
++                    :tags (mapv :block/title added)}}))))
++
++(defn- refresh-refs
++  "Re-runs write-time title handling on blocks already in the graph, so inline tags resolve and
++  unknown `#words` are escaped now rather than at the block's next edit. Previews unless `apply`."
++  [conn creator page apply?]
++  (let [db @conn
++        ;; A preview prepares against a copy, so links to missing pages create nothing.
++        scratch (d/conn-from-db db)
++        changes (->> (refresh-candidates db page)
++                     (keep #(refresh-change scratch %))
++                     (take (inc max-limit))
++                     vec)
++        truncated? (> (count changes) max-limit)
++        changes (vec (take max-limit changes))]
++    (when (and apply? (seq changes))
++      (atomic-write! conn creator false :save-block
++                     (fn [tx-conn]
++                       (doseq [{:keys [e title]} changes]
++                         (outliner-core/save-block! tx-conn
++                                                    (assoc (prepare-block-title! tx-conn false title)
++                                                           :block/uuid (:block/uuid (d/entity @tx-conn e))))))))
++    (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
++      truncated? (assoc :truncated true))))
++
+ (defn- handle-blocks [{:keys [^js self request conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+@@ -1106,13 +1230,31 @@
+             block (find-entity db (:block-id path-params))]
+       (if (or (nil? block) (not (non-blank-string? (:title body))))
+         (http/bad-request "invalid block-id or title")
+-        (do
+-          (authored-write! conn creator (fn [actor-conn] (outliner-core/save-block! actor-conn
+-                                     (assoc (prepare-block-title! actor-conn e2ee? (:title body))
+-                                            :block/uuid (:block/uuid block))
+-                                     :encrypted-title? e2ee? :encrypted-name (:name body))))
++        (let [prepared (volatile! nil)]
++          (authored-write! conn creator (fn [actor-conn]
++                                          (vreset! prepared (prepare-block-title! actor-conn e2ee? (:title body)))
++                                          (outliner-core/save-block! actor-conn
++                                                                     (assoc @prepared :block/uuid (:block/uuid block))
++                                                                     :encrypted-title? e2ee? :encrypted-name (:name body))))
+           (broadcast-change! self)
+-          (http/json-response nil {:uuid (str (:block/uuid block)) :kind (block-kind block) :title (:title body)}))))
++          (http/json-response nil (with-escaped
++                                    {:uuid (str (:block/uuid block)) :kind (block-kind block)
++                                     ;; The stored title shows what was escaped; E2EE stores the input.
++                                     :title (if e2ee?
++                                              (:title body)
++                                              (:block/title (d/entity @conn [:block/uuid (:block/uuid block)])))}
++                                    @prepared)))))
++
++    :semantic/refresh-refs
++    (p/let [body (body-clj request)
++            page (when-let [page-id (:page-id body)] (find-entity db page-id))]
++      (cond
++        e2ee? (http/error-response "refresh-refs is unavailable for E2EE graphs" 409)
++        (and (:page-id body) (not (page? page))) (http/bad-request "page not found")
++        :else (let [result (refresh-refs conn creator page (true? (:apply body)))]
++                (when (and (:applied result) (seq (:changed result)))
++                  (broadcast-change! self))
++                (http/json-response nil result))))
+ 
+     :semantic/blocks-delete
+     (if-let [block (find-entity db (:block-id path-params))]
+@@ -2063,7 +2205,7 @@
+ 
+ (def ^:private block-handlers
+   #{:semantic/blocks-get :semantic/blocks-update :semantic/blocks-delete :semantic/blocks-move
+-    :semantic/blocks-insert-children :semantic/blocks-insert-tree})
++    :semantic/blocks-insert-children :semantic/blocks-insert-tree :semantic/refresh-refs})
+ 
+ (def ^:private block-property-handlers
+   #{:semantic/blocks-set-property :semantic/blocks-delete-property
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 43b3ad2fc7..3e8088a03d 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -32,6 +32,8 @@
+     :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
+     :handler :semantic/blocks-delete-many :operation-id "deleteBlocks" :scope "logseq/write" :rate-class :write}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/refresh-refs" :internal-path "/semantic/refresh-refs"
++    :handler :semantic/refresh-refs :operation-id "refreshRefs" :scope "logseq/write" :rate-class :write}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
+     :handler :semantic/blocks-get :operation-id "getBlock" :scope "logseq/read" :rate-class :read}
+    {:method "PATCH" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
+@@ -117,18 +119,19 @@
+    "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and user and library property values but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
+-   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it."]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and user and library property values, without loading an unbounded tree."]
+-   "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID."]
++   "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
++   "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+-   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction."]
+-   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction."]
++   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title."]
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+    "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax."]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
+-   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end."]
++   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+@@ -247,6 +250,8 @@
+   (case operation-id
+     "createPage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+     "updatePage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
++    "refreshRefs" {:properties {:page-id {:type "string"}
++                                :apply {:type "boolean" :default false}}}
+     "updateBlock" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+     "moveBlocks" {:required ["block-ids" "target-id" "position"]
+                   :properties {:block-ids {:type "array" :minItems 1 :uniqueItems true
+@@ -552,6 +557,8 @@
+                                             :order {:type "string"}
+                                             :parent-id {:type "string"}
+                                             :page-id {:type "string"}
++                                            :escaped {:type "array" :items {:type "string"}
++                                                      :description "On writes: inline tags stored escaped as text because no tag has that name, as written (#15, #Unknown)."}
+                                             :children {:type "array"
+                                                        :items {:$ref "#/components/schemas/BlockResponse"}}}}
+                :EntityProperty {:type "object" :required ["ident" "value"]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+index 9eb913f2e3..fe61eef73b 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+@@ -451,3 +451,22 @@
+               "block tree nodes take properties"))
+         (p/catch #(is false (str %)))
+         (p/finally done))))
++
++(deftest compact-and-batch-responses-name-escaped-tags-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id]}]
++        (p/let [compact (request! self "POST" "/semantic/block-trees?verbose=false"
++                                  {:target-id (str page-id)
++                                   :blocks [{:title "Fixed in PR #3" :children [{:title "Plain child"}]}]})
++                batch (request! self "POST" "/semantic/block-trees/batch?verbose=false"
++                                {:entries [{:target-id (str page-id) :blocks [{:title "See #Unknown"}]}]})
++                parent (get-in compact [:body :blocks 0])
++                batched (get-in batch [:body :entries 0 :blocks 0])]
++          (is (= 201 (:status compact)))
++          (is (= ["#3"] (:escaped parent)) "a compact response still names what was escaped")
++          (is (= #{:uuid} (set (keys (get-in parent [:children 0])))) "nothing escaped, nothing added")
++          (is (= "Fixed in PR \\#3" (:block/title (entity conn (:uuid parent)))))
++          (is (= 201 (:status batch)))
++          (is (= ["#Unknown"] (:escaped batched)) "batch inserts escape and report like single inserts")
++          (is (= "See \\#Unknown" (:block/title (entity conn (:uuid batched))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 68dc00aead..801c268ae7 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -2,6 +2,7 @@
+   (:require ["better-sqlite3" :as sqlite3]
+             [cljs.test :refer [async deftest is testing]]
+             [clojure.string :as string]
++            [clojure.walk :as walk]
+             [datascript.core :as d]
+             [logseq.common.util.page-ref :as page-ref]
+             [logseq.db-sync.checksum :as sync-checksum]
+@@ -21,6 +22,7 @@
+             [logseq.db.frontend.schema :as db-schema]
+             [logseq.db.sqlite.build :as sqlite-build]
+             [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.graph-parser.mldoc :as gp-mldoc]
+             [logseq.outliner.core :as outliner-core]
+             [logseq.outliner.page :as outliner-page]
+             [logseq.outliner.property :as outliner-property]
+@@ -3935,10 +3937,11 @@
+                   _ (is (= #{decision-id meeting-id} (tags-of (ids 1))))
+                   _ (is (= (str "Notes " (ref-of meeting-id) " and " (ref-of decision-id) ".") (title-of (ids 1))))
+                   _ (is (empty? (tags-of (ids 2))) "issue numbers, URL fragments and unknown names stay text")
+-                  _ (is (= (titles 2) (title-of (ids 2))))
++                  _ (is (= "Connector \\#7, see https://example.com/#frag and C# \\#Unknown" (title-of (ids 2)))
++                        "unknown names are escaped so a later edit can't turn them into tags")
+                   _ (is (= #{decision-id} (tags-of (ids 3))) "a unique case-insensitive match resolves")
+                   _ (is (empty? (tags-of (ids 4))) "built-in classes Logseq disallows inline are not applied")
+-                  _ (is (= (titles 4) (title-of (ids 4))))
++                  _ (is (= "Not inline \\#Page" (title-of (ids 4))))
+                   update-response (sync-handler/handle-http
+                                    self
+                                    (semantic-json-request (str "/semantic/blocks/" (ids 2) "?graph-id=graph-1")
+@@ -4075,3 +4078,119 @@
+           (is (= 200 (.-status list-response)))
+           (is (= ["URL block 0" "URL block 1"] (mapv :title (:blocks body))))
+           (is (= 200 (.-status block-response)) "the value block is still readable by UUID"))))))
++
++(defn- editor-tag-names
++  "Names the editor's parser reads as inline tags in a stored title, excluding `#[[uuid]]` refs."
++  [title]
++  (let [found (atom [])]
++    (walk/prewalk (fn [x]
++                    (when (and (vector? x) (= "Tag" (first x)))
++                      (swap! found conj (pr-str (second x))))
++                    x)
++                  (gp-mldoc/->edn title (gp-mldoc/default-config :markdown)))
++    (remove #(re-find #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" %) @found)))
++
++(deftest semantic-unresolved-inline-tags-are-escaped-test
++  (async done
++    (with-tree-identity-test done
++      (fn [{:keys [conn page-id request self]}]
++        (let [decision-id (random-uuid)
++              _ (d/transact! conn [{:db/ident :user.class/Decision :block/uuid decision-id
++                                    :block/name "decision" :block/title "Decision"
++                                    :block/tags :logseq.class/Tag}])
++              titles ["Done: 8 (PR #15), order-key fix PR #19), 14 (PR #20) and 15 (PR #21), all deployed"
++                      "Fixed in PR#7"
++                      "Untouched: `#15`, [PR #15](https://example.com/pull/15), https://example.com/#frag, C#"
++                      "Known #Decision) and #Unknown"
++                      "## Heading #Unknown"]
++              ids (vec (repeatedly (count titles) random-uuid))
++              tags-of (fn [id] (set (map :block/uuid (:block/tags (d/entity @conn [:block/uuid id])))))
++              title-of (fn [id] (:block/raw-title (d/entity @conn [:block/uuid id])))
++              ref-of (fn [id] (str "#" (page-ref/->page-ref id)))]
++          (p/let [response (request {:target-id (str page-id)
++                                     :blocks (mapv (fn [id title] {:uuid (str id) :title title}) ids titles)})
++                  _ (is (= 201 (.-status response)))
++                  inserted-body (json-body response)
++                  inserted (:blocks inserted-body)
++                  _ (is (= ["#15)" "#19)" "#20)" "#21)"] (:escaped (inserted 0)))
++                        "the response names each escaped tag as the editor reads it")
++                  _ (is (= "Fixed in PR\\#7" (:title (inserted 1))) "the response title is the stored one")
++                  _ (is (not (contains? (inserted 2) :escaped)) "nothing escaped, no escaped key")
++                  _ (is (= ["#Unknown"] (:escaped (inserted 3))))
++                  _ (is (= "Done: 8 (PR \\#15), order-key fix PR \\#19), 14 (PR \\#20) and 15 (PR \\#21), all deployed"
++                           (title-of (ids 0))))
++                  _ (is (= "Fixed in PR\\#7" (title-of (ids 1))) "a tag needs no space before #")
++                  _ (is (= (titles 2) (title-of (ids 2))) "code spans, link labels, URL fragments and C# are not tags")
++                  _ (is (= #{decision-id} (tags-of (ids 3))))
++                  _ (is (= (str "Known " (ref-of decision-id) ") and \\#Unknown") (title-of (ids 3))))
++                  _ (is (= "## Heading \\#Unknown" (title-of (ids 4))))
++                  _ (doseq [id ids]
++                      (is (empty? (editor-tag-names (title-of id)))
++                          (str "the editor would create no tag from " (pr-str (title-of id)))))
++                  _ (doseq [id (pop ids)] (is (empty? (disj (tags-of id) decision-id))))
++                  update-response (sync-handler/handle-http
++                                   self
++                                   (semantic-json-request (str "/semantic/blocks/" (ids 0) "?graph-id=graph-1")
++                                                          "PATCH" {:title "Now PR #9"}))]
++            (is (= 200 (.-status update-response)))
++            (is (= "Now PR \\#9" (title-of (ids 0))))
++            (p/let [body (json-body update-response)]
++              (is (= "Now PR \\#9" (:title body)) "PATCH returns the stored title, not the input")
++              (is (= ["#9"] (:escaped body))))))))))
++
++(deftest semantic-refresh-refs-previews-then-applies-test
++  (async done
++    (with-tree-identity-test done
++      (fn [{:keys [conn page-id self]}]
++        (let [decision-id (random-uuid)
++              keep-id (random-uuid)
++              other-page-id (random-uuid)
++              [stale-id clean-id other-id] (repeatedly 3 random-uuid)
++              block (fn [id page title order]
++                      {:block/uuid id :block/title title :block/page [:block/uuid page]
++                       :block/parent [:block/uuid page] :block/order order
++                       :block/created-at 1 :block/updated-at 1})
++              _ (d/transact! conn [{:db/ident :user.class/Decision :block/uuid decision-id
++                                    :block/name "decision" :block/title "Decision" :block/tags :logseq.class/Tag}
++                                   {:db/ident :user.class/Keep :block/uuid keep-id
++                                    :block/name "keep" :block/title "Keep" :block/tags :logseq.class/Tag}
++                                   {:block/uuid other-page-id :block/name "other" :block/title "Other"
++                                    :block/tags :logseq.class/Page :block/created-at 1 :block/updated-at 1}])
++              ;; Titles written before inline tags were handled on write, so still raw text.
++              _ (d/transact! conn [(assoc (block stale-id page-id "Done (PR #15) and #Decision" "a0")
++                                          :block/tags [[:block/uuid keep-id]])
++                                   (block clean-id page-id "Nothing to do" "a1")
++                                   (block other-id other-page-id "Other #Unknown" "a0")])
++              title-of (fn [id] (:block/raw-title (d/entity @conn [:block/uuid id])))
++              tags-of (fn [id] (set (map :block/uuid (:block/tags (d/entity @conn [:block/uuid id])))))
++              refresh! (fn [body]
++                         (p/let [response (sync-handler/handle-http
++                                           self (semantic-json-request "/semantic/refresh-refs?graph-id=graph-1" "POST" body))
++                                 text (.text response)]
++                           [(.-status response) (js->clj (js/JSON.parse text) :keywordize-keys true)]))
++              escaped "Done (PR \\#15) and "]
++          (p/let [[s1 preview] (refresh! {:page-id (str page-id)})
++                  _ (is (= 200 s1))
++                  _ (is (= false (:applied preview)) "previews by default")
++                  _ (is (= [{:uuid (str stale-id) :page-id (str page-id)
++                             :before "Done (PR #15) and #Decision"
++                             :after (str escaped "#Decision")
++                             :tags ["Decision"]}]
++                           (:changed preview))
++                        "only the stale block on the page, shown with tag names")
++                  _ (is (= "Done (PR #15) and #Decision" (title-of stale-id)) "a preview writes nothing")
++                  [s2 applied] (refresh! {:page-id (str page-id) :apply true})
++                  _ (is (= [200 true 1] [s2 (:applied applied) (count (:changed applied))]))
++                  _ (is (= (str escaped "#" (page-ref/->page-ref decision-id)) (title-of stale-id)))
++                  _ (is (= #{keep-id decision-id} (tags-of stale-id)) "existing tags are kept")
++                  _ (is (= "Nothing to do" (title-of clean-id)))
++                  _ (is (= "Other #Unknown" (title-of other-id)) "page scope leaves other pages alone")
++                  [s3 graph-wide] (refresh! {:apply true})
++                  _ (is (= [200 [(str other-id)]] [s3 (mapv :uuid (:changed graph-wide))]))
++                  _ (is (= "Other \\#Unknown" (title-of other-id)))
++                  [s4 again] (refresh! {:apply true})
++                  _ (is (= [200 []] [s4 (:changed again)]) "refreshing twice changes nothing")
++                  e2ee-response (sync-handler/handle-http
++                                 self (semantic-json-request "/semantic/refresh-refs?graph-id=graph-1&graph-e2ee=true"
++                                                             "POST" {:apply true}))]
++            (is (= 409 (.-status e2ee-response)) "E2EE titles are opaque, so there is nothing to refresh")))))))

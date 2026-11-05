@@ -1,0 +1,39 @@
+name: usage
+
+on:
+  # 03:00, 09:00, 15:00 and 21:00 UTC. Free allowances reset at 00:00 UTC, so each run sees
+  # an eighth or more of the day, enough for the report's end-of-day projection.
+  schedule:
+    - cron: "0 3,9,15,21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: usage
+  cancel-in-progress: false
+
+jobs:
+  usage:
+    # USAGE_REPORT_ENABLED is a GitHub variable, like CONNECTOR_ENABLED: unset means off.
+    if: vars.USAGE_REPORT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          install_args: node
+
+      # Fails the run, which emails you, when an allowance is at 70% or on course to pass its
+      # limit. The table is on the run's summary page.
+      - name: Report usage
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ANALYTICS_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/usage-report.mjs --settings config/settings.json

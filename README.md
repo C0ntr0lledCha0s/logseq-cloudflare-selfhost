@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies fourteen small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies fifteen small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -32,7 +32,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Pages as readable outlines.** `patches/0003-semantic-page-outline.patch` adds `getPageOutline` (the connector's `get_page_outline`). It returns a page's tags, its property values and its whole block tree as a markdown outline, in one call, with `[[links]]` shown as page titles instead of UUIDs. It refuses E2EE graphs.
 - **Search that finds pages.** Upstream's `searchGraph` returns pages under the `blocks` type, sorted after every block that mentions them, and ignores unknown `types` values. `patches/0004-semantic-search-pages-and-ranking.patch` adds a `pages` type, rejects unknown types with a 400, and ranks an exact title match first, then pages, tags, properties and assets, then blocks.
 - **Batch errors that say what's wrong.** Upstream's `batchSetBlockProperty` and `batchDeleteBlockProperty` answer every rejected batch with `invalid batch property entry`, whether `entries` is missing, isn't an array, or one entry names a block, property or value that doesn't exist. `patches/0005-semantic-batch-property-errors.patch` returns `entries must be a non-empty array` for the first case and `entry <index>: <reason>` for the others. A rejected batch still writes nothing.
-- **Inline tags that tag.** Upstream stores `#Tag` in a block written through the API as plain text, so the block never gets the tag, unlike the same text typed in the editor. `patches/0006-semantic-inline-tags.patch` resolves `#Tag` and `#[[Multi Word Tag]]` in inserted and updated block titles to an existing tag (exact title first, then a unique case-insensitive match) and stores them as the editor does, as `#[[uuid]]` with the tag set on the block. Anything else after a `#`, such as an issue number, a URL fragment or an unknown name, stays plain text, and tags Logseq refuses inline (page, property and other built-in kinds) are skipped.
+- **Inline tags that tag.** Upstream stores `#Tag` in a block written through the API as plain text, so the block never gets the tag, unlike the same text typed in the editor. `patches/0006-semantic-inline-tags.patch` resolves `#Tag` and `#[[Multi Word Tag]]` in inserted and updated block titles to an existing tag (exact title first, then a unique case-insensitive match) and stores them as the editor does, as `#[[uuid]]` with the tag set on the block. Tags Logseq refuses inline (page, property and other built-in kinds) are skipped. Patch 0015 escapes any other `#` that would read as a tag.
 - **Text property values.** Upstream accepts only an existing entity as the value of a text (default-type) property such as *Description*, so a plain string fails, and text that happens to match a page title links that page and then fails Logseq's schema check with a 500. `patches/0007-semantic-text-property-values.patch` stores a plain string, or an array of strings for a multi-value property, in a new value block as the editor does. Text is never looked up by title; a UUID still references an existing value. Properties with fixed choices, such as Status, are unchanged, and encrypted graphs still need an existing entity.
 - **Order keys that don't collide.** Some outliner writes, such as property value blocks and new pages, take the next order key after a process-wide maximum. Clients seed that maximum from the graph when they load it; upstream's Worker never does, so API writes can reuse an order key a sibling already holds, and a client later moves one of the blocks. `patches/0008-seed-order-key-for-server-writes.patch` seeds it from the graph on every semantic API request. It also fixes `get-max-order`, which returned another attribute's value on a graph with no ordered blocks.
 - **Moves that land where they say.** Upstream's `moveBlocks` maps `before` and `after` to outliner options that address the target's children, so `before` made the block the target's first child and `after` its last child (or first, when it had none). `patches/0009-semantic-move-before-after.patch` makes `after` the target's next sibling and `before` its previous sibling (the first child of its parent when it has none), and refuses `before` and `after` on a page.
@@ -41,6 +41,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Bulk operations.** Upstream reads, deletes and moves one item (or one target) per call, so routine work such as tagging a dozen people or filling several pages runs into the limit of 20 writes per minute. `patches/0012-semantic-bulk-operations.patch` adds `getBlocks` (up to 100 blocks or pages by UUID, with tags and properties, optionally with their trees as outlines), `deleteBlocks` (up to 100 blocks), `batchMoveBlocks` (up to 100 moves, each to its own target) and `batchInsertBlockTrees` (block trees and properties for several pages, naming a page by title creates it). Block tree nodes take a `properties` object, so a block gets its tags and property values as it is inserted. Each bulk write is one request, checks every entry first, and applies all of them or none; `dry-run` reports what would change without changing anything. `verbose=false` makes insert responses just the new blocks' UUIDs and a count.
 - **Backlinks by relation, graph health and a knowledge index.** Upstream's `listPageReferences` is one flat list, and no operation reads the graph as a whole. `patches/0013-semantic-backlinks-health-knowledge-index.patch` adds three read operations, all refused on E2EE graphs. `getPageBacklinks` groups everything that points at a page, tag or property into text links, tagged objects, property values and other references, with a complete count for each. `getGraphHealth` lists tags and properties nothing uses, titles that collide ignoring case, and pages whose first block isn't a `**Summary:**` block or that have no tag, a page of each at a time. `listKnowledgeIndex` pages through the non-journal pages people wrote, with their tags and the classes those extend, summary, reference count and last update, and leaves out pages with an excluded tag. The connector's `kb_index` is built on it (11.8). On a synthetic graph of 3,000 pages and 30,000 blocks, each call took under half a second in a Node test run.
 - **A change feed for a search index.** The API has no way to list the blocks that changed since a point, or to notice deletes. `patches/0014-semantic-block-changes-feed.patch` adds `listBlockChanges`: every content block with its page title, breadcrumb and tags, or, given an earlier response's `t` and `epoch`, only what changed since, read from the sync tx log, plus the UUIDs that went away. The connector's optional semantic search (11.11) uses it; it isn't a connector tool.
+- **No stray tags from issue numbers.** Text such as `PR #15` or `PR#7` written through the API stays plain text only until the block is next edited in Logseq, when the editor turns `#15` into a new tag named `15` (or `21)`, since `)` belongs to the name). `patches/0015-semantic-escape-inline-tags-and-refresh-refs.patch` escapes every `#` that Logseq's own markdown parser (mldoc) would read as a tag, other than one 0006 resolved, as `\#`, which Logseq displays as `#` and never turns into a tag. Code spans, link labels and URL fragments are left alone. Each write's response lists the tags it escaped under `escaped`, even with `verbose=false`, and `updateBlock` now returns the stored title rather than echoing its input. It also adds `refreshRefs` (the connector's `refresh_refs`): it reruns this handling, and 0006's, on blocks already in the graph, for one page or the whole graph. It previews by default, applies with `apply: true`, returns each block's before and after text, handles at most 200 blocks per call and refuses E2EE graphs.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
@@ -61,6 +62,37 @@ Your graph content is not sent to Logseq. The patched server no longer calls `ap
 The connector's optional semantic search (11.11) runs on Free for graphs up to about 13,000 indexed blocks (the Free plan stores 5M Vectorize dimensions). A larger graph needs Workers Paid, where it adds under $0.01/month.
 
 R2 is billed separately. It has a monthly free tier, but Cloudflare asks for a payment method before you can enable it. Check Cloudflare's current pricing pages for the exact allowances.
+
+### Watching your usage
+
+On the Free plan, going over a daily allowance makes requests fail until the allowance resets at 00:00 UTC; nothing is billed. The allowances are account-wide, so the sync server and the connector share them.
+
+**In the dashboard:**
+
+| Where | What it shows |
+|---|---|
+| **Workers & Pages → the Worker → Metrics** | Requests, errors and CPU time per Worker |
+| **Workers & Pages → the Worker → Logs** | Each request and cron run; failures show as "Exception Thrown" |
+| **Storage & Databases → D1 → the database → Metrics** | Rows read and written |
+| **Storage & Databases → KV**, **Vectorize** | Operations, and stored vectors |
+| **AI → Workers AI** | Neurons by model |
+| **Compute → Durable Objects** | Requests, duration and SQLite rows |
+
+**The usage report.** `scripts/usage-report.mjs` reads every Free allowance from Cloudflare's GraphQL Analytics API and prints a table with today's usage, its share of the limit, and a projection to 00:00 UTC that continues the last hour's rate (so a fix or a new spike shows in the next run). It exits 1 when an allowance is at 70% (`--threshold`) or its projection passes the limit. The `usage` workflow runs it at 03:00, 09:00, 15:00 and 21:00 UTC; a failed run emails you, and the table is on the run's summary page. It only knows the Free plan; on Workers Paid, use **Manage Account → Billing → Billable usage** instead.
+
+To turn it on:
+
+1. Create a second, read-only token under **Manage Account → Account API Tokens → Create Token → Custom token**, with one policy: **Account** → your account → **Account Analytics** Read. Every dataset the report reads (Workers, Durable Objects, D1, KV, Workers AI, Vectorize) is covered by that one permission. Keep it separate from the deploy token, which can change everything.
+2. Store it as the `production` secret `CLOUDFLARE_ANALYTICS_TOKEN`, and set the variable `USAGE_REPORT_ENABLED` to `true`:
+
+   ```bash
+   gh secret set CLOUDFLARE_ANALYTICS_TOKEN --env production   # paste the token at the prompt
+   gh variable set USAGE_REPORT_ENABLED --body true
+   ```
+
+3. Run it once: **Actions → usage → Run workflow**, or `gh workflow run usage.yml`.
+
+To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`.
 
 ## Prerequisites
 
@@ -242,8 +274,9 @@ Then add the secrets:
 | `OWNER_GITHUB_USER_ID` | Only with the connector |
 | `COOKIE_ENCRYPTION_KEY` | Only with the connector |
 | `GRAPH_TOKEN_KEY` | Only with the connector |
+| `CLOUDFLARE_ANALYTICS_TOKEN` | Only with the usage report ([Watching your usage](#watching-your-usage)) |
 
-**One setting is a variable, not a secret.** `CONNECTOR_ENABLED` turns the optional connector on (section 11). Leave it unset for now: unset means off.
+**Two settings are variables, not secrets.** `CONNECTOR_ENABLED` turns the optional connector on (section 11), and `USAGE_REPORT_ENABLED` the usage report ([Watching your usage](#watching-your-usage)). Leave them unset for now: unset means off.
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
@@ -461,7 +494,7 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
   - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
 - **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials. An asset deleted by accident or by an attacker is no longer in the mirror after the next backup, but it is kept in `daily/<date>/assets-deleted/` for the retention window; restore it from there.
 
-**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop both the daily backup and the weekly bump. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml` and `gh workflow enable bump-upstream.yml`. Check occasionally that the latest runs are recent.
+**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop the daily backup, the weekly bump and the usage report. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml`, `gh workflow enable bump-upstream.yml` and `gh workflow enable usage.yml`. Check occasionally that the latest runs are recent.
 
 **If rclone gets a 403 on its bucket check,** set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. That's the usual fix for R2 tokens that can't list buckets. The verified setup didn't need it, because the token from 1.1 can list buckets.
 
@@ -524,7 +557,8 @@ This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
 | `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
-| Backups or the weekly bump stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` (section 7). |
+| Backups, the weekly bump or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` / `gh workflow enable usage.yml` (section 7). |
+| The usage report fails with `not authorized` | `CLOUDFLARE_ANALYTICS_TOKEN` lacks **Account Analytics** Read, or belongs to another account ([Watching your usage](#watching-your-usage)). |
 | Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
@@ -693,7 +727,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
   - **Cache.** The index comes from the sync server's `listKnowledgeIndex`, 200 pages a request, and is cached per alias in the `KB_INDEX_KV` namespace. The cron rebuilds every graph's index hourly. `create_page`, `update_page`, `delete_page`, `update_tag` and `delete_tag` through the connector mark it dirty, so the next call rebuilds it. A call also rebuilds a cache older than two hours, or one built for another graph under the same alias. Other edits, such as a new summary, show after the next hourly rebuild. The first line of every answer says when the index was built.
 - **`get_page_backlinks`** shows how a page, tag or property is used: links in text, objects tagged with it, property values pointing at it (with the property) and other references, each with a complete count and up to `limit` of the most recently updated.
 - **`get_graph_health`**, for a weekly review, returns counts and the first items of five checks: `orphan-tags`, `orphan-properties`, `duplicate-titles`, `pages-without-summary` and `pages-without-tags`. `updated-after` narrows the page checks to recent pages, and `checks` with one check plus its `next-cursor` pages through it.
-- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `get_page_outline`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`, `get_page_backlinks`), blocks (`get_block`, `get_blocks`, `update_block`, `delete_block`, `delete_blocks`, `insert_block_children`, `insert_block_tree`, `batch_insert_block_trees`, `move_blocks`, `batch_move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `search_graph`, `get_graph_health` and `list_assets`. `listKnowledgeIndex` has no tool of its own: `kb_index` uses it. `connector/tools-manifest.json` has the full list.
+- **One tool per sync-server REST operation**, named after the operation in snake case. At the current `UPSTREAM_REF` that's pages (`list_pages`, `get_page`, `get_page_outline`, `create_page`, `update_page`, `delete_page`, `list_page_blocks`, `list_page_references`, `get_page_backlinks`), blocks (`get_block`, `get_blocks`, `update_block`, `delete_block`, `delete_blocks`, `insert_block_children`, `insert_block_tree`, `batch_insert_block_trees`, `move_blocks`, `batch_move_blocks`), properties (`list_properties`, `get_property`, `create_property`, `update_property`, `delete_property`, `set_block_property`, `delete_block_property`, `batch_set_block_property`, `batch_delete_block_property`), tags (`list_tags`, `get_tag`, `create_tag`, `update_tag`, `delete_tag`, `list_tag_objects`), tasks (`list_tasks`, `create_task`), `capture_to_today`, `refresh_refs`, `search_graph`, `get_graph_health` and `list_assets`. `listKnowledgeIndex` has no tool of its own: `kb_index` uses it. `connector/tools-manifest.json` has the full list.
 - **With semantic search on (11.11):** `semantic_search` finds blocks by meaning and by title at once, and `semantic_index_status` says how much of a graph is indexed.
 - **Files:**
   - `save_document` saves text (as UTF-8) or base64 bytes, at most 150,000 characters, under a file name whose extension sets the type;

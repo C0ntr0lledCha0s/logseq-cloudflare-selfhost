@@ -85,6 +85,15 @@ async function rows(graphId = WORK_ID): Promise<{ block_uuid: string; tags: stri
   return results;
 }
 
+/** Each state row's block count (migration 0003's triggers) equals its graph's rows. */
+async function expectExactCounts(): Promise<void> {
+  const { results } = await env.DB.prepare(
+    `SELECT graph_id, blocks, (SELECT count(*) FROM semantic_blocks b WHERE b.graph_id = s.graph_id) AS actual
+     FROM semantic_state s`,
+  ).all<{ graph_id: string; blocks: number; actual: number }>();
+  for (const r of results) expect(r.blocks, r.graph_id).toBe(r.actual);
+}
+
 beforeEach(async () => {
   await env.DB.exec("DELETE FROM graphs; DELETE FROM semantic_blocks; DELETE FROM semantic_state;");
   work = new FakeGraph(WORK_ID, WORK_TOKEN);
@@ -128,10 +137,19 @@ describe("documents", () => {
     expect(await vectorId(HOME_ID, "b1")).not.toBe(a);
   });
 
+  it("reads the feed's last page, whose next-cursor is null as the sync server sends it", () => {
+    // JSON as patch 0014 serialises a last page: Clojure nil becomes null, not a missing key.
+    const last = JSON.parse('{"blocks":[],"removed":[],"next-cursor":null,"epoch":"e","t":7}');
+    expect(parseFeedPage(last)).toEqual({ epoch: "e", t: 7, blocks: [], removed: [], nextCursor: null });
+    expect(parseFeedPage({ ...last, "next-cursor": "c" }).nextCursor).toBe("c");
+  });
+
   it("rejects a feed page of the wrong shape", () => {
-    expect(() => parseFeedPage({ epoch: "e", t: 1, blocks: [], removed: [] })).not.toThrow();
-    expect(() => parseFeedPage({ epoch: "e", t: "1", blocks: [], removed: [] })).toThrow(/unexpected shape/);
-    expect(() => parseFeedPage({ epoch: "e", t: 1, blocks: [{ uuid: "u" }], removed: [] })).toThrow(/malformed block/);
+    const ok = { epoch: "e", t: 1, blocks: [], removed: [], "next-cursor": null };
+    expect(() => parseFeedPage(ok)).not.toThrow();
+    expect(() => parseFeedPage({ ...ok, t: "1" })).toThrow(/unexpected shape/);
+    expect(() => parseFeedPage({ ...ok, "next-cursor": 3 })).toThrow(/unexpected shape/);
+    expect(() => parseFeedPage({ ...ok, blocks: [{ uuid: "u" }] })).toThrow(/malformed block/);
   });
 });
 
@@ -218,6 +236,8 @@ describe("indexer", () => {
     const state = await semanticStore().state(WORK_ID);
     expect(state).toMatchObject({ status: "ready", t: work.t, epoch: work.epoch, cursor: null, pendingT: null, error: null });
     for (const v of index.vectors.values()) expect(v.namespace).toBe(WORK_ID);
+    await expectExactCounts();
+    expect(await semanticStore().counts(WORK_ID)).toEqual({ graph: 120, total: 120 });
     expect(logged().some((l) => /^semantic index graph=work status=ready pages=1 embedded=20 deleted=0 ms=\d+$/.test(l))).toBe(true);
   });
 
@@ -313,6 +333,7 @@ describe("indexer", () => {
     expect((await rows()).map((r) => r.block_uuid)).toEqual([c]);
     expect(index.vectors.size).toBe(1);
     expect(embedder.calls).toEqual([]); // c's text is unchanged
+    await expectExactCounts();
     expect(await semanticStore().state(WORK_ID)).toMatchObject({ status: "ready", epoch: "epoch-2", t: work.t });
   });
 
@@ -325,6 +346,8 @@ describe("indexer", () => {
     await runUntilReady();
     expect((await rows()).map((r) => r.block_uuid)).toEqual(ids.filter((id) => !gone.includes(id)));
     expect(index.vectors.size).toBe(127);
+    await expectExactCounts();
+    expect(await semanticStore().total()).toBe(127);
   });
 
   it("stops at the vector cap and says so", async () => {
@@ -337,6 +360,30 @@ describe("indexer", () => {
     await expireLeases();
     await run(1000);
     expect(index.vectors.size).toBe(60);
+    await expectExactCounts();
+  });
+
+  it("checks the cap against every graph's blocks without counting the blocks", async () => {
+    seedWork(30);
+    const page = home.addPage("Garden");
+    for (let i = 0; i < 30; i++) home.addBlock(page, `Plant ${i}`);
+    await graphs().add({
+      alias: "home", graphId: HOME_ID, graphName: "Home", mode: "write", permission: "both", expiresAt: null, token: HOME_TOKEN,
+    });
+    await run(50);
+    // Whichever graph runs second finds the first one's 30 blocks in the total.
+    const states = await semanticStore().states();
+    expect(states.map((s) => s.status).sort()).toEqual(["full", "ready"]);
+    expect(states.find((s) => s.status === "full")?.error).toMatch(/index is full: 30 of 50 vectors stored and this page adds 30/);
+    await expectExactCounts();
+  });
+
+  it("refuses a block row for a graph with no state row", async () => {
+    await expect(
+      env.DB.prepare(
+        "INSERT INTO semantic_blocks (vector_id, graph_id, block_uuid, page_uuid, page_title, breadcrumb, text, tags, hash) VALUES ('v', 'g', 'b', 'p', 'P', '[]', 't', '[]', 'h')",
+      ).run(),
+    ).rejects.toThrow(/semantic_blocks row without a semantic_state row/);
   });
 
   it("records token, encryption and model failures on the graph and recovers", async () => {
@@ -399,6 +446,7 @@ describe("indexer", () => {
     expect(report.orphansDeleted).toBe(3);
     expect(index.vectors.size).toBe(0);
     expect(await rows()).toEqual([]);
+    await expectExactCounts();
     await run();
     expect(await semanticStore().state(WORK_ID)).toBeNull();
   });
