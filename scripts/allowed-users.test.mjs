@@ -274,15 +274,24 @@ test("cli check-format: none and no masks outside Actions", async () => {
   assert.equal(local.stdout.trim(), "DB_SYNC_ALLOWED_USERS: 1 user(s)");
 });
 
-test("cli check-format: a bad value exits 1 with the error on stderr and no value", async () => {
+test("cli check-format: a bad value exits 1 with an Actions ::error:: annotation on stdout and no value", async () => {
   for (const value of ["", D.toUpperCase(), "bob", `${A},,${B}`]) {
     const r = await cli(["check-format"], { DB_SYNC_ALLOWED_USERS: value, GITHUB_ACTIONS: "true" });
     assert.equal(r.status, 1, JSON.stringify(value));
-    assert.match(r.stderr, /DB_SYNC_ALLOWED_USERS/);
+    assert.match(r.stdout, /^::error::.*DB_SYNC_ALLOWED_USERS/m);
+    assert.equal(r.stderr, "");
     assert.ok(!r.stdout.includes("::add-mask::"), "nothing is masked from a malformed value");
     assert.ok(!(r.stdout + r.stderr).includes(D.toUpperCase()));
     assert.ok(!(r.stdout + r.stderr).includes("bob"));
   }
+});
+
+test("cli check-format: outside Actions a bad value goes to stderr as error: text", async () => {
+  const r = await cli(["check-format"], { DB_SYNC_ALLOWED_USERS: "bob" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^error: .*DB_SYNC_ALLOWED_USERS/m);
+  assert.ok(!r.stdout.includes("::error::"));
+  assert.ok(!(r.stdout + r.stderr).includes("bob"));
 });
 
 test("cli check-known: a listed and known user passes with counts only", async () => {

@@ -149,10 +149,7 @@ export async function run(argv, env = process.env) {
 
   if (command === "check-format") {
     const parsed = parseAllowedUsers(env[NAME]);
-    if (!parsed.ok) {
-      console.error(`error: ${parsed.error}`);
-      return 1;
-    }
+    if (!parsed.ok) return fail(parsed.error);
     if (inActions) for (const id of parsed.ids) console.log(`::add-mask::${id}`);
     console.log(parsed.ids.length === 0 ? `${NAME}: none (every user is refused)` : `${NAME}: ${parsed.ids.length} user(s)`);
     return 0;

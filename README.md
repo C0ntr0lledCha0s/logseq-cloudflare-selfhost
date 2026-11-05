@@ -345,6 +345,8 @@ On each device, running a nightly build (section 0):
 
 Then sign in with your Logseq account and create or upload a graph.
 
+**On a new install, the first sign-in is refused.** The allow-list starts as `none`, which refuses everyone. Get your user ID as [9.1](#91-who-can-use-your-server) describes for a fresh install, set `DB_SYNC_ALLOWED_USERS`, push it and redeploy. Then sign in again. Re-enter the server URL first if the client signed you out.
+
 **Logging out clears the custom URL.** The client goes back to Logseq's hosted sync. Re-enter the URL after every logout, before you sign in again.
 
 ### Encrypted or unencrypted graph?
@@ -540,23 +542,23 @@ The value is `none`, or one or more Logseq user IDs separated by commas. Each ID
 
 - **`scripts/list-users.sh`** prints each user's ID, email, username, how many graphs they own and whether they're on your list. It needs `.env.local` (1.4), runs only on your machine, and refuses to run in GitHub Actions because it prints IDs and emails.
 - **The Cloudflare dashboard.** Go to Storage & Databases → D1 → the sync database (`logseq-sync-index` by default) → Console, and run `SELECT id, email FROM users`.
-- **On a fresh install,** no one has signed in yet, and a refused user is never recorded, so neither of the above shows you. Sign in once from Logseq. You are refused, and the Worker logs a `db-sync/user-not-allowed` warning with your user ID and email. Read it with `wrangler tail logseq-sync` (the default worker name; `config/settings.json` has `workerName`) or in Workers Logs in the dashboard. Then set the list and redeploy.
+- **On a fresh install,** no one has signed in yet, and a refused user is never recorded, so neither of the above shows you. Sign in once from Logseq. You are refused, and the Worker logs a `db-sync/user-not-allowed` warning with your user ID and email. Read it with `wrangler tail logseq-sync` (the default worker name; `config/settings.json` has `workerName`) or in Workers Logs in the dashboard. Then set the list and redeploy. You can also decode the `sub` claim of the `id-token` in the client's Local Storage (section 4 shows where it is): that is your user ID.
 
 A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy passes and the server refuses everyone until you set your ID. The deploy prints a warning about that. It is expected.
 
-**Adding someone.** Append their ID to the comma-separated list in `.env.local` and in the `production` secret (push it with [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
+**Adding someone.** Append their ID to the comma-separated list in `.env.local`, with no spaces, and in the `production` secret (reload `.env.local`, then push it with [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
 
 **Removing someone.** Take their ID out of both places and redeploy. It takes effect on the next deploy. Their graphs stay on the server (see the cleanup below).
 
 **Rolling this out on an existing install.** Do these in order. **The secret must be in `production` before you merge the PR that brings the allow-list.** Otherwise the deploy stops at the format check. That stop is safe: nothing is deployed and the running server isn't touched. But you will have to fix it and run the deploy again.
 
 1. Run `scripts/list-users.sh` and find your own row. Note any other users: they are either strangers or your own second account.
-2. Put your ID, and the ID of any other account you use, in `.env.local` as `DB_SYNC_ALLOWED_USERS`, comma-separated.
-3. Push it with [the loop in 1.8](#18-set-up-the-github-production-environment). (`init-env.sh --add-missing` only handles names missing from `.env.local`, so it won't push a value you added by hand.)
+2. Put your ID, and the ID of any other account you use, in `.env.local` as `DB_SYNC_ALLOWED_USERS`, comma-separated. Write them with no spaces (`id1,id2`), because the shell sources the file.
+3. Reload `.env.local` first (the `set -a` line in [1.4](#14-fill-in-envlocal)), so a shell with the old value doesn't push it. Then push it with [the loop in 1.8](#18-set-up-the-github-production-environment). (`init-env.sh --add-missing` only handles names missing from `.env.local`, so it won't push a value you added by hand.)
 4. Merge. The deploy checks the value, ships it together with the code, and the smoke test's `pat-graphs` check (when `SMOKE_PAT` is set) confirms you still get in.
 5. Optional. To remove a stranger's graph, call `DELETE /admin/graphs/<graph-id>` with the header `x-db-sync-admin-token: <DB_SYNC_ADMIN_TOKEN>`. This is manual: nothing does it for you, and it can't be undone.
 
-**If you get locked out.** The deploy can't tell a list that names the wrong known account from the right one, so a mistake there can pass the checks. There is no automatic rollback. Fix the secret in `.env.local` and `production` and redeploy, or run `wrangler rollback` to put back the previous version of the Worker.
+**If you get locked out.** The deploy can't tell a list that names the wrong known account from the right one, so a mistake there can pass the checks. There is no automatic rollback. Fix the secret in `.env.local` and `production` and redeploy, or run `$W rollback --name logseq-sync` to put back the previous version of the Worker (`$W` is the wrangler path from [section 6](#6-upgrades), and `logseq-sync` is the `workerName` in `config/settings.json`). Right after the rollout, the previous version is the one without the allow-list, so rolling back re-opens the server to every Logseq account until you redeploy.
 
 **Rotating secrets:**
 
