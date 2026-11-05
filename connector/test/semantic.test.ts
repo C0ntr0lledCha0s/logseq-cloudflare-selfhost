@@ -128,10 +128,19 @@ describe("documents", () => {
     expect(await vectorId(HOME_ID, "b1")).not.toBe(a);
   });
 
+  it("reads the feed's last page, whose next-cursor is null as the sync server sends it", () => {
+    // JSON as patch 0014 serialises a last page: Clojure nil becomes null, not a missing key.
+    const last = JSON.parse('{"blocks":[],"removed":[],"next-cursor":null,"epoch":"e","t":7}');
+    expect(parseFeedPage(last)).toEqual({ epoch: "e", t: 7, blocks: [], removed: [], nextCursor: null });
+    expect(parseFeedPage({ ...last, "next-cursor": "c" }).nextCursor).toBe("c");
+  });
+
   it("rejects a feed page of the wrong shape", () => {
-    expect(() => parseFeedPage({ epoch: "e", t: 1, blocks: [], removed: [] })).not.toThrow();
-    expect(() => parseFeedPage({ epoch: "e", t: "1", blocks: [], removed: [] })).toThrow(/unexpected shape/);
-    expect(() => parseFeedPage({ epoch: "e", t: 1, blocks: [{ uuid: "u" }], removed: [] })).toThrow(/malformed block/);
+    const ok = { epoch: "e", t: 1, blocks: [], removed: [], "next-cursor": null };
+    expect(() => parseFeedPage(ok)).not.toThrow();
+    expect(() => parseFeedPage({ ...ok, t: "1" })).toThrow(/unexpected shape/);
+    expect(() => parseFeedPage({ ...ok, "next-cursor": 3 })).toThrow(/unexpected shape/);
+    expect(() => parseFeedPage({ ...ok, blocks: [{ uuid: "u" }] })).toThrow(/malformed block/);
   });
 });
 

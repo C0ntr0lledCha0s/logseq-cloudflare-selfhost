@@ -81,7 +81,10 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
-/** Validates a listBlockChanges response. Throws on any other shape: the feed is our own patch. */
+/**
+ * Validates a listBlockChanges response. Throws on any other shape: the feed is our own patch. Its
+ * last page has `"next-cursor": null` (unlike the other list operations, which leave the key out).
+ */
 export function parseFeedPage(body: unknown): FeedPage {
   const b = body as Record<string, unknown> | null;
   if (
@@ -89,7 +92,7 @@ export function parseFeedPage(body: unknown): FeedPage {
     !Number.isSafeInteger(b.t) ||
     !Array.isArray(b.blocks) ||
     !isStringArray(b.removed) ||
-    (b["next-cursor"] !== undefined && typeof b["next-cursor"] !== "string")
+    (b["next-cursor"] !== null && typeof b["next-cursor"] !== "string")
   ) {
     throw new Error("listBlockChanges returned an unexpected shape");
   }
@@ -119,6 +122,6 @@ export function parseFeedPage(body: unknown): FeedPage {
     t: b.t as number,
     blocks,
     removed: b.removed,
-    nextCursor: (b["next-cursor"] as string | undefined) ?? null,
+    nextCursor: b["next-cursor"] as string | null,
   };
 }

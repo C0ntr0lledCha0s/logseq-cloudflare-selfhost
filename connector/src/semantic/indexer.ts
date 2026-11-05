@@ -133,7 +133,7 @@ class Run {
     // last UUID], or everything after it on the last page. Stored rows in that range that the page
     // didn't list are gone from the graph.
     const range = full ? { lo: first ? null : state.lastUuid, hi: page.nextCursor === null ? null : lastUuid } : null;
-    const { rows, inRange, total } = await store.lookup(
+    const { rows, inRange } = await store.lookup(
       state.graphId,
       [...docs.map((d) => d.uuid), ...page.removed],
       range,
@@ -155,7 +155,8 @@ class Run {
     });
     const added = changed.filter((d) => !stored.has(d.uuid)).length;
 
-    if (total - deletes.size + added > bindings.maxVectors) {
+    const total = added > 0 ? await store.total() : 0;
+    if (added > 0 && total - deletes.size + added > bindings.maxVectors) {
       const error = `index is full: ${total} of ${bindings.maxVectors} vectors stored and this page adds ${added}; raise connector.semanticSearch.maxVectors (README 11.11)`;
       const capped: IndexState = { ...state, status: "full", error };
       if (!sameState(state, capped)) await store.save(capped);
