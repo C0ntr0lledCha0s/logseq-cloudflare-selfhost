@@ -109,9 +109,11 @@ One cron invocation, every minute:
 3. Per page: feed (1), D1 reads (1), embed (1), Vectorize upsert (1), Vectorize delete (1), D1 batch write (1). Six subrequests; a run stays under 30 of the Free plan's 50, counting binding calls as subrequests.
 4. A page's results are committed with its cursor in one D1 batch, after Vectorize accepted the vectors. A failure anywhere leaves the cursor where it was, and the next run repeats the page (hashes make that cheap).
 
-CPU on Free is 10 ms per invocation. The expensive part is moving 384 floats per block through JSON twice (AI response, Vectorize request): about 20k numbers per 50-block page. Two pages per run is the estimate that fits; it is *(not yet verified)* on a real account. An idle run (nothing changed) is three D1 queries and one feed call per graph.
+CPU on Free is 10 ms per invocation. The expensive part is moving 384 floats per block through JSON twice (AI response, Vectorize request): about 20k numbers per 50-block page. Two pages per run is the estimate that fits. **Verified 2026-11-05** on a 5,363-block graph: build runs used 33–65 ms CPU, over the nominal 10 ms, and Cloudflare didn't reject them, as with the sync Worker's front requests. An idle run (nothing changed) is three D1 queries and one feed call per graph, about 10 D1 rows read.
 
-**Initial build time:** 100 blocks a minute, so a 13,000-block Free index takes about 2¼ hours and a 50,000-block Paid index about 8½ hours. Raising `PAGES_PER_RUN` on Paid shortens it.
+**D1 rows read are the budget to watch on Free (5M a day).** Two early versions read every stored block on every run: a full scan to find disconnected graphs, and `count(*)` for the cap. At 5,000 blocks that was about 7M rows a day. Disconnected graphs are now found through `semantic_state`, and the cap reads per-graph counts that triggers keep on `semantic_state` (migration 0003). `scripts/usage-report.mjs` watches the daily allowances (README, Watching your usage).
+
+**Initial build time:** 100 blocks a minute (measured on the live graph), so a 13,000-block Free index takes about 2¼ hours and a 50,000-block Paid index about 8½ hours. Raising `PAGES_PER_RUN` on Paid shortens it.
 
 **The cap:** before writing a page the indexer checks `stored − deleted + new ≤ SEMANTIC_MAX_VECTORS`. If not, the graph's status becomes `full` and its indexing stops at that page until the cap is raised or rows are freed. The committed default, 13,000, fits the Free plan's 5M stored dimensions (13,000 × 384 = 4.99M).
 
