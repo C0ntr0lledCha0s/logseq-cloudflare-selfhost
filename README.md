@@ -534,7 +534,7 @@ To go back, set `"plan": "free"` and merge.
 
 The Worker refuses every Logseq user who isn't in the secret `DB_SYNC_ALLOWED_USERS` (patch `0016-allowed-users.patch`). A refused user gets a plain 401 on every route that needs sign-in: syncing, the REST API and PAT management. The admin token, signed asset links and `/health` don't involve a user, so they work as before.
 
-The value is `none`, or one or more Logseq user IDs separated by commas. Each ID is a lowercase UUID, and spaces around it are ignored. **It fails closed.** A missing, empty or malformed value refuses everyone, and so does `none`. `deploy.sh` stops before deploying anything if the value is malformed, so a typo can't ship.
+The value is `none`, or one or more Logseq user IDs separated by commas. Each ID is a lowercase UUID, and spaces around it are ignored. **It fails closed.** A missing, empty or malformed value refuses everyone, and so does `none`. `deploy.sh` stops before deploying anything if the value is malformed, so a typo can't ship. It also stops on `none` once anyone has signed in to the server, so `none` can't switch everyone off on an existing install.
 
 **Finding your user ID.** Use any one of these:
 
@@ -544,7 +544,7 @@ The value is `none`, or one or more Logseq user IDs separated by commas. Each ID
 
 A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy passes and the server refuses everyone until you set your ID. The deploy prints a warning about that. It is expected.
 
-**Adding someone.** Append their ID to the comma-separated list in `.env.local` and in the `production` secret (`scripts/init-env.sh --push`, or the loop in 1.8), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
+**Adding someone.** Append their ID to the comma-separated list in `.env.local` and in the `production` secret (push it with [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
 
 **Removing someone.** Take their ID out of both places and redeploy. It takes effect on the next deploy. Their graphs stay on the server (see the cleanup below).
 
@@ -552,7 +552,7 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 
 1. Run `scripts/list-users.sh` and find your own row. Note any other users: they are either strangers or your own second account.
 2. Put your ID, and the ID of any other account you use, in `.env.local` as `DB_SYNC_ALLOWED_USERS`, comma-separated.
-3. Push it: `scripts/init-env.sh --add-missing --push`, or the loop in 1.8.
+3. Push it with [the loop in 1.8](#18-set-up-the-github-production-environment). (`init-env.sh --add-missing` only handles names missing from `.env.local`, so it won't push a value you added by hand.)
 4. Merge. The deploy checks the value, ships it together with the code, and the smoke test's `pat-graphs` check (when `SMOKE_PAT` is set) confirms you still get in.
 5. Optional. To remove a stranger's graph, call `DELETE /admin/graphs/<graph-id>` with the header `x-db-sync-admin-token: <DB_SYNC_ADMIN_TOKEN>`. This is manual: nothing does it for you, and it can't be undone.
 
@@ -595,8 +595,8 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
 | Everything returns 401 after a deploy | The Worker refuses users who aren't in `DB_SYNC_ALLOWED_USERS`. Check the secret, and look for a `db-sync/user-not-allowed` warning in `wrangler tail logseq-sync` or Workers Logs: it names the refused user's ID. Fix the list and redeploy (9.1). |
-| Deploy fails: `none of the N listed user IDs is a known user of this server` | A typo, or the wrong account. Run `scripts/list-users.sh`, correct `DB_SYNC_ALLOWED_USERS` in `.env.local` and the `production` secret, and deploy again. Nothing was deployed. |
-| Deploy fails: `DB_SYNC_ALLOWED_USERS is empty or missing` | The secret isn't set. Push it with `scripts/init-env.sh --add-missing --push` or the loop in 1.8, then deploy again. Nothing was deployed. |
+| Deploy fails: `none of the N listed user IDs is a known user of this server` | A typo, the wrong account, or `none` on a server that already has users (`none of the 0 listed user IDs ...`). Run `scripts/list-users.sh`, correct `DB_SYNC_ALLOWED_USERS` in `.env.local` and the `production` secret, and deploy again. Nothing was deployed. |
+| Deploy fails: `DB_SYNC_ALLOWED_USERS is empty or missing` | The secret isn't set in the `production` environment. Push it with [the loop in 1.8](#18-set-up-the-github-production-environment), then deploy again. Nothing was deployed. |
 | Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
 
 Connector problems are covered in section 11.
