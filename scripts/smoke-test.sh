@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # Post-deploy smoke test. Usage: smoke-test.sh <base-url>
-# Env: SMOKE_PAT (optional personal access token), PLAN (free|paid, default free).
+# Env: SMOKE_PAT (optional personal access token).
 set -euo pipefail
 
 usage() {
-  echo "usage: smoke-test.sh <base-url>   (env: SMOKE_PAT, PLAN=free|paid)" >&2
+  echo "usage: smoke-test.sh <base-url>   (env: SMOKE_PAT)" >&2
   exit 2
 }
 
 [ "$#" -eq 1 ] && [ -n "$1" ] || usage
 base="${1%/}"
-plan="${PLAN:-free}"
-case "$plan" in
-  free | paid) ;;
-  *) usage ;;
-esac
 
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
@@ -61,6 +56,6 @@ if [ -n "${SMOKE_PAT:-}" ]; then
   if [ "$code" = 200 ]; then pass pat-graphs; else fail pat-graphs "$code"; fi
 fi
 
-if [ "$plan" = paid ]; then
-  expect_status mcp-unauthenticated 401 -X POST -H 'content-type: application/json' -d '{}' "$base/mcp"
-fi
+# Upstream's /mcp answered anyone without a token; patch 0017 removes it, so the
+# path falls through to the sync worker's not-found response.
+expect_status upstream-mcp-off 404 -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"

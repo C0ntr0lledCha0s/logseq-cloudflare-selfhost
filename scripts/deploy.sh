@@ -58,4 +58,4 @@ node -e '
 "$wrangler" secret bulk "$secrets_file"
 
 cd "$repo_root"
-PLAN="$plan" scripts/smoke-test.sh "https://$SYNC_HOSTNAME"
+scripts/smoke-test.sh "https://$SYNC_HOSTNAME"

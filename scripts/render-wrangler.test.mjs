@@ -38,10 +38,10 @@ test("free plan drops limits and worker_loaders", () => {
   assert.ok(out.version_metadata);
 });
 
-test("paid plan keeps limits and worker_loaders", () => {
+test("paid plan keeps limits and drops worker_loaders", () => {
   const out = render({ settings: { ...settings, plan: "paid" } });
   assert.equal(out.limits.cpu_ms, 300000);
-  assert.equal(out.worker_loaders[0].binding, "LOADER");
+  assert.equal(out.worker_loaders, undefined);
 });
 
 test("names and ids come from settings, domain from hostname", () => {

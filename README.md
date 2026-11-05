@@ -17,7 +17,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - [5. Use it from remote Claude Code](#5-use-it-from-remote-claude-code)
 - [6. Upgrades](#6-upgrades)
 - [7. Backups and restore](#7-backups-and-restore)
-- [8. Switching to the paid plan and MCP](#8-switching-to-the-paid-plan-and-mcp)
+- [8. Switching to the paid plan](#8-switching-to-the-paid-plan)
 - [9. Security notes](#9-security-notes)
 - [10. Troubleshooting](#10-troubleshooting)
 - [11. Use your graphs from Claude](#11-use-your-graphs-from-claude)
@@ -57,7 +57,7 @@ Your graph content is not sent to Logseq. The patched server no longer calls `ap
 | Plan | Price | Notes |
 |---|---|---|
 | Workers Free (default) | $0 within the free allowances | Verified working, including the REST API and its rate limiters. Daily caps include 100k Worker requests, 100k D1 row writes and 5M D1 row reads. The front Worker gets 10 ms CPU per request. In testing, the median request used 2.6 ms and the slowest 1% used up to 92 ms, but Cloudflare didn't reject them. Larger imports may hit the limit (see Troubleshooting). D1 Time Travel covers 7 days. |
-| Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s) and enables MCP (Worker Loader). D1 Time Travel covers 30 days. |
+| Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s). D1 Time Travel covers 30 days. |
 
 The connector's optional semantic search (11.11) runs on Free for graphs up to about 13,000 indexed blocks (the Free plan stores 5M Vectorize dimensions). A larger graph needs Workers Paid, where it adds under $0.01/month.
 
@@ -325,7 +325,7 @@ ok health
 ok openapi
 ok unauthenticated-graphs
 ok pat-graphs              # only when SMOKE_PAT is set
-ok mcp-unauthenticated     # only on the paid plan
+ok upstream-mcp-off
 ```
 
 You can check by hand too: `curl https://sync.example.com/health` returns `{"ok":true}`.
@@ -500,22 +500,19 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
 
 **Limits.** Backups live in the same Cloudflare account. If you lose the account, only your clients' local copies remain. An off-account copy is on the backlog.
 
-## 8. Switching to the paid plan and MCP
+## 8. Switching to the paid plan
 
-`config/settings.json` has `"plan": "free"` by default. Free is verified working, including the REST API and its rate limiters. The paid plan adds:
-
-- `[limits] cpu_ms = 300000` (300 s);
-- the Worker Loader binding (`LOADER`) that `/mcp` needs.
+`config/settings.json` has `"plan": "free"` by default. Free is verified working, including the REST API and its rate limiters. The paid plan only raises `[limits] cpu_ms` to 300000 (300 s).
 
 To switch:
 
-1. In the Cloudflare dashboard, subscribe to **Workers Paid**. Do this first: the paid config uses limits and bindings the Free plan doesn't offer.
+1. In the Cloudflare dashboard, subscribe to **Workers Paid**. Do this first: the paid config uses a limit the Free plan doesn't offer.
 2. Set `"plan": "paid"` in `config/settings.json` in a PR.
-3. Merge it to `main`. The deploy renders the paid config, and the smoke test adds the `mcp-unauthenticated` check: `POST /mcp` without a token must return 401.
+3. Merge it to `main`. The deploy renders the paid config.
 
-MCP on this server hasn't been verified end to end yet. To go back, set `"plan": "free"` and merge.
+To go back, set `"plan": "free"` and merge.
 
-This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and can't be added to claude.ai. To use your graphs from claude.ai, use the connector (section 11) instead. It runs on the Free plan.
+**Upstream's own `/mcp` endpoint is off on both plans.** Anyone could call it without a token, so a patch (`patches/0017-remove-upstream-mcp.patch`) removes it and its Worker Loader binding. `/mcp` on the sync server now answers 404, and the smoke test's `upstream-mcp-off` check, which runs on both plans, fails the deploy if it ever answers again. To use your graphs from claude.ai, use the connector (section 11) instead. It runs on the Free plan.
 
 ## 9. Security notes
 
