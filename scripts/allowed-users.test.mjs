@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compareWithKnownUsers, fetchUsers, parseAllowedUsers } from "./allowed-users.mjs";
@@ -233,7 +235,7 @@ async function withStub({ rows = [{ id: A, email: EMAIL, username: "owner", grap
 
 function cli(args, env) {
   return new Promise((resolveRun, reject) => {
-    const base = { ...process.env, GITHUB_ACTIONS: "", DB_SYNC_ALLOWED_USERS: "", CLOUDFLARE_ACCOUNT_ID: "acct", CLOUDFLARE_API_TOKEN: "tok" };
+    const base = { ...process.env, GITHUB_ACTIONS: "", DEPLOY_SYNC_TEST: "1", DB_SYNC_ALLOWED_USERS: "", CLOUDFLARE_ACCOUNT_ID: "acct", CLOUDFLARE_API_TOKEN: "tok" };
     const child = spawn(process.execPath, [script, ...args], { cwd: root, env: { ...base, ...env } });
     let stdout = "";
     let stderr = "";
@@ -288,7 +290,7 @@ test("cli check-known: a listed and known user passes with counts only", async (
     const r = await cli(["check-known", "--database", "logseq-sync-index"], {
       DB_SYNC_ALLOWED_USERS: A,
       GITHUB_ACTIONS: "true",
-      CLOUDFLARE_API_BASE: base,
+      ALLOWED_USERS_API_BASE: base,
     });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(r.stdout, /allowed users: 1 listed, 1 known/);
@@ -299,7 +301,7 @@ test("cli check-known: a listed and known user passes with counts only", async (
 test("cli check-known: warnings print as warning: locally and ::warning:: in Actions", async () => {
   const rows = [{ id: A, email: EMAIL, username: null, graphs: 1 }, { id: B, email: null, username: null, graphs: 3 }];
   await withStub({ rows }, async (base) => {
-    const env = { DB_SYNC_ALLOWED_USERS: A, CLOUDFLARE_API_BASE: base };
+    const env = { DB_SYNC_ALLOWED_USERS: A, ALLOWED_USERS_API_BASE: base };
     const local = await cli(["check-known", "--database", "logseq-sync-index"], env);
     assert.equal(local.status, 0, local.stdout + local.stderr);
     assert.match(local.stderr, /^warning: 1 users who own graphs aren't on the list and will be refused$/m);
@@ -313,7 +315,7 @@ test("cli check-known: warnings print as warning: locally and ::warning:: in Act
 
 test("cli check-known: a list of unknown users exits 1", async () => {
   await withStub({ rows: [{ id: A, email: EMAIL, username: null, graphs: 1 }] }, async (base) => {
-    const env = { DB_SYNC_ALLOWED_USERS: B, CLOUDFLARE_API_BASE: base };
+    const env = { DB_SYNC_ALLOWED_USERS: B, ALLOWED_USERS_API_BASE: base };
     const local = await cli(["check-known", "--database", "logseq-sync-index"], env);
     assert.equal(local.status, 1);
     assert.match(local.stderr, /^error: none of the 1 listed user IDs is a known user of this server \(1 known\)/m);
@@ -330,7 +332,7 @@ test("cli check-known: a D1 API failure exits 1 without echoing the response", a
     const r = await cli(["check-known", "--database", "logseq-sync-index"], {
       DB_SYNC_ALLOWED_USERS: A,
       GITHUB_ACTIONS: "true",
-      CLOUDFLARE_API_BASE: base,
+      ALLOWED_USERS_API_BASE: base,
     });
     assert.equal(r.status, 1);
     assert.match(r.stdout, /::error::D1 API 500: stub failure/);
@@ -342,7 +344,7 @@ test("cli check-known: a malformed list exits 1 before touching the network", as
   await withStub({}, async (base, requests) => {
     const r = await cli(["check-known", "--database", "logseq-sync-index"], {
       DB_SYNC_ALLOWED_USERS: "bob",
-      CLOUDFLARE_API_BASE: base,
+      ALLOWED_USERS_API_BASE: base,
     });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /entry 1 of 1/);
@@ -364,7 +366,7 @@ test("cli list: refuses in Actions before touching the network", async () => {
     const r = await cli(["list", "--database", "logseq-sync-index"], {
       DB_SYNC_ALLOWED_USERS: A,
       GITHUB_ACTIONS: "true",
-      CLOUDFLARE_API_BASE: base,
+      ALLOWED_USERS_API_BASE: base,
     });
     assert.equal(r.status, 1);
     assert.match(r.stderr + r.stdout, /list prints user IDs and emails, so it never runs in GitHub Actions/);
@@ -375,7 +377,7 @@ test("cli list: refuses in Actions before touching the network", async () => {
 
 test("cli list: prints a table with listed yes/no", async () => {
   await withStub({}, async (base) => {
-    const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: A, CLOUDFLARE_API_BASE: base });
+    const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: A, ALLOWED_USERS_API_BASE: base });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const lines = r.stdout.trimEnd().split("\n");
     assert.deepEqual(lines[0].split(/\s+/), ["id", "email", "username", "graphs", "listed"]);
@@ -393,7 +395,7 @@ test("cli list: prints a table with listed yes/no", async () => {
 test("cli list: a missing or malformed list shows every user as no, with one note", async () => {
   await withStub({}, async (base) => {
     for (const value of ["", "bob"]) {
-      const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: value, CLOUDFLARE_API_BASE: base });
+      const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: value, ALLOWED_USERS_API_BASE: base });
       assert.equal(r.status, 0, r.stdout + r.stderr);
       const rows = r.stdout.trimEnd().split("\n").filter((l) => l.startsWith(A) || l.startsWith(B));
       assert.equal(rows.length, 2);
@@ -408,9 +410,43 @@ test("cli list: a missing or malformed list shows every user as no, with one not
 
 test("cli list: none is valid, so no note, every row is no", async () => {
   await withStub({}, async (base) => {
-    const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: "none", CLOUDFLARE_API_BASE: base });
+    const r = await cli(["list", "--database", "logseq-sync-index"], { DB_SYNC_ALLOWED_USERS: "none", ALLOWED_USERS_API_BASE: base });
     assert.equal(r.status, 0);
     assert.ok(!(r.stdout + r.stderr).includes("note:"));
     assert.ok(!r.stdout.includes("yes"));
+  });
+});
+
+test("cli: ALLOWED_USERS_API_BASE without DEPLOY_SYNC_TEST=1 fails fast, before any network call", async () => {
+  await withStub({}, async (base, requests) => {
+    for (const command of [["check-format"], ["check-known", "--database", "logseq-sync-index"], ["list", "--database", "logseq-sync-index"]]) {
+      const r = await cli(command, { DB_SYNC_ALLOWED_USERS: A, ALLOWED_USERS_API_BASE: base, DEPLOY_SYNC_TEST: "" });
+      assert.equal(r.status, 1, command[0]);
+      assert.match(r.stderr, /ALLOWED_USERS_API_BASE is test-only and requires DEPLOY_SYNC_TEST=1/);
+      assert.ok(!(r.stdout + r.stderr).includes("tok"));
+    }
+    assert.equal(requests.length, 0);
+  });
+});
+
+test("cli: runs, and fails closed, when invoked through a symlink", () => {
+  const dir = mkdtempSync(join(tmpdir(), "allowed-users-link-"));
+  return new Promise((resolveTest, reject) => {
+    const link = join(dir, "link.mjs");
+    symlinkSync(script, link);
+    const child = spawn(process.execPath, [link, "check-format"], { cwd: root, env: { ...process.env, DB_SYNC_ALLOWED_USERS: "bob" } });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", (status) => {
+      rmSync(dir, { recursive: true, force: true });
+      try {
+        assert.equal(status, 1);
+        assert.match(stderr, /DB_SYNC_ALLOWED_USERS entry 1 of 1/);
+        resolveTest();
+      } catch (e) {
+        reject(e);
+      }
+    });
   });
 });

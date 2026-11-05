@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Usage: allowed-users.mjs <check-format|check-known|list> [--database <d1 database name>]
 // Env: DB_SYNC_ALLOWED_USERS, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, and optionally
-// CLOUDFLARE_API_BASE (a stub server in the tests).
+// ALLOWED_USERS_API_BASE, honoured only with DEPLOY_SYNC_TEST=1 (a stub server in the tests).
 //
 // The deploy-time and local side of the Worker's user allow-list:
 //   check-format  DB_SYNC_ALLOWED_USERS is `none` or a comma-separated list of lowercase UUIDs.
@@ -9,7 +9,8 @@
 //   list          every user of the sync server, and whether each is on the list. Local only.
 // Everything that can run in GitHub Actions prints counts and entry positions, never an ID or an
 // email. The value's format is the same rule the Worker applies; keep the two in step.
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -122,12 +123,17 @@ async function usersFromEnv(env, databaseName) {
     accountId: requireEnv(env, "CLOUDFLARE_ACCOUNT_ID"),
     apiToken: requireEnv(env, "CLOUDFLARE_API_TOKEN"),
     databaseName,
-    apiBase: env.CLOUDFLARE_API_BASE || undefined,
+    apiBase: env.ALLOWED_USERS_API_BASE || undefined,
   });
 }
 
 /** Returns the exit code. In Actions, `::` workflow commands go to stdout, where GitHub reads them. */
 export async function run(argv, env = process.env) {
+  // A stray variable must never send the API token to another host.
+  if (env.ALLOWED_USERS_API_BASE && env.DEPLOY_SYNC_TEST !== "1") {
+    console.error("error: ALLOWED_USERS_API_BASE is test-only and requires DEPLOY_SYNC_TEST=1");
+    return 1;
+  }
   const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: { database: { type: "string" } } });
   const [command] = positionals;
   const inActions = env.GITHUB_ACTIONS === "true";
@@ -193,7 +199,8 @@ export async function run(argv, env = process.env) {
   return 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare real paths: this is a deploy gate, and a symlinked invocation must still run it.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   run(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;
