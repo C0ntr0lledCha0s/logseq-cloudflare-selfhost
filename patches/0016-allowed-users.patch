@@ -102,10 +102,10 @@ index 52e8c46..46d5cd0 100644
              [logseq.db-sync.worker-handler-assets-test]
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs
 new file mode 100644
-index 0000000..3befd27
+index 0000000..72a0523
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,154 @@
 +(ns logseq.db-sync.worker-allowed-users-test
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
@@ -113,12 +113,7 @@ index 0000000..3befd27
 +            [logseq.common.authorization :as authorization]
 +            [logseq.db-sync.common :as common]
 +            [logseq.db-sync.index :as index]
-+            [logseq.db-sync.worker.asset-link :as asset-link]
 +            [logseq.db-sync.worker.auth :as auth]
-+            [logseq.db-sync.worker.dispatch :as dispatch]
-+            [logseq.db-sync.worker.handler.assets :as assets-handler]
-+            [logseq.db-sync.worker.handler.index :as index-handler]
-+            [logseq.db-sync.worker.http :as http]
 +            [promesa.core :as p]))
 +
 +(def ^:private allowed-id "11111111-1111-4111-8111-111111111111")
@@ -126,30 +121,11 @@ index 0000000..3befd27
 +;; allowed-id has no hex letters, so upper-casing it is a no-op; case needs letters.
 +(def ^:private lettered-id "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 +
-+(defn- bearer-request [path token]
-+  (js/Request. (str "http://localhost" path)
-+               #js {:headers #js {"authorization" (str "Bearer " token)}}))
-+
 +(defn- verify-jwt-as
 +  "A verify-jwt stub that resolves claims for `sub` with an email."
 +  [sub]
 +  (fn [_token _env]
 +    (js/Promise.resolve #js {"sub" sub "email" "x@example.com"})))
-+
-+(defn- ok-json-response []
-+  (js/Response. (js/JSON.stringify #js {:ok true})
-+                #js {:status 200
-+                     :headers #js {"content-type" "application/json"}}))
-+
-+(defn- capturing-do-namespace [requests]
-+  #js {:idFromName (fn [graph-id] graph-id)
-+       :get (fn [_]
-+              #js {:fetch (fn [request]
-+                            (swap! requests conj request)
-+                            (p/resolved (ok-json-response)))})})
-+
-+(defn- rate-limiter []
-+  #js {:limit (fn [_] (p/resolved #js {:success true}))})
 +
 +(defn- fail-and-done [done]
 +  (fn [error]
@@ -248,80 +224,6 @@ index 0000000..3befd27
 +               (p/then (fn [] (done)))
 +               (p/catch (fail-and-done done))))))
 +
-+(defn- token-subs
-+  "A verify-jwt stub that maps each bearer token to a subject."
-+  [subs-by-token]
-+  (fn [token _env]
-+    (js/Promise.resolve #js {"sub" (get subs-by-token token)
-+                             "email" "x@example.com"
-+                             "scope" "logseq/read"})))
-+
-+(deftest dispatch-refuses-unlisted-users-test
-+  (async done
-+         (let [forwarded (atom [])
-+               env #js {"DB" #js {}
-+                        "DB_SYNC_ALLOWED_USERS" allowed-id
-+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
-+                        "SEMANTIC_READ_RATE_LIMITER" (rate-limiter)}
-+               fetch (fn [path token]
-+                       (dispatch/handle-worker-fetch (bearer-request path token) env))]
-+           (-> (p/with-redefs [authorization/verify-jwt
-+                               (token-subs {"allow-list-listed" allowed-id
-+                                            "allow-list-unlisted" other-id})
-+                               index/<user-has-access-to-graph? (fn [_ _ _] (p/resolved true))
-+                               index/<graph-activity-touch! (fn [& _] (p/resolved nil))
-+                               index/<user-activity-touch! (fn [& _] (p/resolved nil))
-+                               index/<semantic-graphs-list
-+                               (fn [_ _ _] (p/resolved {:graphs [] :next-cursor nil}))
-+                               index/<personal-access-tokens-list (fn [_ _] (p/resolved []))]
-+                 (p/let [sync-listed (fetch "/sync/graph-1/snapshot/download" "allow-list-listed")
-+                         sync-unlisted (fetch "/sync/graph-1/snapshot/download" "allow-list-unlisted")
-+                         rest-listed (fetch "/api/v1/graphs" "allow-list-listed")
-+                         rest-unlisted (fetch "/api/v1/graphs" "allow-list-unlisted")
-+                         pat-listed (fetch "/api/v1/personal-access-tokens" "allow-list-listed")
-+                         pat-unlisted (fetch "/api/v1/personal-access-tokens" "allow-list-unlisted")]
-+                   (testing "a listed user gets through each path"
-+                     (is (= 200 (.-status sync-listed)))
-+                     (is (= 1 (count @forwarded)))
-+                     (is (= 200 (.-status rest-listed)))
-+                     (is (= 200 (.-status pat-listed))))
-+                   (testing "an unlisted user gets 401 from each path"
-+                     (is (= 401 (.-status sync-unlisted)))
-+                     (is (= 401 (.-status rest-unlisted)))
-+                     (is (= 401 (.-status pat-unlisted))))))
-+               (p/then (fn [] (done)))
-+               (p/catch (fail-and-done done))))))
-+
-+(deftest dispatch-paths-without-a-user-are-unaffected-test
-+  (async done
-+         (let [forwarded (atom [])
-+               access-checks (atom 0)
-+               env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
-+                        "ASSET_LINK_SECRET" "test-asset-link-secret"
-+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
-+           (-> (p/with-redefs [index-handler/graph-access-response
-+                               (fn [_ _ _]
-+                                 (swap! access-checks inc)
-+                                 (p/resolved (http/unauthorized)))
-+                               assets-handler/handle (fn [_ _] (ok-json-response))]
-+                 (p/let [health (dispatch/handle-worker-fetch
-+                                 (js/Request. "http://localhost/health") env)
-+                         admin-sync (dispatch/handle-worker-fetch
-+                                     (js/Request. "http://localhost/sync/graph-1/snapshot/download"
-+                                                  #js {:headers #js {"x-db-sync-admin-token" "test-admin-token"}})
-+                                     env)
-+                         {:keys [url]} (asset-link/<temporary-url
-+                                        (js/Request. "http://localhost/") env
-+                                        "graph-1" "asset-1" "png")
-+                         signed-asset (dispatch/handle-worker-fetch (js/Request. url) env)]
-+                   (is (= 200 (.-status health)))
-+                   (is (= 200 (.-status admin-sync)))
-+                   (is (= 1 (count @forwarded)))
-+                   (is (= 200 (.-status signed-asset)))
-+                   (is (= 0 @access-checks))))
-+               (p/then (fn [] (done)))
-+               (p/catch (fail-and-done done))))))
-+
 +(defn- capture-logs! []
 +  (let [records (atom [])
 +        handler (fn [record] (swap! records conj record))]
@@ -405,35 +307,134 @@ index a34e3eb..475e0a6 100644
                 (p/catch (fn [error]
                            (is false (str error))
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
-index 109efe1..f02fc7f 100644
+index 109efe1..9b8a8a6 100644
 --- a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
-@@ -689,9 +689,11 @@
+@@ -1,10 +1,11 @@
+ (ns logseq.db-sync.worker-dispatch-test
+-  (:require [cljs.test :refer [async deftest is]]
++  (:require [cljs.test :refer [async deftest is testing]]
+             [clojure.string :as string]
+             [logseq.common.authorization :as authorization]
+             [logseq.db :as ldb]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
++            [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.auth :as auth]
+             [logseq.db-sync.worker.dispatch :as dispatch]
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
+@@ -689,9 +690,12 @@
                            (is false (str error))
                            (done)))))))
  
-+(def ^:private pat-user-id "11111111-1111-4111-8111-111111111111")
++(def ^:private allowed-user-id "11111111-1111-4111-8111-111111111111")
++(def ^:private unlisted-user-id "22222222-2222-4222-8222-222222222222")
 +
  (defn- pat-row [permission expires-at]
    {"id" "pat-1"
 -   "user_id" "user-1"
-+   "user_id" pat-user-id
++   "user_id" allowed-user-id
     "graph_id" "graph-1"
     "token_prefix" "logseq_pat_scope"
     "permission" permission
-@@ -726,6 +728,7 @@
+@@ -726,6 +730,7 @@
           (let [now 1700000000000
                 forwarded (atom [])
                 env #js {"DB" #js {}
-+                        "DB_SYNC_ALLOWED_USERS" pat-user-id
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
                          "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
                          "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))
                          "SEMANTIC_WRITE_RATE_LIMITER" (rate-limiter true (atom []))}
-@@ -759,6 +762,7 @@
+@@ -759,6 +764,7 @@
           (let [now 1700000000000
                 forwarded (atom [])
                 env #js {"DB" #js {}
-+                        "DB_SYNC_ALLOWED_USERS" pat-user-id
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
                          "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
                          "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))}]
             (-> (p/with-redefs [common/now-ms (fn [] now)
+@@ -796,3 +802,84 @@
+                (p/catch (fn [error]
+                           (is false (str error))
+                           (done)))))))
++
++(defn- token-subs
++  "A verify-jwt stub that maps each bearer token to a subject."
++  [subs-by-token]
++  (fn [token _env]
++    (js/Promise.resolve #js {"sub" (get subs-by-token token)
++                             "email" "x@example.com"
++                             "scope" "logseq/read"})))
++
++(deftest dispatch-refuses-unlisted-users-test
++  (async done
++         (let [forwarded (atom [])
++               env #js {"DB" #js {}
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
++                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
++                        "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))}
++               fetch (fn [path token]
++                       (dispatch/handle-worker-fetch
++                        (js/Request. (str "http://localhost" path)
++                                     #js {:headers #js {"authorization" (str "Bearer " token)}})
++                        env))]
++           (-> (p/with-redefs [authorization/verify-jwt
++                               (token-subs {"allow-list-listed" allowed-user-id
++                                            "allow-list-unlisted" unlisted-user-id})
++                               index/<user-has-access-to-graph? (fn [_ _ _] (p/resolved true))
++                               index/<graph-activity-touch! (fn [& _] (p/resolved nil))
++                               index/<user-activity-touch! (fn [& _] (p/resolved nil))
++                               index/<semantic-graphs-list
++                               (fn [_ _ _] (p/resolved {:graphs [] :next-cursor nil}))
++                               index/<personal-access-tokens-list (fn [_ _] (p/resolved []))]
++                 (p/let [sync-listed (fetch "/sync/graph-1/snapshot/download" "allow-list-listed")
++                         sync-unlisted (fetch "/sync/graph-1/snapshot/download" "allow-list-unlisted")
++                         rest-listed (fetch "/api/v1/graphs" "allow-list-listed")
++                         rest-unlisted (fetch "/api/v1/graphs" "allow-list-unlisted")
++                         pat-listed (fetch "/api/v1/personal-access-tokens" "allow-list-listed")
++                         pat-unlisted (fetch "/api/v1/personal-access-tokens" "allow-list-unlisted")]
++                   (testing "a listed user gets through each path"
++                     (is (= 200 (.-status sync-listed)))
++                     (is (= 1 (count @forwarded)))
++                     (is (= 200 (.-status rest-listed)))
++                     (is (= 200 (.-status pat-listed))))
++                   (testing "an unlisted user gets 401 from each path"
++                     (is (= 401 (.-status sync-unlisted)))
++                     (is (= 401 (.-status rest-unlisted)))
++                     (is (= 401 (.-status pat-unlisted))))))
++               (p/then (fn [] (done)))
++               (p/catch (fn [error]
++                          (is false (str error))
++                          (done)))))))
++
++(deftest dispatch-paths-without-a-user-are-unaffected-test
++  (async done
++         (let [forwarded (atom [])
++               access-checks (atom 0)
++               env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
++                        "ASSET_LINK_SECRET" "test-asset-link-secret"
++                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
++           (-> (p/with-redefs [index-handler/graph-access-response
++                               (fn [_ _ _]
++                                 (swap! access-checks inc)
++                                 (p/resolved (http/unauthorized)))
++                               assets-handler/handle (fn [_ _] (ok-json-response))]
++                 (p/let [health (dispatch/handle-worker-fetch
++                                 (js/Request. "http://localhost/health") env)
++                         admin-sync (dispatch/handle-worker-fetch
++                                     (js/Request. "http://localhost/sync/graph-1/snapshot/download"
++                                                  #js {:headers #js {"x-db-sync-admin-token" "test-admin-token"}})
++                                     env)
++                         {:keys [url]} (asset-link/<temporary-url
++                                        (js/Request. "http://localhost/") env
++                                        "graph-1" "asset-1" "png")
++                         signed-asset (dispatch/handle-worker-fetch (js/Request. url) env)]
++                   (is (= 200 (.-status health)))
++                   (is (= 200 (.-status admin-sync)))
++                   (is (= 1 (count @forwarded)))
++                   (is (= 200 (.-status signed-asset)))
++                   (is (= 0 @access-checks))))
++               (p/then (fn [] (done)))
++               (p/catch (fn [error]
++                          (is false (str error))
++                          (done)))))))
