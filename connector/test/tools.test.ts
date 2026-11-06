@@ -455,6 +455,21 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("out_of_class");
   });
 
+  it("create_tag and update_tag take extends and tag properties, and update_tag no longer needs a title", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_tag");
+    const update = tools.find((t) => t.name === "update_tag");
+    expect(create.inputSchema.properties.body.properties.extends.type).toBe("array");
+    expect(create.inputSchema.properties.body.properties.properties.type).toBe("array");
+    const body = update.inputSchema.properties.body;
+    expect(body.required ?? []).not.toContain("title");
+    expect(body.properties.extends.type).toBe("array");
+    expect(Object.keys(body.properties.properties.properties).sort()).toEqual(["add", "remove", "set"]);
+    expect(create.description).toContain("extends and properties in the same call");
+    expect(update.description).toContain("properties.add or properties.remove");
+    expect(update.description).toContain("set replaces");
+  });
+
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);
@@ -480,6 +495,7 @@ describe("hand-written tools", () => {
       "create_task with page-id",
       "delete_page on today's journal",
       "restricted to classes",
+      "properties.add",
     ]) {
       expect(result.text).toContain(phrase);
     }

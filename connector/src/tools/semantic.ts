@@ -49,6 +49,10 @@ const HINTS: Record<string, string> = {
     "Give a node property its classes when creating it (classes: tag UUIDs, idents or titles), so the app's picker and every value write accept only objects of those tags.",
   update_property:
     "To restrict a node property to classes, give classes exactly one of set, add or remove (each a list of tag UUIDs, idents or titles); {set: []} clears the restriction. Existing values are kept: out_of_class counts the holders whose value the classes would now refuse.",
+  create_tag:
+    "Give the tag its extends and properties in the same call (tag and property UUIDs, idents or titles), so it is set up in one write.",
+  update_tag:
+    "To change one tag property and keep the rest, use properties.add or properties.remove; properties.set replaces the tag's own properties (built-in ones stay). extends replaces the tags it extends. title is optional.",
 };
 
 function description(op: GraphOperation): string {

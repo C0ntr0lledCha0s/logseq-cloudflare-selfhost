@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..f68e5ef 100644
+index 5dc3e7d..c90b5a1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -88,14 +88,37 @@
+@@ -88,14 +88,46 @@
     :title (:block/title entity)
     :value (:logseq.property/value entity)})
  
@@ -25,6 +25,15 @@ index 5dc3e7d..f68e5ef 100644
 +   :title (:block/title entity)
 +   :ident (entity-ident entity)})
 +
++(defn- tag-detail-response
++  "A tag as getTag, createTag and updateTag answer it: the tags it extends and its tag properties
++  (built-in ones included), so a schema write can be seen to land."
++  [entity]
++  (assoc (tag-response entity)
++         :extends (mapv #(select-keys (class-response %) [:uuid :title])
++                        (sort-by :db/id (:logseq.property.class/extends entity)))
++         :properties (mapv class-response (sort-by :db/id (:logseq.property.class/properties entity)))))
++
 +(defn- property-response
 +  "A property definition: its choices in the order the editor lists them and, for a node property,
 +  the classes it is limited to (empty when it takes any node)."
@@ -42,7 +51,7 @@ index 5dc3e7d..f68e5ef 100644
  
  (defn- asset-response [entity]
    {:uuid (uuid-string (:block/uuid entity))
-@@ -691,6 +714,11 @@
+@@ -691,6 +723,11 @@
    {:logseq.property/status task-status-idents
     :logseq.property/priority task-priority-idents})
  
@@ -54,7 +63,7 @@ index 5dc3e7d..f68e5ef 100644
  (defn- title-candidates
    "The entities a ref property value given by title can mean, or {::error reason}. Another
    property's choice or value block is never one, nor is a hidden entity. A property limited to
-@@ -717,8 +745,7 @@
+@@ -717,8 +754,7 @@
          own-value? #(= (:db/id property) (:db/id (:logseq.property/created-from-property %)))]
      (cond
        (and (seq found) (empty? of-class))
@@ -64,7 +73,7 @@ index 5dc3e7d..f68e5ef 100644
        (every? own-value? ranked) (take 1 (sort-by :db/id ranked))
        :else ranked)))
  
-@@ -847,6 +874,18 @@
+@@ -847,6 +883,18 @@
        (when (and (number? n) (js/isFinite n))
          (str n)))))
  
@@ -83,7 +92,7 @@ index 5dc3e7d..f68e5ef 100644
  (defn- prepare-ref-property-value [db property-ident value e2ee? scope]
    (let [property (d/entity db property-ident)]
      (cond
-@@ -859,7 +898,8 @@
+@@ -859,7 +907,8 @@
             (db-property-type/url? value))
        (own-url-value db property value scope)
        :else
@@ -93,7 +102,7 @@ index 5dc3e7d..f68e5ef 100644
  
  (defn- type-refusal
    "Why `property`'s type refuses `value`, as the outliner's own validator would when writing it,
-@@ -1095,16 +1135,18 @@
+@@ -1095,16 +1144,18 @@
  
  (defn- rejecting
    "Calls `write`, answering 400 when it is rejected: by `reject!`, or by the outliner refusing a change
@@ -117,7 +126,90 @@ index 5dc3e7d..f68e5ef 100644
  
  (defn- dry-run-conn
    "A throwaway copy of the graph: writes to it are validated as real ones are, but never stored."
-@@ -1920,6 +1962,112 @@
+@@ -1703,6 +1754,8 @@
+           (broadcast-change! self)
+           (http/json-response nil {:deleted (count resolved)}))))))
+ 
++(declare find-tag validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!)
++
+ (defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+@@ -1726,19 +1779,27 @@
+     (p/let [body (body-clj request)
+             holders (when (and (not e2ee?) (non-blank-string? (:title body)))
+                       (title-holders db (:title body)))]
+-      (cond
+-        (not (non-blank-string? (:title body))) (http/bad-request "missing title")
+-        (seq holders) (title-taken-response (:title body) holders)
+-        :else
+-        (let [[title tag-id] (authored-write! conn creator outliner-page/create! (:title body)
+-                                                     {:class? true
+-                                                      :encrypted-title? e2ee? :encrypted-name (:name body)})]
+-          (broadcast-change! self)
+-          (http/json-response nil {:uuid (str tag-id) :title title} 201))))
++      (let [{:keys [error parents properties]} (validate-tag-schema db nil body)]
++        (cond
++          (not (non-blank-string? (:title body))) (http/bad-request "missing title")
++          error (http/bad-request error)
++          (seq holders) (title-taken-response (:title body) holders)
++          :else
++          (rejecting
++           #(let [tag-id (atomic-write! conn creator false :create-page
++                          (fn [tx-conn]
++                            (let [[_ tag-uuid] (outliner-page/create! tx-conn (:title body)
++                                                                      {:class? true
++                                                                       :encrypted-title? e2ee? :encrypted-name (:name body)})]
++                              (write-tag-schema! tx-conn (:db/id (d/entity @tx-conn [:block/uuid tag-uuid])) parents properties)
++                              tag-uuid)))]
++              (verify-tag-schema! @conn tag-id (expected-tag-schema nil parents properties))
++              (broadcast-change! self)
++              (http/json-response nil (tag-detail-response (d/entity @conn [:block/uuid tag-id])) 201))))))
+ 
+     :semantic/tags-get
+     (if-let [tag (find-visible-entity db (:tag-id path-params))]
+-      (if (tag? tag) (http/json-response nil (tag-response tag)) (http/not-found))
++      (if (tag? tag) (http/json-response nil (tag-detail-response tag)) (http/not-found))
+       (http/not-found))
+ 
+     :semantic/tags-objects
+@@ -1750,14 +1811,27 @@
+ 
+     :semantic/tags-update
+     (p/let [body (body-clj request)
+-            tag (find-entity db (:tag-id path-params))]
+-      (if (or (not (tag? tag)) (not (non-blank-string? (:title body))))
+-        (http/bad-request "invalid tag-id or title")
+-        (do
+-          (authored-write! conn creator outliner-core/save-block! {:block/uuid (:block/uuid tag) :block/title (:title body)}
+-                                     :encrypted-title? e2ee? :encrypted-name (:name body))
+-          (broadcast-change! self)
+-          (http/json-response nil (assoc (tag-response tag) :title (:title body))))))
++            tag (find-tag db (:tag-id path-params))]
++      (let [{:keys [error parents properties]} (when (tag? tag) (validate-tag-schema db tag body))]
++        (cond
++          (not (tag? tag)) (http/bad-request "invalid tag-id or title")
++          (and (contains? body :title) (or (not (string? (:title body))) (string/blank? (:title body))))
++          (http/bad-request "title: give a title that isn't blank")
++          (not-any? #(contains? body %) [:title :extends :properties])
++          (http/bad-request "give at least one of title, extends or properties")
++          error (http/bad-request error)
++          :else
++          (rejecting
++           #(let [expected (expected-tag-schema tag parents properties)]
++              (atomic-write! conn creator false :save-block
++                             (fn [tx-conn]
++                               (when (contains? body :title)
++                                 (outliner-core/save-block! tx-conn {:block/uuid (:block/uuid tag) :block/title (:title body)}
++                                                            :encrypted-title? e2ee? :encrypted-name (:name body)))
++                               (write-tag-schema! tx-conn (:db/id tag) parents properties)))
++              (verify-tag-schema! @conn (:block/uuid tag) expected)
++              (broadcast-change! self)
++              (http/json-response nil (tag-detail-response (d/entity @conn (:db/id tag)))))))))
+ 
+     :semantic/tags-delete
+     (if-let [tag (find-entity db (:tag-id path-params))]
+@@ -1920,6 +1994,250 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -142,25 +234,34 @@ index 5dc3e7d..f68e5ef 100644
 +          (among-tags (d/datoms db :avet :block/title selector))
 +          (among-tags (d/datoms db :avet :block/name (string/lower-case selector)))))))
 +
++(defn- validate-selectors
++  "Resolves the `selectors` of `field` (classes, classes.add, extends, properties.remove, ...) with
++  `resolve`, each to a `noun` (tag or property): {:ok [entity ...]}, or {:error message} naming each
++  entry that resolves to nothing or that `check` (entity -> reason or nil) refuses."
++  ([db field selectors resolve noun] (validate-selectors db field selectors resolve noun (constantly nil)))
++  ([db field selectors resolve noun check]
++   (if-not (and (sequential? selectors) (every? string? selectors))
++     {:error (str field ": give a list of " noun " UUIDs, idents or titles")}
++     (let [found (mapv #(resolve db %) selectors)
++           refusals (keep-indexed (fn [index [selector entity]]
++                                    (when-let [reason (if entity (check entity) (str "no " noun " " (pr-str selector)))]
++                                      {:entry (str field " " index) :reason reason}))
++                                  (map vector selectors found))]
++       (if (seq refusals) {:error (refusals-message refusals)} {:ok found})))))
++
 +(defn- validate-classes
 +  "Resolves the tag `selectors` of `field` (classes, classes.add, ...): {:ok [tag ...]}, or
 +  {:error message} naming each entry that isn't a tag."
 +  [db field selectors]
-+  (if-not (and (sequential? selectors) (every? string? selectors))
-+    {:error (str field ": give a list of tag UUIDs, idents or titles")}
-+    (let [tags (mapv #(resolve-tag-selector db %) selectors)
-+          refusals (keep-indexed (fn [index [selector tag]]
-+                                   (when-not tag {:entry (str field " " index) :reason (str "no tag " (pr-str selector))}))
-+                                 (map vector selectors tags))]
-+      (if (seq refusals) {:error (refusals-message refusals)} {:ok tags}))))
++  (validate-selectors db field selectors resolve-tag-selector "tag"))
 +
-+(defn- classes-change
-+  "updateProperty's classes field as [mode selectors], when it holds exactly one of set, add or
-+  remove; else nil."
-+  [classes]
-+  (let [modes (when (map? classes) (filterv #(contains? classes %) [:set :add :remove]))]
-+    (when (and (= 1 (count modes)) (= 1 (count classes)))
-+      [(first modes) (get classes (first modes))])))
++(defn- mode-change
++  "A {set | add | remove: [...]} field (updateProperty's classes, updateTag's properties) as
++  [mode selectors], when it holds exactly one of set, add or remove; else nil."
++  [field]
++  (let [modes (when (map? field) (filterv #(contains? field %) [:set :add :remove]))]
++    (when (and (= 1 (count modes)) (= 1 (count field)))
++      [(first modes) (get field (first modes))])))
 +
 +(defn- validate-property-classes
 +  "Checks a classes field for the property titled `title`, judged on `type`, its type once the call
@@ -210,6 +311,13 @@ index 5dc3e7d..f68e5ef 100644
 +           (remove #(entity-util/hidden? (d/entity db %)))
 +           count))))
 +
++(defn- unverified!
++  "Throws, answered as a 500 by `rejecting`, when a read-back found `problems`."
++  [problems]
++  (when (seq problems)
++    (let [message (str "the write did not store what was asked: " (string/join "; " problems))]
++      (throw (ex-info message {::unverified message})))))
++
 +(defn- verify-property-schema!
 +  "Re-reads the property from `db` after a write and throws, answered as a 500 by `rejecting`, when
 +  what the call asked for isn't stored. `expected` may hold :classes, a set of class UUIDs."
@@ -223,14 +331,136 @@ index 5dc3e7d..f68e5ef 100644
 +                     (conj (str "classes missing " (string/join ", " (map title (remove stored classes)))))
 +                     (seq (remove classes stored))
 +                     (conj (str "classes not removed " (string/join ", " (map title (remove classes stored)))))))]
-+    (when (seq problems)
-+      (let [message (str "the write did not store what was asked: " (string/join "; " problems))]
-+        (throw (ex-info message {::unverified message}))))))
++    (unverified! problems)))
++
++;; Tag schema writes (createTag, updateTag) take the same shape: every field is checked against the
++;; graph first, then the tag, what it extends and its tag properties are written in one
++;; atomic-write!, and the tag is read back.
++
++(defn- find-tag
++  "updateTag's tag-id: a tag's UUID or its ident (qualified idents contain /, re-encoded by the
++  connector as patch 0016 does)."
++  [db id]
++  (or (find-entity db id)
++      (when (and (string? id) (qualified-keyword? (keyword id)))
++        (d/entity db (keyword id)))))
++
++(defn- resolve-property-selector
++  "The property a selector names by UUID, ident or title, or nil. Only visible properties count, so
++  a tag, a page or a hidden built-in property never matches."
++  [db selector]
++  (when (non-blank-string? selector)
++    (let [property (resolve-property db selector)]
++      (when (property? property) property))))
++
++(defn- extends-path
++  "The tags `from` extends `to` through, nearest first ([] when directly), or nil when it doesn't
++  extend `to`."
++  [from to]
++  (loop [queue [[from []]]
++         seen #{(:db/id from)}]
++    (when-let [[tag via] (first queue)]
++      (let [parents (:logseq.property.class/extends tag)]
++        (if (some #(= (:db/id to) (:db/id %)) parents)
++          via
++          (let [unseen (remove #(seen (:db/id %)) parents)]
++            (recur (into (vec (rest queue)) (map (fn [parent] [parent (conj via parent)]) unseen))
++                   (into seen (map :db/id unseen)))))))))
++
++(defn- extends-refusal
++  "Why `tag` (nil when creating one) can't extend `parent`: itself, or a tag that already extends
++  it, named with the path."
++  [tag parent]
++  (when tag
++    (if (= (:db/id tag) (:db/id parent))
++      (str (:block/title parent) " can't extend itself")
++      (when-let [via (extends-path parent tag)]
++        (str (:block/title parent) " already extends " (:block/title tag)
++             (when (seq via) (str " through " (string/join ", " (map :block/title via)))))))))
++
++(defn- validate-tag-schema
++  "Checks createTag's or updateTag's extends and properties for `tag` (nil when creating):
++  {:parents [tag ...] :properties {:mode :properties}}, each key only when given, or {:error message}
++  naming every refused entry. extends replaces the tags it extends and names at least one;
++  properties is a list on createTag and exactly one of set, add or remove on updateTag."
++  [db tag body]
++  (let [extends (when (contains? body :extends)
++                  (if (and (sequential? (:extends body)) (empty? (:extends body)))
++                    {:error "extends: name at least one tag"}
++                    (validate-selectors db "extends" (:extends body) resolve-tag-selector "tag"
++                                        #(extends-refusal tag %))))
++        [mode selectors] (if tag (mode-change (:properties body)) [:add (:properties body)])
++        properties (when (contains? body :properties)
++                     (if (nil? mode)
++                       {:error "properties: give exactly one of set, add or remove"}
++                       (validate-selectors db (cond-> "properties" tag (str "." (name mode))) selectors
++                                           resolve-property-selector "property"
++                                           (fn [property]
++                                             (when (and (= :remove mode) (ldb/built-in-class-property? tag property))
++                                               (str (:block/title property) " is built in on " (:block/title tag)
++                                                    " and can't be removed"))))))
++        errors (keep :error [extends properties])]
++    (if (seq errors)
++      {:error (string/join "; " errors)}
++      (cond-> {}
++        extends (assoc :parents (:ok extends))
++        properties (assoc :properties {:mode mode :properties (:ok properties)})))))
++
++(defn- write-tag-schema!
++  "Inside atomic-write!: replaces what the tag with db id `tag-id` extends with `parents`, and changes
++  its tag properties as `mode` asks. :set adds what is missing and removes the rest, except the
++  built-in class properties, which class-remove-property! keeps."
++  [tx-conn tag-id parents {:keys [mode properties]}]
++  (when parents
++    (outliner-property/set-block-property! tx-conn tag-id :logseq.property.class/extends (mapv :db/id parents)))
++  (when mode
++    (let [listed (set (map :db/id properties))
++          current (map :db/id (:logseq.property.class/properties (d/entity @tx-conn tag-id)))]
++      (when (#{:add :set} mode)
++        (doseq [id listed] (outliner-property/class-add-property! tx-conn tag-id id)))
++      (doseq [id (case mode :remove listed :set (remove listed current) :add nil)]
++        (outliner-property/class-remove-property! tx-conn tag-id id)))))
++
++(defn- expected-tag-schema
++  "What `tag` (nil when creating one) should hold after write-tag-schema!: :extends, the UUIDs of
++  `parents` less any another one already extends (the outliner drops those), and the tag property
++  UUIDs that must be :present and :absent."
++  [tag parents {:keys [mode properties]}]
++  (let [ancestors (set (mapcat #(map :db/id (ldb/get-class-extends %)) parents))
++        listed (set (map :block/uuid properties))]
++    (cond-> {}
++      parents (assoc :extends (set (keep #(when-not (ancestors (:db/id %)) (:block/uuid %)) parents)))
++      mode (assoc :present (if (= :remove mode) #{} listed)
++                  :absent (case mode
++                            :add #{}
++                            :remove listed
++                            :set (set (keep #(when-not (or (listed (:block/uuid %)) (ldb/built-in-class-property? tag %))
++                                               (:block/uuid %))
++                                            (:logseq.property.class/properties tag))))))))
++
++(defn- verify-tag-schema!
++  "Re-reads the tag from `db` after a write and throws, answered as a 500 by `rejecting`, when what
++  expected-tag-schema says isn't stored."
++  [db tag-uuid {:keys [extends present absent]}]
++  (let [tag (d/entity db [:block/uuid tag-uuid])
++        stored-extends (set (map :block/uuid (:logseq.property.class/extends tag)))
++        stored (set (map :block/uuid (:logseq.property.class/properties tag)))
++        titles (fn [ids] (string/join ", " (map #(or (:block/title (d/entity db [:block/uuid %])) (str %)) ids)))]
++    (unverified!
++     (cond-> []
++       (and extends (seq (remove stored-extends extends)))
++       (conj (str "extends missing " (titles (remove stored-extends extends))))
++       (and extends (seq (remove extends stored-extends)))
++       (conj (str "extends not removed " (titles (remove extends stored-extends))))
++       (seq (remove stored present))
++       (conj (str "properties missing " (titles (remove stored present))))
++       (seq (filter stored absent))
++       (conj (str "properties not removed " (titles (filter stored absent))))))))
 +
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2079,31 @@
+@@ -1931,14 +2249,31 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -270,7 +500,7 @@ index 5dc3e7d..f68e5ef 100644
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2113,37 @@
+@@ -1948,16 +2283,37 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -285,7 +515,7 @@ index 5dc3e7d..f68e5ef 100644
 -          (broadcast-change! self)
 -          (http/json-response nil (property-response updated)))))
 +      (let [type (if (:type body) (keyword (:type body)) (:logseq.property/type property))
-+            change (classes-change (:classes body))
++            change (mode-change (:classes body))
 +            classes (when (contains? body :classes)
 +                      (if change
 +                        (validate-property-classes db (:block/title property) type (first change) (second change))
@@ -319,7 +549,7 @@ index 5dc3e7d..f68e5ef 100644
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..83891f7 100644
+index c64cc9f..0247d81 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -331,8 +561,17 @@ index c64cc9f..83891f7 100644
         " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
         " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
  
-@@ -157,9 +157,9 @@
-    "updateTag" ["Update a tag" "Renames one tag identified by UUID."]
+@@ -151,15 +151,15 @@
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+-   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
+-   "getTag" ["Get a tag" "Returns one tag by UUID."]
++   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title) is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
++   "getTag" ["Get a tag" "Returns one tag by UUID, with the tags it extends and its tag properties."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+-   "updateTag" ["Update a tag" "Renames one tag identified by UUID."]
++   "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself or a tag that already extends it (the error names the path). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
     "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
     "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
 -   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
@@ -344,17 +583,41 @@ index c64cc9f..83891f7 100644
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
-@@ -254,6 +254,9 @@
+@@ -254,6 +254,12 @@
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
     :description "Text a page's first top-level block starts with when it is the page's summary."})
  
 +(def ^:private tag-selectors-schema
 +  {:type "array" :items {:type "string"} :description "Tag UUIDs, idents or titles."})
 +
++(def ^:private property-selectors-schema
++  {:type "array" :items {:type "string"} :description "Property UUIDs, idents or titles."})
++
  (def ^:private encrypted-name-schema
    {:type "string"
     :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
-@@ -336,10 +339,17 @@
+@@ -331,15 +337,36 @@
+                                :priority {:$ref "#/components/schemas/TaskPrioritySelector"}
+                                :scheduled {:type "integer" :description "Scheduled date/time as a Unix timestamp in milliseconds."}
+                                :deadline {:type "integer" :description "Deadline date/time as a Unix timestamp in milliseconds."}}}
+-    "createTag" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+-    "updateTag" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
++    "createTag" {:required ["title"]
++                 :properties {:title {:type "string"} :name encrypted-name-schema
++                              :extends (assoc tag-selectors-schema
++                                              :minItems 1
++                                              :description "The tags this tag extends, each by UUID, ident or title. Omit to extend Root.")
++                              :properties (assoc property-selectors-schema
++                                                 :description "The tag's properties, each by UUID, ident or title.")}}
++    "updateTag" {:properties {:title {:type "string"} :name encrypted-name-schema
++                              :extends (assoc tag-selectors-schema
++                                              :minItems 1
++                                              :description "Replaces the tags this tag extends: each by UUID, ident or title, at least one.")
++                              :properties {:type "object"
++                                           :description "Give exactly one of add or remove (change only the tags listed, keeping the tag's other properties) or set (replace the tag's own properties; built-in ones stay)."
++                                           :properties {:set property-selectors-schema
++                                                        :add property-selectors-schema
++                                                        :remove property-selectors-schema}}}}
      "createProperty" {:required ["title"]
                        :properties {:title {:type "string"} :name encrypted-name-schema
                                     :type {:$ref "#/components/schemas/PropertyType"}
@@ -374,7 +637,27 @@ index c64cc9f..83891f7 100644
      "encryptE2eeText" {:required ["key" "texts"]
                         :properties {:texts {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "string"}}
-@@ -683,7 +693,12 @@
+@@ -646,7 +673,18 @@
+                :TagResponse {:type "object" :required ["uuid" "title"]
+                              :properties {:uuid {:type "string"}
+                                           :title {:type "string"}
+-                                          :ident {:type "string"}}}
++                                          :ident {:type "string"}
++                                          :extends {:type "array"
++                                                    :description "On getTag, createTag and updateTag: the tags this tag extends."
++                                                    :items {:type "object" :required ["uuid" "title"]
++                                                            :properties {:uuid {:type "string"}
++                                                                         :title {:type "string"}}}}
++                                          :properties {:type "array"
++                                                       :description "On getTag, createTag and updateTag: the tag's properties, built-in ones included."
++                                                       :items {:type "object" :required ["uuid" "title"]
++                                                               :properties {:uuid {:type "string"}
++                                                                            :title {:type "string"}
++                                                                            :ident {:type "string"}}}}}}
+                :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
+                                       :properties {:uuid {:type "string"}
+                                                    :title {:type "string"}
+@@ -683,7 +721,12 @@
                                  :properties {:uuid {:type "string"}
                                               :ident {:type "string"}
                                               :title {:type "string"}
@@ -388,7 +671,7 @@ index c64cc9f..83891f7 100644
                 :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
                                    :properties {:uuid {:type "string"}
                                                 :ident {:type "string"}
-@@ -691,8 +706,16 @@
+@@ -691,8 +734,16 @@
                                                 :type {:type "string"}
                                                 :cardinality {:type "string"}
                                                 :choices {:type "array"
@@ -409,10 +692,10 @@ index c64cc9f..83891f7 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..97b60cd
+index 0000000..0c4e04b
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,725 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -840,6 +1123,304 @@ index 0000000..97b60cd
 +          (is (nil? (thrown {})) "nothing asked, nothing checked")
 +          (is (= "the write did not store what was asked: classes missing Client; classes not removed Service"
 +                 (thrown {:classes #{(:block/uuid client)}}))))))))
++
++;; Tags: extends and tag properties through createTag, updateTag and getTag. The graph adds tags
++;; Organisation and Company, with Client extending Company and Company extending Organisation, and
++;; properties for-service and engagement-partner. Client starts with for-client and for-service as
++;; its tag properties.
++
++(defn- tag-path [tag]
++  (str "/semantic/tags/" (if (uuid? tag) tag (js/encodeURIComponent (ident-str tag)))))
++
++(defn- with-tags
++  [done run]
++  (with-graph done
++    (fn [{:keys [conn self client for-client] :as graph}]
++      (p/let [tag! (fn [title] (p/let [r (request! self "POST" "/semantic/tags" {:title title})]
++                                 (entity conn (uuid (get-in r [:body :uuid])))))
++              organisation (tag! "Organisation")
++              company (tag! "Company")
++              for-service (outliner-property/upsert-property!
++                           conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                           {:property-name "for-service"})
++              partner (outliner-property/upsert-property!
++                       conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                       {:property-name "engagement-partner"})
++              _ (outliner-property/set-block-property! conn (:db/id company) :logseq.property.class/extends (:db/id organisation))
++              _ (outliner-property/set-block-property! conn (:db/id client) :logseq.property.class/extends (:db/id company))
++              _ (outliner-property/class-add-property! conn (:db/id client) for-client)
++              _ (outliner-property/class-add-property! conn (:db/id client) (:db/ident for-service))]
++        (run (assoc graph
++                    :organisation (entity conn (:block/uuid organisation))
++                    :company (entity conn (:block/uuid company))
++                    :for-service (:db/ident for-service)
++                    :partner (:db/ident partner)))))))
++
++(defn- tag-property-idents [conn tag-uuid]
++  (set (map :db/ident (:logseq.property.class/properties (entity conn tag-uuid)))))
++
++(defn- extends-titles [conn tag-uuid]
++  (set (map :block/title (:logseq.property.class/extends (entity conn tag-uuid)))))
++
++(deftest update-tag-properties-add-keeps-others-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client for-client for-service partner]}]
++        (let [client-id (:block/uuid client)
++              partner-uuid (:block/uuid (d/entity @conn partner))]
++          (p/let [added (request! self "PATCH" (tag-path client-id) {:properties {:add ["engagement-partner"]}})
++                  after-add (tag-property-idents conn client-id)
++                  removed (request! self "PATCH" (tag-path client-id) {:properties {:remove [(ident-str for-service)]}})
++                  after-remove (tag-property-idents conn client-id)
++                  got (request! self "GET" (tag-path client-id) nil)
++                  ;; Adding what is already there, by UUID, changes nothing.
++                  again (request! self "PATCH" (tag-path client-id) {:properties {:add [(str partner-uuid)]}})]
++            (is (= 200 (:status added)) (str (:body added)))
++            (is (= #{for-client for-service partner} after-add) "add keeps the tag's other properties")
++            (is (= #{"for-client" "for-service" "engagement-partner"} (set (map :title (get-in added [:body :properties]))))
++                "updateTag answers the tag's properties")
++            (is (= 200 (:status removed)) (str (:body removed)))
++            (is (= #{for-client partner} after-remove) "remove leaves the others")
++            (is (= #{"for-client" "engagement-partner"} (set (map :title (get-in got [:body :properties]))))
++                "getTag agrees")
++            (is (= ["Company"] (mapv :title (get-in got [:body :extends]))) "getTag shows what the tag extends")
++            (is (= 200 (:status again)) (str (:body again)))
++            (is (= #{for-client partner} (tag-property-idents conn client-id)))))))))
++
++(deftest update-tag-properties-set-keeps-built-ins-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client for-client for-service]}]
++        (let [task (d/entity @conn :logseq.class/Task)
++              task-id (:block/uuid task)
++              built-ins (set (map :db/ident (:logseq.property.class/properties task)))]
++          (p/let [_ (request! self "PATCH" (tag-path task-id) {:properties {:add ["for-service"]}})
++                  set-task (request! self "PATCH" (tag-path task-id) {:properties {:set ["for-client"]}})
++                  set-client (request! self "PATCH" (tag-path (:block/uuid client)) {:properties {:set []}})
++                  remove-built-in (request! self "PATCH" (tag-path task-id)
++                                            {:properties {:remove [(ident-str (first (sort built-ins)))]}})]
++            (is (seq built-ins) "Task has built-in class properties")
++            (is (= 200 (:status set-task)) (str (:body set-task)))
++            (is (= (conj built-ins for-client) (tag-property-idents conn task-id))
++                "set keeps the built-in class properties and leaves exactly the listed user property")
++            (is (= 200 (:status set-client)) (str (:body set-client)))
++            (is (= #{} (tag-property-idents conn (:block/uuid client))) "set [] removes every user property")
++            (is (= 400 (:status remove-built-in)) (str (:body remove-built-in)))
++            (is (string/starts-with? (str (get-in remove-built-in [:body :error])) "properties.remove 0: ")
++                (str (:body remove-built-in)))
++            (is (string/includes? (str (get-in remove-built-in [:body :error])) "built in")
++                "removing a built-in class property is refused, not silently skipped")
++            (is (= (conj built-ins for-client) (tag-property-idents conn task-id)))
++            (is (some? for-service))))))))
++
++(deftest create-tag-with-extends-and-properties-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self organisation for-client]}]
++        (p/let [created (request! self "POST" "/semantic/tags"
++                                  {:title "Portfolio" :extends ["Organisation"] :properties ["for-client"]})
++                id (some-> (get-in created [:body :uuid]) uuid)
++                got (when id (request! self "GET" (tag-path id) nil))
++                plain (request! self "POST" "/semantic/tags" {:title "Plain"})]
++          (is (= 201 (:status created)) (str (:body created)))
++          (is (= [{:uuid (str (:block/uuid organisation)) :title "Organisation"}]
++                 (get-in created [:body :extends]))
++              "createTag answers what the tag extends")
++          (is (= [{:uuid (str (:block/uuid (d/entity @conn for-client))) :title "for-client" :ident (ident-str for-client)}]
++                 (get-in created [:body :properties]))
++              "createTag answers the tag's properties")
++          (is (string? (get-in created [:body :ident])) "createTag answers the full tag")
++          (is (= (:body created) (:body got)) "getTag reads the same back")
++          (is (= #{"Organisation"} (extends-titles conn id)))
++          (is (= #{for-client} (tag-property-idents conn id)))
++          (is (= 201 (:status plain)) (str (:body plain)))
++          (is (= [] (get-in plain [:body :properties])) "a tag with no properties answers []"))))))
++
++(deftest update-tag-extends-replaces-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client service company]}]
++        (let [client-id (:block/uuid client)]
++          (p/let [replaced (request! self "PATCH" (tag-path client-id) {:extends ["Organisation"]})
++                  after-replace (extends-titles conn client-id)
++                  by-ident (request! self "PATCH" (tag-path client-id) {:extends [(ident-str (:db/ident company))]})
++                  after-ident (extends-titles conn client-id)
++                  ;; Organisation is already an ancestor of Company, so the outliner keeps only Company.
++                  redundant (request! self "PATCH" (tag-path client-id) {:extends ["Organisation" "Company"]})
++                  after-redundant (extends-titles conn client-id)
++                  two (request! self "PATCH" (tag-path client-id) {:extends [(str (:block/uuid service)) "company"]})
++                  after-two (extends-titles conn client-id)
++                  empty-list (request! self "PATCH" (tag-path client-id) {:extends []})
++                  not-list (request! self "PATCH" (tag-path client-id) {:extends "Company"})]
++            (is (= 200 (:status replaced)) (str (:body replaced)))
++            (is (= #{"Organisation"} after-replace) "extends replaces the set")
++            (is (= ["Organisation"] (mapv :title (get-in replaced [:body :extends]))))
++            (is (= 200 (:status by-ident)) (str (:body by-ident)))
++            (is (= #{"Company"} after-ident) "an ident names a tag")
++            (is (= 200 (:status redundant)) (str "a redundant ancestor is not a failed write: " (:body redundant)))
++            (is (= #{"Company"} after-redundant))
++            (is (= ["Company"] (mapv :title (get-in redundant [:body :extends]))) "the response shows what is stored")
++            (is (= 200 (:status two)) (str (:body two)))
++            (is (= #{"Service" "Company"} after-two) "a UUID and a title ignoring case both name a tag")
++            (is (= 400 (:status empty-list)) (str (:body empty-list)))
++            (is (= "extends: name at least one tag" (get-in empty-list [:body :error])))
++            (is (= 400 (:status not-list)) (str (:body not-list)))
++            (is (= "extends: give a list of tag UUIDs, idents or titles" (get-in not-list [:body :error])))
++            (is (= #{"Service" "Company"} (extends-titles conn client-id)) "a refused call changes nothing")))))))
++
++(deftest extends-cycle-refused-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client organisation company]}]
++        (p/let [through (request! self "PATCH" (tag-path (:block/uuid organisation)) {:extends ["Service" "Client"]})
++                direct (request! self "PATCH" (tag-path (:block/uuid company)) {:extends ["Client"]})
++                self-extend (request! self "PATCH" (tag-path (:block/uuid client)) {:extends [(str (:block/uuid client))]})
++                with-title (request! self "PATCH" (tag-path (:block/uuid organisation))
++                                     {:title "Org" :extends ["Client"]})]
++          (is (= 400 (:status through)) (str (:body through)))
++          (is (= "extends 1: Client already extends Organisation through Company" (get-in through [:body :error]))
++              "the refusal names the path")
++          (is (= 400 (:status direct)) (str (:body direct)))
++          (is (= "extends 0: Client already extends Company" (get-in direct [:body :error])))
++          (is (= 400 (:status self-extend)) (str (:body self-extend)))
++          (is (= "extends 0: Client can't extend itself" (get-in self-extend [:body :error])))
++          (is (= 400 (:status with-title)) (str (:body with-title)))
++          (is (= "Organisation" (:block/title (entity conn (:block/uuid organisation)))) "nothing changes, not even the title")
++          (is (not (contains? (extends-titles conn (:block/uuid organisation)) "Client")))
++          (is (= #{"Organisation"} (extends-titles conn (:block/uuid company))))
++          (is (= #{"Company"} (extends-titles conn (:block/uuid client)))))))))
++
++(deftest tag-refusals-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client service acme for-client for-service]}]
++        (let [client-id (:block/uuid client)
++              path (tag-path client-id)]
++          (p/let [recycled (outliner-property/upsert-property!
++                            conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                            {:property-name "old-notes"})
++                  _ (d/transact! conn [[:db/add (:db/id recycled) :logseq.property/deleted-at 1]])
++                  tag-uuid (request! self "PATCH" path {:properties {:add [(str (:block/uuid service))]}})
++                  tag-ident (request! self "PATCH" path {:properties {:add [(ident-str (:db/ident service))]}})
++                  recycled-one (request! self "PATCH" path {:properties {:add ["old-notes"]}})
++                  unknown (request! self "PATCH" path {:properties {:add ["for-clinet"]}})
++                  hidden (request! self "PATCH" path {:properties {:add ["engagement-partner" "logseq.property/classes"]}})
++                  a-tag (request! self "PATCH" path {:properties {:add ["Service"]}})
++                  not-strings (request! self "PATCH" path {:properties {:add [1]}})
++                  two-modes (request! self "PATCH" path {:properties {:add ["engagement-partner"] :remove ["for-client"]}})
++                  no-mode (request! self "PATCH" path {:properties {}})
++                  not-a-tag (request! self "PATCH" path {:extends ["Acme Ltd"]})
++                  a-property (request! self "PATCH" path {:extends ["for-client"]})
++                  empty-body (request! self "PATCH" path {})
++                  blank-title (request! self "PATCH" path {:title " "})
++                  number-title (request! self "PATCH" path {:title 5 :extends ["Organisation"]})
++                  page-path (request! self "PATCH" (tag-path acme) {:title "Acme Corp"})
++                  create-unknown (request! self "POST" "/semantic/tags" {:title "Team" :extends ["Organisaton"] :properties ["for-clinet"]})
++                  create-not-list (request! self "POST" "/semantic/tags" {:title "Squad" :properties {:add ["for-client"]}})
++                  renamed (request! self "PATCH" path {:title "Customer"})]
++            (is (= 400 (:status unknown)) (str (:body unknown)))
++            (is (= "properties.add 0: no property \"for-clinet\"" (get-in unknown [:body :error])))
++            (is (= 400 (:status hidden)) (str (:body hidden)))
++            (is (= "properties.add 1: no property \"logseq.property/classes\"" (get-in hidden [:body :error]))
++                "a hidden built-in property is not a tag property")
++            (is (= "properties.add 0: no property \"Service\"" (get-in a-tag [:body :error])) "a tag is not a property")
++            (is (= (str "properties.add 0: no property \"" (:block/uuid service) "\"") (get-in tag-uuid [:body :error]))
++                "not by UUID either")
++            (is (= (str "properties.add 0: no property \"" (ident-str (:db/ident service)) "\"") (get-in tag-ident [:body :error]))
++                "nor by ident")
++            (is (= "properties.add 0: no property \"old-notes\"" (get-in recycled-one [:body :error]))
++                "a recycled property is not one")
++            (is (= "properties.add: give a list of property UUIDs, idents or titles" (get-in not-strings [:body :error])))
++            (is (= "properties: give exactly one of set, add or remove" (get-in two-modes [:body :error])))
++            (is (= "properties: give exactly one of set, add or remove" (get-in no-mode [:body :error])))
++            (is (= "extends 0: no tag \"Acme Ltd\"" (get-in not-a-tag [:body :error])) "a page is not a tag")
++            (is (= "extends 0: no tag \"for-client\"" (get-in a-property [:body :error])) "a property is not a tag")
++            (is (= 400 (:status empty-body)) (str (:body empty-body)))
++            (is (= "give at least one of title, extends or properties" (get-in empty-body [:body :error])))
++            (is (= 400 (:status blank-title)) (str (:body blank-title)))
++            (is (= "title: give a title that isn't blank" (get-in blank-title [:body :error])))
++            (is (= "title: give a title that isn't blank" (get-in number-title [:body :error])))
++            (is (= "invalid tag-id or title" (get-in page-path [:body :error])) "a page is not a tag")
++            (is (= "Acme" (:block/title (entity conn acme))))
++            (is (= 400 (:status create-unknown)) (str (:body create-unknown)))
++            (is (= "extends 0: no tag \"Organisaton\"; properties 0: no property \"for-clinet\""
++                   (get-in create-unknown [:body :error]))
++                "every refused entry is named")
++            (is (empty? (d/datoms @conn :avet :block/title "Team")) "a refused create writes nothing")
++            (is (= 400 (:status create-not-list)) (str (:body create-not-list)))
++            (is (= "properties: give a list of property UUIDs, idents or titles" (get-in create-not-list [:body :error])))
++            (is (empty? (d/datoms @conn :avet :block/title "Squad")))
++            (is (= #{for-client for-service} (tag-property-idents conn client-id)) "no refused call changed the tag")
++            (is (= 200 (:status renamed)) (str (:body renamed)))
++            (is (= "Customer" (get-in renamed [:body :title])) "a title-only update still renames")
++            (is (= "Customer" (:block/title (entity conn client-id))))
++            (is (= #{"Company"} (extends-titles conn client-id)) "renaming leaves extends alone")
++            (is (= #{for-client for-service} (tag-property-idents conn client-id)) "and the tag properties")))))))
++
++(deftest update-tag-qualified-ident-path-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client for-client for-service partner]}]
++        (is (string/includes? (ident-str (:db/ident client)) "/"))
++        (p/let [response (request! self "PATCH" (tag-path (:db/ident client)) {:properties {:add ["engagement-partner"]}})]
++          (is (= 200 (:status response)) (str (:body response)))
++          (is (= #{for-client for-service partner} (tag-property-idents conn (:block/uuid client)))))))))
++
++(deftest tag-write-is-one-transaction-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client]}]
++        (let [reports (atom [])
++              listen! #(d/listen! conn ::reports (fn [report] (when (seq (:tx-data report)) (swap! reports conj report))))]
++          (listen!)
++          (p/let [created (request! self "POST" "/semantic/tags"
++                                    {:title "Portfolio" :extends ["Organisation"] :properties ["for-client" "for-service"]})
++                  _ (d/unlisten! conn ::reports)
++                  created-reports @reports
++                  _ (reset! reports [])
++                  _ (listen!)
++                  updated (request! self "PATCH" (tag-path (:block/uuid client))
++                                    {:title "Customer" :extends ["Organisation"] :properties {:set ["engagement-partner"]}})
++                  _ (d/unlisten! conn ::reports)
++                  updated-reports @reports]
++            (let [tx-data (mapcat :tx-data created-reports)
++                  tag-id (:db/id (entity conn (uuid (get-in created [:body :uuid]))))
++                  written (fn [tx-data e a] (filter #(and (= e (:e %)) (= a (:a %)) (:added %)) tx-data))]
++              (is (= 201 (:status created)) (str (:body created)))
++              (is (= 1 (count created-reports)) "createTag is one transaction")
++              (is (= 1 (count (distinct (map :tx tx-data)))) "one tx id")
++              (is (= 2 (count (written tx-data tag-id :logseq.property.class/properties)))
++                  "the tag properties are in the tag's own transaction")
++              (is (seq (written tx-data tag-id :logseq.property.class/extends)) "and so is extends")
++              (let [tx-data (mapcat :tx-data updated-reports)
++                    client-id (:db/id client)]
++                (is (= 200 (:status updated)) (str (:body updated)))
++                (is (= 1 (count updated-reports)) "updateTag is one transaction")
++                (is (= 1 (count (distinct (map :tx tx-data)))) "one tx id")
++                (is (seq (written tx-data client-id :block/title)) "the title,")
++                (is (seq (written tx-data client-id :logseq.property.class/extends)) "extends")
++                (is (seq (written tx-data client-id :logseq.property.class/properties)) "and properties land together")))))))))
++
++(deftest tag-schema-read-back-test
++  ;; After a write the tag is read back; extends or tag properties that aren't stored as asked
++  ;; answer 500, naming them, rather than success.
++  (async done
++    (with-tags done
++      (fn [{:keys [conn client organisation company for-client for-service partner]}]
++        (let [verify! #'semantic/verify-tag-schema!
++              uuid-of (fn [ident] (:block/uuid (d/entity @conn ident)))
++              thrown (fn [expected]
++                       (try (verify! @conn (:block/uuid client) expected) nil
++                            (catch :default e (ex-message e))))]
++          (is (nil? (thrown {:extends #{(:block/uuid company)}
++                             :present #{(uuid-of for-client)} :absent #{(uuid-of partner)}}))
++              "what was asked is stored")
++          (is (nil? (thrown {})) "nothing asked, nothing checked")
++          (is (= (str "the write did not store what was asked: extends missing Organisation; "
++                      "extends not removed Company; properties missing engagement-partner; "
++                      "properties not removed for-service")
++                 (thrown {:extends #{(:block/uuid organisation)}
++                          :present #{(uuid-of partner)} :absent #{(uuid-of for-service)}}))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 4d9e7d2..e1c9ab9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
