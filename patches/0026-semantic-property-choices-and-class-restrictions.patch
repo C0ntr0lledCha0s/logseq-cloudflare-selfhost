@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..d1de9ec 100644
+index 5dc3e7d..dc37577 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -88,14 +88,46 @@
@@ -209,7 +209,7 @@ index 5dc3e7d..d1de9ec 100644
  
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
-@@ -1920,6 +1994,478 @@
+@@ -1920,6 +1994,504 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -420,7 +420,8 @@ index 5dc3e7d..d1de9ec 100644
 +  order}) for the property titled `title`, judged on `type`, its type once the call has applied.
 +  {:ok plan} or {:error message} naming every refused entry. The plan is {:add [{:uuid :text :icon
 +  :description}] :update [{:uuid :text? :icon? :description?}] :order [uuid ...]?}; a new choice's UUID
-+  is chosen here so order can name it."
++  is chosen here so order can name it. The plan's updates are in the order they apply: a rename after
++  the rename that frees its title."
 +  [db property title type choices e2ee?]
 +  (let [create? (nil? property)
 +        shape (choices-shape-refusal create? choices)]
@@ -473,6 +474,31 @@ index 5dc3e7d..d1de9ec 100644
 +                (let [k (choice-key type (renamed id))]
 +                  (when (some #(and (not= id (:id %)) (= k (choice-key type (:text %)))) final)
 +                    (refuse! field (str (pr-str (renamed id)) " is already a choice on " title)))))
++            ;; The order the updates are applied in. upsert-closed-value! refuses a title another
++            ;; choice still holds (compared exactly, as stored), so a rename runs after the rename of
++            ;; the choice holding its title. Renames whose titles go round a cycle can't be ordered.
++            holder (into {} (keep (fn [{:keys [id field] :as u}]
++                                    (when (and (renamed id) (= field (get updated-ids id)))
++                                      [(choice-content (d/entity db id)) u]))
++                                  updates))
++            state (volatile! {})
++            applied (volatile! [])
++            _ (doseq [u updates]
++                ((fn visit [{:keys [id field] :as u} path]
++                   (when-not (get @state field)
++                     (vswap! state assoc field :visiting)
++                     (when-let [dep (some->> (renamed id) (choice-stored type) (get holder))]
++                       (when (not= id (:id dep))
++                         (if (= :visiting (get @state (:field dep)))
++                           (let [cycle (drop-while #(not= (:field dep) (:field %)) (conj path u))]
++                             (refuse! field (str (pr-str (renamed id)) " is the title of the choice " (:field dep)
++                                                 " renames, and the renames form a cycle ("
++                                                 (string/join ", " (map :field cycle))
++                                                 "); rename one of them to a spare title in a separate call first")))
++                           (visit dep (conj path u)))))
++                     (vswap! state assoc field :done)
++                     (vswap! applied conj u)))
++                 u []))
 +            ;; additions
 +            given (into {} (keep (fn [{:keys [id field]}]
 +                                   (when-let [t (renamed id)] [(choice-key type t) field]))
@@ -533,7 +559,7 @@ index 5dc3e7d..d1de9ec 100644
 +                                          (contains? entry :title) (assoc :text (choice-text (:title entry)))
 +                                          (contains? entry :icon) (assoc :icon (choice-icon (:icon entry)))
 +                                          (contains? entry :description) (assoc :description (:description entry))))
-+                                      updates)}
++                                      @applied)}
 +                 order (assoc :order order))
 +           :expected {:titles (merge (into {} (map (fn [[id t]] [(uuid-of id) (choice-stored type t)]) renamed))
 +                                     (into {} (map (fn [{:keys [uuid text]}] [uuid (choice-stored type text)]) additions)))
@@ -688,7 +714,7 @@ index 5dc3e7d..d1de9ec 100644
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2477,37 @@
+@@ -1931,14 +2503,37 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -734,7 +760,7 @@ index 5dc3e7d..d1de9ec 100644
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2517,43 @@
+@@ -1948,16 +2543,43 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -789,7 +815,7 @@ index 5dc3e7d..d1de9ec 100644
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..f42cd5a 100644
+index c64cc9f..3996463 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -819,7 +845,7 @@ index c64cc9f..f42cd5a 100644
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
 +   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 +   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
@@ -962,10 +988,10 @@ index c64cc9f..f42cd5a 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..02b952e
+index 0000000..cf7db1d
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,1111 @@
+@@ -0,0 +1,1195 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -1852,6 +1878,90 @@ index 0000000..02b952e
 +            (is (= 200 (:status response)) (str (:body response)))
 +            (is (= ["Active" "Closed" "Backlog" "Done"] (choice-titles conn status)))
 +            (is (= done-id (choice-uuid conn status "Closed")) "the renamed choice keeps its UUID")))))))
++
++(deftest choices-rename-chain-any-order-test
++  ;; A rename may take a title another rename in the same call frees, whatever order the entries
++  ;; come in: the renames are applied so a title is freed before it is taken. For text (ignoring
++  ;; case), number and URL choices alike.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status score site]}]
++        (let [active (choice-uuid conn status "Active")
++              done-id (choice-uuid conn status "Done")
++              backlog (choice-uuid conn status "Backlog")]
++          (p/let [chain (choices! self status {:update [{:choice "Backlog" :title "Active"}
++                                                        {:choice "Active" :title "Done2"}]})
++                  after-chain (choice-titles conn status)
++                  chain-ids (mapv #(choice-uuid conn status %) ["Done2" "Done" "Active"])
++                  three (choices! self status {:update [{:choice "Done" :title "Live"}
++                                                        {:choice "Done2" :title "Done"}
++                                                        {:choice (str backlog) :title "done2"}]})
++                  after-three (choice-titles conn status)
++                  three-ids (mapv #(choice-uuid conn status %) ["Done" "Live" "done2"])
++                  ;; titles that differ only in case may swap: neither is held as written
++                  swap-case (choices! self status {:update [{:choice "Done" :title "live"}
++                                                            {:choice "Live" :title "done"}]})
++                  after-swap-case (choice-titles conn status)
++                  ;; a choice given its own title holds it already, and is no cycle
++                  own (choices! self status {:update [{:choice "done2" :title "done2" :description "Parked"}]})
++                  _ (choices! self score {:add [{:title "2"}]})
++                  number (choices! self score {:update [{:choice "1" :title "2"} {:choice "2" :title 3}]})
++                  _ (choices! self site {:add [{:title "https://b.example.com"}]})
++                  url (choices! self site {:update [{:choice "https://a.example.com" :title "https://b.example.com"}
++                                                    {:choice "https://b.example.com" :title "https://c.example.com"}]})]
++            (is (= 200 (:status chain)) (str (:body chain)))
++            (is (= ["Done2" "Done" "Active"] after-chain))
++            (is (= [active done-id backlog] chain-ids)
++                "each renamed choice keeps its UUID")
++            (is (= 200 (:status three)) (str (:body three)))
++            (is (= ["Done" "Live" "done2"] after-three))
++            (is (= [active done-id backlog] three-ids))
++            (is (= 200 (:status swap-case)) (str (:body swap-case)))
++            (is (= ["live" "done" "done2"] after-swap-case))
++            (is (= 200 (:status own)) (str (:body own)))
++            (is (= 200 (:status number)) (str (:body number)))
++            (is (= [2 3] (mapv :value (get-in number [:body :choices]))))
++            (is (= 200 (:status url)) (str (:body url)))
++            (is (= ["https://b.example.com" "https://c.example.com"] (choice-titles conn site)))))))))
++
++(deftest choices-rename-cycle-refused-test
++  ;; Renames that move titles round a cycle (a swap, or three choices in turn) can't be applied one
++  ;; at a time, so the call is refused up front, naming the entry and the cycle, and nothing is written.
++  ;; A number title is held by value: 1.0 is the title 1.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status score]}]
++        (let [initial (choice-titles conn status)]
++          (p/let [swap (choices! self status {:update [{:choice "Active" :title "Done"}
++                                                       {:choice "Done" :title "Active"}]})
++                  rotate (choices! self status {:update [{:choice "Active" :title "Done"}
++                                                         {:choice "Done" :title "Backlog"}
++                                                         {:choice "Backlog" :title "Active"}]})
++                  twice (choices! self status {:update [{:choice "Active" :title "Done"}
++                                                        {:choice "Done" :title "Active"}
++                                                        {:choice "active" :icon nil}]})
++                  _ (choices! self score {:add [{:title "2"}]})
++                  number (choices! self score {:update [{:choice "1" :title "2"} {:choice "2" :title "1.0"}]})]
++            (is (= 400 (:status swap)) (str (:body swap)))
++            (is (= (str "choices.update 1: \"Active\" is the title of the choice choices.update 0 renames, and "
++                        "the renames form a cycle (choices.update 0, choices.update 1); rename one of them to a "
++                        "spare title in a separate call first")
++                   (get-in swap [:body :error])))
++            (is (= 400 (:status rotate)) (str (:body rotate)))
++            (is (= (str "choices.update 2: \"Active\" is the title of the choice choices.update 0 renames, and "
++                        "the renames form a cycle (choices.update 0, choices.update 1, choices.update 2); rename one "
++                        "of them to a spare title in a separate call first")
++                   (get-in rotate [:body :error])))
++            (is (= (str "choices.update 2: \"Active\" is already updated in choices.update 0; "
++                        "choices.update 1: \"Active\" is the title of the choice choices.update 0 renames, and "
++                        "the renames form a cycle (choices.update 0, choices.update 1); rename one of them to a "
++                        "spare title in a separate call first")
++                   (get-in twice [:body :error]))
++                "a choice updated twice is named once, and the cycle names its first update")
++            (is (= initial (choice-titles conn status)) "nothing is written")
++            (is (= 400 (:status number)) (str (:body number)))
++            (is (string/includes? (str (get-in number [:body :error])) "the renames form a cycle (choices.update 0, choices.update 1)"))
++            (is (= ["1" "2"] (choice-titles conn score)))))))))
 +
 +(deftest choices-update-number-and-url-test
 +  ;; The other choice types go through the same update path: a number choice is renamed to a
