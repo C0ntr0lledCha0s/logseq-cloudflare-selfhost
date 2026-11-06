@@ -69,7 +69,7 @@ Staged work runs as a lane. Start one with `/lane` (it routes to the right workf
 | Bug | `lane-bug` | A defect: preconditions → investigate (the root cause is challenged by skeptics) → failing test → fix → review rounds → docs → compound and retro → closeout |
 | Feature | `lane-feature` | An enhancement: preconditions → design panel → spec (stops for approval) → plan → staged build → review rounds → docs → compound and retro → closeout |
 | Spike | `lane-spike` | A question: multi-angle research → write-up in `docs/spikes/` → challenge → compound |
-| Review | `lane-review` | Correctness, integrity, tests, efficiency, security (and contract) lenses. Skeptics verify each serious finding, and open findings are re-checked by id. The other lanes call it every round. |
+| Review | `lane-review` | Tests, correctness, integrity and light (efficiency, security and contract) lenses, over the lane's own commits. Skeptics verify each serious finding and send pre-existing ones to the backlog, and open findings are re-checked by id. The other lanes call it every round. |
 
 Lane agents commit as they go, one commit per stage. `/lane` pushes, and opens a PR only when asked.
 
