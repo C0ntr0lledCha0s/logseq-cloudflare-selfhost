@@ -185,6 +185,11 @@
     "path": "/api/v1/graphs/{graph-id}/block-moves"
   },
   {
+    "name": "promote_page_to_tag",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/promote-to-tag"
+  },
+  {
     "name": "read_file",
     "method": null,
     "path": null

@@ -512,6 +512,37 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("set replaces");
   });
 
+  it("promote_page_to_tag takes a page's UUID, needs no body, and says what it keeps and refuses", async () => {
+    const tools = await listTools();
+    const promote = tools.find((t) => t.name === "promote_page_to_tag");
+    expect(promote).toBeDefined();
+    expect(promote.inputSchema.required.sort()).toEqual(["graph", "page-id"]);
+    expect(promote.inputSchema.properties["page-id"].type).toBe("string");
+    expect(promote.inputSchema.properties.body.type).toBe("object");
+    expect(promote.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(promote.description).toContain(
+      "Turns an existing page into a tag in place: its UUID, blocks, properties and references are kept, and links to it stay links (they aren't tagged).",
+    );
+    expect(promote.description).toContain("Refuses journals, built-ins, properties, namespaced pages and existing tags.");
+    expect(promote.description).toContain("Setting a page's tags to Tag is refused; use this instead.");
+    expect(committedManifest).toContainEqual({
+      name: "promote_page_to_tag",
+      method: "POST",
+      path: "/api/v1/graphs/{graph-id}/pages/{page-id}/promote-to-tag",
+    });
+  });
+
+  it("promote_page_to_tag sends no body unless given one, and passes the server's refusal through", async () => {
+    syncHandler = () =>
+      Response.json({ error: 'page-id: "Notes" (p1) is namespaced under Library' }, { status: 400 });
+    const refused = await callTool("promote_page_to_tag", { graph: "work", "page-id": "p1" });
+    expect(refused).toEqual({ isError: true, text: 'page-id: "Notes" (p1) is namespaced under Library' });
+    expect(syncRequests).toHaveLength(1);
+    expect(syncRequests[0].method).toBe("POST");
+    expect(new URL(syncRequests[0].url).pathname).toBe(`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`);
+    expect(syncRequests[0].body).toBe("");
+  });
+
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);

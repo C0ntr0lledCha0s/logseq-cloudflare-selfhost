@@ -38,7 +38,14 @@ export const KB_INDEX_PRIVATE_TAGS = ["private"];
 /** The cron runs hourly (wrangler.template.jsonc); an older cache means it has not run, so rebuild. */
 export const KB_INDEX_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 /** Tools whose success changes the index's pages or their names; they mark the cache dirty. */
-export const KB_INDEX_WRITE_TOOLS = new Set(["create_page", "update_page", "delete_page", "update_tag", "delete_tag"]);
+export const KB_INDEX_WRITE_TOOLS = new Set([
+  "create_page",
+  "update_page",
+  "delete_page",
+  "promote_page_to_tag",
+  "update_tag",
+  "delete_tag",
+]);
 
 const PAGE_SIZE = 200;
 /** 100 requests of 200 pages: an index larger than 20,000 pages is refused rather than truncated. */
