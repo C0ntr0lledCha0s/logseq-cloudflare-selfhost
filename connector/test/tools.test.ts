@@ -443,6 +443,18 @@ describe("hand-written tools", () => {
     expect(syncRequests).toHaveLength(0);
   });
 
+  it("create_property and update_property take a node property's classes, and say how", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_property");
+    const update = tools.find((t) => t.name === "update_property");
+    expect(create.inputSchema.properties.body.properties.classes.type).toBe("array");
+    expect(Object.keys(update.inputSchema.properties.body.properties.classes.properties).sort()).toEqual(["add", "remove", "set"]);
+    expect(create.description).toContain("Give a node property its classes when creating it");
+    expect(update.description).toContain("exactly one of set, add or remove");
+    expect(update.description).toContain("{set: []}");
+    expect(update.description).toContain("out_of_class");
+  });
+
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);
@@ -467,6 +479,7 @@ describe("hand-written tools", () => {
       "insert_block_tree with that journal's UUID as target-id",
       "create_task with page-id",
       "delete_page on today's journal",
+      "restricted to classes",
     ]) {
       expect(result.text).toContain(phrase);
     }

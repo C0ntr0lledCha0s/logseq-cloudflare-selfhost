@@ -45,6 +45,10 @@ const HINTS: Record<string, string> = {
   insert_block_tree:
     "Prefer this for whole notes such as meeting notes: one write call instead of many (writes are rate-limited).",
   create_task: "Use this for every task or action item.",
+  create_property:
+    "Give a node property its classes when creating it (classes: tag UUIDs, idents or titles), so the app's picker and every value write accept only objects of those tags.",
+  update_property:
+    "To restrict a node property to classes, give classes exactly one of set, add or remove (each a list of tag UUIDs, idents or titles); {set: []} clears the restriction. Existing values are kept: out_of_class counts the holders whose value the classes would now refuse.",
 };
 
 function description(op: GraphOperation): string {

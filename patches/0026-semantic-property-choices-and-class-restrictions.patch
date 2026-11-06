@@ -1,0 +1,854 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 5dc3e7d..f68e5ef 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -88,14 +88,37 @@
+    :title (:block/title entity)
+    :value (:logseq.property/value entity)})
+ 
+-(defn- property-response [entity]
++(declare property-choices)
++
++(defn- property-choice-detail-response
++  "A choice as getProperty lists it: property-choice-response plus its icon and description, when
++  set, so a schema write can be seen to land."
++  [entity]
++  (let [description (:logseq.property/description entity)]
++    (cond-> (property-choice-response entity)
++      (:logseq.property/icon entity) (assoc :icon (:logseq.property/icon entity))
++      description (assoc :description (if (de/entity? description)
++                                        (db-property/property-value-content description)
++                                        description)))))
++
++(defn- class-response [entity]
++  {:uuid (uuid-string (:block/uuid entity))
++   :title (:block/title entity)
++   :ident (entity-ident entity)})
++
++(defn- property-response
++  "A property definition: its choices in the order the editor lists them and, for a node property,
++  the classes it is limited to (empty when it takes any node)."
++  [entity]
+   (cond-> {:uuid (uuid-string (:block/uuid entity))
+            :ident (entity-ident entity)
+            :title (:block/title entity)
+            :type (some-> (:logseq.property/type entity) name)
+            :cardinality (some-> (:db/cardinality entity) name)}
+     (seq (:block/_closed-value-property entity))
+-    (assoc :choices (mapv property-choice-response (:block/_closed-value-property entity)))))
++    (assoc :choices (mapv property-choice-detail-response (property-choices entity)))
++    (= :node (:logseq.property/type entity))
++    (assoc :classes (mapv class-response (sort-by :db/id (:logseq.property/classes entity))))))
+ 
+ (defn- asset-response [entity]
+   {:uuid (uuid-string (:block/uuid entity))
+@@ -691,6 +714,11 @@
+   {:logseq.property/status task-status-idents
+    :logseq.property/priority task-priority-idents})
+ 
++(defn- classes-label
++  "A property's classes as an error names them: #Client or #Service."
++  [classes]
++  (string/join " or " (map #(str "#" (:block/title %)) (sort-by :db/id classes))))
++
+ (defn- title-candidates
+   "The entities a ref property value given by title can mean, or {::error reason}. Another
+   property's choice or value block is never one, nor is a hidden entity. A property limited to
+@@ -717,8 +745,7 @@
+         own-value? #(= (:db/id property) (:db/id (:logseq.property/created-from-property %)))]
+     (cond
+       (and (seq found) (empty? of-class))
+-      {::error (str "no " (string/join " or " (map #(str "#" (:block/title %)) (sort-by :db/id classes)))
+-                    " object titled " (pr-str value))}
++      {::error (str "no " (classes-label classes) " object titled " (pr-str value))}
+       (every? own-value? ranked) (take 1 (sort-by :db/id ranked))
+       :else ranked)))
+ 
+@@ -847,6 +874,18 @@
+       (when (and (number? n) (js/isFinite n))
+         (str n)))))
+ 
++(defn- class-refusal
++  "{::error reason} when `property` is limited to classes and the entity with db id `id` is an
++  object of none of them (nor of a tag extending one), else nil. A title only ever resolves among
++  the classes' objects (title-candidates); this holds a value given by UUID, ident or db id to the
++  same rule, as the app's picker does."
++  [db property value id]
++  (let [classes (:logseq.property/classes property)]
++    (when (and (seq classes) (number? id)
++               (not (some #(db-db/class-instance? % (d/entity db id)) classes)))
++      {::error (str "no " (classes-label classes) " object "
++                    (if (keyword? value) (subs (str value) 1) (str value)))})))
++
+ (defn- prepare-ref-property-value [db property-ident value e2ee? scope]
+   (let [property (d/entity db property-ident)]
+     (cond
+@@ -859,7 +898,8 @@
+            (db-property-type/url? value))
+       (own-url-value db property value scope)
+       :else
+-      (resolve-ref-entity db property-ident value))))
++      (let [resolved (resolve-ref-entity db property-ident value)]
++        (or (class-refusal db property value resolved) resolved)))))
+ 
+ (defn- type-refusal
+   "Why `property`'s type refuses `value`, as the outliner's own validator would when writing it,
+@@ -1095,16 +1135,18 @@
+ 
+ (defn- rejecting
+   "Calls `write`, answering 400 when it is rejected: by `reject!`, or by the outliner refusing a change
+-  with a user-facing notification (such as editing a built-in node). Other errors propagate."
++  with a user-facing notification (such as editing a built-in node). A write that didn't store what
++  it was asked to (verify-property-schema!) answers 500. Other errors propagate."
+   [write]
+   (try
+     (write)
+     (catch :default error
+       (let [data (ex-data error)]
+-        (if-let [message (or (::rejected data)
+-                             (when (= :notification (:type data)) (get-in data [:payload :message])))]
+-          (http/bad-request message)
+-          (throw error))))))
++        (cond
++          (::unverified data) (http/error-response (::unverified data) 500)
++          (or (::rejected data) (= :notification (:type data)))
++          (http/bad-request (or (::rejected data) (get-in data [:payload :message])))
++          :else (throw error))))))
+ 
+ (defn- dry-run-conn
+   "A throwaway copy of the graph: writes to it are validated as real ones are, but never stored."
+@@ -1920,6 +1962,112 @@
+           (http/json-response nil (merge (asset-response asset) link))))
+       (http/not-found))))
+ 
++;; Property schema writes (createProperty, updateProperty). Every field is checked against the graph
++;; first, keeping the first refusal per entry; any refusal writes nothing. The writes then run in one
++;; atomic-write!, so a call is one tx id, and the property is read back from the graph afterwards.
++
++(defn- refusals-message
++  "Refusals [{:entry :reason}] as `entry: reason`, joined with \"; \"."
++  [refusals]
++  (string/join "; " (map (fn [{:keys [entry reason]}] (str entry ": " reason)) refusals)))
++
++(defn- resolve-tag-selector
++  "The tag a selector names by UUID, ident or title, or nil. Only tags count, so a page with the
++  same title never matches. A title matches exactly, else ignoring case."
++  [db selector]
++  (when (non-blank-string? selector)
++    (let [tag-entity (fn [entity] (when (and entity (tag? entity) (not (entity-util/hidden? entity))) entity))
++          among-tags (fn [datoms] (->> datoms (map #(d/entity db (:e %))) (keep tag-entity) (sort-by :db/id) first))]
++      (or (when (common-util/uuid-string? selector) (tag-entity (d/entity db [:block/uuid (uuid selector)])))
++          (when (qualified-keyword? (keyword selector)) (tag-entity (d/entity db (keyword selector))))
++          (among-tags (d/datoms db :avet :block/title selector))
++          (among-tags (d/datoms db :avet :block/name (string/lower-case selector)))))))
++
++(defn- validate-classes
++  "Resolves the tag `selectors` of `field` (classes, classes.add, ...): {:ok [tag ...]}, or
++  {:error message} naming each entry that isn't a tag."
++  [db field selectors]
++  (if-not (and (sequential? selectors) (every? string? selectors))
++    {:error (str field ": give a list of tag UUIDs, idents or titles")}
++    (let [tags (mapv #(resolve-tag-selector db %) selectors)
++          refusals (keep-indexed (fn [index [selector tag]]
++                                   (when-not tag {:entry (str field " " index) :reason (str "no tag " (pr-str selector))}))
++                                 (map vector selectors tags))]
++      (if (seq refusals) {:error (refusals-message refusals)} {:ok tags}))))
++
++(defn- classes-change
++  "updateProperty's classes field as [mode selectors], when it holds exactly one of set, add or
++  remove; else nil."
++  [classes]
++  (let [modes (when (map? classes) (filterv #(contains? classes %) [:set :add :remove]))]
++    (when (and (= 1 (count modes)) (= 1 (count classes)))
++      [(first modes) (get classes (first modes))])))
++
++(defn- validate-property-classes
++  "Checks a classes field for the property titled `title`, judged on `type`, its type once the call
++  has applied. `mode` is :set, :add or :remove, or nil for createProperty's list (a set).
++  {:ok {:mode :tags}} or {:error message}."
++  [db title type mode selectors]
++  (if (not= :node type)
++    {:error (str "classes: " title " is not a node property")}
++    (let [resolved (validate-classes db (cond-> "classes" mode (str "." (name mode))) selectors)]
++      (if (:error resolved) resolved {:ok {:mode (or mode :set) :tags (:ok resolved)}}))))
++
++(defn- class-tx
++  "The datoms that give the property with db id `property-id`, which has the classes `current`,
++  the classes `mode` asks for. :set retracts what isn't listed."
++  [property-id current mode tags]
++  (let [current-ids (set (map :db/id current))
++        ids (set (map :db/id tags))
++        add (fn [ids] (map #(vector :db/add property-id :logseq.property/classes %) ids))
++        retract (fn [ids] (map #(vector :db/retract property-id :logseq.property/classes %) ids))]
++    (vec (case mode
++           :set (concat (retract (remove ids current-ids)) (add (remove current-ids ids)))
++           :add (add (remove current-ids ids))
++           :remove (retract (filter current-ids ids))))))
++
++(defn- expected-classes
++  "The class UUIDs a property should have after class-tx."
++  [current mode tags]
++  (let [current (set (map :block/uuid current))
++        uuids (set (map :block/uuid tags))]
++    (case mode
++      :set uuids
++      :add (into current uuids)
++      :remove (reduce disj current uuids))))
++
++(defn- out-of-class-count
++  "How many visible holders of `property` hold a value that is an object of none of its classes,
++  which the app's picker and value writes would now refuse; 0 when it has no classes. One :avet
++  scan of the property's datoms."
++  [db property]
++  (let [classes (:logseq.property/classes property)]
++    (if (empty? classes)
++      0
++      (->> (d/datoms db :avet (:db/ident property))
++           (remove (fn [datom] (some #(db-db/class-instance? % (d/entity db (:v datom))) classes)))
++           (map :e)
++           distinct
++           (remove #(entity-util/hidden? (d/entity db %)))
++           count))))
++
++(defn- verify-property-schema!
++  "Re-reads the property from `db` after a write and throws, answered as a 500 by `rejecting`, when
++  what the call asked for isn't stored. `expected` may hold :classes, a set of class UUIDs."
++  [db property-uuid {:keys [classes]}]
++  (let [property (d/entity db [:block/uuid property-uuid])
++        stored (set (map :block/uuid (:logseq.property/classes property)))
++        title (fn [id] (or (:block/title (d/entity db [:block/uuid id])) (str id)))
++        problems (when (and (some? classes) (not= classes stored))
++                   (cond-> []
++                     (seq (remove stored classes))
++                     (conj (str "classes missing " (string/join ", " (map title (remove stored classes)))))
++                     (seq (remove classes stored))
++                     (conj (str "classes not removed " (string/join ", " (map title (remove classes stored)))))))]
++    (when (seq problems)
++      (let [message (str "the write did not store what was asked: " (string/join "; " problems))]
++        (throw (ex-info message {::unverified message}))))))
++
+ (defn- handle-properties-and-search
+   [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+@@ -1931,14 +2079,31 @@
+ 
+     :semantic/properties-create
+     (p/let [body (body-clj request)]
+-      (if (or (not (non-blank-string? (:title body))) (not (valid-property-schema? body)))
+-        (http/bad-request "invalid property schema")
+-        (let [property (authored-write! conn creator outliner-property/upsert-property! nil
+-                        {:logseq.property/type (keyword (or (:type body) "default"))
+-                         :db/cardinality (keyword (or (:cardinality body) "db.cardinality/one"))}
+-                        {:property-name (:title body) :e2ee? e2ee? :encrypted-name (:name body)})]
+-          (broadcast-change! self)
+-          (http/json-response nil (property-response property) 201))))
++      (let [type (keyword (or (:type body) "default"))
++            classes (when (contains? body :classes)
++                      (validate-property-classes db (:title body) type nil (:classes body)))
++            {:keys [mode tags]} (:ok classes)]
++        (cond
++          (or (not (non-blank-string? (:title body))) (not (valid-property-schema? body)))
++          (http/bad-request "invalid property schema")
++          (:error classes) (http/bad-request (:error classes))
++          :else
++          (rejecting
++           #(let [ident (atomic-write! conn creator false :upsert-property
++                         (fn [tx-conn]
++                           (let [property (outliner-property/upsert-property!
++                                           tx-conn nil
++                                           {:logseq.property/type type
++                                            :db/cardinality (keyword (or (:cardinality body) "db.cardinality/one"))}
++                                           {:property-name (:title body) :e2ee? e2ee? :encrypted-name (:name body)})
++                                 tx (when classes (class-tx (:db/id property) nil mode tags))]
++                             (when (seq tx) (ldb/transact! tx-conn tx))
++                             (:db/ident property))))
++                  property (d/entity @conn ident)]
++              (when classes
++                (verify-property-schema! @conn (:block/uuid property) {:classes (expected-classes nil mode tags)}))
++              (broadcast-change! self)
++              (http/json-response nil (property-response property) 201))))))
+ 
+     :semantic/properties-get
+     (if-let [property (resolve-property db (:property-id path-params))]
+@@ -1948,16 +2113,37 @@
+     :semantic/properties-update
+     (p/let [body (body-clj request)
+             property (resolve-property db (:property-id path-params))]
+-      (if (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
+-        (http/bad-request "invalid property-id or update")
+-        (let [schema (cond-> {}
+-                       (:type body) (assoc :logseq.property/type (keyword (:type body)))
+-                       (:cardinality body) (assoc :db/cardinality (keyword (:cardinality body))))
+-              updated (authored-write! conn creator outliner-property/upsert-property! (:db/ident property) schema
+-                       (cond-> {:e2ee? e2ee? :encrypted-name (:name body)}
+-                         (:title body) (assoc :property-name (:title body))))]
+-          (broadcast-change! self)
+-          (http/json-response nil (property-response updated)))))
++      (let [type (if (:type body) (keyword (:type body)) (:logseq.property/type property))
++            change (classes-change (:classes body))
++            classes (when (contains? body :classes)
++                      (if change
++                        (validate-property-classes db (:block/title property) type (first change) (second change))
++                        {:error "classes: give exactly one of set, add or remove"}))
++            {:keys [mode tags]} (:ok classes)
++            current (:logseq.property/classes property)]
++        (cond
++          (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
++          (http/bad-request "invalid property-id or update")
++          (:error classes) (http/bad-request (:error classes))
++          :else
++          (rejecting
++           #(let [schema (cond-> {}
++                           (:type body) (assoc :logseq.property/type (keyword (:type body)))
++                           (:cardinality body) (assoc :db/cardinality (keyword (:cardinality body))))
++                  _ (atomic-write! conn creator false :update-property
++                     (fn [tx-conn]
++                       (when (some (fn [k] (contains? body k)) [:title :name :type :cardinality])
++                         (outliner-property/upsert-property! tx-conn (:db/ident property) schema
++                                                             (cond-> {:e2ee? e2ee? :encrypted-name (:name body)}
++                                                               (:title body) (assoc :property-name (:title body)))))
++                       (let [tx (when classes (class-tx (:db/id property) current mode tags))]
++                         (when (seq tx) (ldb/transact! tx-conn tx)))))
++                  updated (d/entity @conn (:db/ident property))]
++              (when classes
++                (verify-property-schema! @conn (:block/uuid property) {:classes (expected-classes current mode tags)}))
++              (broadcast-change! self)
++              (http/json-response nil (cond-> (property-response updated)
++                                        classes (assoc :out_of_class (out-of-class-count @conn updated)))))))))
+ 
+     :semantic/properties-delete
+     (if-let [property (resolve-property db (:property-id path-params))]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index c64cc9f..83891f7 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -107,7 +107,7 @@
+   "How the property-writing operations resolve a value and what they refuse. One copy, shared by
+   every operation that sets properties, so the descriptions can't drift apart."
+   (str "A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed."
+-       " A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs."
++       " A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags (its classes) takes only an object with one of those tags or a tag extending one, however it is given: a title only other entities have, and a UUID, ident or db id of anything else, are refused. A title several pages share is refused with their UUIDs."
+        " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
+        " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
+ 
+@@ -157,9 +157,9 @@
+    "updateTag" ["Update a tag" "Renames one tag identified by UUID."]
+    "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+-   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+-   "getProperty" ["Get a property definition" "Returns one property definition by UUID."]
+-   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
++   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, and for a node property the classes (tags) it is limited to, in one transaction. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
++   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, and a node property's classes: classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
+    "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+@@ -254,6 +254,9 @@
+   {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
+    :description "Text a page's first top-level block starts with when it is the page's summary."})
+ 
++(def ^:private tag-selectors-schema
++  {:type "array" :items {:type "string"} :description "Tag UUIDs, idents or titles."})
++
+ (def ^:private encrypted-name-schema
+   {:type "string"
+    :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
+@@ -336,10 +339,17 @@
+     "createProperty" {:required ["title"]
+                       :properties {:title {:type "string"} :name encrypted-name-schema
+                                    :type {:$ref "#/components/schemas/PropertyType"}
+-                                   :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}}}
++                                   :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}
++                                   :classes (assoc tag-selectors-schema
++                                                   :description "For a node property only: the tags whose objects it takes, each by UUID, ident or title.")}}
+     "updateProperty" {:properties {:title {:type "string"} :name encrypted-name-schema
+                                    :type {:$ref "#/components/schemas/PropertyType"}
+-                                    :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}}}
++                                   :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}
++                                   :classes {:type "object"
++                                             :description "For a node property only: give exactly one of set (replace the classes; [] removes the limit), add or remove."
++                                             :properties {:set tag-selectors-schema
++                                                          :add tag-selectors-schema
++                                                          :remove tag-selectors-schema}}}}
+     "encryptE2eeText" {:required ["key" "texts"]
+                        :properties {:texts {:type "array" :minItems 1 :maxItems 100
+                                             :items {:type "string"}}
+@@ -683,7 +693,12 @@
+                                 :properties {:uuid {:type "string"}
+                                              :ident {:type "string"}
+                                              :title {:type "string"}
+-                                             :value {}}}
++                                             :value {}
++                                             :icon {:type "object"
++                                                    :description "The choice's icon, when set (getProperty and listProperties)."
++                                                    :properties {:type {:type "string"} :id {:type "string"}}}
++                                             :description {:type "string"
++                                                           :description "The choice's description, when set (getProperty and listProperties)."}}}
+                :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
+                                   :properties {:uuid {:type "string"}
+                                                :ident {:type "string"}
+@@ -691,8 +706,16 @@
+                                                :type {:type "string"}
+                                                :cardinality {:type "string"}
+                                                :choices {:type "array"
+-                                                         :description "The current user-extensible choices for this property."
+-                                                         :items {:$ref "#/components/schemas/PropertyChoice"}}}}
++                                                         :description "The current user-extensible choices for this property, in the order the editor lists them."
++                                                         :items {:$ref "#/components/schemas/PropertyChoice"}}
++                                               :classes {:type "array"
++                                                         :description "For a node property, the tags whose objects it takes; empty when it takes any node."
++                                                         :items {:type "object" :required ["uuid" "title"]
++                                                                 :properties {:uuid {:type "string"}
++                                                                              :title {:type "string"}
++                                                                              :ident {:type "string"}}}}
++                                               :out_of_class {:type "integer"
++                                                              :description "On updateProperty with classes: how many holders have a value that is an object of none of the classes."}}}
+                :PropertyType {:type "string"
+                               :enum ["default" "number" "date" "datetime" "checkbox" "url" "node" "asset"
+                                      "map" "json" "string"]}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+new file mode 100644
+index 0000000..97b60cd
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+@@ -0,0 +1,427 @@
++(ns logseq.db-sync.semantic-property-schema-test
++  "A property's schema through createProperty, updateProperty and getProperty: its choices read
++  back in editor order with icon and description, and a node property's classes. A value given by
++  UUID, ident or db id is checked against the classes as a title already is, on every write path.
++  The graph has tags Client and Service, Client pages Acme and Bolt, a Service page Audit, and a
++  decoy plain page Acme Ltd."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.semantic :as semantic]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- ident-str [ident] (subs (str ident) 1))
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid id]))
++
++(defn- with-graph
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++              tag! (fn [title] (p/let [r (request! self "POST" "/semantic/tags" {:title title})]
++                                 (entity conn (uuid (get-in r [:body :uuid])))))
++              client (tag! "Client")
++              service (tag! "Service")
++              vip (tag! "VIP")
++              _ (d/transact! conn [[:db/add (:db/id vip) :logseq.property.class/extends (:db/id client)]])
++              page-id (random-uuid)
++              [acme bolt audit acme-ltd zed] (repeatedly 5 random-uuid)
++              blocks (vec (repeatedly 8 random-uuid))
++              page (fn [id title tags]
++                     {:block/uuid id :block/name (string/lower-case title) :block/title title
++                      :block/tags (into #{:logseq.class/Page} tags) :block/created-at 1 :block/updated-at 1})
++              _ (d/transact! conn (concat
++                                   [(page page-id "Notes" [])
++                                    ;; The decoy is created before the Client pages, so a graph-wide
++                                    ;; title lookup would find it first.
++                                    (page acme-ltd "Acme Ltd" [])
++                                    (page acme "Acme" [(:db/id client)])
++                                    (page bolt "Bolt" [(:db/id client)])
++                                    (page audit "Audit" [(:db/id service)])
++                                    (page zed "Zed" [(:db/id vip)])]
++                                   (map-indexed (fn [index id]
++                                                  {:block/uuid id :block/title (str "Block " index)
++                                                   :block/page [:block/uuid page-id]
++                                                   :block/parent [:block/uuid page-id]
++                                                   :block/order (str "a" index)
++                                                   :block/created-at 1 :block/updated-at 1})
++                                                blocks)))
++              for-client (outliner-property/upsert-property!
++                          conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                          {:property-name "for-client"})
++              clients (outliner-property/upsert-property!
++                       conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/many}
++                       {:property-name "clients"})
++              grade (outliner-property/upsert-property!
++                     conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                     {:property-name "grade"})]
++        (run {:conn conn :self self :page-id page-id :blocks blocks
++              :client client :service service :vip vip
++              :acme acme :bolt bolt :audit audit :acme-ltd acme-ltd :zed zed
++              :for-client (:db/ident for-client) :clients (:db/ident clients) :grade (:db/ident grade)}))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- property-path [property]
++  (str "/semantic/properties/" (js/encodeURIComponent (ident-str property))))
++
++(defn- value-path [block-id property]
++  (str "/semantic/blocks/" block-id "/properties/" (js/encodeURIComponent (ident-str property))))
++
++(defn- stored [conn id property]
++  (let [value (get (entity conn id) property)]
++    (if (set? value) (set (map :block/uuid value)) (:block/uuid value))))
++
++(defn- class-uuids [conn property]
++  (set (map :block/uuid (:logseq.property/classes (d/entity @conn property)))))
++
++(defn- restrict! [self property mode tags]
++  (request! self "PATCH" (property-path property) {:classes {mode tags}}))
++
++(deftest get-property-lists-choices-in-editor-order-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [status (outliner-property/upsert-property!
++                        conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                        {:property-name "project-status"})
++                status (:db/ident status)
++                [a b c] (repeatedly 3 random-uuid)
++                ;; Written C, A, B, so datom order is C, A, B; the editor orders by :block/order.
++                _ (outliner-property/upsert-closed-value! conn status {:id c :value "C"})
++                _ (outliner-property/upsert-closed-value! conn status {:id a :value "A"
++                                                                        :icon {:type :emoji :id "rocket"}
++                                                                        :description "The first one"})
++                _ (outliner-property/upsert-closed-value! conn status {:id b :value "B"})
++                _ (d/transact! conn [[:db/add [:block/uuid a] :block/order "a1"]
++                                     [:db/add [:block/uuid b] :block/order "a2"]
++                                     [:db/add [:block/uuid c] :block/order "a3"]])
++                got (request! self "GET" (property-path status) nil)
++                listed (request! self "GET" "/semantic/properties?limit=200" nil)]
++          (is (= 200 (:status got)) (str (:body got)))
++          (is (= ["A" "B" "C"] (mapv :title (get-in got [:body :choices])))
++              "getProperty lists choices in editor order")
++          (is (= [(str a) (str b) (str c)] (mapv :uuid (get-in got [:body :choices]))))
++          (let [first-choice (first (get-in got [:body :choices]))]
++            (is (= {:type "emoji" :id "rocket"} (:icon first-choice)) "a choice's icon reads back")
++            (is (= "The first one" (:description first-choice)) "a choice's description reads back"))
++          (is (not (contains? (second (get-in got [:body :choices])) :icon))
++              "a choice without an icon has none")
++          (is (= ["A" "B" "C"]
++                 (->> (get-in listed [:body :properties])
++                      (some #(when (= (ident-str status) (:ident %)) %))
++                      :choices
++                      (mapv :title)))
++              "listProperties lists them in the same order"))))))
++
++(deftest classes-set-restricts-node-property-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks client service vip acme audit zed for-client clients]}]
++        (let [[b0 b1 b2 b3 b4 b5 b6 b7] blocks
++              audit-id (:db/id (entity conn audit))]
++          (p/let [restricted (restrict! self for-client :set ["Client"])
++                  _ (restrict! self clients :set [(str (:block/uuid client))])
++                  by-title (request! self "PUT" (value-path b0 for-client) {:value "Audit"})
++                  by-uuid (request! self "PUT" (value-path b1 for-client) {:value (str audit)})
++                  by-ident (request! self "PUT" (value-path b2 for-client) {:value (ident-str (:db/ident service))})
++                  by-db-id (request! self "PUT" (value-path b3 for-client) {:value audit-id})
++                  missing (request! self "PUT" (value-path b3 for-client) {:value (str (random-uuid))})
++                  mixed-list (request! self "PUT" (value-path b4 clients) {:value [(str acme) (str audit)]})
++                  accepted (request! self "PUT" (value-path b5 for-client) {:value (str acme)})
++                  inherited (request! self "PUT" (value-path b6 for-client) {:value (str zed)})
++                  accepted-list (request! self "PUT" (value-path b7 clients) {:value [(str acme) (str zed)]})
++                  got (request! self "GET" (property-path for-client) nil)]
++            (is (= 200 (:status restricted)) (str (:body restricted)))
++            (is (= [{:uuid (str (:block/uuid client)) :title "Client" :ident (ident-str (:db/ident client))}]
++                   (get-in restricted [:body :classes]))
++                "updateProperty answers the classes it set")
++            (is (= [(str (:block/uuid client))] (mapv :uuid (get-in got [:body :classes])))
++                "getProperty reads the classes back")
++            (testing "a value that isn't a Client object is refused however it is given"
++              (is (= 400 (:status by-title)) (str (:body by-title)))
++              (is (= "no #Client object titled \"Audit\"" (get-in by-title [:body :error]))
++                  "a title keeps its own wording")
++              (is (= "property value must resolve to an existing entity by UUID, ident, or title"
++                     (get-in missing [:body :error]))
++                  "a UUID that names nothing is not reported as out of class")
++              (is (= 400 (:status by-uuid)) (str (:body by-uuid)))
++              (is (= (str "no #Client object " audit) (get-in by-uuid [:body :error])))
++              (is (= 400 (:status by-ident)) (str (:body by-ident)))
++              (is (string/includes? (str (get-in by-ident [:body :error])) "no #Client object")
++                  (str (:body by-ident)))
++              (is (= 400 (:status by-db-id)) (str (:body by-db-id)))
++              (is (= 400 (:status mixed-list)) (str (:body mixed-list)))
++              (doseq [id [b0 b1 b2 b3]]
++                (is (nil? (stored conn id for-client)) "nothing is stored"))
++              (is (nil? (stored conn b4 clients)) "nothing of a refused list is stored"))
++            (testing "a Client object by UUID is accepted, also through a tag that extends Client"
++              (is (= 200 (:status accepted)) (str (:body accepted)))
++              (is (= acme (stored conn b5 for-client)))
++              (is (= 200 (:status inherited)) (str (:body inherited)))
++              (is (= zed (stored conn b6 for-client)))
++              (is (= 200 (:status accepted-list)) (str (:body accepted-list)))
++              (is (= #{acme zed} (stored conn b7 clients))))
++            (is (some? vip))))))))
++
++(deftest class-check-leaves-other-properties-alone-test
++  ;; The class check runs only for a property with classes: an unrestricted node property and a
++  ;; property with choices resolve UUIDs as before, and a built-in property limited to Page
++  ;; (Assignee) now refuses a block given by UUID, as the app's picker does.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks acme audit for-client]}]
++        (let [[b0 b1 b2 b3] blocks]
++          (p/let [status (outliner-property/upsert-property!
++                          conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                          {:property-name "stage"})
++                  status (:db/ident status)
++                  active (random-uuid)
++                  _ (outliner-property/upsert-closed-value! conn status {:id active :value "Active"})
++                  unrestricted (request! self "PUT" (value-path b0 for-client) {:value (str audit)})
++                  choice (request! self "PUT" (value-path b1 status) {:value (str active)})
++                  assignee-block (request! self "PUT" (value-path b2 :logseq.property/assignee) {:value (str (nth blocks 7))})
++                  assignee-page (request! self "PUT" (value-path b3 :logseq.property/assignee) {:value (str acme)})]
++            (is (= 200 (:status unrestricted)) (str (:body unrestricted)))
++            (is (= audit (stored conn b0 for-client)))
++            (is (= 200 (:status choice)) (str (:body choice)))
++            (is (= active (stored conn b1 status)))
++            (is (= 400 (:status assignee-block)) (str (:body assignee-block)))
++            (is (string/includes? (str (get-in assignee-block [:body :error])) "no #Page object")
++                (str (:body assignee-block)))
++            (is (= 200 (:status assignee-page)) (str (:body assignee-page)))
++            (is (= #{acme} (stored conn b3 :logseq.property/assignee)))))))))
++
++(deftest class-check-covers-every-write-path-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page-id blocks audit for-client]}]
++        (let [[b0 b1] blocks
++              fc (ident-str for-client)
++              tree-child (random-uuid)
++              batch-child (random-uuid)]
++          (p/let [_ (restrict! self for-client :set ["Client"])
++                  batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                      {:entries [{:block-id (str b0) :property-id fc :value "Acme"}
++                                                 {:block-id (str b1) :property-id fc :value (str audit)}]})
++                  tree (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str page-id)
++                                  :blocks [{:uuid (str tree-child) :title "Tree child"
++                                            :properties {fc (str audit)}}]})
++                  batch-tree (request! self "POST" "/semantic/block-trees/batch"
++                                       {:entries [{:target-id (str page-id)
++                                                   :blocks [{:uuid (str batch-child) :title "Batch child"
++                                                             :properties {fc (str audit)}}]}]})]
++            (is (= 400 (:status batch-set)) (str (:body batch-set)))
++            (is (= (str "entry 1: no #Client object " audit) (get-in batch-set [:body :error]))
++                "batchSetBlockProperty names the entry")
++            (is (nil? (stored conn b0 for-client)) "the batch's valid entry isn't written either")
++            (is (nil? (stored conn b1 for-client)))
++            (is (= 400 (:status tree)) (str (:body tree)))
++            (is (string/includes? (str (get-in tree [:body :error])) (str "no #Client object " audit)))
++            (is (nil? (entity conn tree-child)) "insertBlockTree writes nothing")
++            (is (= 400 (:status batch-tree)) (str (:body batch-tree)))
++            (is (string/includes? (str (get-in batch-tree [:body :error])) (str "no #Client object " audit)))
++            (is (nil? (entity conn batch-child)) "batchInsertBlockTrees writes nothing")))))))
++
++(deftest classes-add-and-remove-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks client service audit for-client]}]
++        (let [[b0 b1 b2] blocks]
++          (p/let [_ (restrict! self for-client :set ["Client"])
++                  added (restrict! self for-client :add [(ident-str (:db/ident service))])
++                  by-uuid (request! self "PUT" (value-path b0 for-client) {:value (str audit)})
++                  removed (restrict! self for-client :remove ["Client" (str (:block/uuid service))])
++                  _ (restrict! self for-client :set ["Client"])
++                  refused (request! self "PUT" (value-path b1 for-client) {:value (str audit)})
++                  cleared (restrict! self for-client :set [])
++                  after-clear (request! self "PUT" (value-path b2 for-client) {:value (str audit)})]
++            (is (= 200 (:status added)) (str (:body added)))
++            (is (= #{"Client" "Service"} (set (map :title (get-in added [:body :classes])))))
++            (is (= 200 (:status by-uuid)) (str (:body by-uuid)))
++            (is (= audit (stored conn b0 for-client)) "Audit is accepted once Service is added")
++            (is (= 200 (:status removed)) (str (:body removed)))
++            (is (= [] (get-in removed [:body :classes])) "removing both clears the restriction")
++            (is (= 400 (:status refused)) (str (:body refused)))
++            (is (= 200 (:status cleared)) (str (:body cleared)))
++            (is (= [] (get-in cleared [:body :classes])))
++            (is (empty? (class-uuids conn for-client)) "{set: []} clears the restriction")
++            (is (= 200 (:status after-clear)) (str (:body after-clear)))
++            (is (= audit (stored conn b2 for-client)))
++            (is (some? client))))))))
++
++(deftest create-property-with-classes-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self client]}]
++        (p/let [created (request! self "POST" "/semantic/properties"
++                                  {:title "engagement-partner" :type "node"
++                                   :classes [(str (:block/uuid client))]})
++                got (request! self "GET" (str "/semantic/properties/" (get-in created [:body :uuid])) nil)
++                property (entity conn (uuid (get-in created [:body :uuid])))]
++          (is (= 201 (:status created)) (str (:body created)))
++          (is (= ["Client"] (mapv :title (get-in created [:body :classes]))))
++          (is (= ["Client"] (mapv :title (get-in got [:body :classes]))) "getProperty reads the classes back")
++          (is (= #{(:block/uuid client)} (class-uuids conn (:db/ident property)))))))))
++
++(deftest out-of-class-reported-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks acme audit acme-ltd for-client clients]}]
++        (let [[b0 b1 b2 b3 b4] blocks
++              id (fn [uuid] (:db/id (entity conn uuid)))]
++          (p/let [_ (outliner-property/set-block-property! conn [:block/uuid b0] for-client (id acme))
++                  _ (outliner-property/set-block-property! conn [:block/uuid b1] for-client (id audit))
++                  ;; A recycled holder doesn't count.
++                  _ (outliner-property/set-block-property! conn [:block/uuid b3] for-client (id audit))
++                  _ (d/transact! conn [[:db/add [:block/uuid b3] :logseq.property/deleted-at 1]])
++                  ;; A holder with two out-of-class values counts once.
++                  _ (outliner-property/batch-set-property! conn [(id b4)] clients (id audit) {:entity-id? true})
++                  _ (outliner-property/batch-set-property! conn [(id b4)] clients (id acme-ltd) {:entity-id? true})
++                  many (restrict! self clients :set ["Client"])
++                  restricted (restrict! self for-client :set ["Client"])
++                  service-too (restrict! self for-client :add ["Service"])
++                  cleared (restrict! self for-client :set [])]
++            (is (= 200 (:status restricted)) (str (:body restricted)))
++            (is (= 1 (get-in restricted [:body :out_of_class])) "Audit is counted, Acme and a recycled holder are not")
++            (is (= 2 (count (get (entity conn b4) clients))))
++            (is (= 1 (get-in many [:body :out_of_class])) "a holder is counted once")
++            (is (= acme (stored conn b0 for-client)) "existing values stay")
++            (is (= audit (stored conn b1 for-client)) "existing values stay, even out of class")
++            (is (nil? (stored conn b2 for-client)))
++            (is (= 0 (get-in service-too [:body :out_of_class])))
++            (is (= 0 (get-in cleared [:body :out_of_class])) "no classes, nothing out of class")))))))
++
++(deftest classes-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self client for-client grade]}]
++        (p/let [not-node (restrict! self grade :set ["Client"])
++                unknown (restrict! self for-client :add ["Client" "Clinet"])
++                decoy (restrict! self for-client :set ["Acme Ltd"])
++                two-modes (request! self "PATCH" (property-path for-client)
++                                    {:classes {:set ["Client"] :add ["Service"]}})
++                no-mode (request! self "PATCH" (property-path for-client) {:classes {}})
++                not-list (request! self "PATCH" (property-path for-client) {:classes {:set "Client"}})
++                extra-key (request! self "PATCH" (property-path for-client) {:classes {:set ["Client"] :replace ["Service"]}})
++                two-unknown (restrict! self for-client :add ["Clinet" "Client" "Servise"])
++                create-not-node (request! self "POST" "/semantic/properties"
++                                          {:title "rating" :type "default" :classes ["Client"]})
++                create-unknown (request! self "POST" "/semantic/properties"
++                                         {:title "partner" :type "node" :classes ["Clinet"]})
++                type-change (request! self "PATCH" (property-path grade) {:type "node" :classes {:set ["Client"]}})]
++          (is (= 400 (:status not-node)) (str (:body not-node)))
++          (is (= "classes: grade is not a node property" (get-in not-node [:body :error])))
++          (is (= 400 (:status unknown)) (str (:body unknown)))
++          (is (= "classes.add 1: no tag \"Clinet\"" (get-in unknown [:body :error])))
++          (is (= 400 (:status decoy)) (str (:body decoy)))
++          (is (= "classes.set 0: no tag \"Acme Ltd\"" (get-in decoy [:body :error])) "a page is not a tag")
++          (is (= 400 (:status two-modes)) (str (:body two-modes)))
++          (is (= "classes: give exactly one of set, add or remove" (get-in two-modes [:body :error])))
++          (is (= 400 (:status no-mode)) (str (:body no-mode)))
++          (is (= 400 (:status not-list)) (str (:body not-list)))
++          (is (= "classes.set: give a list of tag UUIDs, idents or titles" (get-in not-list [:body :error])))
++          (is (= 400 (:status extra-key)) (str (:body extra-key)))
++          (is (= "classes: give exactly one of set, add or remove" (get-in extra-key [:body :error])))
++          (is (= "classes.add 0: no tag \"Clinet\"; classes.add 2: no tag \"Servise\"" (get-in two-unknown [:body :error]))
++              "every entry that isn't a tag is named")
++          (is (empty? (class-uuids conn for-client)) "no refused call wrote classes")
++          (is (= 400 (:status create-not-node)) (str (:body create-not-node)))
++          (is (= "classes: rating is not a node property" (get-in create-not-node [:body :error])))
++          (is (= 400 (:status create-unknown)) (str (:body create-unknown)))
++          (is (= "classes 0: no tag \"Clinet\"" (get-in create-unknown [:body :error])))
++          (is (empty? (d/datoms @conn :avet :block/title "rating")) "a refused create writes nothing")
++          (is (empty? (d/datoms @conn :avet :block/title "partner")))
++          (is (= 200 (:status type-change))
++              (str "a type change and classes in one call is judged on the new type: " (:body type-change)))
++          (is (= :node (:logseq.property/type (d/entity @conn grade))))
++          (is (= #{(:block/uuid client)} (class-uuids conn grade))))))))
++
++(deftest update-property-qualified-ident-path-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self client for-client]}]
++        (is (string/includes? (ident-str for-client) "/"))
++        (p/let [response (request! self "PATCH" (property-path for-client) {:classes {:set ["Client"]}})]
++          (is (= 200 (:status response)) (str (:body response)))
++          (is (= #{(:block/uuid client)} (class-uuids conn for-client))))))))
++
++(deftest classes-write-is-one-transaction-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self client]}]
++        (let [reports (atom [])]
++          (d/listen! conn ::reports (fn [report] (when (seq (:tx-data report)) (swap! reports conj report))))
++          (p/let [created (request! self "POST" "/semantic/properties"
++                                    {:title "engagement-partner" :type "node" :classes ["Client"]})
++                  _ (d/unlisten! conn ::reports)
++                  tx-data (mapcat :tx-data @reports)
++                  property-id (:db/id (entity conn (uuid (get-in created [:body :uuid]))))]
++            (is (= 201 (:status created)) (str (:body created)))
++            (is (= 1 (count @reports)) "one transaction")
++            (is (= 1 (count (distinct (map :tx tx-data)))) "one tx id")
++            (is (some #(and (= property-id (:e %)) (= :logseq.property/classes (:a %))
++                            (= (:db/id client) (:v %)))
++                      tx-data)
++                "the classes are in the property's own transaction")))))))
++
++(deftest class-selector-resolves-among-tags-test
++  ;; A class is a tag given by UUID, ident or title: a title matches exactly first, then ignoring
++  ;; case, and a recycled tag is not one.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self service for-client]}]
++        (p/let [shouting (random-uuid)
++                gone (random-uuid)
++                _ (d/transact! conn [{:block/uuid shouting :block/name "client" :block/title "CLIENT"
++                                      :block/tags #{:logseq.class/Tag} :block/created-at 1 :block/updated-at 1}
++                                     {:block/uuid gone :block/name "gone" :block/title "Gone"
++                                      :block/tags #{:logseq.class/Tag} :logseq.property/deleted-at 1
++                                      :block/created-at 1 :block/updated-at 1}])
++                lower (restrict! self for-client :set ["service"])
++                lower-classes (class-uuids conn for-client)
++                exact (restrict! self for-client :set ["CLIENT"])
++                exact-classes (class-uuids conn for-client)
++                recycled (restrict! self for-client :set ["Gone"])]
++          (is (= 200 (:status lower)) (str (:body lower)))
++          (is (= #{(:block/uuid service)} lower-classes) "a title matches a tag ignoring case")
++          (is (= 200 (:status exact)) (str (:body exact)))
++          (is (= #{shouting} exact-classes)
++              "an exact title wins over an older tag whose title differs only by case")
++          (is (= 400 (:status recycled)) (str (:body recycled)))
++          (is (= "classes.set 0: no tag \"Gone\"" (get-in recycled [:body :error]))))))))
++
++(deftest property-schema-read-back-test
++  ;; After a write the property is read back; classes that aren't stored as asked answer 500,
++  ;; naming them, rather than success.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn client service for-client]}]
++        (let [verify! #'semantic/verify-property-schema!
++              property-uuid (:block/uuid (d/entity @conn for-client))
++              thrown (fn [expected]
++                       (try (verify! @conn property-uuid expected) nil
++                            (catch :default e (ex-message e))))]
++          (d/transact! conn [[:db/add (:db/id (d/entity @conn for-client)) :logseq.property/classes (:db/id service)]])
++          (is (nil? (thrown {:classes #{(:block/uuid service)}})) "what was asked is stored")
++          (is (nil? (thrown {})) "nothing asked, nothing checked")
++          (is (= "the write did not store what was asked: classes missing Client; classes not removed Service"
++                 (thrown {:classes #{(:block/uuid client)}}))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 4d9e7d2..e1c9ab9 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -18,6 +18,7 @@
+             [logseq.db-sync.semantic-headings-test]
+             [logseq.db-sync.semantic-node-value-read-test]
+             [logseq.db-sync.semantic-today-tz-test]
++            [logseq.db-sync.semantic-property-schema-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
