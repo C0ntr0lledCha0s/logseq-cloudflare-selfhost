@@ -64,9 +64,11 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
     );
   }
 
+  // Upstream's Worker Loader only served its /mcp code mode, which is removed
+  // (patch 0020), so neither plan binds it.
+  delete cfg.worker_loaders;
   if (settings.plan === "free") {
     delete cfg.limits;
-    delete cfg.worker_loaders;
   } else if (settings.plan !== "paid") {
     throw new Error(`unknown plan: ${settings.plan}`);
   }

@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # Post-deploy smoke test. Usage: smoke-test.sh <base-url>
-# Env: SMOKE_PAT (optional personal access token), PLAN (free|paid, default free).
+# Env: SMOKE_PAT (optional personal access token).
 set -euo pipefail
 
 usage() {
-  echo "usage: smoke-test.sh <base-url>   (env: SMOKE_PAT, PLAN=free|paid)" >&2
+  echo "usage: smoke-test.sh <base-url>   (env: SMOKE_PAT)" >&2
   exit 2
 }
 
 [ "$#" -eq 1 ] && [ -n "$1" ] || usage
 base="${1%/}"
-plan="${PLAN:-free}"
-case "$plan" in
-  free | paid) ;;
-  *) usage ;;
-esac
 
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
@@ -53,14 +48,20 @@ fi
 expect_status openapi 200 "$base/openapi.json"
 expect_status unauthenticated-graphs 401 "$base/api/v1/graphs"
 
+# A token that isn't a JWT must be refused. Keep it to this exact shape: a three-part
+# garbage token makes upstream's JWT decoder throw a 500, which is outside this check.
+expect_status jwt-garbage-refused 401 -H 'Authorization: Bearer not-a-jwt' "$base/api/v1/graphs"
+
 if [ -n "${SMOKE_PAT:-}" ]; then
   # PATs are assumed to contain no '"' or '\' (curl config quoting).
   # The token is fed to curl on stdin so it never appears in the process list.
   code="$(printf 'header = "Authorization: Bearer %s"\n' "$SMOKE_PAT" |
     status -K - "$base/api/v1/graphs")"
   if [ "$code" = 200 ]; then pass pat-graphs; else fail pat-graphs "$code"; fi
+else
+  echo "note: SMOKE_PAT is not set, so the allow-list was not checked end to end"
 fi
 
-if [ "$plan" = paid ]; then
-  expect_status mcp-unauthenticated 401 -X POST -H 'content-type: application/json' -d '{}' "$base/mcp"
-fi
+# Upstream's /mcp answered anyone without a token; patch 0020 removes it, so the
+# path falls through to the sync worker's not-found response.
+expect_status upstream-mcp-off 404 -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"

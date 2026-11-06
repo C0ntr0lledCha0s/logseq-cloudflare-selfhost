@@ -21,6 +21,10 @@ const CONNECTOR_INPUTS = {
   GITHUB_CLIENT_SECRET: "ghsecret0123456789abcdef0123456789abcdef01",
   OWNER_GITHUB_USER_ID: "1234567",
 };
+const ALLOWED = "DB_SYNC_ALLOWED_USERS";
+// Made-up Logseq user IDs (never real ones).
+const USER_A = "aaaaaaaa-0000-4000-8000-000000000001";
+const USER_B = "bbbbbbbb-0000-4000-8000-000000000002";
 const ORIGINAL_NAMES = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE",
   "ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "SYNC_HOSTNAME",
@@ -70,6 +74,7 @@ function spawnScript(args, env, cwd = root) {
         ...process.env,
         CLOUDFLARE_API_TOKEN: "", CLOUDFLARE_ACCOUNT_ID: "", SYNC_HOSTNAME: "",
         CONNECTOR_HOSTNAME: "", GITHUB_CLIENT_ID: "", GITHUB_CLIENT_SECRET: "", OWNER_GITHUB_USER_ID: "",
+        DB_SYNC_ALLOWED_USERS: "",
         ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -174,9 +179,11 @@ test("--push sets each secret via gh with the value on stdin only", { timeout: 6
     const calls = all.slice(2);
     const names = [
       "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE",
-      "ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "SYNC_HOSTNAME",
+      "ASSET_LINK_SECRET", "DB_SYNC_ADMIN_TOKEN", "SYNC_HOSTNAME", "DB_SYNC_ALLOWED_USERS",
     ];
     assert.equal(calls.length, names.length);
+    assert.equal(calls.length, 7);
+    assert.match(r.stdout, /Pushed 7 secrets/);
     calls.forEach((c, i) => {
       assert.deepEqual(c.argv, ["secret", "set", names[i], "-R", "expected/repo", "--env", "production"]);
       assert.equal(c.stdin, env[names[i]]);
@@ -232,7 +239,8 @@ const SIX_ORIGINAL = [
   `DB_SYNC_ADMIN_TOKEN=${"c".repeat(64)}`, `SYNC_HOSTNAME=${HOST}`,
 ];
 // An existing .env.local, with a comment, an optional name and odd spacing that must survive.
-const EXISTING = `# my local secrets\n${SIX_ORIGINAL.join("\n")}\n\nSMOKE_PAT=logseq_pat_x  \n# PAT_WORK=\n`;
+const ALLOWED_LINE = "DB_SYNC_ALLOWED_USERS=none";
+const EXISTING = `# my local secrets\n${SIX_ORIGINAL.join("\n")}\n${ALLOWED_LINE}\n\nSMOKE_PAT=logseq_pat_x  \n# PAT_WORK=\n`;
 const writeExisting = (dir, text, mode = 0o644) => {
   writeFileSync(join(dir, ".env.local"), text);
   chmodSync(join(dir, ".env.local"), mode);
@@ -287,7 +295,7 @@ const STATE_SECRETS = {
 test("--add-missing fills missing prompted original names too and handles no trailing newline", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
     const state = SIX_ORIGINAL.filter((l) => l.split("=")[0] in STATE_SECRETS);
-    const existing = `${state.join("\n")}\nSMOKE_PAT=keep`;
+    const existing = `${state.join("\n")}\n${ALLOWED_LINE}\nSMOKE_PAT=keep`;
     writeExisting(dir, existing);
     const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
     assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -413,7 +421,7 @@ test("--add-missing needs an existing .env.local", { timeout: 60000 }, async () 
 
 test("--add-missing refuses a present-but-empty name instead of duplicating it", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
-    const existing = `${SIX_ORIGINAL.join("\n")}\nGITHUB_CLIENT_ID=\n`;
+    const existing = `${SIX_ORIGINAL.join("\n")}\n${ALLOWED_LINE}\nGITHUB_CLIENT_ID=\n`;
     writeExisting(dir, existing);
     const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
     assert.notEqual(r.status, 0);
@@ -471,7 +479,7 @@ test("--add-missing fails and leaves the file unchanged when key generation fail
 
 test("--add-missing treats `export NAME=` and indented `NAME=` lines as present", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
-    const existing = `${SIX_ORIGINAL.map((l) => `export ${l}`).join("\n")}\n  CONNECTOR_HOSTNAME=mcp.example.com\nexport GITHUB_CLIENT_ID=abc\n`;
+    const existing = `${SIX_ORIGINAL.map((l) => `export ${l}`).join("\n")}\nexport ${ALLOWED_LINE}\n  CONNECTOR_HOSTNAME=mcp.example.com\nexport GITHUB_CLIENT_ID=abc\n`;
     writeExisting(dir, existing);
     const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
     assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -484,7 +492,7 @@ test("--add-missing treats `export NAME=` and indented `NAME=` lines as present"
 
 test("--add-missing treats an empty `export NAME=` line as present-but-empty", { timeout: 60000 }, async () => {
   await withDir(async (dir) => {
-    const existing = `${SIX_ORIGINAL.join("\n")}\nexport GITHUB_CLIENT_ID=\n`;
+    const existing = `${SIX_ORIGINAL.join("\n")}\n${ALLOWED_LINE}\nexport GITHUB_CLIENT_ID=\n`;
     writeExisting(dir, existing);
     const r = await run(dir, ["--add-missing"], CONNECTOR_INPUTS);
     assert.notEqual(r.status, 0);
@@ -520,5 +528,131 @@ test("--add-missing accepts a 253-character lowercase CONNECTOR_HOSTNAME", { tim
     const r = await run(dir, ["--add-missing"], { ...CONNECTOR_INPUTS, CONNECTOR_HOSTNAME: host });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.equal(parseEnv(dir).CONNECTOR_HOSTNAME, host);
+  });
+});
+
+// --- DB_SYNC_ALLOWED_USERS ---
+
+test("fresh run writes DB_SYNC_ALLOWED_USERS=none, whatever the environment holds, and says what to do next", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const r = await run(dir, [], { DB_SYNC_ALLOWED_USERS: USER_A });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(parseEnv(dir).DB_SYNC_ALLOWED_USERS, "none");
+    assert.match(r.stdout, /db-sync\/user-not-allowed/);
+    assert.match(r.stdout, /README section 9\.1/);
+  });
+});
+
+test("fresh --push pushes DB_SYNC_ALLOWED_USERS as the seventh secret, with the file's value on stdin", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push"], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((c) => c.argv[0] === "secret");
+    assert.equal(calls.length, 7);
+    assert.deepEqual(calls[6].argv, ["secret", "set", ALLOWED, "-R", "expected/repo", "--env", "production"]);
+    assert.equal(calls[6].stdin, "none");
+  });
+});
+
+// A file with the six original names and nothing else: only DB_SYNC_ALLOWED_USERS is missing.
+const SIX_ONLY = `${SIX_ORIGINAL.join("\n")}\n`;
+const NO_CONNECTOR = { CONNECTOR_HOSTNAME: "x.example.com", GITHUB_CLIENT_ID: "x", GITHUB_CLIENT_SECRET: "x", OWNER_GITHUB_USER_ID: "1" };
+const CONNECTOR_PRESENT = `${CONNECTOR_NAMES.map((n) => `${n}=v`).join("\n")}\n`;
+
+test("--add-missing appends DB_SYNC_ALLOWED_USERS from the environment, never generated, and pushes it", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const existing = SIX_ONLY + CONNECTOR_PRESENT;
+    writeExisting(dir, existing);
+    const { bin, log } = stubGh(dir);
+    // Typed with a space, written without one: a space would break sourcing .env.local.
+    const typed = `${USER_A}, ${USER_B}`;
+    const list = `${USER_A},${USER_B}`;
+    const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: typed, PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const after = readFileSync(join(dir, ".env.local"), "utf8");
+    assert.ok(after.startsWith(existing));
+    assert.equal(after.slice(existing.length), `\n# --- added by scripts/init-env.sh --add-missing ---\nDB_SYNC_ALLOWED_USERS=${list}\n`);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((c) => c.argv[0] === "secret");
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].argv, ["secret", "set", ALLOWED, "-R", "expected/repo", "--env", "production"]);
+    assert.equal(calls[0].stdin, list);
+    assert.match(r.stdout, /Pushed 1 secrets/);
+  });
+});
+
+test("--add-missing does not ask for the connector values when only DB_SYNC_ALLOWED_USERS is missing", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, SIX_ONLY + CONNECTOR_PRESENT);
+    const r = await run(dir, ["--add-missing"], { DB_SYNC_ALLOWED_USERS: "none" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(readFileSync(join(dir, ".env.local"), "utf8"), /\nDB_SYNC_ALLOWED_USERS=none\n$/);
+    assert.match(r.stdout, /db-sync\/user-not-allowed/);
+  });
+});
+
+for (const [name, value] of [
+  ["a non-UUID", "bob"],
+  ["an uppercase UUID", USER_A.toUpperCase()],
+  ["an empty entry", `${USER_A},,${USER_B}`],
+  ["a trailing comma", `${USER_A},`],
+]) {
+  // GITHUB_ACTIONS=true switches check-format to `::error::` on stdout; init-env must still show the error.
+  for (const actions of ["", "true"]) {
+    test(`--add-missing --push rejects ${name} in DB_SYNC_ALLOWED_USERS, writing and pushing nothing (GITHUB_ACTIONS=${actions || "unset"})`, { timeout: 60000 }, async () => {
+      await withDir(async (dir) => {
+        const existing = SIX_ONLY + CONNECTOR_PRESENT;
+        writeExisting(dir, existing);
+        const { bin, log } = stubGh(dir);
+        const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: value, GITHUB_ACTIONS: actions, PATH: `${bin}:${process.env.PATH}` });
+        assert.equal(r.status, 1, r.stdout + r.stderr);
+        assert.match(r.stderr, /^error: DB_SYNC_ALLOWED_USERS entry \d+ of \d+ is not a lowercase UUID/m);
+        assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), existing, "file must be byte-identical");
+        assert.equal(existsSync(log), false, "gh must not be called");
+        assert.ok(!(r.stdout + r.stderr).includes(value), "the value must not be printed");
+      });
+    });
+  }
+}
+
+test("--add-missing without a terminal lists DB_SYNC_ALLOWED_USERS with the other unset inputs", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, SIX_ONLY);
+    const r = await run(dir, ["--add-missing"], { CONNECTOR_HOSTNAME: "mcp.example.com", GITHUB_CLIENT_ID: "abc" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /no terminal: export GITHUB_CLIENT_SECRET, OWNER_GITHUB_USER_ID, DB_SYNC_ALLOWED_USERS\n/);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), SIX_ONLY);
+  });
+});
+
+test("--add-missing leaves an existing DB_SYNC_ALLOWED_USERS line alone, even when the environment differs", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const existing = `${SIX_ONLY}DB_SYNC_ALLOWED_USERS=${USER_B}\n${CONNECTOR_PRESENT}`;
+    writeExisting(dir, existing);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: USER_A, PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), existing);
+    assert.equal(existsSync(log), false, "nothing was added, so nothing is pushed");
+  });
+});
+
+test("a missing DB_SYNC_ALLOWED_USERS is never listed as something to restore from the password manager", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, `${SIX_ONLY.replace(/^TOFU_ENCRYPTION_PASSPHRASE=.*\n/m, "")}`);
+    const r = await run(dir, ["--add-missing"], { ...NO_CONNECTOR, DB_SYNC_ALLOWED_USERS: "none" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /TOFU_ENCRYPTION_PASSPHRASE is missing/);
+    assert.ok(!/DB_SYNC_ALLOWED_USERS is missing/.test(r.stderr));
+  });
+});
+
+test("--add-missing --push names DB_SYNC_ALLOWED_USERS when gh fails to set it", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, SIX_ONLY + CONNECTOR_PRESENT);
+    const { bin } = stubGh(dir, { failOn: ALLOWED });
+    const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: USER_A, PATH: `${bin}:${process.env.PATH}` });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /failed to set DB_SYNC_ALLOWED_USERS/);
   });
 });
