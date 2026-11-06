@@ -1303,10 +1303,10 @@ index c64cc9f..c20b05b 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..9a231b6
+index 0000000..1626fbf
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,2136 @@
+@@ -0,0 +1,2180 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -3081,6 +3081,50 @@ index 0000000..9a231b6
 +            (doseq [response [page-ref type-change number url node checkbox date e2ee not-boolean]]
 +              (is (= 400 (:status response)) (str (:body response))))
 +            (is (true? (= before after)) "no refused call wrote anything")))))))
++
++(deftest convert-values-other-property-values-test
++  ;; Only old data has a holder pointing at a value another property owns: another text property's
++  ;; value block, or another property's choice. Neither is phase's to convert or delete.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase quadrant blocks]}]
++        (let [[b0 b1 b2 b3] blocks
++              grade (:db/ident (outliner-property/upsert-property!
++                                conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                {:property-name "grade"}))]
++          (p/let [_ (hold! self b0 grade "Active")
++                  _ (hold! self b3 quadrant "Active")
++                  _ (add-choice! conn phase "Active")
++                  grade-value (:db/id (get (entity conn b0) grade))
++                  quadrant-active (:db/id (get (entity conn b3) quadrant))
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn b1)) phase grade-value]])
++                  before-text (snapshot conn)
++                  text-value (convert! self phase {})
++                  after-text (snapshot conn)
++                  grade-read (read-value self b0 grade)
++                  _ (d/transact! conn [[:db/retract (:db/id (entity conn b1)) phase grade-value]
++                                       [:db/add (:db/id (entity conn b2)) phase quadrant-active]])
++                  before-choice (snapshot conn)
++                  choice-value (convert! self phase {})
++                  after-choice (snapshot conn)
++                  quadrant-read (read-value self b3 quadrant)]
++            (is (some? grade-value) "grade's text value is a value block")
++            (is (= #{(:db/id (d/entity @conn quadrant))}
++                   (set (map :db/id (:block/closed-value-property (d/entity @conn quadrant-active)))))
++                "b3 holds quadrant's own Active choice")
++            (is (= 400 (:status text-value)) (str (:body text-value)))
++            (is (= (str "convert_values: " b1 " holds Active, which isn't a text value of phase")
++                   (get-in text-value [:body :error]))
++                "another text property's value block is named, not converted")
++            (is (true? (= before-text after-text)) "nothing was written")
++            (is (= "Active" grade-read) "grade's holder keeps its value")
++            (is (= 400 (:status choice-value)) (str (:body choice-value)))
++            (is (= (str "convert_values: " b2 " holds Active, which isn't a text value of phase")
++                   (get-in choice-value [:body :error]))
++                "another property's choice is named, not treated as phase's own")
++            (is (true? (= before-choice after-choice)) "nothing was written")
++            (is (= {:uuid (str (:block/uuid (d/entity @conn quadrant-active))) :title "Active"} quadrant-read)
++                "quadrant's holder keeps its choice")))))))
 +
 +(deftest convert-one-transaction-test
 +  (async done
