@@ -783,6 +783,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | The cron run fails with `kb index refresh failed for N of M graphs` | The `kb-index graph=… status=…` lines before it name the graph: `http-401` or `http-403` means its token expired (replace it at `/graphs`). The other graphs were still rebuilt. |
 | `kb_index` answers `the knowledge index of 'x' has more than 20000 pages` | The connector refuses to cache a graph that large. Use `search_graph` and `list_pages` instead. |
 | Deploy fails at **Read connector setting** with `The CONNECTOR_ENABLED variable must be true or false` | The variable holds something else, such as `True` or `yes`. Set it to exactly `true` or `false`, or delete it for off. |
+| `property value must resolve to one of X's choices (…)` | The value isn't one of that property's own choices, or the block's tags don't allow it (the message then says `for this block`). Use one of the listed choices, or its UUID from `get_property`. Before patch 0019 the same title could store another property's choice without an error; `get_graph_health` with `checks: mismatched-choice-values` lists values stored that way. |
+| `"X" matches N entities (…)` | A node property was given a title that several pages share. Pass the UUID of the page you mean, from the list in the message. |
 
 ### 11.11 Semantic search (optional)
 
@@ -826,6 +828,7 @@ To turn it on, with the connector already on (11.5):
 6. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
 7. **Confirm the minimal token permissions**, in particular whether DNS Write is needed.
 8. **Measure a large real graph against the Free CPU limits:** first upload, asset sync and snapshot download.
+9. **Scope Tags titles the same way.** A `Tags` value given by title still takes the first class with that title. Duplicate class titles are rare, but it is the pattern patch 0019 fixed for choices and node properties.
 
 ## Licence and credits
 
