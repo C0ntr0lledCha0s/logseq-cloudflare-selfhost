@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index c03e19a..3ab02ab 100644
+index c03e19a..fb155e0 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -124,6 +124,8 @@
@@ -11,7 +11,40 @@ index c03e19a..3ab02ab 100644
        (and (db-property/logseq-property? k)
             (contains? db-property/public-built-in-properties k))))
  
-@@ -524,15 +526,30 @@
+@@ -347,10 +349,17 @@
+ ;; to titles, so an agent can read a page in one call.
+ (def ^:private max-outline-blocks 2000)
+ 
++(defn- outline-heading-level
++  "A block's heading level as its outline line's markdown prefix shows it: 1 to 6, or nil."
++  [entity]
++  (let [level (:logseq.property/heading entity)]
++    (when (and (integer? level) (<= 1 level 6)) level)))
++
+ (defn- outline-property-lines [db entity indent]
+   (for [{:keys [ident title value]} (entity-properties-response db entity)
+-        ;; A block's status is its line's [Status] marker.
+-        :when (not= "logseq.property/status" ident)
++        ;; A block's status is its line's [Status] marker, and its heading level its `## ` prefix.
++        :when (and (not= "logseq.property/status" ident)
++                   (not (and (= "logseq.property/heading" ident) (outline-heading-level entity))))
+         :let [values (if (vector? value) value [value])
+               text (string/join ", " (map #(if (map? %) (page-ref/->page-ref (:title %)) (str %)) values))]]
+     (str indent "  " title ":: " text)))
+@@ -370,9 +379,11 @@
+                   (vreset! truncated? true)
+                   (let [indent (apply str (repeat depth "  "))
+                         status (some-> (:logseq.property/status block) :block/title)
++                        heading (outline-heading-level block)
+                         title (or (db-content/recur-replace-uuid-in-block-title block) "")]
+                     (vswap! n inc)
+-                    (conj! lines (str indent "- " (when status (str "[" status "] ")) title))
++                    (conj! lines (str indent "- " (when status (str "[" status "] "))
++                                      (when heading (str (apply str (repeat heading "#")) " ")) title))
+                     (doseq [line (outline-property-lines db block indent)] (conj! lines line))
+                     (walk block (inc depth))))))]
+       (walk page 0))
+@@ -524,15 +535,38 @@
                (recur title (inc i) escaped-tags)))
            {:title title :escaped escaped-tags})))))
  
@@ -28,24 +61,32 @@ index c03e19a..3ab02ab 100644
 +      (re-find #"^#+\s" title) {:title (str "\\" title)}
 +      :else {:title title})))
 +
++(defn- reads-heading?
++  "Whether a block's title can hold a markdown heading. A block with a display type (a code, math
++  or quote block) holds text, where a leading `# ` is a comment: the outliner's save leaves its
++  title alone, and so does every write here."
++  [block]
++  (not (:logseq.property.node/display-type block)))
++
  (defn- prepare-block-title!
 -  "The block attributes for a written title. Tags escaped as text are in the result's metadata as
--  `:escaped`, so the attributes can be saved as they are."
 +  "The block attributes for a written title. A markdown heading prefix becomes
-+  :logseq.property/heading, as the app stores it. Tags escaped as text are in the result's metadata
-+  as `:escaped`, so the attributes can be saved as they are."
-   [conn e2ee? title]
++  :logseq.property/heading, as the app stores it, unless `block` (the block being written, or nil
++  for a new one) has a display type. Tags escaped as text are in the result's metadata as
+   `:escaped`, so the attributes can be saved as they are."
+-  [conn e2ee? title]
++  [conn e2ee? title block]
    ;; E2EE titles are opaque ciphertext packages — they contain no resolvable
    ;; [[refs]] (and transit punctuation must never be parsed as refs).
    (if e2ee?
      {:block/title title}
 -    (let [{:keys [title classes]} (resolve-inline-tags @conn title)
-+    (let [{:keys [level title]} (markdown-heading title)
++    (let [{:keys [level title]} (if (reads-heading? block) (markdown-heading title) {:title title})
 +          {:keys [title classes]} (resolve-inline-tags @conn title)
            {:keys [title escaped]} (escape-unresolved-inline-tags title)
            refs (->> (page-ref-values title)
                    (keep #(resolve-page-ref! conn %))
-@@ -543,6 +560,7 @@
+@@ -543,6 +577,7 @@
        (with-meta
          (cond-> {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
                   :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)}
@@ -53,33 +94,83 @@ index c03e19a..3ab02ab 100644
            (seq classes) (assoc :block/tags (mapv #(vector :block/uuid (:block/uuid %)) (distinct classes))))
          {:escaped escaped}))))
  
-@@ -1420,7 +1438,8 @@
+@@ -974,7 +1009,7 @@
+   (let [id (if-let [value (:uuid node)] (uuid (string/lower-case value)) (random-uuid))]
+     (if (d/entity @conn [:block/uuid id])
+       {:block/uuid id}
+-      (assoc (prepare-block-title! conn e2ee? (:title node)) :block/uuid id))))
++      (assoc (prepare-block-title! conn e2ee? (:title node) nil) :block/uuid id))))
+ 
+ (defn- insert-tree!
+   "Inserts prepared `nodes` under `target` and sets each new block's properties. A node whose uuid
+@@ -1413,14 +1448,16 @@
+ (defn- refresh-change
+   "What a write of the block's stored title would change today, prepared against `conn`, or nil."
+   [conn [e title]]
+-  (let [prepared (prepare-block-title! conn false title)
+-        db @conn
++  (let [db @conn
+         block (d/entity db e)
++        prepared (prepare-block-title! conn false title block)
+         existing (set (map :db/id (:block/tags block)))
          added (->> (:block/tags prepared)
                     (map #(d/entity db %))
                     (remove #(contains? existing (:db/id %))))]
 -    (when (or (not= title (:block/title prepared)) (seq added))
 +    ;; A heading prefix alone is not a change: refreshRefs fixes tags and links, not headings.
-+    (when (or (not= (:title (markdown-heading title)) (:block/title prepared)) (seq added))
++    (when (or (not= (if (reads-heading? block) (:title (markdown-heading title)) title) (:block/title prepared))
++              (seq added))
        (let [show #(db-content/id-ref->title-ref % (map (fn [ref] (d/entity db ref)) (:block/refs prepared)))]
          {:e e :title title
           :response {:uuid (str (:block/uuid block))
+@@ -1446,9 +1483,10 @@
+       (atomic-write! conn creator false :save-block
+                      (fn [tx-conn]
+                        (doseq [{:keys [e title]} changes]
+-                         (outliner-core/save-block! tx-conn
+-                                                    (assoc (prepare-block-title! tx-conn false title)
+-                                                           :block/uuid (:block/uuid (d/entity @tx-conn e))))))))
++                         (let [block (d/entity @tx-conn e)]
++                           (outliner-core/save-block! tx-conn
++                                                      (assoc (prepare-block-title! tx-conn false title block)
++                                                             :block/uuid (:block/uuid block))))))))
+     (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
+       truncated? (assoc :truncated true))))
+ 
+@@ -1467,7 +1505,7 @@
+         (http/bad-request "invalid block-id or title")
+         (let [prepared (volatile! nil)]
+           (authored-write! conn creator (fn [actor-conn]
+-                                          (vreset! prepared (prepare-block-title! actor-conn e2ee? (:title body)))
++                                          (vreset! prepared (prepare-block-title! actor-conn e2ee? (:title body) block))
+                                           (outliner-core/save-block! actor-conn
+                                                                      (assoc @prepared :block/uuid (:block/uuid block))
+                                                                      :encrypted-title? e2ee? :encrypted-name (:name body))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index a206260..61941f3 100644
+index a206260..fed0673 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -111,6 +111,11 @@
+@@ -111,12 +111,17 @@
         " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
         " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
  
 +(def ^:private heading-note
 +  "How a written block title's markdown heading is stored, shared by every operation that writes one."
-+  (str "A title starting with # to ###### and whitespace (## Section) is stored as the app stores a heading: the title without the prefix, and the level in logseq.property/heading, which getBlock shows."
-+       " On update, a title without a prefix keeps the block's heading. Seven or more #, or # with nothing after it, is not a heading and is stored as text with the first # escaped (\\#)."))
++  (str "A title starting with # to ###### and whitespace (## Section) is stored as the app stores a heading: the title without the prefix, and the level in logseq.property/heading, which getBlock and getBlocks show as a property and getPageOutline shows as the ## prefix (listPageBlocks titles don't show it)."
++       " On update, a title without a prefix keeps the block's heading, and a code, math or quote block (one with a display type) keeps its title as given, # lines included, with no heading. Seven or more #, or # with nothing after it, is not a heading and is stored as text with the first # escaped (\\#)."))
 +
  (def ^:private operation-docs
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
     "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
-@@ -127,19 +132,19 @@
+    "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+-   "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
+-   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
++   "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
++   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+    "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+@@ -127,21 +132,21 @@
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
@@ -102,14 +193,17 @@ index a206260..61941f3 100644
 -   "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped.")]
 +   "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
-    "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
+-   "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
++   "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text. " heading-note)]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+    "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
+    "getTag" ["Get a tag" "Returns one tag by UUID."]
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_headings_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_headings_test.cljs
 new file mode 100644
-index 0000000..f9f054d
+index 0000000..fc6ff82
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_headings_test.cljs
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,308 @@
 +(ns logseq.db-sync.semantic-headings-test
 +  "A block title that starts with a markdown heading (`#` to `######`, then whitespace) is stored
 +  the way the app stores it, whichever write made it: the prefix comes off the title and the level
@@ -331,6 +425,89 @@ index 0000000..f9f054d
 +          (outliner-core/insert-blocks! conn [{:block/uuid id :block/title "## Plain heading"}]
 +                                        (d/entity @conn [:block/uuid page-id])
 +                                        {:sibling? false :keep-uuid? true :bottom? true})
++          (p/let [response (request! self "POST" "/semantic/refresh-refs" {})]
++            (is (= 200 (:status response)) (pr-str (:body response)))
++            (is (not-any? #(= (str id) (:uuid %)) (get-in response [:body :changed]))
++                (pr-str (:body response)))))))))
++
++;; A block with a display type (a code, math or quote block) holds text, not an outline title: a
++;; leading `# ` is a comment or literal text. The outliner's save leaves such a title alone, so
++;; every write keeps it as given and sets no heading. (Only updateBlock and refreshRefs can reach
++;; one: an insert can't set a display type, which takes a keyword JSON can't carry.)
++(def display-typed
++  [[:code "# install deps\nnpm install"]
++   [:code "####### banner\necho hi"]
++   [:math "# x^2"]
++   [:quote "## Not a heading"]])
++
++(deftest update-block-keeps-display-typed-title-test
++  (async done
++    (with-graph done (count display-typed)
++      (fn [{:keys [conn self ids]}]
++        (d/transact! conn (mapv (fn [[display-type] id]
++                                  [:db/add [:block/uuid id] :logseq.property.node/display-type display-type])
++                                display-typed ids))
++        (p/let [responses (p/all (map (fn [[_ title] id]
++                                        (request! self "PATCH" (str "/semantic/blocks/" id) {:title title}))
++                                      display-typed ids))]
++          (doseq [[[display-type title] id response] (map vector display-typed ids responses)]
++            (testing (pr-str display-type title)
++              (is (= 200 (:status response)) (pr-str (:body response)))
++              (is (= title (get-in response [:body :title])) "response title")
++              (is (= {:title title :heading nil} (stored conn id)) "stored as given, no heading"))))))))
++
++(deftest refresh-refs-keeps-display-typed-title-test
++  ;; A code block whose comment line starts with `# ` and which holds an unknown #word that
++  ;; refreshRefs escapes: the re-save keeps the comment and sets no heading.
++  (async done
++    (with-graph done 0
++      (fn [{:keys [conn self page-id]}]
++        (let [id (random-uuid)]
++          (outliner-core/insert-blocks! conn [{:block/uuid id :block/title "# build #Unknownword\nmake"}]
++                                        (d/entity @conn [:block/uuid page-id])
++                                        {:sibling? false :keep-uuid? true :bottom? true})
++          (d/transact! conn [[:db/add [:block/uuid id] :logseq.property.node/display-type :code]])
++          (p/let [preview (request! self "POST" "/semantic/refresh-refs" {})
++                  response (request! self "POST" "/semantic/refresh-refs" {:apply true})]
++            (is (= 200 (:status response)) (pr-str (:body response)))
++            (is (= ["# build \\#Unknownword\nmake"]
++                   (keep #(when (= (str id) (:uuid %)) (:after %)) (get-in preview [:body :changed])))
++                (str "preview: " (pr-str (:body preview))))
++            (is (= {:title "# build \\#Unknownword\nmake" :heading nil} (stored conn id)))))))))
++
++(deftest page-outline-shows-heading-as-prefix-test
++  ;; The outline is markdown, so a heading reads as it is written: `## Section`, not a key:: line.
++  (async done
++    (with-graph done 0
++      (fn [{:keys [self page-id]}]
++        (p/let [_ (request! self "POST" "/semantic/block-trees"
++                            {:target-id (str page-id)
++                             :blocks [{:title "## Section" :children [{:title "###### Deep"}]}
++                                      {:title "Plain"}]})
++                outline (request! self "GET" (str "/semantic/pages/" page-id "/outline") nil)]
++          (is (= 200 (:status outline)) (pr-str (:body outline)))
++          (is (= "- ## Section\n  - ###### Deep\n- Plain" (get-in outline [:body :markdown]))))))))
++
++(deftest page-outline-shows-other-heading-values-as-property-test
++  ;; A heading value that is no markdown level (the app's auto heading, true, or a number outside
++  ;; 1 to 6) has no prefix to show, so the outline keeps it as a property line.
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self page-id ids]}]
++        (d/transact! conn [[:db/add [:block/uuid (first ids)] :logseq.property/heading true]
++                           [:db/add [:block/uuid (second ids)] :logseq.property/heading 7]])
++        (p/let [outline (request! self "GET" (str "/semantic/pages/" page-id "/outline") nil)]
++          (is (= "- placeholder\n  Heading:: true\n- placeholder\n  Heading:: 7"
++                 (get-in outline [:body :markdown]))))))))
++
++(deftest refresh-refs-preview-skips-display-typed-comment-test
++  ;; A code block whose only `#` is its `# ` comment line has nothing for refreshRefs to change.
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self ids]}]
++        (let [id (first ids)]
++          (d/transact! conn [[:db/add [:block/uuid id] :block/title "# list files\nls"]
++                             [:db/add [:block/uuid id] :logseq.property.node/display-type :code]])
 +          (p/let [response (request! self "POST" "/semantic/refresh-refs" {})]
 +            (is (= 200 (:status response)) (pr-str (:body response)))
 +            (is (not-any? #(= (str id) (:uuid %)) (get-in response [:body :changed]))
