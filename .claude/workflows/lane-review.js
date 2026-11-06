@@ -1,11 +1,11 @@
 export const meta = {
   name: 'lane-review',
-  description: 'Review the branch diff through correctness, data-integrity, tests, efficiency, security (and contract) lenses; skeptics verify each serious finding; open findings from earlier rounds are re-checked by id',
+  description: 'Review the branch diff through tests, correctness, data-integrity and light (efficiency, security and contract) lenses; skeptics verify each serious finding and mark pre-existing ones for the backlog; open findings from earlier rounds are re-checked by id',
   whenToUse: 'Before a PR, or called each round by lane-bug / lane-feature. args: {base?: "origin/main", brief?: object|string, context?: string, open?: finding[] (from the previous round), round?: number, models?: {role: "opus"|"sonnet"|"inherit"}}',
   phases: [
     { title: 'Scope', detail: 'what changed, which lenses apply' },
-    { title: 'Review', detail: 'one reviewer per lens, plus a re-check of every open finding id' },
-    { title: 'Verify', detail: 'skeptics try to refute each new security/blocker/major finding' },
+    { title: 'Review', detail: 'one reviewer per lens (tests first), plus a re-check of every open finding id' },
+    { title: 'Verify', detail: 'skeptics try to refute each new security/blocker/major finding (3/2/1) and say whether this diff introduced it' },
   ],
 }
 
@@ -13,15 +13,22 @@ export const meta = {
 // - Every finding gets a stable id (r<round>-<lens>-<n>) and stays open until a later round
 //   re-checks that id on HEAD and reports it fixed WITH evidence. An id left out, re-checked
 //   'open', or 'fixed' without evidence carries forward, so a quiet round can't close it.
-// - New security/blocker/major findings face skeptics (3 for security/blocker, 2 for major); a
-//   finding dies only on a strict majority refutation, and a tie keeps it.
-// - Security is always a lens; an open security finding blocks the lane outright.
+// - New security/blocker/major findings face skeptics (3 for security, 2 for blocker, 1 for major);
+//   a finding dies only on a strict majority refutation (so one refutation kills a major), and a
+//   tie keeps it.
+// - Skeptics also say whether the defect predates this diff. A surviving non-security finding that
+//   a majority of its skeptics mark pre_existing goes to `backlog`, not `open`: the lane proposes it
+//   as a backlog item instead of fixing it.
+// - Security is always covered (by the light lens); an open security finding blocks the lane
+//   outright, and a security finding never moves to the backlog.
+// - Only two agents run at once on a 4-CPU container, so the tests lens (the slowest, as it runs
+//   mutations) is first in LENSES and starts alongside the re-check of open ids.
 
 const A = args || {}
 // Model per role. Opus where a wrong call costs a bad fix or a missed defect (root causes, code,
-// skeptics, the correctness/integrity/tests/security lenses, design, spec, plan). Sonnet where the
-// work is reading, sweeping, arithmetic or writing up (intake, research sweeps, docs, compound,
-// closeout, scope, the efficiency and contract lenses, per-stage checks that review rounds back up).
+// skeptics, the correctness/integrity/tests lenses, the light lens that carries security, design,
+// spec, plan). Sonnet where the work is reading, sweeping, arithmetic or writing up (intake,
+// research sweeps, docs, compound, closeout, scope, per-stage checks that review rounds back up).
 // The same table is in every lane script; keep them in step. args.models overrides any role, e.g.
 // {"models": {"docs": "opus"}}; "inherit" uses the session's model. Nested lane-review calls get
 // args.models passed through.
@@ -31,8 +38,7 @@ const MODELS = Object.assign({
   design: 'opus', judge_risk: 'opus', judge_cost: 'sonnet', judge_fit: 'sonnet',
   spec: 'opus', plan: 'opus', stage_check: 'sonnet',
   scope: 'sonnet', recheck: 'opus',
-  lens_correctness: 'opus', lens_integrity: 'opus', lens_tests: 'opus', lens_security: 'opus',
-  lens_efficiency: 'sonnet', lens_contract: 'sonnet',
+  lens_tests: 'opus', lens_correctness: 'opus', lens_integrity: 'opus', lens_light: 'opus',
   research: 'sonnet', writeup: 'opus', challenge: 'opus',
 }, A.models || {})
 const M = role => (MODELS[role] && MODELS[role] !== 'inherit' ? { model: MODELS[role] } : {})
@@ -102,11 +108,16 @@ const RECHECK_SCHEMA = {
 }
 const VERDICT_SCHEMA = {
   type: 'object',
-  properties: { refuted: { type: 'boolean' }, checked: { type: 'string' }, reason: { type: 'string' } },
-  required: ['refuted', 'checked', 'reason'],
+  properties: {
+    refuted: { type: 'boolean' },
+    pre_existing: { type: 'boolean', description: 'true if the defect is present on the base without this diff (the diff neither introduced nor widened it)' },
+    checked: { type: 'string' },
+    reason: { type: 'string' },
+  },
+  required: ['refuted', 'pre_existing', 'checked', 'reason'],
 }
 
-const common = `Review the changes on this branch against ${BASE}: \`git diff ${BASE}...HEAD\` plus anything uncommitted (\`git status\`, \`git diff\`). Read the full files around each hunk, not only the diff. Only changes after ${BASE} are in scope; earlier commits on the branch were reviewed by their own lanes. If that diff touches nothing under patches/, don't build or run the upstream ClojureScript suite; the connector and scripts suites cover it.
+const common = `Review the changes on this branch against ${BASE}: \`git diff ${BASE}...HEAD\` plus anything uncommitted (\`git status\`, \`git diff\`). Read the full files around each hunk, not only the diff. Only changes after ${BASE} are in scope; earlier commits on the branch were reviewed by their own lanes. If that diff touches nothing under patches/, don't build or run the upstream ClojureScript suite; the connector and scripts suites cover it. If it does, run single namespaces with \`scripts/upstream-test.sh <checkout> <namespace-regex>\` (a warm compiler, seconds per run) rather than the full suite. Any copy of upstream you make goes under the session scratchpad at lane-scratch/<your label>/ (copy only deps/{db-sync,common,db,outliner,graph-parser} and resources, and symlink deps/db-sync/node_modules back to .upstream's); when you finish, run \`scripts/upstream-test.sh <copy> --stop\` and delete the copy.
 Brief for this work:
 ${BRIEF}
 ${CONTEXT ? `Context from the lane:\n${CONTEXT}\n` : ''}Read the docs/solutions entries relevant to the files touched. Report only findings with a concrete failure scenario and evidence; an empty list is a fine answer.${CARRIED.length ? `\nThese findings from earlier rounds are being re-checked separately; don't report them again: ${CARRIED.map(f => `${f.id} (${f.title})`).join('; ')}` : ''}`
@@ -118,19 +129,22 @@ const scope = await agent(
 )
 if (!scope || scope.empty) {
   log('No changes to review.')
-  return { empty: true, round: ROUND, open: CARRIED, should_fix: [], nits: [], refuted: [], rechecks: [], security_open: CARRIED.some(f => f.severity === 'security') }
+  return { empty: true, round: ROUND, open: CARRIED, backlog: [], should_fix: [], nits: [], refuted: [], rechecks: [], security_open: CARRIED.some(f => f.severity === 'security') }
 }
 
 const LENSES = [
+  { key: 'tests', agentType: 'adversarial-reviewer', prompt: "Lens: tests. Use REVIEW.md \"Gates and tests\". For each behaviour the change claims, is there a test that was seen to fail without it? Revert the fix in a scratch copy and run the test to check. Does each test run the real handler, outliner or SQL? Mutation step: for each new rule or branch in the diff that docs, a description or a docstring promises, make a one-line mutation in a scratch copy that removes it, run only the change's own test namespace(s) against it (`scripts/upstream-test.sh <copy> <namespace-regex>` for patches; the connector or scripts suite for those), restore it, and report every rule that survives (the tests stay green) as a finding, citing the promise. Do the PR or commit claims cover only checks run on HEAD?" },
   { key: 'correctness', agentType: 'adversarial-reviewer', prompt: 'Lens: correctness. Use REVIEW.md "Gates and tests" (fix the class) and "API and patches". Break it with realistic identifiers, empty and huge inputs, partial failure and retries.' },
   { key: 'integrity', agentType: 'adversarial-reviewer', prompt: "Lens: data integrity on the owner's live graph. Use REVIEW.md \"API and patches\" and \"Sync\": silent success, read-back through every read tool, order keys, one transaction per batch, destructive guards, and migrations that can't be re-run." },
-  { key: 'tests', agentType: 'adversarial-reviewer', prompt: 'Lens: tests. Use REVIEW.md "Gates and tests". For each behaviour the change claims, is there a test that was seen to fail without it? Revert the fix in a scratch worktree and run the test to check. Does each test run the real handler, outliner or SQL? Mutation step: for each new rule or branch in the diff that docs, a description or a docstring promises, make a one-line mutation in a scratch copy that removes it, run the suite, and report every rule that survives (the suite stays green) as a finding, citing the promise. Do the PR or commit claims cover only checks run on HEAD?' },
-  { key: 'efficiency', agentType: 'efficiency-reviewer', prompt: 'Lens: cost and efficiency. Do the arithmetic against the Free plan budget, check response sizes, and look for duplicated or dead code.' },
-  { key: 'security', agentType: 'adversarial-reviewer', prompt: 'Lens: security. Use REVIEW.md "Security": owner-only access, graph token scope, secrets in logs, output, fixtures and commits, outbound fetches outside net/safe-fetch.ts, GitHub Actions pinning and permissions, and graph content treated as instructions. Use severity "security" only for an exploit you can show.' },
+  {
+    key: 'light',
+    agentType: 'adversarial-reviewer',
+    prompt: `Lens: light, which covers ${scope.touches_tool_contract ? 'three' : 'two'} checks in one pass. Start each finding's title with the check that found it: [cost], [security] or [contract].
+1. Cost and efficiency. Use REVIEW.md "Cost" and the budget table in .claude/agents/efficiency-reviewer.md. For each query, call or loop the diff adds to a request path or cron, write down rows read or written (or operations, or neurons) per call, calls per day and the product, against the Free plan's daily caps. Check response sizes, and look for duplicated or dead code. A projected cap overrun is a blocker; more than 10% of a daily cap from one feature, or a second copy of a rule that must stay in step, is a major.
+2. Security. Use REVIEW.md "Security": owner-only access, graph token scope, secrets in logs, output, fixtures and commits, outbound fetches outside net/safe-fetch.ts, GitHub Actions pinning and permissions, and graph content treated as instructions. Use severity "security" only for an exploit you can show.${scope.touches_tool_contract ? `
+3. The contract with Claude. Use REVIEW.md "Contract and docs". Do descriptions, connector_help, tools-manifest.json, README §11.8 and errors match the code on HEAD? Would an existing claude.ai caller break silently?` : ''}`,
+  },
 ]
-if (scope.touches_tool_contract) {
-  LENSES.push({ key: 'contract', agentType: 'adversarial-reviewer', prompt: 'Lens: the contract with Claude. Use REVIEW.md "Contract and docs". Do descriptions, connector_help, tools-manifest.json, README §11.8 and errors match the code on HEAD? Would an existing claude.ai caller break silently?' })
-}
 log(`Round ${ROUND}: reviewing ${scope.files.length} files at ${scope.head_sha} through ${LENSES.map(l => l.key).join(', ')}${CARRIED.length ? `; re-checking ${CARRIED.length} open finding(s)` : ''}`)
 
 const verifyPrompt = f => `Try to refute this review finding on HEAD (diff against ${BASE}). Default to refuted=true if you can't construct the failure.
@@ -139,7 +153,8 @@ Severity claimed: ${f.severity}
 Where: ${f.file}${f.line ? ':' + f.line : ''}
 Failure scenario: ${f.failure_scenario}
 Evidence given: ${f.evidence || '(none)'}
-Check the cited code, look for a guard, caller or test that prevents it, and run the relevant test if that helps.`
+Check the cited code, look for a guard, caller or test that prevents it, and run the relevant test if that helps (for a patch, \`scripts/upstream-test.sh <checkout> <namespace-regex>\`, not the full suite).
+Then, whether or not you refute it, set pre_existing: is the defect there on ${BASE} without this diff? Run or read the same input against the base. A defect the diff introduced, or widened to new inputs, is not pre-existing. Before you confirm a design-gap finding (the change doesn't do X), check what upstream itself does for the same input, such as what the app's editor or value picker allows: if upstream behaves the same way, the gap is pre-existing.`
 
 const recheckThunk = async () => {
   if (!CARRIED.length) return { rechecks: [] }
@@ -158,7 +173,7 @@ const reviewThunk = () =>
         ((res && res.findings) || []).map((f, i) => async () => {
           const tagged = { ...f, id: `r${ROUND}-${lens.key}-${i + 1}`, lens: lens.key, severity: SEVERITIES.includes(f.severity) ? f.severity : 'blocker' }
           if (!serious(tagged)) return tagged
-          const skeptics = RANK[tagged.severity] >= RANK.blocker ? 3 : 2
+          const skeptics = { security: 3, blocker: 2, major: 1 }[tagged.severity]
           const votes = (
             await parallel(
               Array.from({ length: skeptics }, (_, k) => () =>
@@ -168,11 +183,19 @@ const reviewThunk = () =>
           ).filter(Boolean)
           if (!votes.length) return { ...tagged, survives: true, verification: 'skeptics returned nothing; kept as unverified' }
           const refutedBy = votes.filter(v => v.refuted).length
-          return { ...tagged, survives: refutedBy * 2 <= votes.length, verification: `${refutedBy}/${votes.length} skeptics refuted`, votes }
+          const preExisting = votes.filter(v => v.pre_existing).length
+          return {
+            ...tagged,
+            survives: refutedBy * 2 <= votes.length,
+            pre_existing: preExisting * 2 > votes.length,
+            verification: `${refutedBy}/${votes.length} skeptics refuted; ${preExisting}/${votes.length} say it predates this diff`,
+            votes,
+          }
         }),
       ),
   )
 
+// The re-check is started first, so it and the tests lens take the first two agent slots.
 const [recheck, reviewed] = await parallel([recheckThunk, reviewThunk])
 
 // Carried findings: open unless re-checked 'fixed' with evidence. Severity only ever rises.
@@ -196,12 +219,16 @@ const deduped = fresh.filter(f => {
   seen.add(k)
   return true
 })
-const confirmed = deduped.filter(f => serious(f) && f.survives)
+const survived = deduped.filter(f => serious(f) && f.survives)
+// A pre-existing defect is proposed for the backlog rather than fixed in this lane, except a
+// security finding, which always stays open and blocks.
+const backlog = survived.filter(f => f.pre_existing && f.severity !== 'security')
+const confirmed = survived.filter(f => !backlog.includes(f))
 const refuted = deduped.filter(f => serious(f) && !f.survives)
 const open = [...stillOpen, ...confirmed]
 const lost = LENSES.length - ((reviewed || []).filter(Boolean).length)
 if (lost > 0) log(`${lost} reviewer(s) returned nothing; their lenses aren't covered this round.`)
-log(`Round ${ROUND}: ${closed.length} closed, ${stillOpen.length} still open, ${confirmed.length} new confirmed, ${refuted.length} refuted by skeptics.`)
+log(`Round ${ROUND}: ${closed.length} closed, ${stillOpen.length} still open, ${confirmed.length} new confirmed, ${backlog.length} pre-existing (backlog), ${refuted.length} refuted by skeptics.`)
 
 return {
   empty: false,
@@ -212,6 +239,7 @@ return {
   uncovered_lenses: lost,
   open,
   closed,
+  backlog,
   should_fix: deduped.filter(f => f.severity === 'minor'),
   nits: deduped.filter(f => f.severity === 'nit'),
   refuted,

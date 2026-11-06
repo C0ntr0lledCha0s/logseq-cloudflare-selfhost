@@ -21,7 +21,9 @@ bug      Intake ─ Investigate ─ Reproduce ─ Fix ─ Review ⟲ ─ Documen
          (pre-     (2 lenses; the  (test seen  (gate   (lane-review each
           conditions) cause faces   to fail)    green,  round; open ids
                     2 skeptics;                 commit) carried and
-                    max 2 rounds)                       re-checked)
+                    max 2 rounds)                       re-checked; then one
+                                                        targeted round on
+                                                        majors still open)
 
 feature  Intake ─ Design ─ Spec ║ Plan ─ Build ×N ─ Review ⟲ ─ Document ─ Compound ─ Closeout
                   (3 angles,     ║        (per stage: test-first, commit,
@@ -32,7 +34,7 @@ spike    Intake ─ Research ─ Write-up ─ Challenge ⟲ ─ Compound
                   (codebase, upstream,   (one more research round
                    platform, cost/ops)    if the gaps are researchable)
 
-review   Scope ─ Review (one agent per lens) ∥ Re-check open ids ─ Verify (skeptics)
+review   Scope ─ Review (one agent per lens, tests first) ∥ Re-check open ids ─ Verify (skeptics)
 ```
 
 | Lane | Workflow | Statuses it ends in |
@@ -40,7 +42,7 @@ review   Scope ─ Review (one agent per lens) ∥ Re-check open ids ─ Verify 
 | Bug | `.claude/workflows/lane-bug.js` | `ready`, `ready-with-open-findings`, `blocked-security`, `needs-human`, `not-a-bug`, `blocked`, `stopped` |
 | Feature | `.claude/workflows/lane-feature.js` | `awaiting-approval`, `ready`, `ready-with-open-findings`, `blocked-security`, `needs-human`, `blocked`, `stopped` |
 | Spike | `.claude/workflows/lane-spike.js` | `ready`, `needs-human`, `blocked` |
-| Review | `.claude/workflows/lane-review.js` | Returns `open`, `closed`, `should_fix`, `nits`, `refuted`, `security_open` |
+| Review | `.claude/workflows/lane-review.js` | Returns `open`, `closed`, `backlog`, `should_fix`, `nits`, `refuted`, `security_open` |
 
 ## Who does what
 
@@ -48,8 +50,8 @@ review   Scope ─ Review (one agent per lens) ∥ Re-check open ids ─ Verify 
 |---|---|---|
 | `investigator` | Root cause with evidence, in two lenses (trace and reproduce) | Scratch only |
 | `implementer` | Failing test (with its fail-before), fix, feature stages, findings by id, the gate. Commits each stage. | Yes |
-| `adversarial-reviewer` | The correctness, integrity, tests, security and contract lenses; re-checks by id; skeptic votes; challenging root causes and spikes; risk judge | No |
-| `efficiency-reviewer` | Cost lens (Free plan arithmetic, response size, duplicated code) and cost judge | No |
+| `adversarial-reviewer` | The tests, correctness and integrity lenses, and the light lens (efficiency, security and, when the tool contract changes, contract, in one agent); re-checks by id; skeptic votes; challenging root causes and spikes; risk judge | No |
+| `efficiency-reviewer` | Cost judge in the feature design panel (Free plan arithmetic, response size, duplicated code). Its budget table is what the light lens works from. | No |
 | `docs-steward` | README, `connector_help`, descriptions, manifest, spec *As built* notes, and the Logseq skill note | Docs |
 | `compounder` | `docs/solutions`, promotions to `REVIEW.md` and `CLAUDE.md`, known false positives, and retro proposals | Learning files only |
 
@@ -61,8 +63,8 @@ Each stage runs on the model that fits its job. The table is `MODELS` at the top
 
 | Model | Roles |
 |---|---|
-| Opus | Investigate, root-cause skeptics, the implementer (test, fix, build stages, review fixes), design angles, the risk judge, spec, plan, the correctness, integrity, tests and security lenses, re-checks by id, finding skeptics, spike write-up and challenge |
-| Sonnet | Intake, closeout, docs, compound and retro, review scope, the efficiency and contract lenses, the cost and fit judges, per-stage checks in a feature build (the review rounds back them up), spike research sweeps |
+| Opus | Investigate, root-cause skeptics, the implementer (test, fix, build stages, review fixes), design angles, the risk judge, spec, plan, the tests, correctness and integrity lenses, the light lens (`lens_light`, which carries security), re-checks by id, finding skeptics, spike write-up and challenge |
+| Sonnet | Intake, closeout, docs, compound and retro, review scope, the cost and fit judges, per-stage checks in a feature build (the review rounds back them up), spike research sweeps |
 
 The rule: Opus where a wrong call ships a bad fix or lets a defect through, and Sonnet where the work is reading, sweeping, arithmetic or writing up. Override any role with `args.models`, e.g. `{"models": {"docs": "opus"}}`, or use `"inherit"` for the session's model. The bug and feature lanes pass `models` on to `lane-review`. Outside a workflow, `docs-steward`, `compounder` and `efficiency-reviewer` default to Sonnet through their frontmatter.
 
@@ -74,10 +76,15 @@ The rule: Opus where a wrong call ships a bad fix or lets a defect through, and 
 - **Fail-before.** Every regression test quotes its failure on the code without the fix. If the suite can't run here, the lane says so instead of claiming it.
 - **The gate.** `scripts/check.sh` runs everything this checkout can run, and names what it skipped. Every stage and fix leaves it green, and is committed.
 - **Review scope.** Intake records the commit the lane starts from (`start_sha`), and every review round diffs against it, so a lane on a shared phase branch reviews only its own commits. Pass `review_base` (for example `origin/main`) for a full-branch review before a PR. A diff that touches nothing under `patches/` never builds the upstream ClojureScript suite.
-- **Review rounds.** `lane-review` runs every lens that applies. Each new security, blocker or major finding goes to skeptics (three for security and blocker, two for major). A finding dies only on a strict majority refutation, and a tie keeps it.
+- **Fast iteration, one gate.** While a stage iterates on a patch, it runs only the namespaces it changes with `scripts/upstream-test.sh <checkout> <namespace-regex>`, which keeps a `shadow-cljs watch` warm per checkout (patch 0021 lets the runner take the regex). A one-namespace run takes seconds; a cold compile plus the full suite took about 62 s. The stage still ends with `scripts/check.sh --upstream`, which compiles from cold and runs every test. Connector-only work runs the connector suite only. Reviewers run their mutations against the change's own namespace the same way.
+- **Scratch copies.** An agent that needs its own copy of upstream puts it under the session scratchpad at `lane-scratch/<label>/`, copies only `deps/{db-sync,common,db,outliner,graph-parser}` and `resources` (with `node_modules` symlinked back to `.upstream`), and at the end runs `scripts/upstream-test.sh <copy> --stop` and deletes the copy.
+- **Review rounds.** `lane-review` runs four lenses: tests, correctness, integrity, and a light lens that covers efficiency, security and (when the tool contract changes) the contract in one agent. Only two agents run at once on a 4-CPU container, so the tests lens, the slowest, goes first and starts alongside the re-check of open ids. Each new security, blocker or major finding goes to skeptics (three for security, two for blocker, one for major). A finding dies only on a strict majority refutation, so one refutation kills a major, and a tie keeps it.
+  - Skeptics also say whether the diff introduced the defect or it was already there (`pre_existing`), checking what upstream itself does (such as the app's editor or value picker) before confirming a design gap. A surviving finding that most of its skeptics mark pre-existing goes to `backlog`, not `open`. The closeout proposes it as a backlog item. A security finding never moves to the backlog.
   - Each surviving finding gets an id (`r<round>-<lens>-<n>`) and stays open until a later round re-checks that id on HEAD and reports it fixed with evidence. A quiet round can't close it.
   - Fixers report every id they were given.
-  - After `max_fix_rounds` (default 2), open non-security findings go to the owner as "for your call", and an open security finding blocks.
+  - After `max_fix_rounds` (default 2), if non-security blockers or majors are still open, the lane runs one targeted round: one implementer on just those ids, then one re-check of just those ids (no fresh lenses).
+  - What is still open after that goes into `followup`, and the closeout lists it, with the backlog, as proposed backlog items with the probe or test path attached. Open non-security findings go to the owner as "for your call", and an open security finding blocks.
+  - **Class sweep.** A fix that narrows a type or a resolver lists every property type or input kind that reaches the same resolver, tests a representative input for each, and runs the mutation step on its own new rules before the stage ends.
 - **Approval.** A feature always stops after its spec unless an approved `spec` is passed in.
 - **Claims.** The closeout runs the gate once on HEAD and reports the SHA. The PR body only claims checks run there.
 - **Logseq.** No lane writes to Logseq. `/lane` shows the draft and writes it only on the owner's yes.
@@ -159,11 +166,14 @@ The workflows are saved under `.claude/workflows/`, so you can run them without 
 
 | Run | Agents |
 |---|---|
-| Bug lane, clean first review | About 18 (6 before review, 6–7 in the review, 5 after) |
-| Each further review round | 7–8, plus 2–3 skeptics per serious finding and 1 fixer |
-| Bug lane worst case (two investigation rounds, three review rounds) | Over 60 |
+| Bug lane, clean first review | About 16 (6 before review, 5 in the review, 5 after) |
+| Each further review round | 6, plus skeptics (1 per major, 2 per blocker, 3 per security finding) and 1 fixer |
+| Targeted round after the last review round | 2 (one fixer, one re-check), only when blockers or majors are still open |
+| Bug lane worst case (two investigation rounds, three review rounds) | About 50 |
 | Feature lane to its spec | 8 |
 | Each feature stage | 2–3 |
 | Spike | 8–14 |
 
 Use `stop_after` (`"investigate"`, `"spec"` or `"plan"`) to buy a diagnosis or a plan without paying for the rest.
+
+Time goes mostly on upstream test cycles. Measured on a 4-CPU container: a cold `clojure -M:cljs compile db-sync-test` takes about 20 s even with nothing to compile, and the full suite (~312 tests) about 40 s. With `scripts/upstream-test.sh`, a warm watch rebuilds after a one-file edit in about 5 s, and one namespace (`semantic-choice-values`, 16 tests) runs in about 7 s. The first call on a checkout pays about 20 s to start the watch.

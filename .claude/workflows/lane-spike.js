@@ -13,9 +13,9 @@ export const meta = {
 
 const A = args || {}
 // Model per role. Opus where a wrong call costs a bad fix or a missed defect (root causes, code,
-// skeptics, the correctness/integrity/tests/security lenses, design, spec, plan). Sonnet where the
-// work is reading, sweeping, arithmetic or writing up (intake, research sweeps, docs, compound,
-// closeout, scope, the efficiency and contract lenses, per-stage checks that review rounds back up).
+// skeptics, the correctness/integrity/tests lenses, the light lens that carries security, design,
+// spec, plan). Sonnet where the work is reading, sweeping, arithmetic or writing up (intake,
+// research sweeps, docs, compound, closeout, scope, per-stage checks that review rounds back up).
 // The same table is in every lane script; keep them in step. args.models overrides any role, e.g.
 // {"models": {"docs": "opus"}}; "inherit" uses the session's model. Nested lane-review calls get
 // args.models passed through.
@@ -25,8 +25,7 @@ const MODELS = Object.assign({
   design: 'opus', judge_risk: 'opus', judge_cost: 'sonnet', judge_fit: 'sonnet',
   spec: 'opus', plan: 'opus', stage_check: 'sonnet',
   scope: 'sonnet', recheck: 'opus',
-  lens_correctness: 'opus', lens_integrity: 'opus', lens_tests: 'opus', lens_security: 'opus',
-  lens_efficiency: 'sonnet', lens_contract: 'sonnet',
+  lens_tests: 'opus', lens_correctness: 'opus', lens_integrity: 'opus', lens_light: 'opus',
   research: 'sonnet', writeup: 'opus', challenge: 'opus',
 }, A.models || {})
 const M = role => (MODELS[role] && MODELS[role] !== 'inherit' ? { model: MODELS[role] } : {})

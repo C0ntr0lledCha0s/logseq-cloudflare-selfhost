@@ -53,14 +53,15 @@ Read `status` first.
 - **`blocked-security`**: a security finding is still open. Don't push for a PR. Quote the finding (id, claim, evidence) and stop.
 - **`needs-human`**: say which stage stopped and why, and quote the refuted hypotheses, a red gate or the open findings. Don't paper over it.
 - **`not-a-bug`**: explain what the investigation found, and what the compounder recorded.
-- **`ready-with-open-findings`** with `followup`: offer a follow-up run before moving on. One `implementer` addresses `followup.open` by id (fail-first tests, same patch number), then `lane-review` runs with `base: followup.review_base`, `open: followup.open` and `round: followup.next_round`. Open the PR as a draft until the follow-up closes them.
+- **`ready-with-open-findings`** with `followup`: the lane has already run one targeted round on the blockers and majors that were still open, so these survived it. Show them as proposed backlog items (the closeout's *Proposed backlog items* section has each with its probe or test path), and offer a follow-up run only if the owner wants them fixed in this branch: one `implementer` addresses `followup.open` by id (fail-first tests, same patch number), then `lane-review` runs with `base: followup.review_base`, `open: followup.open` and `round: followup.next_round`. Open the PR as a draft until they are closed or moved to the backlog.
 - **`ready`** / **`ready-with-open-findings`**:
   1. Check the work yourself: `git status --porcelain` (it should be empty), `git log --oneline origin/main..HEAD`, and `scripts/check.sh` (add `--upstream` if patches changed). Never report a check as passing that you didn't see pass. Confirm that `closeout.head_sha` matches HEAD.
   2. Push to the branch.
   3. Report the result: what changed, the regression tests with their fail-before evidence, the review rounds (closed, refuted, open), the docs updated, the learnings recorded and promoted, and the live verification steps.
-  4. List any open findings under "for your call".
+  4. List any open findings under "for your call", and the lane's `backlog` (pre-existing defects that skeptics confirmed) as proposed backlog items. Add them to the issues page or README *Backlog* only on the owner's yes.
   5. Show the **retro proposals** (`compound.retro_proposals`). These are changes to the lanes themselves, each with its evidence. Apply only the ones the owner approves, in a separate `chore(lanes): …` commit.
   6. Offer to open a PR with `closeout.pr_title` and `closeout.pr_body`. Don't open one unless the owner says yes.
+  7. Stop any warm compiler the lane left running: `scripts/upstream-test.sh .upstream --stop`. Lane agents run upstream tests one namespace at a time through it while they iterate; the gate (`scripts/check.sh --upstream`) still runs the full suite.
 
 ## 5. Logseq write-back (always ask)
 
