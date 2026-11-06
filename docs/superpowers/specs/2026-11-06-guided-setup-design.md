@@ -379,7 +379,7 @@ The builder runs a spike on a test fork before building. If no approach puts a p
 None. The builder check raised four questions:
 
 - **How forks get updates:** the owner chose the weekly update PR (D12).
-- **The other three were the designer's calls,** recorded above:
+- **The other three became four rulings by the designer,** recorded above:
   - a lost `.env.local` stops setup (D4 stage 3);
   - `allow-user.sh` chooses its mode by checking D1 (D5);
   - new token permissions only warn on existing installs (D6, D11);
