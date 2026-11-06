@@ -1,0 +1,432 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+index a019c3b..2a0bf61 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+@@ -222,3 +222,23 @@
+ 
+ (defn pages-without-tags [db]
+   (filter #(empty? (page-tag-ids db %)) (user-pages db)))
++
++(defn mismatched-choice-values
++  "Values of properties with choices (closed values) that are not one of the property's own
++  choices, such as another property's choice with the same title, as {:holder :property :value}
++  entity maps. Hidden holders are left out."
++  [db]
++  (let [owners (fn [value-id] (set (map :v (d/datoms db :eavt value-id :block/closed-value-property))))]
++    (->> (d/datoms db :aevt :block/closed-value-property)
++         (map :v)
++         (distinct)
++         (mapcat (fn [property-id]
++                   (let [ident (attr-value db property-id :db/ident)]
++                     (when (and ident (= :db.type/ref (get-in (:schema db) [ident :db/valueType])))
++                       (->> (d/datoms db :aevt ident)
++                            (remove #(contains? (owners (:v %)) property-id))
++                            (remove #(hidden-id? db (:e %)))
++                            (map (fn [datom]
++                                   {:holder (d/entity db (:e datom))
++                                    :property (d/entity db property-id)
++                                    :value (d/entity db (:v datom))}))))))))))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index b3bd63c..a79417d 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -651,6 +651,42 @@
+                (or (not= property-ident :block/tags) (entity-util/class? entity)))
+       (:db/id entity))))
+ 
++(defn- property-choices
++  "The property's own choices (closed values), in the order the editor lists them."
++  [property]
++  (sort-by (juxt :block/order :db/id) (:block/_closed-value-property property)))
++
++(defn- choice-content [choice]
++  (str (db-property/property-value-content choice)))
++
++(defn- resolve-choice
++  "The db id of one of `property`'s own choices given by UUID, db id, ident or title, or nil.
++  A title is matched exactly first, then ignoring case, and only among the property's choices:
++  another property may have a choice with the same title."
++  [db property value]
++  (let [property-ident (:db/ident property)
++        value (if (string? value)
++                (get-in property-choice-aliases [property-ident (string/lower-case value)] value)
++                value)
++        choices (property-choices property)
++        own (fn [entity] (when (and entity (some #(= (:db/id entity) (:db/id %)) choices))
++                           (:db/id entity)))
++        by-title (fn [same?] (some #(when (same? (choice-content %)) (:db/id %)) choices))]
++    (cond
++      (number? value) (own (d/entity db value))
++      (qualified-keyword? value) (own (d/entity db value))
++      (and (string? value) (common-util/uuid-string? value)) (own (d/entity db [:block/uuid (uuid value)]))
++      (string? value) (or (when (qualified-keyword? (keyword value)) (own (d/entity db (keyword value))))
++                          (by-title #(= % value))
++                          (by-title #(= (string/lower-case %) (string/lower-case value))))
++      :else nil)))
++
++(defn- choice-error
++  "Why `property` refused a value that is not one of its choices, listing the valid ones."
++  [property]
++  (str "property value must resolve to one of " (or (:block/title property) (entity-ident property))
++       "'s choices (" (string/join ", " (map choice-content (property-choices property))) ")"))
++
+ (defn- free-text-value?
+   "A plain string for a text (default-type) property without fixed choices. The outliner stores it
+   in a new value block, as the editor does, so it is never looked up by title: text that happens to
+@@ -665,8 +701,10 @@
+ 
+ (defn- prepare-ref-property-value [db property-ident value e2ee?]
+   (let [property (d/entity db property-ident)]
+-    (if (free-text-value? property value e2ee?)
+-      value
++    (cond
++      (seq (:block/_closed-value-property property)) (resolve-choice db property value)
++      (free-text-value? property value e2ee?) value
++      :else
+       (or (resolve-ref-entity db property-ident value)
+           (when (and (not e2ee?)
+                      (= :url (:logseq.property/type property))
+@@ -683,8 +721,13 @@
+             resolved (mapv #(prepare-ref-property-value db property-ident % e2ee?) values)]
+         (if (every? some? resolved)
+           {:value (if many-input? resolved (first resolved))}
+-          {:error (if (= property-ident :block/tags)
++          {:error (cond
++                    (= property-ident :block/tags)
+                     "property value must resolve to an existing class by UUID, ident, or title"
++                    (seq (:block/_closed-value-property property))
++                    (str (choice-error property) ", got "
++                         (pr-str (str (some (fn [[v r]] (when (nil? r) v)) (map vector values resolved)))))
++                    :else
+                     "property value must resolve to an existing entity by UUID, ident, or title")})))))
+ 
+ (defn- set-prepared-property! [conn block-id property-ident value reset-existing-values?]
+@@ -837,14 +880,8 @@
+     (:logseq.property/deadline task) (assoc :deadline (:logseq.property/deadline task))))
+ 
+ (defn- resolve-property-choice [db property-ident aliases selector]
+-  (let [selector (get aliases selector selector)
+-        choice-id (resolve-ref-entity db property-ident selector)
+-        choice (when choice-id (d/entity db choice-id))
+-        property-id (d/entid db property-ident)]
+-    (when (and choice-id
+-               (some #(= property-id (:v %))
+-                     (d/datoms db :eavt choice-id :block/closed-value-property)))
+-      choice)))
++  (some->> (resolve-choice db (d/entity db property-ident) (get aliases selector selector))
++           (d/entity db)))
+ 
+ (def ^:private search-types #{"pages" "blocks" "tags" "properties" "assets"})
+ 
+@@ -1963,7 +2000,17 @@
+       (> (count selected) limit) (assoc :next-cursor (encode-cursor (first (last page)))))))
+ 
+ (def ^:private health-checks
+-  ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"])
++  ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"
++   "mismatched-choice-values"])
++
++(defn- mismatched-choice-response [{:keys [holder property value]}]
++  (let [value-property (first (:block/closed-value-property value))]
++    (assoc (holder-response holder)
++           :property (entity-ident property)
++           :property-title (:block/title property)
++           :value (choice-content value)
++           :value-uuid (uuid-string (:block/uuid value))
++           :value-property (some-> value-property entity-ident))))
+ 
+ (defn- comma-list [^js url param]
+   (let [raw (.get (.-searchParams url) param)]
+@@ -1984,7 +2031,13 @@
+                                                   :entities (mapv page-ref-response group)})
+                                                %))
+       "pages-without-summary" (pages-check (graph-insights/pages-without-summary db prefix))
+-      "pages-without-tags" (pages-check (graph-insights/pages-without-tags db)))))
++      "pages-without-tags" (pages-check (graph-insights/pages-without-tags db))
++      "mismatched-choice-values"
++      (update (paginate-by (fn [{:keys [holder property value]}]
++                             [(uuid-string (:block/uuid holder))
++                              (str (entity-ident property) " " (uuid-string (:block/uuid value)))])
++                           (graph-insights/mismatched-choice-values db) limit cursor)
++              :items #(mapv mismatched-choice-response %)))))
+ 
+ (defn- knowledge-index-entry [db {:keys [ref-properties lineage prefix]} page]
+   (let [summary (graph-insights/page-summary db page prefix)]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 7f4a34e..5ab25ae 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -111,7 +111,7 @@
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+-   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order: orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix) and pages-without-tags (non-journal user pages with no tag). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values of a property with choices that are not one of its own choices, such as another property's choice with the same title; each item names the holder, the property, the value and the property the value's choice belongs to). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+@@ -119,17 +119,17 @@
+    "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
+-   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. A property with choices (such as Status) takes only one of its own choices, by UUID, ident or title (ignoring case); any other value is refused with the valid choices listed. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
+    "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
+    "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+-   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+-   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+-   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title."]
++   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices, by UUID, ident or title (ignoring case); any other value is refused with the valid choices listed. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices, by UUID, ident or title (ignoring case); any other value is refused with the valid choices listed. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices, by UUID, ident or title (ignoring case); any other value is refused with the valid choices listed."]
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+-   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax."]
++   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices, by UUID, ident or title (ignoring case); any other value is refused with the valid choices listed."]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
+    "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+@@ -353,7 +353,7 @@
+             :description "Most items listed per relation. Counts are always complete."}])
+     (= "getGraphHealth" operation-id)
+     (into (concat [{:name "checks" :in "query" :schema {:type "string"}
+-                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags. Defaults to all; any other value is rejected."}
++                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags, mismatched-choice-values. Defaults to all; any other value is rejected."}
+                    {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
+                     :description "Most items listed per check. Counts are always complete."}
+                    {:name "cursor" :in "query" :schema {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs
+new file mode 100644
+index 0000000..bd11bcc
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs
+@@ -0,0 +1,201 @@
++(ns logseq.db-sync.semantic-choice-values-test
++  "Values of a property with choices (closed values) resolve only among that property's own
++  choices. Two properties here share the choice title \"active\"; Project status's choice is
++  created first, so it is the older entity a graph-wide title lookup would find first."
++  (:require [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- with-choices
++  "A page `Choices` with blocks, a plain block titled \"one\", and two properties with choices:
++  Project status (active, paused) and then Relationship status (active, prospect)."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              page-id (random-uuid)
++              blocks (vec (repeatedly 6 random-uuid))
++              plain-id (random-uuid)
++              _ (d/transact! conn (concat
++                                   [{:block/uuid page-id :block/name "choices" :block/title "Choices"
++                                     :block/tags :logseq.class/Page
++                                     :block/created-at 1 :block/updated-at 1}
++                                    {:block/uuid plain-id :block/title "one" :block/page [:block/uuid page-id]
++                                     :block/parent [:block/uuid page-id] :block/order "a0"
++                                     :block/created-at 1 :block/updated-at 1}]
++                                   (map-indexed (fn [index id]
++                                                  {:block/uuid id :block/title (str "Block " index)
++                                                   :block/page [:block/uuid page-id]
++                                                   :block/parent [:block/uuid page-id]
++                                                   :block/order (str "a" (inc index))
++                                                   :block/created-at 1 :block/updated-at 1})
++                                                blocks)))
++              project (outliner-property/upsert-property!
++                       conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                       {:property-name "Project status"})
++              project-active (random-uuid)
++              project-paused (random-uuid)
++              _ (outliner-property/upsert-closed-value! conn (:db/ident project) {:id project-active :value "active"})
++              _ (outliner-property/upsert-closed-value! conn (:db/ident project) {:id project-paused :value "paused"})
++              relationship (outliner-property/upsert-property!
++                            conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                            {:property-name "Relationship status"})
++              rel-active (random-uuid)
++              rel-prospect (random-uuid)
++              _ (outliner-property/upsert-closed-value! conn (:db/ident relationship) {:id rel-active :value "active"})
++              _ (outliner-property/upsert-closed-value! conn (:db/ident relationship) {:id rel-prospect :value "prospect"})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self :page-id page-id :blocks blocks :plain-id plain-id
++              :project (:db/ident project) :relationship (:db/ident relationship)
++              :project-active project-active :project-paused project-paused
++              :rel-active rel-active :rel-prospect rel-prospect}))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- stored-uuid
++  "The :block/uuid of the value `property` holds on block `id`, or nil."
++  [conn id property]
++  (let [value (get (d/entity @conn [:block/uuid id]) property)
++        value (if (set? value) (first value) value)]
++    (:block/uuid value)))
++
++(defn- property-path [block-id property]
++  (str "/semantic/blocks/" block-id "/properties/"
++       (js/encodeURIComponent (subs (str property) 1))))
++
++(defn- names-property? [error property]
++  (or (string/includes? error "Relationship status")
++      (string/includes? error (subs (str property) 1))))
++
++(deftest choice-title-resolves-among-the-propertys-own-choices-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id blocks relationship rel-active rel-prospect]}]
++        (let [[b0 b1 b2 b3] blocks
++              tree-child (random-uuid)
++              batch-child (random-uuid)
++              rel-ident (subs (str relationship) 1)]
++          (p/let [put (request! self "PUT" (property-path b0 relationship) {:value "active"})
++                  put-case (request! self "PUT" (property-path b1 relationship) {:value "Active"})
++                  put-only-one (request! self "PUT" (property-path b2 relationship) {:value "prospect"})
++                  batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                      {:entries [{:block-id (str b3) :property-id rel-ident :value "active"}]})
++                  tree (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str page-id)
++                                  :blocks [{:uuid (str tree-child) :title "Tree child"
++                                            :properties {"Relationship status" "active"}}]})
++                  batch-tree (request! self "POST" "/semantic/block-trees/batch"
++                                       {:entries [{:target-id (str page-id)
++                                                   :blocks [{:uuid (str batch-child) :title "Batch child"
++                                                             :properties {rel-ident "active"}}]}]})]
++            (is (= [200 200 200 200 201 201]
++                   (mapv :status [put put-case put-only-one batch-set tree batch-tree])))
++            (is (= rel-active (stored-uuid conn b0 relationship))
++                "set_block_property stores Relationship status's own \"active\"")
++            (is (= rel-active (stored-uuid conn b1 relationship))
++                "a title differing only by case resolves to the same choice")
++            (is (= rel-prospect (stored-uuid conn b2 relationship)))
++            (is (= rel-active (stored-uuid conn b3 relationship))
++                "batch_set_block_property stores Relationship status's own \"active\"")
++            (is (= rel-active (stored-uuid conn tree-child relationship))
++                "insert_block_tree stores Relationship status's own \"active\"")
++            (is (= rel-active (stored-uuid conn batch-child relationship))
++                "batch_insert_block_trees stores Relationship status's own \"active\"")))))))
++
++(deftest value-outside-the-propertys-choices-is-refused-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id blocks relationship project-active]}]
++        (let [[b0 b1] blocks
++              rel-ident (subs (str relationship) 1)
++              refused-values ["nope" "one" "paused" (str project-active)]]
++          (p/let [puts (p/all (map #(request! self "PUT" (property-path b0 relationship) {:value %})
++                                   refused-values))
++                  batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                      {:entries [{:block-id (str b0) :property-id rel-ident :value "prospect"}
++                                                 {:block-id (str b1) :property-id rel-ident :value "paused"}]})
++                  tree (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str page-id)
++                                  :blocks [{:title "Tree child" :properties {"Relationship status" "nope"}}]})
++                  batch-tree (request! self "POST" "/semantic/block-trees/batch"
++                                       {:entries [{:target-id (str page-id) :blocks [{:title "Fine"}]}
++                                                  {:target-id (str page-id)
++                                                   :blocks [{:title "Batch child"
++                                                             :properties {rel-ident "one"}}]}]})]
++            (doseq [[value response] (map vector refused-values puts)
++                    :let [error (str (get-in response [:body :error]))]]
++              (is (= 400 (:status response)) (str "PUT " value " is refused"))
++              (is (names-property? error relationship) (str "PUT " value ": " error))
++              (is (and (string/includes? error "active") (string/includes? error "prospect"))
++                  (str "PUT " value " lists the valid choices: " error)))
++            (is (= 400 (:status batch-set)))
++            (let [error (str (get-in batch-set [:body :error]))]
++              (is (string/starts-with? error "entry 1: ") error)
++              (is (names-property? error relationship) error)
++              (is (and (string/includes? error "active") (string/includes? error "prospect")) error))
++            (is (= 400 (:status tree)))
++            (let [error (str (get-in tree [:body :error]))]
++              (is (string/starts-with? error "blocks[0]: ") error)
++              (is (names-property? error relationship) error)
++              (is (and (string/includes? error "active") (string/includes? error "prospect")) error))
++            (is (= 400 (:status batch-tree)))
++            (let [error (str (get-in batch-tree [:body :error]))]
++              (is (string/starts-with? error "entries[1].blocks[0]: ") error)
++              (is (names-property? error relationship) error)
++              (is (and (string/includes? error "active") (string/includes? error "prospect")) error))
++            (is (nil? (stored-uuid conn b0 relationship)) "a refused value writes nothing")
++            (is (nil? (stored-uuid conn b1 relationship)) "a refused batch writes nothing")
++            (is (not-any? #(contains? #{"Tree child" "Batch child" "Fine"} (:block/title %))
++                          (:block/_parent (d/entity @conn [:block/uuid page-id])))
++                "refused trees insert nothing")))))))
++
++(deftest task-status-title-shared-with-another-property-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id project]}]
++        (let [project-blocked (random-uuid)
++              status-blocked (random-uuid)
++              _ (outliner-property/upsert-closed-value! conn project {:id project-blocked :value "Blocked"})
++              _ (outliner-property/upsert-closed-value! conn :logseq.property/status
++                                                        {:id status-blocked :value "Blocked"})]
++          (p/let [created (request! self "POST" "/semantic/tasks"
++                                    {:title "Waiting on legal" :page-id (str page-id) :status "Blocked"})]
++            (is (= 201 (:status created)) (str (:body created)))
++            (is (= (str status-blocked) (get-in created [:body :status :uuid]))
++                "the task's own status choice is found, not Project status's")))))))
++
++(deftest health-flags-choice-values-owned-by-another-property-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self blocks project relationship project-active rel-active]}]
++        (let [[b0 b1] blocks
++              _ (d/transact! conn [[:db/add [:block/uuid b0] relationship [:block/uuid project-active]]
++                                   [:db/add [:block/uuid b1] relationship [:block/uuid rel-active]]])]
++          (p/let [health (request! self "GET" "/semantic/health?checks=mismatched-choice-values" nil)]
++            (is (= 200 (:status health)) (str (:body health)))
++            (let [check (get-in health [:body :checks :mismatched-choice-values])]
++              (is (= 1 (:count check)))
++              (is (= [{:uuid (str b0)
++                       :property (subs (str relationship) 1)
++                       :value "active"
++                       :value-uuid (str project-active)
++                       :value-property (subs (str project) 1)}]
++                     (mapv #(select-keys % [:uuid :property :value :value-uuid :value-property])
++                           (:items check)))
++                  "only the value whose choice belongs to Project status is flagged"))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+index 7a23de6..e3a00c4 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+@@ -166,7 +166,8 @@
+                                                              (js/encodeURIComponent cursor))])
+                            checks (get-in all [:body :checks])]
+                      (is (= 200 (:status all)))
+-                     (is (= #{:orphan-tags :orphan-properties :duplicate-titles :pages-without-summary :pages-without-tags}
++                     (is (= #{:orphan-tags :orphan-properties :duplicate-titles :pages-without-summary :pages-without-tags
++                            :mismatched-choice-values}
+                             (set (keys checks))))
+                      (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))
+                          "classes with holders or subclasses are not orphans; built-in classes are left out")
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 52e8c46..d69fbda 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -14,6 +14,7 @@
+             [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.semantic-index-health-test]
+             [logseq.db-sync.semantic-block-changes-test]
++            [logseq.db-sync.semantic-choice-values-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-auth-test]
