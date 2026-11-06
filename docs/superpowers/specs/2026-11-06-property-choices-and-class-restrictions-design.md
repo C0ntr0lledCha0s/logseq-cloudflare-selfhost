@@ -239,3 +239,18 @@ Connector: vitest checks that the generated tools expose the new fields (through
 4. **Flag placement.** `dry-run` and `acknowledge-holders` are query flags here, as on the delete endpoints. The bulk endpoints take `dry-run` in the body. Keep the delete convention for `update_property`, or follow the bulk one?
 5. **Case-insensitive matching in conversion.** "active" maps to the choice "Active". Is that what you want for every property in the backfill, or should conversion match exactly only?
 6. **Icons.** Choices take `{type: "emoji" | "tabler-icon", id}`. Is that enough, or do you want to set colours too?
+
+## As built
+
+Patch 0026 follows this design: the four existing endpoints gain optional fields, there are no new routes or tools, and every call validates all its fields, writes in one `atomic-write!` and reads the result back (500 if it didn't land). The tools manifest did not change, because the new inputs come from the generated OpenAPI. The differences:
+
+- **Renames may chain, and cycles are refused (3.3).** The design applied `choices.update` entries as listed. As built, `validate-choices` puts each rename after the rename of the choice that holds its new title, so a chain works in any order. Titles are compared exactly as stored, as `upsert-closed-value!` compares them. Renames that pass titles round a cycle (a swap, a three-way rotation) are refused before anything is written, naming the entry and the cycle.
+- **`choices.order` names the titles the call leaves (3.3).** A title that a rename frees and an add or another rename takes names its new owner. A title the call frees and nothing takes still names its old choice.
+- **The default-value choice counts as held (3.4).** Retiring the choice that is the property's default value would have cleared the default with no 409. It is now marked `default: true`, needs `acknowledge-holders=true`, and the dry run and 200 response report `default: true`.
+- **Built-in properties keep their classes (3.6).** `classes` on a built-in property (Assignee's Page restriction, for instance) is refused for set, add, remove and `set: []`, because the handler's raw transact skipped the outliner's built-in guard.
+- **`out_of_class` skips empty placeholders (3.6).** Holders left at Logseq's empty placeholder are not counted, on cardinality one and many.
+- **Conversion is stricter than 3.5.** `convert_values` also refuses a property that has a default value, and a text value block with child blocks (naming its holder and the count), because `delete-blocks!` removes children and keeps a lone default-value block. Holders of the empty placeholder are left as they are. It converts only value blocks the property itself made, and skips only the property's own choices, so another property's value block or choice as a holder is a 400. The dry-run mapping is as designed.
+- **Tags refuse hidden built-in parents (3.7).** `extends` naming a built-in tag that the app's picker hides (`ldb/extends-hidden-tags`: Tag, Page, Journal, Property, Query, Template and others) is refused, as well as a self-extension or a descendant. Properties take `add`, `remove` or `set` as designed, and `set` keeps built-in properties.
+- **Flags.** `dry-run` and `acknowledge-holders` stayed query parameters (open question 4).
+
+Not built, and now on the README backlog: `replace-with` on retire (open question 1), and resolving node-property titles against entities created earlier in the same `batch_insert_block_trees` call (3.8). The empty-page-into-a-tag 500 belongs to item 16.
