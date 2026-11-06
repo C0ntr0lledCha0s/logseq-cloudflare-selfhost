@@ -3,9 +3,9 @@ title: A value given by title must resolve only among the property's allowed val
 area: api
 tags: [identifiers, titles, closed-values, choices, node-property, classes, value-blocks, url, silent-success, resolve-ref-entity, title-candidates]
 seen:
-  - 2026-11-06 – item 25, patch 0019 (relationship-status "active" stored project-status's "active" choice)
+  - 2026-11-06 – item 25, patch 0021 (relationship-status "active" stored project-status's "active" choice)
   - 2026-11-06 – item 25, review rounds 2 and 3 (r2-correctness-1, r3-correctness-1, r3-integrity-1): the fix's own title ranking repeated the class
-  - 2026-11-06 – item 23, patch 0020, review round 3 (r3-correctness-1): a bare JSON integer is still read as a db id for node and text properties
+  - 2026-11-06 – item 23, patch 0022, review round 3 (r3-correctness-1): a bare JSON integer is still read as a db id for node and text properties
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
@@ -22,7 +22,7 @@ promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 
 ## Fix
 
-Patch 0019 (`patches/0019-semantic-choice-values-scoped-to-property.patch`): for a property with choices, every input form (UUID, db id, ident, title, case-insensitive) resolves only among `:block/_closed-value-property` of that property, scoped to the block's tags, and anything else is refused with an error that names the property, the entry and the valid choices. `resolve-property-choice` looks inside the property first. Node properties skip other properties' choices and value blocks and refuse a title several pages share. `get_graph_health` flags values whose choice belongs to another property. Two review findings were still open when the lane ended (class order and URL value blocks); see the lane's PR.
+Patch 0021 (`patches/0021-semantic-choice-values-scoped-to-property.patch`): for a property with choices, every input form (UUID, db id, ident, title, case-insensitive) resolves only among `:block/_closed-value-property` of that property, scoped to the block's tags, and anything else is refused with an error that names the property, the entry and the valid choices. `resolve-property-choice` looks inside the property first. Node properties skip other properties' choices and value blocks and refuse a title several pages share. `get_graph_health` flags values whose choice belongs to another property. Two review findings were still open when the lane ended (class order and URL value blocks); see the lane's PR.
 
 ## How to catch it next time
 

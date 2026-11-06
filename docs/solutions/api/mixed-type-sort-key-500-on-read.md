@@ -3,7 +3,7 @@ title: A sort key that mixes types makes a valid stored value unreadable (HTTP 5
 area: api
 tags: [read-500, sort-by, compare, block-order, node-property, many-cardinality, entity-properties-response, db-id, number-text, silent-success]
 seen:
-  - 2026-11-06 – item 23, patch 0020
+  - 2026-11-06 – item 23, patch 0022
 promoted_to: []
 ---
 
@@ -17,11 +17,11 @@ promoted_to: []
 
 Related finds in the same lane:
 - A default-type property given a page UUID reached the outliner's validator and came back as a 500 "Schema validation failed", not a refusal naming the entry.
-- A number property given a JSON integer read it as a db id (`resolve-ref-entity`: `(number? value) (d/entity db value)`), silently storing another block's value block. Patch 0020 added `number-text` for number properties only; the same bare-integer-as-db-id read is still open for node and default-type properties (a node property given `150` stored db id 150, not the page titled "150").
+- A number property given a JSON integer read it as a db id (`resolve-ref-entity`: `(number? value) (d/entity db value)`), silently storing another block's value block. Patch 0022 added `number-text` for number properties only; the same bare-integer-as-db-id read is still open for node and default-type properties (a node property given `150` stored db id 150, not the page titled "150").
 
 ## Fix
 
-Patch 0020: a total sort key (ordered values by order key, then unordered by db id), refusal up front by type with entry and property named, and `number-text` for number properties. The bare-integer case for node and text properties and the `isFinite` guard test were open at the end of the lane.
+Patch 0022: a total sort key (ordered values by order key, then unordered by db id), refusal up front by type with entry and property named, and `number-text` for number properties. The bare-integer case for node and text properties and the `isFinite` guard test were open at the end of the lane.
 
 ## How to catch it next time
 

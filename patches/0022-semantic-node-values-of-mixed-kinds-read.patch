@@ -647,7 +647,7 @@ index 0000000..2591008
 +                (is (nil? (get (d/entity @conn [:block/uuid block]) (:db/ident points)))
 +                    (str label ": stored " (pr-str (number block points))))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index d69fbda..53363a1 100644
+index 0ca5a37..6ef57d9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -15,6 +15,7 @@
@@ -657,4 +657,4 @@ index d69fbda..53363a1 100644
 +            [logseq.db-sync.semantic-node-value-read-test]
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]
-             [logseq.db-sync.worker-auth-test]
+             [logseq.db-sync.worker-allowed-users-test]

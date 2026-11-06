@@ -1406,7 +1406,7 @@ index 7a23de6..e3a00c4 100644
                       (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))
                           "classes with holders or subclasses are not orphans; built-in classes are left out")
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 52e8c46..d69fbda 100644
+index 46d5cd0..0ca5a37 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -14,6 +14,7 @@
@@ -1416,4 +1416,4 @@ index 52e8c46..d69fbda 100644
 +            [logseq.db-sync.semantic-choice-values-test]
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]
-             [logseq.db-sync.worker-auth-test]
+             [logseq.db-sync.worker-allowed-users-test]

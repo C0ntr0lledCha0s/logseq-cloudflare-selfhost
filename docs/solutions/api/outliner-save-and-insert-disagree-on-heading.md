@@ -1,9 +1,9 @@
 ---
 title: The outliner's save strips a heading prefix and the insert keeps it, so a server write must convert the prefix itself
 area: api
-tags: [heading, markdown-prefix, save-block, insert-blocks, clear-markdown-heading, display-type, two-write-paths, update_block, patch-0022]
+tags: [heading, markdown-prefix, save-block, insert-blocks, clear-markdown-heading, display-type, two-write-paths, update_block, patch-0024]
 seen:
-  - 2026-11-06 – item 32 (update_block dropped a leading "## "), patch 0022
+  - 2026-11-06 – item 32 (update_block dropped a leading "## "), patch 0024
 promoted_to: []
 ---
 
@@ -20,7 +20,7 @@ The two paths call different outliner functions. `save-block!` reaches `-save`, 
 
 ## Fix
 
-Patch 0022. `prepare-block-title!` takes the block being written. Unless the block has a display type, it reads `^(#{1,6})\s+`, strips it and returns `:logseq.property/heading` with the title attributes, so `update_block`, every insert tool, `capture_to_today`, `create_task` and `refresh_refs` store the app's form. A title with no prefix keeps the existing heading. Seven or more `#`, or `#` with nothing after it, is not a heading, and its first `#` is stored escaped so `-save` cannot strip it. The reads show the level (`get_page_outline` as the `## ` prefix).
+Patch 0024. `prepare-block-title!` takes the block being written. Unless the block has a display type, it reads `^(#{1,6})\s+`, strips it and returns `:logseq.property/heading` with the title attributes, so `update_block`, every insert tool, `capture_to_today`, `create_task` and `refresh_refs` store the app's form. A title with no prefix keeps the existing heading. Seven or more `#`, or `#` with nothing after it, is not a heading, and its first `#` is stored escaped so `-save` cannot strip it. The reads show the level (`get_page_outline` as the `## ` prefix).
 
 ## How to catch it next time
 

@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 53363a1..d536c7b 100644
+index 6ef57d9..f47b910 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -38,7 +38,17 @@
+@@ -39,7 +39,17 @@
    (-> (env/get-test-data)
        (env/reset-test-data!)))
  

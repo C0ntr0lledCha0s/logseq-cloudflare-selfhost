@@ -513,7 +513,7 @@ index 0000000..fc6ff82
 +            (is (not-any? #(= (str id) (:uuid %)) (get-in response [:body :changed]))
 +                (pr-str (:body response)))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index d536c7b..23caac3 100644
+index f47b910..6011943 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -15,6 +15,7 @@
@@ -525,7 +525,7 @@ index d536c7b..23caac3 100644
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
-index 2fb5c14..5c8a79d 100644
+index 2fb5c14..86e143f 100644
 --- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 @@ -4139,7 +4139,9 @@
@@ -533,7 +533,7 @@ index 2fb5c14..5c8a79d 100644
                    _ (is (= #{decision-id} (tags-of (ids 3))))
                    _ (is (= (str "Known " (ref-of decision-id) ") and \\#Unknown") (title-of (ids 3))))
 -                  _ (is (= "## Heading \\#Unknown" (title-of (ids 4))))
-+                  ;; The heading prefix is stored as the app stores it (patch 0022): off the title, into the property.
++                  ;; The heading prefix is stored as the app stores it (patch 0024): off the title, into the property.
 +                  _ (is (= "Heading \\#Unknown" (title-of (ids 4))))
 +                  _ (is (= 2 (:logseq.property/heading (d/entity @conn [:block/uuid (ids 4)]))))
                    _ (doseq [id ids]

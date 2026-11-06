@@ -10,7 +10,7 @@
 # waits until the watch has finished a build that started after the latest source change, exits 1
 # with the compiler's error on a build failure, and otherwise runs
 # `node worker/dist/worker-test.js [ns-regex]` and exits with its code. With ns-regex, only the
-# namespaces whose name contains a match run (patch 0021), e.g. `semantic-choice-values`.
+# namespaces whose name contains a match run (patch 0023), e.g. `semantic-choice-values`.
 # --stop kills the checkout's watch. If the watch can't start, it falls back to a one-shot compile.
 #
 # Callers on one checkout are serialised with flock. Overrides (for tests):
