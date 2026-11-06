@@ -1,0 +1,440 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/auth.cljs b/deps/db-sync/src/logseq/db_sync/worker/auth.cljs
+index 2b71b42..7c307f0 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/auth.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/auth.cljs
+@@ -1,5 +1,6 @@
+ (ns logseq.db-sync.worker.auth
+   (:require [clojure.string :as string]
++            [lambdaisland.glogi :as log]
+             [logseq.common.authorization :as authorization]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
+@@ -68,6 +69,53 @@
+       (and (number? exp)
+            (<= exp now-s)))))
+ 
++(def ^:private allowed-user-id-pattern
++  #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
++
++(defn- allowed-user-entries
++  [value]
++  (map string/trim (string/split value #"," -1)))
++
++(defn parse-allowed-users
++  "Parses DB_SYNC_ALLOWED_USERS. `none`, empty or unset means nobody; otherwise
++  every comma-separated entry must be a lowercase UUID, or the list is
++  malformed and allows nobody."
++  [raw]
++  (let [value (some-> raw string/trim)]
++    (if (or (string/blank? value) (= "none" value))
++      {:ids #{} :malformed? false}
++      (let [entries (allowed-user-entries value)]
++        (if (every? #(re-matches allowed-user-id-pattern %) entries)
++          {:ids (set entries) :malformed? false}
++          {:ids #{} :malformed? true})))))
++
++;; The last raw value seen by this isolate and its parsed ids.
++(defonce ^:private *allowed-users (atom nil))
++
++(defn- allowed-user-ids
++  [env]
++  (let [raw (aget env "DB_SYNC_ALLOWED_USERS")
++        cached @*allowed-users]
++    (if (and cached (= raw (:raw cached)))
++      (:ids cached)
++      (let [{:keys [ids malformed?]} (parse-allowed-users raw)]
++        (when malformed?
++          (log/error :db-sync/allowed-users-malformed
++                     {:entries (count (allowed-user-entries (string/trim raw)))}))
++        (reset! *allowed-users {:raw raw :ids ids})
++        ids))))
++
++(defn- allowed-claims
++  [claims env]
++  (when claims
++    (let [sub (aget claims "sub")]
++      (if (and (string? sub) (contains? (allowed-user-ids env) sub))
++        claims
++        (let [email (aget claims "email")]
++          (log/warn :db-sync/user-not-allowed
++                    {:sub sub :email (when (string? email) email)})
++          nil)))))
++
+ (defn auth-claims [request env]
+   (let [token (token-from-request request)]
+     (if (string? token)
+@@ -83,7 +131,8 @@
+                          (unsafe-jwt-claims token)
+ 
+                          :else
+-                         (p/rejected error))))))
++                         (p/rejected error))))
++            (p/then #(allowed-claims % env))))
+       (p/resolved nil))))
+ 
+ (defn personal-access-token?
+@@ -119,9 +168,10 @@
+           (when (and pat
+                      scope
+                      (> (:expires-at pat) (common/now-ms)))
+-            #js {"sub" (:user-id pat)
+-                 "scope" scope
+-                 "pat_id" (:id pat)
+-                 "pat_graph_id" (:graph-id pat)}))
++            (allowed-claims #js {"sub" (:user-id pat)
++                                 "scope" scope
++                                 "pat_id" (:id pat)
++                                 "pat_graph_id" (:graph-id pat)}
++                            env)))
+         (p/resolved nil))
+       (auth-claims request env))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 52e8c46..46d5cd0 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -16,6 +16,7 @@
+             [logseq.db-sync.semantic-block-changes-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
++            [logseq.db-sync.worker-allowed-users-test]
+             [logseq.db-sync.worker-auth-test]
+             [logseq.db-sync.worker-dispatch-test]
+             [logseq.db-sync.worker-handler-assets-test]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs
+new file mode 100644
+index 0000000..72a0523
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs
+@@ -0,0 +1,154 @@
++(ns logseq.db-sync.worker-allowed-users-test
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [lambdaisland.glogi :as log]
++            [logseq.common.authorization :as authorization]
++            [logseq.db-sync.common :as common]
++            [logseq.db-sync.index :as index]
++            [logseq.db-sync.worker.auth :as auth]
++            [promesa.core :as p]))
++
++(def ^:private allowed-id "11111111-1111-4111-8111-111111111111")
++(def ^:private other-id "22222222-2222-4222-8222-222222222222")
++;; allowed-id has no hex letters, so upper-casing it is a no-op; case needs letters.
++(def ^:private lettered-id "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
++
++(defn- verify-jwt-as
++  "A verify-jwt stub that resolves claims for `sub` with an email."
++  [sub]
++  (fn [_token _env]
++    (js/Promise.resolve #js {"sub" sub "email" "x@example.com"})))
++
++(defn- fail-and-done [done]
++  (fn [error]
++    (is false (str error))
++    (done)))
++
++(deftest parse-allowed-users-test
++  (testing "none, empty, nil and whitespace mean nobody and are well-formed"
++    (doseq [raw ["none" "" nil "  "]]
++      (is (= {:ids #{} :malformed? false} (auth/parse-allowed-users raw)) (pr-str raw))))
++  (testing "comma-separated UUIDs, trimmed"
++    (is (= {:ids #{allowed-id other-id} :malformed? false}
++           (auth/parse-allowed-users (str allowed-id ", " other-id))))
++    (is (= {:ids #{allowed-id} :malformed? false}
++           (auth/parse-allowed-users (str " " allowed-id "\n"))))
++    (is (= {:ids #{lettered-id} :malformed? false}
++           (auth/parse-allowed-users lettered-id))))
++  (testing "any bad entry makes the whole list malformed and empty"
++    (doseq [raw [(string/upper-case lettered-id)
++                 (str allowed-id ",")
++                 (str allowed-id ",," other-id)
++                 "bob"]]
++      (is (= {:ids #{} :malformed? true} (auth/parse-allowed-users raw)) (pr-str raw)))))
++
++(defn- jwt-request [token]
++  (js/Request. "http://localhost/graphs"
++               #js {:headers #js {"authorization" (str "Bearer " token)}}))
++
++(deftest auth-claims-filters-by-allowed-users-test
++  (async done
++         (let [claims-for (fn [sub env]
++                            (p/with-redefs [authorization/verify-jwt (verify-jwt-as sub)]
++                              (auth/auth-claims (jwt-request "jwt-token") env)))]
++           (-> (p/let [allowed (claims-for allowed-id #js {"DB_SYNC_ALLOWED_USERS" allowed-id})
++                       other (claims-for other-id #js {"DB_SYNC_ALLOWED_USERS" allowed-id})
++                       unset (claims-for allowed-id #js {})
++                       nobody (claims-for allowed-id #js {"DB_SYNC_ALLOWED_USERS" "none"})
++                       malformed (claims-for allowed-id #js {"DB_SYNC_ALLOWED_USERS" "not-a-uuid"})]
++                 (is (= allowed-id (aget allowed "sub")))
++                 (is (nil? other))
++                 (is (nil? unset))
++                 (is (nil? nobody))
++                 (is (nil? malformed)))
++               (p/then (fn [] (done)))
++               (p/catch (fail-and-done done))))))
++
++(deftest auth-claims-unverified-fallback-is-filtered-test
++  (async done
++         (let [payload (-> (js/btoa (js/JSON.stringify #js {"sub" other-id}))
++                           (string/replace #"=+$" ""))
++               token (str "eyJhbGciOiJSUzI1NiJ9." payload ".signature")
++               env #js {"DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" "true"
++                        "DB_SYNC_ALLOWED_USERS" allowed-id}]
++           (-> (p/with-redefs [authorization/verify-jwt
++                               (fn [_token _env]
++                                 (p/rejected (ex-info "jwks" {})))]
++                 (p/let [claims (auth/auth-claims (jwt-request token) env)]
++                   (is (= other-id (aget (auth/unsafe-jwt-claims token) "sub")))
++                   (is (nil? claims))))
++               (p/then (fn [] (done)))
++               (p/catch (fail-and-done done))))))
++
++(deftest auth-claims-without-string-sub-is-refused-test
++  (async done
++         (let [env #js {"DB_SYNC_ALLOWED_USERS" allowed-id}
++               claims-for (fn [claims]
++                            (p/with-redefs [authorization/verify-jwt
++                                            (fn [_ _] (js/Promise.resolve claims))]
++                              (auth/auth-claims (jwt-request "jwt-token") env)))]
++           (-> (p/let [no-sub (claims-for #js {})
++                       number-sub (claims-for #js {"sub" 42})]
++                 (is (nil? no-sub))
++                 (is (nil? number-sub)))
++               (p/then (fn [] (done)))
++               (p/catch (fail-and-done done))))))
++
++(deftest semantic-auth-claims-pat-filtered-test
++  (async done
++         (let [env #js {"DB" #js {} "DB_SYNC_ALLOWED_USERS" allowed-id}
++               claims-for (fn [user-id]
++                            (p/with-redefs [index/<personal-access-token-by-hash
++                                            (fn [_db _hash]
++                                              (p/resolved {:user-id user-id
++                                                           :permission "read"
++                                                           :expires-at (+ (common/now-ms) 60000)
++                                                           :id "pat-1"
++                                                           :graph-id "graph-1"}))]
++                              (auth/semantic-auth-claims (jwt-request "logseq_pat_x") env)))]
++           (-> (p/let [allowed (claims-for allowed-id)
++                       other (claims-for other-id)
++                       no-user (claims-for nil)]
++                 (is (= allowed-id (aget allowed "sub")))
++                 (is (= "pat-1" (aget allowed "pat_id")))
++                 (is (nil? other))
++                 (is (nil? no-user)))
++               (p/then (fn [] (done)))
++               (p/catch (fail-and-done done))))))
++
++(defn- capture-logs! []
++  (let [records (atom [])
++        handler (fn [record] (swap! records conj record))]
++    (log/add-handler handler)
++    {:records records
++     :stop! #(log/remove-handler handler)}))
++
++(defn- logged
++  "The data of each `event` record logged at `level` (glogi's :warning or :severe)."
++  [records level event]
++  (->> @records
++       (filter #(= level (:level %)))
++       (keep #(get-in % [:message event]))))
++
++(deftest allowed-users-logs-test
++  (async done
++         (let [{:keys [records stop!]} (capture-logs!)
++               ;; A raw value no other test uses, so its malformed log is not already spent.
++               malformed (str allowed-id ", Secret-Entry ," other-id)
++               claims-for (fn [sub raw]
++                            (p/with-redefs [authorization/verify-jwt (verify-jwt-as sub)]
++                              (auth/auth-claims (jwt-request "jwt-token")
++                                                #js {"DB_SYNC_ALLOWED_USERS" raw})))]
++           (-> (p/let [_ (claims-for other-id allowed-id)
++                       _ (claims-for allowed-id malformed)
++                       _ (claims-for allowed-id malformed)]
++                 (testing "a refusal logs the subject and email at warn"
++                   (is (some #{{:sub other-id :email "x@example.com"}}
++                             (logged records :warning :db-sync/user-not-allowed))))
++                 (testing "a malformed list logs once, with a count and never the value"
++                   (is (= [{:entries 3}]
++                          (vec (logged records :severe :db-sync/allowed-users-malformed))))
++                   (is (not (string/includes? (pr-str @records) "Secret-Entry")))))
++               (p/finally stop!)
++               (p/then (fn [] (done)))
++               (p/catch (fail-and-done done))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_auth_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_auth_test.cljs
+index a34e3eb..475e0a6 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_auth_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_auth_test.cljs
+@@ -4,6 +4,8 @@
+             [logseq.db-sync.worker.auth :as auth]
+             [promesa.core :as p]))
+ 
++(def ^:private test-user-id "11111111-1111-4111-8111-111111111111")
++
+ (deftest cognito-client-id-allowlist-test
+   (let [env #js {"COGNITO_CLIENT_ID" "web-client"
+                  "COGNITO_CLIENT_IDS" "chatgpt-client, admin-client"}]
+@@ -25,9 +27,9 @@
+                                     #js {:headers #js {"authorization" "Bearer dev-token"}})]
+            (-> (p/with-redefs [authorization/verify-jwt
+                                (fn [token _env]
+-                                 (js/Promise.resolve #js {"sub" (str "jwt:" token)}))]
+-                 (p/let [claims (auth/auth-claims request #js {})]
+-                   (is (= "jwt:dev-token" (aget claims "sub")))))
++                                 (js/Promise.resolve #js {"sub" (get {"dev-token" test-user-id} token)}))]
++                 (p/let [claims (auth/auth-claims request #js {"DB_SYNC_ALLOWED_USERS" test-user-id})]
++                   (is (= test-user-id (aget claims "sub")))))
+                (p/then (fn [] (done)))
+                (p/catch (fn [error]
+                           (is false (str error))
+@@ -74,15 +76,16 @@
+ 
+ (deftest auth-claims-jwks-error-falls-back-to-unsafe-claims-when-enabled-test
+   (async done
+-         (let [token "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1MSJ9.signature"
++         (let [token "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.signature"
+                request (js/Request. "http://localhost/graphs"
+                                    #js {:headers #js {"authorization" (str "Bearer " token)}})
+-               env #js {"DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" "true"}]
++               env #js {"DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS" "true"
++                        "DB_SYNC_ALLOWED_USERS" test-user-id}]
+            (-> (p/with-redefs [authorization/verify-jwt
+                                (fn [_token _env]
+                                  (p/rejected (ex-info "jwks" {})))]
+                  (p/let [claims (auth/auth-claims request env)]
+-                   (is (= "u1" (aget claims "sub")))))
++                   (is (= test-user-id (aget claims "sub")))))
+                (p/then (fn [] (done)))
+                (p/catch (fn [error]
+                           (is false (str error))
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+index 109efe1..9b8a8a6 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
+@@ -1,10 +1,11 @@
+ (ns logseq.db-sync.worker-dispatch-test
+-  (:require [cljs.test :refer [async deftest is]]
++  (:require [cljs.test :refer [async deftest is testing]]
+             [clojure.string :as string]
+             [logseq.common.authorization :as authorization]
+             [logseq.db :as ldb]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
++            [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.auth :as auth]
+             [logseq.db-sync.worker.dispatch :as dispatch]
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
+@@ -689,9 +690,12 @@
+                           (is false (str error))
+                           (done)))))))
+ 
++(def ^:private allowed-user-id "11111111-1111-4111-8111-111111111111")
++(def ^:private unlisted-user-id "22222222-2222-4222-8222-222222222222")
++
+ (defn- pat-row [permission expires-at]
+   {"id" "pat-1"
+-   "user_id" "user-1"
++   "user_id" allowed-user-id
+    "graph_id" "graph-1"
+    "token_prefix" "logseq_pat_scope"
+    "permission" permission
+@@ -726,6 +730,7 @@
+          (let [now 1700000000000
+                forwarded (atom [])
+                env #js {"DB" #js {}
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
+                         "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
+                         "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))
+                         "SEMANTIC_WRITE_RATE_LIMITER" (rate-limiter true (atom []))}
+@@ -759,6 +764,7 @@
+          (let [now 1700000000000
+                forwarded (atom [])
+                env #js {"DB" #js {}
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
+                         "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
+                         "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))}]
+            (-> (p/with-redefs [common/now-ms (fn [] now)
+@@ -796,3 +802,84 @@
+                (p/catch (fn [error]
+                           (is false (str error))
+                           (done)))))))
++
++(defn- token-subs
++  "A verify-jwt stub that maps each bearer token to a subject."
++  [subs-by-token]
++  (fn [token _env]
++    (js/Promise.resolve #js {"sub" (get subs-by-token token)
++                             "email" "x@example.com"
++                             "scope" "logseq/read"})))
++
++(deftest dispatch-refuses-unlisted-users-test
++  (async done
++         (let [forwarded (atom [])
++               env #js {"DB" #js {}
++                        "DB_SYNC_ALLOWED_USERS" allowed-user-id
++                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
++                        "SEMANTIC_READ_RATE_LIMITER" (rate-limiter true (atom []))}
++               fetch (fn [path token]
++                       (dispatch/handle-worker-fetch
++                        (js/Request. (str "http://localhost" path)
++                                     #js {:headers #js {"authorization" (str "Bearer " token)}})
++                        env))]
++           (-> (p/with-redefs [authorization/verify-jwt
++                               (token-subs {"allow-list-listed" allowed-user-id
++                                            "allow-list-unlisted" unlisted-user-id})
++                               index/<user-has-access-to-graph? (fn [_ _ _] (p/resolved true))
++                               index/<graph-activity-touch! (fn [& _] (p/resolved nil))
++                               index/<user-activity-touch! (fn [& _] (p/resolved nil))
++                               index/<semantic-graphs-list
++                               (fn [_ _ _] (p/resolved {:graphs [] :next-cursor nil}))
++                               index/<personal-access-tokens-list (fn [_ _] (p/resolved []))]
++                 (p/let [sync-listed (fetch "/sync/graph-1/snapshot/download" "allow-list-listed")
++                         sync-unlisted (fetch "/sync/graph-1/snapshot/download" "allow-list-unlisted")
++                         rest-listed (fetch "/api/v1/graphs" "allow-list-listed")
++                         rest-unlisted (fetch "/api/v1/graphs" "allow-list-unlisted")
++                         pat-listed (fetch "/api/v1/personal-access-tokens" "allow-list-listed")
++                         pat-unlisted (fetch "/api/v1/personal-access-tokens" "allow-list-unlisted")]
++                   (testing "a listed user gets through each path"
++                     (is (= 200 (.-status sync-listed)))
++                     (is (= 1 (count @forwarded)))
++                     (is (= 200 (.-status rest-listed)))
++                     (is (= 200 (.-status pat-listed))))
++                   (testing "an unlisted user gets 401 from each path"
++                     (is (= 401 (.-status sync-unlisted)))
++                     (is (= 401 (.-status rest-unlisted)))
++                     (is (= 401 (.-status pat-unlisted))))))
++               (p/then (fn [] (done)))
++               (p/catch (fn [error]
++                          (is false (str error))
++                          (done)))))))
++
++(deftest dispatch-paths-without-a-user-are-unaffected-test
++  (async done
++         (let [forwarded (atom [])
++               access-checks (atom 0)
++               env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
++                        "ASSET_LINK_SECRET" "test-asset-link-secret"
++                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
++           (-> (p/with-redefs [index-handler/graph-access-response
++                               (fn [_ _ _]
++                                 (swap! access-checks inc)
++                                 (p/resolved (http/unauthorized)))
++                               assets-handler/handle (fn [_ _] (ok-json-response))]
++                 (p/let [health (dispatch/handle-worker-fetch
++                                 (js/Request. "http://localhost/health") env)
++                         admin-sync (dispatch/handle-worker-fetch
++                                     (js/Request. "http://localhost/sync/graph-1/snapshot/download"
++                                                  #js {:headers #js {"x-db-sync-admin-token" "test-admin-token"}})
++                                     env)
++                         {:keys [url]} (asset-link/<temporary-url
++                                        (js/Request. "http://localhost/") env
++                                        "graph-1" "asset-1" "png")
++                         signed-asset (dispatch/handle-worker-fetch (js/Request. url) env)]
++                   (is (= 200 (.-status health)))
++                   (is (= 200 (.-status admin-sync)))
++                   (is (= 1 (count @forwarded)))
++                   (is (= 200 (.-status signed-asset)))
++                   (is (= 0 @access-checks))))
++               (p/then (fn [] (done)))
++               (p/catch (fn [error]
++                          (is false (str error))
++                          (done)))))))

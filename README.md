@@ -2,7 +2,7 @@
 
 Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on your own Cloudflare account, at a hostname you control such as `https://sync.example.com`. Your Logseq clients sync through it. Remote agents such as Claude Code can read and write your graph through its REST API using a personal access token (PAT). An optional second Worker, the connector, lets claude.ai and Claude Code cloud sessions work in your graphs with no per-session setup (section 11).
 
-The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies eighteen small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
+The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies twenty small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
 ## Contents
 
@@ -17,7 +17,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - [5. Use it from remote Claude Code](#5-use-it-from-remote-claude-code)
 - [6. Upgrades](#6-upgrades)
 - [7. Backups and restore](#7-backups-and-restore)
-- [8. Switching to the paid plan and MCP](#8-switching-to-the-paid-plan-and-mcp)
+- [8. Switching to the paid plan](#8-switching-to-the-paid-plan)
 - [9. Security notes](#9-security-notes)
 - [10. Troubleshooting](#10-troubleshooting)
 - [11. Use your graphs from Claude](#11-use-your-graphs-from-claude)
@@ -45,6 +45,8 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Property idents in paths.** Upstream's router decodes `logseq.property%2Fstatus` in a request path to `logseq.property/status`, then pastes it, unencoded, into the path it forwards to the graph's Durable Object. The `/` becomes an extra path segment, so `setBlockProperty`, `deleteBlockProperty`, `getProperty`, `updateProperty` and `deleteProperty` answered 404 for any property named by its ident, although the API documents idents as accepted. `patches/0016-semantic-forward-encoded-path-params.patch` encodes each path parameter again when forwarding.
 - **Built-in property values that the editor shows.** Patch 0002 left every built-in `logseq.*` property out of `getPage`, `getBlock` and `getBlocks`, so a task's Status, Priority and Deadline, and a page's Description, never appeared: a Done task read as having no properties. `patches/0017-semantic-get-returns-public-built-in-properties.patch` returns the built-ins Logseq marks public, which are the ones the editor shows. Hidden built-ins (timestamps, creators and the like) are still left out. `getPageOutline` lists them as `key:: value` lines too, apart from Status, which is already the line's `[Status]` marker.
 - **Batched writes that sync as they were written.** A batched write (such as `batchSetBlockProperty` or a block tree insert with properties) runs on a temporary copy of the graph, then replays its changes into the graph in one transaction, but each change kept the copy's transaction id. The log clients replay keeps one change per entity, attribute, value and transaction id and sorts by transaction id, so a value removed, added back and removed again within a batch could log as "remove, then add", and clients kept a value the server had removed: resetting two tags' parent to Organization left the second tag under Root as well in the app, while the server was right. `patches/0018-batch-commits-as-one-transaction.patch` replays the changes without their transaction ids, so a batch is one transaction with one id. The desktop app runs its own batched edits through the same upstream code, which this patch can't reach.
+- **A list of who may use the server.** Upstream lets any Logseq account sign in, create graphs and create PATs on your server. `patches/0019-allowed-users.patch` refuses every user who isn't in the secret `DB_SYNC_ALLOWED_USERS`, with a 401. A missing, empty or malformed list refuses everyone. Section 9 explains how to set it.
+- **No unauthenticated MCP endpoint.** Upstream's `/mcp` answers anyone, with no token. `patches/0020-remove-upstream-mcp.patch` removes it, so the path now answers 404 (section 8). The connector (section 11) does its job.
 - **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
 
 **What still depends on Logseq the company:**
@@ -60,7 +62,7 @@ Your graph content is not sent to Logseq. The patched server no longer calls `ap
 | Plan | Price | Notes |
 |---|---|---|
 | Workers Free (default) | $0 within the free allowances | Verified working, including the REST API and its rate limiters. Daily caps include 100k Worker requests, 100k D1 row writes and 5M D1 row reads. The front Worker gets 10 ms CPU per request. In testing, the median request used 2.6 ms and the slowest 1% used up to 92 ms, but Cloudflare didn't reject them. Larger imports may hit the limit (see Troubleshooting). D1 Time Travel covers 7 days. |
-| Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s) and enables MCP (Worker Loader). D1 Time Travel covers 30 days. |
+| Workers Paid | $5/month plus usage beyond the included amounts | Raises the CPU limit (the config sets 300 s). D1 Time Travel covers 30 days. |
 
 The connector's optional semantic search (11.11) runs on Free for graphs up to about 13,000 indexed blocks (the Free plan stores 5M Vectorize dimensions). A larger graph needs Workers Paid, where it adds under $0.01/month.
 
@@ -162,7 +164,7 @@ Open **Workers & Pages** in the dashboard once. That creates your account's `wor
 
 `.env.local` holds the same values the GitHub `production` environment holds, so you can run everything from your machine. It is git-ignored.
 
-**You supply only three things: the Cloudflare API token, the Cloudflare account ID, and your hostname. The other three values are generated.**
+**You supply only three things: the Cloudflare API token, the Cloudflare account ID, and your hostname. Three more values are generated, and the allow-list starts as `none`.**
 
 ```bash
 scripts/init-env.sh
@@ -182,6 +184,7 @@ The optional connector's values aren't asked for here. You add them later with `
 | `ASSET_LINK_SECRET` | The HMAC key for signed asset links. | Generated |
 | `DB_SYNC_ADMIN_TOKEN` | Admin header token. It bypasses graph access checks, and backups use it. | Generated |
 | `TOFU_ENCRYPTION_PASSPHRASE` | Encrypts the OpenTofu state and plans. | Generated |
+| `DB_SYNC_ALLOWED_USERS` | Logseq user IDs allowed to use the server, or `none`. Written as `none`; set your ID after your first sign-in (section 9). | Template |
 | `SMOKE_PAT` | Optional. Leave it empty until you have a PAT (section 4). | Later |
 | `CONNECTOR_ENABLED` | `false` until you turn the connector on (section 11). | Template |
 
@@ -269,6 +272,7 @@ Then add the secrets:
 | `TOFU_ENCRYPTION_PASSPHRASE` | Yes |
 | `ASSET_LINK_SECRET` | Yes |
 | `DB_SYNC_ADMIN_TOKEN` | Yes |
+| `DB_SYNC_ALLOWED_USERS` | Yes. `none` or your user ID(s) (section 9). The deploy stops without it. |
 | `SYNC_HOSTNAME` | Yes |
 | `SMOKE_PAT` | Optional. It enables the authenticated smoke check. |
 | `CONNECTOR_HOSTNAME` | Only with the connector (section 11) |
@@ -283,14 +287,14 @@ Then add the secrets:
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
-The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the six required secrets above in the `production` environment of the repo that owns your checkout (it prints the repo name first and passes it to `gh` with `-R`), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in. The connector's secrets are pushed later, by `scripts/init-env.sh --add-missing --push` (section 11).
+The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the seven required secrets above in the `production` environment of the repo that owns your checkout (it prints the repo name first and passes it to `gh` with `-R`), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in. The connector's secrets are pushed later, by `scripts/init-env.sh --add-missing --push` (section 11).
 
 If `.env.local` already exists, or a push failed part-way, load `.env.local` as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments. Uncomment the second `names` line once the connector's values are in `.env.local`:
 
 ```bash
 repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # run inside this checkout
 echo "Pushing to $repo"
-names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME"
+names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN DB_SYNC_ALLOWED_USERS SYNC_HOSTNAME"
 # names="$names CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
 for name in $names; do
   [ -n "${!name}" ] || { echo "$name is empty: load .env.local first" >&2; break; }
@@ -304,12 +308,13 @@ done
 
 You can deploy either from your machine or from GitHub Actions; both have been verified. Both run the same script, `scripts/deploy.sh`, which:
 
-1. reads the OpenTofu outputs (the D1 database ID);
-2. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`);
-3. applies D1 migrations (`wrangler d1 migrations apply logseq-sync-index --remote`) **before** deploying;
-4. runs `wrangler deploy`, which also attaches the custom domain;
-5. sets `ASSET_LINK_SECRET` and `DB_SYNC_ADMIN_TOKEN` with `wrangler secret bulk`;
-6. runs `scripts/smoke-test.sh https://$SYNC_HOSTNAME`.
+1. checks that `DB_SYNC_ALLOWED_USERS` is `none` or a list of user IDs, and stops before anything is deployed if it isn't (section 9);
+2. reads the OpenTofu outputs (the D1 database ID);
+3. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`);
+4. applies D1 migrations (`wrangler d1 migrations apply logseq-sync-index --remote`) **before** deploying;
+5. checks the list against the users the server already knows. It stops when none of the listed IDs is a known user, and warns when a listed ID hasn't signed in yet or a user who owns graphs isn't listed;
+6. runs `wrangler deploy --secrets-file`, which ships the code and the three secrets (`ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `DB_SYNC_ALLOWED_USERS`) together, and attaches the custom domain;
+7. runs `scripts/smoke-test.sh https://$SYNC_HOSTNAME`.
 
 **From your machine**, with `.env.local` loaded and steps 1.5 and 1.7 done:
 
@@ -327,8 +332,9 @@ A passing smoke test prints:
 ok health
 ok openapi
 ok unauthenticated-graphs
-ok pat-graphs              # only when SMOKE_PAT is set
-ok mcp-unauthenticated     # only on the paid plan
+ok jwt-garbage-refused
+ok pat-graphs              # only when SMOKE_PAT is set; otherwise a note says so
+ok upstream-mcp-off
 ```
 
 You can check by hand too: `curl https://sync.example.com/health` returns `{"ok":true}`.
@@ -341,6 +347,8 @@ On each device, running a nightly build (section 0):
 - **Mobile:** Settings → Sync Server URL = `https://sync.example.com`.
 
 Then sign in with your Logseq account and create or upload a graph.
+
+**On a new install, the first sign-in is refused.** The allow-list starts as `none`, which refuses everyone. Get your user ID as [9.1](#91-who-can-use-your-server) describes for a fresh install, set `DB_SYNC_ALLOWED_USERS`, push it and redeploy. Then sign in again. Re-enter the server URL first if the client signed you out.
 
 **Logging out clears the custom URL.** The client goes back to Logseq's hosted sync. Re-enter the URL after every logout, before you sign in again.
 
@@ -503,26 +511,23 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
 
 **Limits.** Backups live in the same Cloudflare account. If you lose the account, only your clients' local copies remain. An off-account copy is on the backlog.
 
-## 8. Switching to the paid plan and MCP
+## 8. Switching to the paid plan
 
-`config/settings.json` has `"plan": "free"` by default. Free is verified working, including the REST API and its rate limiters. The paid plan adds:
-
-- `[limits] cpu_ms = 300000` (300 s);
-- the Worker Loader binding (`LOADER`) that `/mcp` needs.
+`config/settings.json` has `"plan": "free"` by default. Free is verified working, including the REST API and its rate limiters. The paid plan only raises `[limits] cpu_ms` to 300000 (300 s).
 
 To switch:
 
-1. In the Cloudflare dashboard, subscribe to **Workers Paid**. Do this first: the paid config uses limits and bindings the Free plan doesn't offer.
+1. In the Cloudflare dashboard, subscribe to **Workers Paid**. Do this first: the paid config uses a limit the Free plan doesn't offer.
 2. Set `"plan": "paid"` in `config/settings.json` in a PR.
-3. Merge it to `main`. The deploy renders the paid config, and the smoke test adds the `mcp-unauthenticated` check: `POST /mcp` without a token must return 401.
+3. Merge it to `main`. The deploy renders the paid config.
 
-MCP on this server hasn't been verified end to end yet. To go back, set `"plan": "free"` and merge.
+To go back, set `"plan": "free"` and merge.
 
-This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and can't be added to claude.ai. To use your graphs from claude.ai, use the connector (section 11) instead. It runs on the Free plan.
+**Upstream's own `/mcp` endpoint is off on both plans.** Anyone could call it without a token, so a patch (`patches/0020-remove-upstream-mcp.patch`) removes it, and the rendered config no longer binds the Worker Loader. `/mcp` on the sync server now answers 404, and the smoke test's `upstream-mcp-off` check, which runs on both plans, fails the deploy if it ever answers again. To use your graphs from claude.ai, use the connector (section 11) instead. It runs on the Free plan.
 
 ## 9. Security notes
 
-- **Any Logseq account can use your server** today: sign in, create graphs and create PATs for them. Users can't read each other's graphs, but they do use your quota and storage. A user allow-list is on the backlog.
+- **Only the Logseq accounts you list can use your server.** Without a list, any Logseq account could sign in, create graphs and create PATs, and use your quota and storage. See 9.1.
 - **Never set `DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS`.** It lets anyone impersonate any user. `render-wrangler.mjs` refuses to render a config containing it, or any `SENTRY_*` var.
 - **`DB_SYNC_ADMIN_TOKEN` bypasses graph access checks.** It can read every graph. Keep it only in `.env.local` and the `production` environment.
 - **The Cloudflare API token** controls everything here, including the derived R2 keys. Treat it like a root password.
@@ -530,11 +535,40 @@ This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and
 - **Secrets stay out of the repo and the logs.** The repo, the rendered `wrangler.toml` and the logs hold no secrets. The OpenTofu state and plans are encrypted. The OpenTofu outputs are marked sensitive, and `deploy.yml` and `deploy.sh` mask the D1 database id in Actions logs, so it and the other resource ids stay out of public run logs. `deploy.yml` and `backup.yml` never run on pull requests, and `ci.yml` uses no secrets, so fork PRs can't reach them.
 - **Your hostname is public.** Certificate transparency logs publish it, and internet scanners start probing a new hostname within hours. You'll see requests for paths like `/.env` in the Worker logs. They're harmless, but expected. Keeping `SYNC_HOSTNAME` out of the repo only avoids advertising it.
 
+### 9.1 Who can use your server
+
+The Worker refuses every Logseq user who isn't in the secret `DB_SYNC_ALLOWED_USERS` (patch `0019-allowed-users.patch`). A refused user gets a plain 401 on every route that needs sign-in: syncing, the REST API and PAT management. The admin token, signed asset links and `/health` don't involve a user, so they work as before.
+
+The value is `none`, or one or more Logseq user IDs separated by commas. Each ID is a lowercase UUID, and spaces around it are ignored. **It fails closed.** A missing, empty or malformed value refuses everyone, and so does `none`. `deploy.sh` stops before deploying anything if the value is malformed, so a typo can't ship. It also stops on `none` once anyone has signed in to the server, so `none` can't switch everyone off on an existing install.
+
+**Finding your user ID.** Use any one of these:
+
+- **`scripts/list-users.sh`** prints each user's ID, email, username, how many graphs they own and whether they're on your list. It needs `.env.local` (1.4), runs only on your machine, and refuses to run in GitHub Actions because it prints IDs and emails.
+- **The Cloudflare dashboard.** Go to Storage & Databases → D1 → the sync database (`logseq-sync-index` by default) → Console, and run `SELECT id, email FROM users`.
+- **On a fresh install,** no one has signed in yet, and a refused user is never recorded, so neither of the above shows you. Sign in once from Logseq. You are refused, and the Worker logs a `db-sync/user-not-allowed` warning with your user ID and email. Read it with `wrangler tail logseq-sync` (the default worker name; `config/settings.json` has `workerName`) or in Workers Logs in the dashboard. Then set the list and redeploy. You can also decode the `sub` claim of the `id-token` in the client's Local Storage (section 4 shows where it is): that is your user ID.
+
+A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy passes and the server refuses everyone until you set your ID. The deploy prints a warning about that. It is expected.
+
+**Adding someone.** Append their ID to the comma-separated list in `.env.local`, with no spaces, and in the `production` secret (reload `.env.local`, then push it with [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
+
+**Removing someone.** Take their ID out of both places and redeploy. It takes effect on the next deploy. Their graphs stay on the server (see the cleanup below).
+
+**Rolling this out on an existing install.** Do these in order. **The secret must be in `production` before you merge the PR that brings the allow-list.** Otherwise the deploy stops at the format check. That stop is safe: nothing is deployed and the running server isn't touched. But you will have to fix it and run the deploy again.
+
+1. Run `scripts/list-users.sh` and find your own row. Note any other users: they are either strangers or your own second account.
+2. Put your ID, and the ID of any other account you use, in `.env.local` as `DB_SYNC_ALLOWED_USERS`, comma-separated. Write them with no spaces (`id1,id2`), because the shell sources the file.
+3. Reload `.env.local` first (the `set -a` line in [1.4](#14-fill-in-envlocal)), so a shell with the old value doesn't push it. Then push it with [the loop in 1.8](#18-set-up-the-github-production-environment). (`init-env.sh --add-missing` only handles names missing from `.env.local`, so it won't push a value you added by hand.)
+4. Merge. The deploy checks the value, ships it together with the code, and the smoke test's `pat-graphs` check (when `SMOKE_PAT` is set) confirms you still get in.
+5. Optional. To remove a stranger's graph, call `DELETE /admin/graphs/<graph-id>` with the header `x-db-sync-admin-token: <DB_SYNC_ADMIN_TOKEN>`. This is manual: nothing does it for you, and it can't be undone.
+
+**If you get locked out.** The deploy can't tell a list that names the wrong known account from the right one, so a mistake there can pass the checks. There is no automatic rollback. Fix the secret in `.env.local` and `production` and redeploy, or run `$W rollback --name logseq-sync` to put back the previous version of the Worker (`$W` is the wrangler path from [section 6](#6-upgrades), and `logseq-sync` is the `workerName` in `config/settings.json`). Right after the rollout, the previous version is the one without the allow-list, so rolling back re-opens the server to every Logseq account until you redeploy.
+
 **Rotating secrets:**
 
 | Secret | How |
 |---|---|
 | `ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN` | Generate a new value. Update `.env.local` and the `production` secret, then redeploy: every deploy re-sets them. Rotating `ASSET_LINK_SECRET` invalidates asset links signed earlier. |
+| `DB_SYNC_ALLOWED_USERS` | Not a credential, so there is nothing to rotate. To change who may use the server, edit it in `.env.local` and the `production` secret, then redeploy (9.1). |
 | `CLOUDFLARE_API_TOKEN` | Roll it in the dashboard, then update `.env.local` and the secret. The derived R2 keys change with it automatically. |
 | `TOFU_ENCRYPTION_PASSPHRASE` | Changing it needs an OpenTofu key migration (a `fallback` key in `infra/encryption.tf`). Don't just swap the value. |
 | A PAT | Revoke it in Settings → Personal Access Tokens and create a new one. Update `LOGSEQ_PAT` and `SMOKE_PAT`. For a graph connected to the connector, use **Replace token** at `/graphs` (section 11). |
@@ -565,6 +599,9 @@ This is upstream's own `/mcp` endpoint, which signs in with Logseq's Cognito and
 | Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
+| Everything returns 401 after a deploy | The Worker refuses users who aren't in `DB_SYNC_ALLOWED_USERS`. Check the secret, and look for a `db-sync/user-not-allowed` warning in `wrangler tail logseq-sync` or Workers Logs: it names the refused user's ID. Fix the list and redeploy (9.1). |
+| Deploy fails: `none of the N listed user IDs is a known user of this server` | A typo, the wrong account, or `none` on a server that already has users (`none of the 0 listed user IDs ...`). Run `scripts/list-users.sh`, correct `DB_SYNC_ALLOWED_USERS` in `.env.local` and the `production` secret, and deploy again. Nothing was deployed. |
+| Deploy fails: `DB_SYNC_ALLOWED_USERS is empty or missing` | The secret isn't set in the `production` environment. Push it with [the loop in 1.8](#18-set-up-the-github-production-environment), then deploy again. Nothing was deployed. |
 | Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
 
 Connector problems are covered in section 11.
@@ -817,13 +854,12 @@ To turn it on, with the connector already on (11.5):
 ## Backlog
 
 1. **A publish server** at `publish.example.com`. Mobile has no publish URL setting, and rendered pages load from `asset.logseq.com` and jsdelivr.
-2. **A user allow-list** by Cognito `sub` on all authenticated routes, failing closed.
-3. **Finish checking the connector** and record the results in `docs/spike-results.md`: that a second GitHub account is refused, whether annotations change claude.ai's prompting, and the file tools' CPU time on large inputs.
-4. **An upstream PR** making the PAT groups configurable, so the patch can be dropped.
-5. **An off-account backup copy.**
-6. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
-7. **Confirm the minimal token permissions**, in particular whether DNS Write is needed.
-8. **Measure a large real graph against the Free CPU limits:** first upload, asset sync and snapshot download.
+2. **Finish checking the connector** and record the results in `docs/spike-results.md`: that a second GitHub account is refused, whether annotations change claude.ai's prompting, and the file tools' CPU time on large inputs.
+3. **An upstream PR** making the PAT groups configurable, so the patch can be dropped.
+4. **An off-account backup copy.**
+5. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
+6. **Confirm the minimal token permissions**, in particular whether DNS Write is needed.
+7. **Measure a large real graph against the Free CPU limits:** first upload, asset sync and snapshot download.
 
 ## Licence and credits
 

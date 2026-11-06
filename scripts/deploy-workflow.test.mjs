@@ -189,3 +189,11 @@ test("the semantic search step fails on another value or without the connector",
   assert.match(r.stdout, /::error::SEMANTIC_SEARCH_ENABLED=true needs CONNECTOR_ENABLED=true/);
   assert.equal(r.env, "");
 });
+
+test("the Deploy step passes DB_SYNC_ALLOWED_USERS and no other step does", () => {
+  assert.ok(step("Deploy").includes("          DB_SYNC_ALLOWED_USERS: ${{ secrets.DB_SYNC_ALLOWED_USERS }}"));
+  const others = workflow
+    .split("\n")
+    .filter((line) => line.includes("DB_SYNC_ALLOWED_USERS"));
+  assert.equal(others.length, 1, others.join("\n"));
+});

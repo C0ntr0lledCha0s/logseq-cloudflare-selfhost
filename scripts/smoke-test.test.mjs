@@ -21,7 +21,7 @@ const healthy = (req, res) => {
       ? reply(200, "[]")
       : reply(401, "{}");
   }
-  if (method === "POST" && url === "/mcp") return reply(401, "{}");
+  if (method === "POST" && url === "/mcp") return reply(404, "{}");
   return reply(404);
 };
 
@@ -41,7 +41,7 @@ function spawnScript(args, env = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(script, args, {
       cwd: root,
-      env: { ...process.env, SMOKE_PAT: "", PLAN: "", ...env },
+      env: { ...process.env, SMOKE_PAT: "", ...env },
     });
     let stdout = "";
     let stderr = "";
@@ -61,7 +61,8 @@ test("passes against a healthy stub", { timeout: 120000 }, async () => {
     assert.match(r.stdout, /^ok health$/m);
     assert.match(r.stdout, /^ok openapi$/m);
     assert.match(r.stdout, /^ok unauthenticated-graphs$/m);
-    assert.doesNotMatch(r.stdout, /pat-graphs|mcp-unauthenticated/);
+    assert.match(r.stdout, /^ok upstream-mcp-off$/m);
+    assert.doesNotMatch(r.stdout, /pat-graphs/);
   });
 });
 
@@ -96,7 +97,7 @@ test("never prints the PAT and checks it", { timeout: 120000 }, async () => {
 
 test("fails when the PAT is rejected without leaking it", { timeout: 120000 }, async () => {
   const h = (req, res) =>
-    req.url === "/api/v1/graphs" && req.headers.authorization
+    req.url === "/api/v1/graphs" && req.headers.authorization === "Bearer logseq_pat_secret"
       ? (res.writeHead(403), res.end("{}"))
       : healthy(req, res);
   await withStub(h, async (base) => {
@@ -107,18 +108,21 @@ test("fails when the PAT is rejected without leaking it", { timeout: 120000 }, a
   });
 });
 
-test("paid plan checks /mcp is 401", { timeout: 120000 }, async () => {
+test("checks upstream /mcp is gone", { timeout: 120000 }, async () => {
   await withStub(healthy, async (base) => {
-    const r = await run(base, { PLAN: "paid" });
+    const r = await run(base);
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /^ok mcp-unauthenticated$/m);
+    assert.match(r.stdout, /^ok upstream-mcp-off$/m);
   });
+});
+
+test("fails when upstream /mcp still answers", { timeout: 120000 }, async () => {
   const h = (req, res) =>
-    req.url === "/mcp" ? (res.writeHead(404), res.end()) : healthy(req, res);
+    req.url === "/mcp" ? (res.writeHead(200), res.end("{}")) : healthy(req, res);
   await withStub(h, async (base) => {
-    const r = await run(base, { PLAN: "paid" });
+    const r = await run(base);
     assert.equal(r.status, 1);
-    assert.match(r.stdout, /FAIL mcp-unauthenticated: 404/);
+    assert.match(r.stdout, /FAIL upstream-mcp-off: 200/);
   });
 });
 
@@ -128,14 +132,44 @@ test("connection refused is a FAIL, not a crash", { timeout: 120000 }, async () 
   assert.match(r.stdout, /FAIL health: 000/);
 });
 
-test("rejects an invalid PLAN with exit 2", { timeout: 120000 }, async () => {
-  const r = await run("http://127.0.0.1:1", { PLAN: "enterprise" });
-  assert.equal(r.status, 2);
-  assert.match(r.stderr, /usage/i);
-});
-
 test("requires a base url", { timeout: 120000 }, async () => {
   const r = await spawnScript([]);
   assert.equal(r.status, 2);
   assert.match(r.stderr, /usage/i);
+});
+
+test("refuses a garbage bearer token", { timeout: 120000 }, async () => {
+  const seen = [];
+  const h = (req, res) => {
+    if (req.url === "/api/v1/graphs") seen.push(req.headers.authorization);
+    return healthy(req, res);
+  };
+  await withStub(h, async (base) => {
+    const r = await run(base);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ok jwt-garbage-refused$/m);
+    assert.ok(seen.includes("Bearer not-a-jwt"));
+  });
+});
+
+test("fails when a garbage bearer token is accepted", { timeout: 120000 }, async () => {
+  const h = (req, res) =>
+    req.url === "/api/v1/graphs" && req.headers.authorization === "Bearer not-a-jwt"
+      ? (res.writeHead(200), res.end("[]"))
+      : healthy(req, res);
+  await withStub(h, async (base) => {
+    const r = await run(base);
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /FAIL jwt-garbage-refused: 200/);
+  });
+});
+
+test("notes when SMOKE_PAT is unset", { timeout: 120000 }, async () => {
+  await withStub(healthy, async (base) => {
+    const r = await run(base);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^note: SMOKE_PAT is not set, so the allow-list was not checked end to end$/m);
+    const withPat = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.doesNotMatch(withPat.stdout, /note: SMOKE_PAT/);
+  });
 });
