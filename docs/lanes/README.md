@@ -73,6 +73,7 @@ The rule: Opus where a wrong call ships a bad fix or lets a defect through, and 
 - **Root cause.** Two skeptics try to refute the top hypothesis. If both refute it, the lane runs a second round of investigation that carries the refutation. After two rounds without a surviving cause, the lane stops as `needs-human`. A `not_a_bug` cause skips to compound.
 - **Fail-before.** Every regression test quotes its failure on the code without the fix. If the suite can't run here, the lane says so instead of claiming it.
 - **The gate.** `scripts/check.sh` runs everything this checkout can run, and names what it skipped. Every stage and fix leaves it green, and is committed.
+- **Review scope.** Intake records the commit the lane starts from (`start_sha`), and every review round diffs against it, so a lane on a shared phase branch reviews only its own commits. Pass `review_base` (for example `origin/main`) for a full-branch review before a PR. A diff that touches nothing under `patches/` never builds the upstream ClojureScript suite.
 - **Review rounds.** `lane-review` runs every lens that applies. Each new security, blocker or major finding goes to skeptics (three for security and blocker, two for major). A finding dies only on a strict majority refutation, and a tie keeps it.
   - Each surviving finding gets an id (`r<round>-<lens>-<n>`) and stays open until a later round re-checks that id on HEAD and reports it fixed with evidence. A quiet round can't close it.
   - Fixers report every id they were given.

@@ -106,7 +106,7 @@ const VERDICT_SCHEMA = {
   required: ['refuted', 'checked', 'reason'],
 }
 
-const common = `Review the changes on this branch against ${BASE}: \`git diff ${BASE}...HEAD\` plus anything uncommitted (\`git status\`, \`git diff\`). Read the full files around each hunk, not only the diff.
+const common = `Review the changes on this branch against ${BASE}: \`git diff ${BASE}...HEAD\` plus anything uncommitted (\`git status\`, \`git diff\`). Read the full files around each hunk, not only the diff. Only changes after ${BASE} are in scope; earlier commits on the branch were reviewed by their own lanes. If that diff touches nothing under patches/, don't build or run the upstream ClojureScript suite; the connector and scripts suites cover it.
 Brief for this work:
 ${BRIEF}
 ${CONTEXT ? `Context from the lane:\n${CONTEXT}\n` : ''}Read the docs/solutions entries relevant to the files touched. Report only findings with a concrete failure scenario and evidence; an empty list is a fine answer.${CARRIED.length ? `\nThese findings from earlier rounds are being re-checked separately; don't report them again: ${CARRIED.map(f => `${f.id} (${f.title})`).join('; ')}` : ''}`

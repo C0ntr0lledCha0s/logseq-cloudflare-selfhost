@@ -53,7 +53,7 @@ Read `status` first.
 - **`blocked-security`**: a security finding is still open. Don't push for a PR. Quote the finding (id, claim, evidence) and stop.
 - **`needs-human`**: say which stage stopped and why, and quote the refuted hypotheses, a red gate or the open findings. Don't paper over it.
 - **`not-a-bug`**: explain what the investigation found, and what the compounder recorded.
-- **`ready-with-open-findings`** with `followup`: offer a follow-up run before moving on. One `implementer` addresses `followup.open` by id (fail-first tests, same patch number), then `lane-review` runs with `open: followup.open` and `round: followup.next_round`. Open the PR as a draft until the follow-up closes them.
+- **`ready-with-open-findings`** with `followup`: offer a follow-up run before moving on. One `implementer` addresses `followup.open` by id (fail-first tests, same patch number), then `lane-review` runs with `base: followup.review_base`, `open: followup.open` and `round: followup.next_round`. Open the PR as a draft until the follow-up closes them.
 - **`ready`** / **`ready-with-open-findings`**:
   1. Check the work yourself: `git status --porcelain` (it should be empty), `git log --oneline origin/main..HEAD`, and `scripts/check.sh` (add `--upstream` if patches changed). Never report a check as passing that you didn't see pass. Confirm that `closeout.head_sha` matches HEAD.
   2. Push to the branch.

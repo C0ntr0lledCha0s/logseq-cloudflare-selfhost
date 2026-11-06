@@ -1,7 +1,7 @@
 export const meta = {
   name: 'lane-feature',
   description: 'Feature lane: precondition + intake -> design panel judged for risk, cost and fit -> spec (stops for approval) -> plan -> staged test-first build, each stage checked -> review rounds with findings re-checked by id -> docs -> compound + retro -> closeout',
-  whenToUse: 'An enhancement or new tool. The first run stops after the spec; rerun with args.spec to build. args: {issue?: number, brief?: string, today: "YYYY-MM-DD", tracker?: {graph, page}, trailer?: string, base?: "origin/main", spec?: path, stop_after?: "spec"|"plan", max_fix_rounds?: 2, models?: {role: "opus"|"sonnet"|"inherit"}}',
+  whenToUse: 'An enhancement or new tool. The first run stops after the spec; rerun with args.spec to build. args: {issue?: number, brief?: string, today: "YYYY-MM-DD", tracker?: {graph, page}, trailer?: string, base?: "origin/main", spec?: path, stop_after?: "spec"|"plan", max_fix_rounds?: 2, review_base?: sha|ref, models?: {role: "opus"|"sonnet"|"inherit"}}',
   phases: [
     { title: 'Intake', detail: 'precondition checks, the issue, related learnings' },
     { title: 'Design', detail: 'three approaches, judged for risk, Free-plan cost and fit' },
@@ -52,8 +52,8 @@ const BRIEF_SCHEMA = {
     problem: { type: 'string' },
     env: {
       type: 'object',
-      properties: { branch: { type: 'string' }, clean_tree: { type: 'boolean' }, behind_base: { type: 'integer' }, vendor: { type: 'boolean' }, upstream: { type: 'boolean' }, notes: { type: 'string' } },
-      required: ['branch', 'clean_tree', 'vendor', 'upstream'],
+      properties: { branch: { type: 'string' }, clean_tree: { type: 'boolean' }, start_sha: { type: 'string', description: 'git rev-parse HEAD at intake' }, behind_base: { type: 'integer' }, vendor: { type: 'boolean' }, upstream: { type: 'boolean' }, notes: { type: 'string' } },
+      required: ['branch', 'clean_tree', 'start_sha', 'vendor', 'upstream'],
     },
     issue_number: { type: 'integer' },
     task_status: { type: 'string' },
@@ -186,7 +186,7 @@ const CLOSEOUT_SCHEMA = {
 phase('Intake')
 const brief = await agent(
   `Check preconditions, then build the brief for a feature-lane run.
-Preconditions (run them; don't fix anything): git fetch origin main; git branch --show-current; git status --porcelain (clean_tree is true when it's empty); commits behind ${BASE}; whether connector/vendor/openapi.json and connector/vendor/semantic_api_tools.mjs exist; whether .upstream/deps/db-sync exists. Set ok=false if the tree has uncommitted changes (other than an approved spec or plan for this feature), or if the branch is main.
+Preconditions (run them; don't fix anything): git fetch origin main; git branch --show-current; git rev-parse HEAD (start_sha); git status --porcelain (clean_tree is true when it's empty); commits behind ${BASE}; whether connector/vendor/openapi.json and connector/vendor/semantic_api_tools.mjs exist; whether .upstream/deps/db-sync exists. Set ok=false if the tree has uncommitted changes (other than an approved spec or plan for this feature), or if the branch is main.
 ${A.issue ? `Issue: item ${A.issue} on the Logseq page "${PAGE}" in ${GRAPH}. Load the Logseq tools with ToolSearch ("select:mcp__Logseq__list_graphs,mcp__Logseq__search_graph,mcp__Logseq__get_page_outline"), find the page by title, and read the section headed "## ${A.issue}.", including its task status. If the outline is truncated, find the section with search_graph and read its blocks.` : ''}
 ${A.brief ? `Brief text from the owner:\n${A.brief}` : ''}
 ${A.spec ? `An approved spec already exists at ${A.spec}; read it as well.` : ''}
@@ -203,6 +203,10 @@ const undone = (brief.depends_on || []).filter(d => !d.done)
 if (undone.length) log(`Warning: depends on unfinished item(s): ${undone.map(d => d.item).join(', ')}`)
 if (!brief.env.vendor && brief.areas.some(a => ['connector', 'semantic', 'patch', 'migrations'].includes(a))) log('Warning: connector/vendor is missing, so the connector suite will be skipped. Build it first for real test proofs.')
 const BRIEF = J(brief)
+// Reviewers see only what this lane changed: commits before the lane started were reviewed by
+// earlier lanes on the same branch. args.review_base overrides (e.g. "origin/main" for a full-branch review).
+const REVIEW_BASE = A.review_base || brief.env.start_sha || BASE
+log(`Review scope: ${REVIEW_BASE}...HEAD`)
 
 // ---------- design + spec ----------
 let spec = A.spec ? { path: A.spec, summary: '(approved spec supplied)' } : null
@@ -296,7 +300,7 @@ const rounds = []
 for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
   phase('Review')
   review = await workflow('lane-review', {
-    base: BASE,
+    base: REVIEW_BASE,
     models: A.models,
     brief,
     round,
@@ -344,5 +348,5 @@ Feature:\n${BRIEF}\nSpec: ${spec.path}\nPlan: ${plan.path}\nStages:\n${J(built.m
 )
 
 const status = securityOpen ? 'blocked-security' : !closeout || !closeout.gate_green ? 'needs-human' : open.length ? 'ready-with-open-findings' : 'ready'
-const followup = open.length ? { open, next_round: (rounds.length ? rounds[rounds.length - 1].round : 0) + 1, pr_draft: true } : null
+const followup = open.length ? { open, next_round: (rounds.length ? rounds[rounds.length - 1].round : 0) + 1, pr_draft: true, review_base: REVIEW_BASE } : null
 return { status, followup, brief, spec, plan, built, review: { rounds, open, should_fix: review && review.should_fix, nits: review && review.nits, refuted: review && review.refuted }, docs, compound, closeout }
