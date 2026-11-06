@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 10558ac..75b4a56 100644
+index 10558ac..b690780 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -127,6 +127,12 @@
@@ -24,7 +24,33 @@ index 10558ac..75b4a56 100644
                             (property-value-response v))})))))
  
  (defn- block-detail-response [db entity]
-@@ -784,6 +790,50 @@
+@@ -771,11 +777,25 @@
+              :db/id))
+       value))
+ 
++(defn- number-text
++  "For a number property, a JSON number or numeric text as the number's text, else nil. The
++  outliner parses it and stores it in a number value block, as the editor does. A bare integer is
++  the number itself, never a db id: an existing value is named by its UUID."
++  [property value]
++  (when (= :number (:logseq.property/type property))
++    (let [n (cond
++              (number? value) value
++              (and (string? value) (not (common-util/uuid-string? value))) (parse-double (string/trim value))
++              :else nil)]
++      (when (and (number? n) (js/isFinite n))
++        (str n)))))
++
+ (defn- prepare-ref-property-value [db property-ident value e2ee? scope]
+   (let [property (d/entity db property-ident)]
+     (cond
+       (seq (:block/_closed-value-property property)) (resolve-choice db property value scope)
+       (free-text-value? property value e2ee?) value
++      (number-text property value) (number-text property value)
+       (and (not e2ee?)
+            (= :url (:logseq.property/type property))
+            (string? value)
+@@ -784,6 +804,50 @@
        :else
        (resolve-ref-entity db property-ident value))))
  
@@ -75,7 +101,7 @@ index 10558ac..75b4a56 100644
  (defn- prepare-property-value
    "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
    the value is for (an entity, or a map of the :block/tags a new block will have), which limits a
-@@ -791,7 +841,10 @@
+@@ -791,7 +855,10 @@
    [db property-ident value e2ee? scope]
    (let [property (d/entity db property-ident)]
      (cond
@@ -87,7 +113,7 @@ index 10558ac..75b4a56 100644
        (nil? value) {:error "missing property value"}
        :else
        (let [many-input? (or (sequential? value) (set? value))
-@@ -800,7 +853,9 @@
+@@ -800,7 +867,9 @@
          (cond
            (some ::error resolved) {:error (some ::error resolved)}
            (every? some? resolved)
@@ -98,7 +124,7 @@ index 10558ac..75b4a56 100644
            :else
            {:error (cond
                      (= property-ident :block/tags)
-@@ -866,7 +921,7 @@
+@@ -866,7 +935,7 @@
                    (cond
                      (not (property? property)) (reduced {:error (str "property not found: " selector)})
                      (nil? value) (reduced {:error (str selector ": missing property value")})
@@ -108,15 +134,30 @@ index 10558ac..75b4a56 100644
                {:properties []}
                properties))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 57b3b39..666590e 100644
+index 57b3b39..a206260 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -119,19 +119,19 @@
+@@ -103,6 +103,14 @@
+    {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/decrypt" :internal-path "/e2ee/decrypt"
+     :handler :semantic/e2ee-decrypt :operation-id "decryptE2eeText" :scope "logseq/read" :rate-class :read :edge? true}])
+ 
++(def ^:private value-notes
++  "How the property-writing operations resolve a value and what they refuse. One copy, shared by
++  every operation that sets properties, so the descriptions can't drift apart."
++  (str "A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed."
++       " A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs."
++       " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
++       " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
++
+ (def ^:private operation-docs
+   {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+@@ -119,19 +127,19 @@
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
 -   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled. Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped.")]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
     "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
     "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
@@ -125,24 +166,24 @@ index 57b3b39..666590e 100644
 -   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
 -   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
 -   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs."]
-+   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."]
++   "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped.")]
++   "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped.")]
++   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. " value-notes)]
     "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
 -   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link."]
-+   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled. Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link."]
++   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
     "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
 -   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped.")]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
 new file mode 100644
-index 0000000..c7537f8
+index 0000000..21150b5
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,433 @@
 +(ns logseq.db-sync.semantic-node-value-read-test
 +  "A node (many) property can hold entities of different kinds: plain and journal pages, which
 +  have no :block/order, and blocks, property entities and pages under the Library or a namespace
@@ -275,7 +316,7 @@ index 0000000..c7537f8
 +    (with-graph done
 +      (fn [{:keys [conn self journal-id host-id blocks other-block plain-a plain-b ns-child areas
 +                   about]}]
-+        (let [[b0 b1 b2 b3 b4 b5 b6 b7] blocks
++        (let [[b0 b1 b2 b3 b4 b5 b6 b7 b8] blocks
 +              about-id (ident-id about)
 +              get-block #(request! self "GET" (str "/semantic/blocks/" %) nil)
 +              ordered? #(some? (:block/order (d/entity @conn [:block/uuid %])))]
@@ -304,6 +345,18 @@ index 0000000..c7537f8
 +                  _ (batch-set! self (set-entry b5 about-id [(str plain-a) (str plain-b)]))
 +                  _ (batch-set! self (set-entry b6 about-id [(str ns-child) (str other-block)]))
 +                  _ (batch-set! self (set-entry b7 about-id (str ns-child)))
++                  ;; Two blocks whose order keys sort the other way from their db ids.
++                  later-key (random-uuid)
++                  earlier-key (random-uuid)
++                  notes-page (:block/uuid (:block/page (d/entity @conn [:block/uuid other-block])))
++                  _ (d/transact! conn (for [[id order] [[later-key "a3"] [earlier-key "a2"]]]
++                                        {:block/uuid id :block/title (str "Ordered " order)
++                                         :block/page [:block/uuid notes-page]
++                                         :block/parent [:block/uuid notes-page]
++                                         :block/order order
++                                         :block/created-at 1 :block/updated-at 1}))
++                  _ (batch-set! self (set-entry b8 about-id [(str later-key) (str earlier-key)]))
++                  r8 (get-block b8)
 +                  ;; A page holding the mixed pair, for getPage.
 +                  _ (batch-set! self (set-entry host-id about-id [(str plain-a) (str ns-child)]))
 +                  reads (p/all (map get-block [b0 b1 b2 b3 b4 b5 b6 b7]))
@@ -332,7 +385,13 @@ index 0000000..c7537f8
 +              (testing "ordered values (blocks, Library and namespace pages) come first, then the rest by db id"
 +                (is (= [(str ns-child) (str plain-a)] (value-uuids r0 about)))
 +                (is (= [(str areas) (str plain-b)] (value-uuids r3 about)))
-+                (is (= [(str other-block) (str journal-id)] (value-uuids r4 about)))))
++                (is (= [(str other-block) (str journal-id)] (value-uuids r4 about))))
++              (testing "ordered values are listed by order key, not db id"
++                (is (< (:db/id (d/entity @conn [:block/uuid later-key]))
++                       (:db/id (d/entity @conn [:block/uuid earlier-key])))
++                    "precondition: the block with the later order key has the lower db id")
++                (is (= 200 (:status r8)) (pr-str (:body r8)))
++                (is (= [(str earlier-key) (str later-key)] (value-uuids r8 about)))))
 +            (testing "getBlocks: one mixed block doesn't fail the bulk read"
 +              (is (= 200 (:status bulk)) (pr-str (:body bulk))))
 +            (testing "getPage on a page holding the mixed pair"
@@ -448,8 +507,7 @@ index 0000000..c7537f8
 +                  ;; Deleting b16's project never touches b15's objective.
 +                  _ (request! self "DELETE" (str "/semantic/blocks/" b16 "/properties/"
 +                                                 (js/encodeURIComponent (ident-id project))) nil)
-+                  ;; The API has no free-number path, so the number value is made by the outliner.
-+                  _ (outliner-property/set-block-property! conn [:block/uuid b15] (:db/ident points) 3)
++                  _ (batch-set! self (set-entry b15 (ident-id points) 3))
 +                  points-value (value-uuid b15 points)
 +                  estimate-other-value (batch-set! self (set-entry b16 (ident-id estimate) (str points-value)))
 +                  link-content (batch-set! self (set-entry b16 (ident-id link) (str link-block)))
@@ -508,6 +566,57 @@ index 0000000..c7537f8
 +              (is (= 400 (:status insert-deadline)) (pr-str (:body insert-deadline)))
 +              (is (= (str "blocks[0]: " deadline ": \"2026-11-10\" should be a datetime")
 +                     (get-in insert-deadline [:body :error]))))))))))
++
++(deftest number-property-takes-a-number-test
++  ;; A number given to a number property is the number itself, stored in a number value block as
++  ;; the editor does, never read as a db id, whichever path writes it and whatever its value.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks host-id points estimate]}]
++        (let [[b0 b1 b2 b3 b4 b5] blocks
++              put! (fn [block property value]
++                     (request! self "PUT" (str "/semantic/blocks/" block "/properties/"
++                                               (js/encodeURIComponent (ident-id property)))
++                               {:value value}))
++              number (fn [block property]
++                       (:logseq.property/value (get (d/entity @conn [:block/uuid block]) (:db/ident property))))]
++          (p/let [scores (outliner-property/upsert-property!
++                          conn nil {:logseq.property/type :number :db/cardinality :db.cardinality/many}
++                          {:property-name "scores"})
++                  batch (batch-set! self (set-entry b0 (ident-id points) 3))
++                  put (put! b1 estimate 5)
++                  decimal (batch-set! self (set-entry b2 (ident-id points) 2.5))
++                  text (put! b3 points "42")
++                  ;; A number equal to the db id of one of points' own value blocks is still a number.
++                  value-id (:db/id (get (d/entity @conn [:block/uuid b0]) (:db/ident points)))
++                  same-as-id (batch-set! self (set-entry b4 (ident-id points) value-id))
++                  many (batch-set! self (set-entry b5 (ident-id scores) [1 value-id]))
++                  insert (request! self "POST" (str "/semantic/blocks/" host-id "/children")
++                                   {:position "append"
++                                    :blocks [{:title "inserted" :properties {"points" 7}}]})
++                  inserted (some-> (get-in insert [:body :blocks 0 :uuid]) uuid)
++                  read (request! self "GET" (str "/semantic/blocks/" b0) nil)
++                  not-a-number (batch-set! self (set-entry b2 (ident-id points) "three"))]
++            (doseq [[label r] [["batch" batch] ["single set" put] ["decimal" decimal] ["numeric text" text]
++                               ["a db id of an own value" same-as-id] ["list" many]]]
++              (is (= 200 (:status r)) (str label ": " (pr-str (:body r)))))
++            (is (= 201 (:status insert)) (pr-str (:body insert)))
++            (is (= 3 (number b0 points)))
++            (is (= 5 (number b1 estimate)))
++            (is (= 2.5 (number b2 points)))
++            (is (= 42 (number b3 points)))
++            (is (= value-id (number b4 points)) "the number is stored, not the value block it names")
++            (is (= #{1 value-id} (set (map :logseq.property/value
++                                           (get (d/entity @conn [:block/uuid b5]) (:db/ident scores))))))
++            (is (= 7 (some-> inserted (#(number % points)))))
++            (testing "the number reads back"
++              (is (= 200 (:status read)) (pr-str (:body read)))
++              (is (= 3 (some #(when (= (ident-id points) (:ident %)) (:value %))
++                             (get-in read [:body :properties])))
++                  (pr-str (:body read))))
++            (testing "control: text that isn't a number is still refused"
++              (is (= 400 (:status not-a-number)) (pr-str (:body not-a-number)))
++              (is (= 2.5 (number b2 points))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index d69fbda..53363a1 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
