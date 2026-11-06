@@ -532,6 +532,36 @@ describe("hand-written tools", () => {
     });
   });
 
+  it("promote_page_to_tag takes extends and a dry-run flag, and says to dry-run a well-linked page first", async () => {
+    const tools = await listTools();
+    const promote = tools.find((t) => t.name === "promote_page_to_tag");
+    expect(promote.inputSchema.properties["dry-run"].type).toBe("boolean");
+    expect(promote.inputSchema.properties.body.properties.extends.type).toBe("array");
+    expect(promote.inputSchema.properties.body.additionalProperties).toBe(false);
+    expect(promote.description).toContain(
+      "Run with dry-run first on a page with many references and show the user the counts.",
+    );
+    expect(promote.description).toContain("Give extends to set the tags it extends in the same call");
+  });
+
+  it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
+    syncHandler = () =>
+      Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],
+        promoted: { blocks: 3, references: 2 }, "dry-run": true });
+    const result = await callTool("promote_page_to_tag", {
+      graph: "work",
+      "page-id": "p1",
+      "dry-run": true,
+      body: { extends: ["Food"] },
+    });
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toMatchObject({ promoted: { blocks: 3, references: 2 }, "dry-run": true });
+    const url = new URL(syncRequests[0].url);
+    expect(url.pathname).toBe(`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`);
+    expect(url.searchParams.get("dry-run")).toBe("true");
+    expect(JSON.parse(syncRequests[0].body)).toEqual({ extends: ["Food"] });
+  });
+
   it("promote_page_to_tag sends no body unless given one, and passes the server's refusal through", async () => {
     syncHandler = () =>
       Response.json({ error: 'page-id: "Notes" (p1) is namespaced under Library' }, { status: 400 });

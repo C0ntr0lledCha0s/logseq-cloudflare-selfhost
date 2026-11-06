@@ -52,7 +52,7 @@ const HINTS: Record<string, string> = {
   create_tag:
     "Give the tag its extends and properties in the same call (tag and property UUIDs, idents or titles), so it is set up in one write. Built-in tags such as Tag, Page, Journal, Query and Template can't be extended.",
   promote_page_to_tag:
-    "Turns an existing page into a tag in place: its UUID, blocks, properties and references are kept, and links to it stay links (they aren't tagged). Refuses journals, built-ins, properties, namespaced pages and existing tags. Setting a page's tags to Tag is refused; use this instead.",
+    "Turns an existing page into a tag in place: its UUID, blocks, properties and references are kept, and links to it stay links (they aren't tagged). Run with dry-run first on a page with many references and show the user the counts. Give extends to set the tags it extends in the same call (tag UUIDs, idents or titles; built-in tags such as Tag and Page, and the page itself, are refused). Refuses journals, built-ins, properties, namespaced pages and existing tags. Setting a page's tags to Tag is refused; use this instead.",
   update_tag:
     "To change one tag property and keep the rest, use properties.add or properties.remove; properties.set replaces the tag's own properties (built-in ones stay). extends replaces the tags it extends; built-in tags such as Tag, Page, Journal, Query and Template can't be extended. title is optional.",
 };
