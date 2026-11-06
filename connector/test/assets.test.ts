@@ -13,6 +13,7 @@ const WORK_ID = "11111111-1111-1111-1111-111111111111";
 const NOTES_ID = "22222222-2222-2222-2222-222222222222";
 const ASSET_ID = "33333333-3333-4333-8333-333333333333";
 const PAGE_ID = "44444444-4444-4444-8444-444444444444";
+const JOURNAL_ID = "00000001-2026-1106-0000-000000000000";
 const MIB = 1024 * 1024;
 const MAX_BYTES = 25 * MIB;
 
@@ -129,7 +130,7 @@ function onlyText(result: { content: Content[] }): string {
   return (result.content[0] as { text: string }).text;
 }
 
-/** A sync stub that accepts asset uploads and answers like createAsset. */
+/** A sync stub that accepts asset uploads and answers like createAsset: on page-id, else on today's journal. */
 function acceptUploads(): void {
   syncHandler = (request) => {
     const url = new URL(request.url);
@@ -141,6 +142,8 @@ function acceptUploads(): void {
           type: "md",
           size: Number(url.searchParams.get("size")),
           checksum: url.searchParams.get("checksum"),
+          "page-id": url.searchParams.get("page-id") ?? JOURNAL_ID,
+          "page-title": url.searchParams.has("page-id") ? "Standup" : "Nov 6th, 2026",
         },
         { status: 201 },
       );
@@ -159,7 +162,13 @@ describe("save_document", () => {
     const result = await callTool("save_document", { graph: "work", fileName: "standup.md", text });
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(onlyText(result))).toEqual({ assetUuid: ASSET_ID, fileName: "standup.md", size: bytes.length });
+    expect(JSON.parse(onlyText(result))).toEqual({
+      assetUuid: ASSET_ID,
+      fileName: "standup.md",
+      size: bytes.length,
+      pageId: JOURNAL_ID,
+      pageTitle: "Nov 6th, 2026",
+    });
     expect(syncCalls).toHaveLength(1);
     const upload = syncCalls[0];
     expect(upload.method).toBe("POST");
@@ -179,7 +188,13 @@ describe("save_document", () => {
     const raw = new Uint8Array([0, 255, 1, 2, 128, 64]);
     const fromBase64 = await callTool("save_document", { graph: "work", fileName: "blob.bin", base64: base64(raw) });
     expect(fromBase64.isError).toBe(false);
-    expect(JSON.parse(onlyText(fromBase64))).toEqual({ assetUuid: ASSET_ID, fileName: "blob.bin", size: 6 });
+    expect(JSON.parse(onlyText(fromBase64))).toEqual({
+      assetUuid: ASSET_ID,
+      fileName: "blob.bin",
+      size: 6,
+      pageId: JOURNAL_ID,
+      pageTitle: "Nov 6th, 2026",
+    });
     expect(Object.fromEntries(syncCalls[0].url.searchParams)).toEqual({
       "file-name": "blob.bin",
       size: "6",
@@ -194,6 +209,7 @@ describe("save_document", () => {
     expect(byUuid.isError).toBe(false);
     expect(syncCalls).toHaveLength(1);
     expect(syncCalls[0].url.searchParams.get("page-id")).toBe(PAGE_ID);
+    expect(JSON.parse(onlyText(byUuid))).toMatchObject({ pageId: PAGE_ID, pageTitle: "Standup" });
 
     syncCalls = [];
     const upload = syncHandler;
@@ -500,7 +516,13 @@ describe("save_file_from_url", () => {
     });
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(onlyText(result))).toEqual({ assetUuid: ASSET_ID, fileName: "Q3 report.pdf", size: pdf.length });
+    expect(JSON.parse(onlyText(result))).toEqual({
+      assetUuid: ASSET_ID,
+      fileName: "Q3 report.pdf",
+      size: pdf.length,
+      pageId: PAGE_ID,
+      pageTitle: "Standup",
+    });
     expect(syncCalls).toHaveLength(1);
     expect(Object.fromEntries(syncCalls[0].url.searchParams)).toEqual({
       "file-name": "Q3 report.pdf",
@@ -510,6 +532,14 @@ describe("save_file_from_url", () => {
     });
     expect(syncCalls[0].contentType).toBe("application/octet-stream");
     expect(syncCalls[0].bytes).toEqual(pdf);
+
+    // With no page, the server puts it on today's journal, and the result names that journal.
+    syncCalls = [];
+    fetchSpy.mockResolvedValueOnce(new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+    const toToday = await callTool("save_file_from_url", { graph: "work", url: "https://files.example.com/a.pdf" });
+    expect(toToday.isError).toBe(false);
+    expect(syncCalls[0].url.searchParams.has("page-id")).toBe(false);
+    expect(JSON.parse(onlyText(toToday))).toMatchObject({ pageId: JOURNAL_ID, pageTitle: "Nov 6th, 2026" });
 
     // A refused URL becomes a tool error and nothing is uploaded.
     syncCalls = [];

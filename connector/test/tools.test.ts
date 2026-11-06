@@ -461,6 +461,8 @@ describe("hand-written tools", () => {
       "batch_move_blocks",
       "verbose",
       "dry-run",
+      "owner's time zone",
+      "page-title",
     ]) {
       expect(result.text).toContain(phrase);
     }

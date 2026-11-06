@@ -86,6 +86,29 @@ test("forbidden vars throw", () => {
   }
 });
 
+test("timeZone becomes the TIMEZONE var that sets 'today'", () => {
+  assert.equal(render().vars.TIMEZONE, "Pacific/Auckland", "the owner's zone, from config/settings.json");
+  const { timeZone: _omit, ...withoutZone } = settings;
+  assert.equal("TIMEZONE" in render({ settings: withoutZone }).vars, false, "unset: the server uses UTC");
+  assert.equal(
+    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings: withoutZone }).vars,
+    undefined,
+    "unset adds no [vars] table",
+  );
+  assert.equal(render({ settings: { ...settings, timeZone: "UTC" } }).vars.TIMEZONE, "UTC");
+  assert.equal(
+    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings }).vars.TIMEZONE,
+    "Pacific/Auckland",
+    "upstream with no [vars] table still gets it",
+  );
+});
+
+test("an unknown or blank timeZone throws", () => {
+  for (const timeZone of ["Mars/Olympus", "", "  ", 13]) {
+    assert.throws(() => render({ settings: { ...settings, timeZone } }), /settings\.timeZone/);
+  }
+});
+
 test("unknown plan throws", () => {
   assert.throws(() => render({ settings: { ...settings, plan: "pro" } }), /plan/);
 });
