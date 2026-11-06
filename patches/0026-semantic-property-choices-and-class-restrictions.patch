@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..eb500be 100644
+index 5dc3e7d..d933fab 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -88,14 +88,46 @@
@@ -209,7 +209,7 @@ index 5dc3e7d..eb500be 100644
  
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
-@@ -1920,6 +1994,723 @@
+@@ -1920,6 +1994,743 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -584,8 +584,10 @@ index 5dc3e7d..eb500be 100644
 +                    (let [listed (reduce
 +                                  (fn [listed [index ref]]
 +                                    (let [field (str "choices.order " index)
-+                                          u (or (some-> (resolve-choice db property ref nil) uuid-of)
-+                                                (when-let [text (choice-text ref)] (get by-key (choice-key type text))))]
++                                          ;; the title the call leaves a choice with first, so a title
++                                          ;; a rename frees and an add or rename takes names the new owner
++                                          u (or (when-let [text (choice-text ref)] (get by-key (choice-key type text)))
++                                                (some-> (resolve-choice db property ref nil) uuid-of))]
 +                                      (cond
 +                                        (nil? u) (do (refuse! field (no-choice ref)) listed)
 +                                        (retired-uuids u) (do (refuse! field (str (pr-str (label u)) " is retired in this call")) listed)
@@ -685,15 +687,18 @@ index 5dc3e7d..eb500be 100644
 +                   (into seen (map :db/id unseen)))))))))
 +
 +(defn- extends-refusal
-+  "Why `tag` (nil when creating one) can't extend `parent`: itself, or a tag that already extends
-+  it, named with the path."
++  "Why `tag` (nil when creating one) can't extend `parent`: a built-in tag the app's extends picker
++  hides (ldb/extends-hidden-tags: Tag, Page, Journal, Query, Template, ...), itself, or a tag that
++  already extends it, named with the path."
 +  [tag parent]
-+  (when tag
-+    (if (= (:db/id tag) (:db/id parent))
-+      (str (:block/title parent) " can't extend itself")
-+      (when-let [via (extends-path parent tag)]
-+        (str (:block/title parent) " already extends " (:block/title tag)
-+             (when (seq via) (str " through " (string/join ", " (map :block/title via)))))))))
++  (if (contains? ldb/extends-hidden-tags (:db/ident parent))
++    (str (:block/title parent) " is a built-in tag that other tags can't extend")
++    (when tag
++      (if (= (:db/id tag) (:db/id parent))
++        (str (:block/title parent) " can't extend itself")
++        (when-let [via (extends-path parent tag)]
++          (str (:block/title parent) " already extends " (:block/title tag)
++               (when (seq via) (str " through " (string/join ", " (map :block/title via))))))))))
 +
 +(defn- validate-tag-schema
 +  "Checks createTag's or updateTag's extends and properties for `tag` (nil when creating):
@@ -832,6 +837,12 @@ index 5dc3e7d..eb500be 100644
 +      {:error (str "convert_values: " title " is a " (name type)
 +                   " property; only a default (text) property's values can be converted")}
 +      e2ee? {:error "convert_values: not on an E2EE graph, where choice titles would be stored as plain text"}
++      ;; The outliner's delete keeps a lone value block of a property with a default (it re-points
++      ;; holders at the empty placeholder instead), and the default would stay text.
++      (:logseq.property/default-value property)
++      {:error (str "convert_values: " title " has a default value "
++                   (pr-str (str (db-property/property-value-content (:logseq.property/default-value property))))
++                   "; clear it in the app's property settings first")}
 +      :else
 +      (let [property-ident (:db/ident property)
 +            targets (call-choices db property (when (:ok choices) choices))
@@ -841,7 +852,8 @@ index 5dc3e7d..eb500be 100644
 +            [values other] (reduce (fn [[values other] {:keys [e v]}]
 +                                     (let [value (d/entity db v)]
 +                                       (cond
-+                                         (choice? value) [values other]
++                                         (or (choice? value) (= :logseq.property/empty-placeholder (:db/ident value)))
++                                         [values other]
 +                                         (own? value) [(update values v (fnil conj #{}) e) other]
 +                                         :else [values (conj other [e value])])))
 +                                   [(sorted-map) []] datoms)
@@ -849,8 +861,16 @@ index 5dc3e7d..eb500be 100644
 +                           (let [text (str (db-property/property-value-content (d/entity db id)))]
 +                             {:id id :text text :choice (match-choice targets text) :holders holders}))
 +                         values)
-+            unmatched (distinct (keep #(when-not (:choice %) (:text %)) values))]
++            unmatched (distinct (keep #(when-not (:choice %) (:text %)) values))
++            ;; Deleting a value block deletes the blocks under it, which the caller never named.
++            nested (keep (fn [{:keys [id text]}]
++                           (when (seq (:block/_parent (d/entity db id)))
++                             (str "convert_values: " (:block/uuid (:block/parent (d/entity db id))) " value "
++                                  (pr-str text) " has " (count (ldb/get-block-full-children-ids db id))
++                                  " child blocks; move or delete them first")))
++                         values)]
 +        (cond
++          (seq nested) {:error (string/join "; " nested)}
 +          (seq other)
 +          {:error (string/join "; " (map (fn [[e value]]
 +                                           (str "convert_values: " (:block/uuid (d/entity db e)) " holds "
@@ -933,7 +953,7 @@ index 5dc3e7d..eb500be 100644
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2722,37 @@
+@@ -1931,14 +2742,37 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -979,7 +999,7 @@ index 5dc3e7d..eb500be 100644
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2762,37 @@
+@@ -1948,16 +2782,37 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -1028,7 +1048,7 @@ index 5dc3e7d..eb500be 100644
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..f95cd53 100644
+index c64cc9f..ee0bcf0 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -1046,11 +1066,11 @@ index c64cc9f..f95cd53 100644
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
 -   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
 -   "getTag" ["Get a tag" "Returns one tag by UUID."]
-+   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title) is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
++   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
 +   "getTag" ["Get a tag" "Returns one tag by UUID, with the tags it extends and its tag properties."]
     "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
 -   "updateTag" ["Update a tag" "Renames one tag identified by UUID."]
-+   "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself or a tag that already extends it (the error names the path). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
++   "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
     "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
     "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
 -   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
@@ -1058,7 +1078,7 @@ index c64cc9f..f95cd53 100644
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
 +   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 +   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, and an E2EE graph are refused. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
@@ -1102,13 +1122,13 @@ index c64cc9f..f95cd53 100644
 +                 :properties {:title {:type "string"} :name encrypted-name-schema
 +                              :extends (assoc tag-selectors-schema
 +                                              :minItems 1
-+                                              :description "The tags this tag extends, each by UUID, ident or title. Omit to extend Root.")
++                                              :description "The tags this tag extends, each by UUID, ident or title. Omit to extend Root. Built-in tags the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like) are refused.")
 +                              :properties (assoc property-selectors-schema
 +                                                 :description "The tag's properties, each by UUID, ident or title.")}}
 +    "updateTag" {:properties {:title {:type "string"} :name encrypted-name-schema
 +                              :extends (assoc tag-selectors-schema
 +                                              :minItems 1
-+                                              :description "Replaces the tags this tag extends: each by UUID, ident or title, at least one.")
++                                              :description "Replaces the tags this tag extends: each by UUID, ident or title, at least one. Built-in tags the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like) are refused.")
 +                              :properties {:type "object"
 +                                           :description "Give exactly one of add or remove (change only the tags listed, keeping the tag's other properties) or set (replace the tag's own properties; built-in ones stay)."
 +                                           :properties {:set property-selectors-schema
@@ -1144,13 +1164,13 @@ index c64cc9f..f95cd53 100644
 +                                                                                        :icon {:anyOf [{:$ref "#/components/schemas/Icon"} {:type "null"}]}
 +                                                                                        :description {:type "string"}}}}
 +                                                          :order {:type "array"
-+                                                                  :description "Every choice that survives the call, including any added in this call (by title), exactly once, in the order the editor should list them."
++                                                                  :description "Every choice that survives the call, including any added in this call, exactly once, in the order the editor should list them. A title names the choice that ends the call with it (so a title a rename frees and an add takes names the new choice); a title the call frees and nothing takes still names its old choice."
 +                                                                  :items {:type "string"}}
 +                                                          :retire {:type "array"
 +                                                                   :description "Choices to remove, each by UUID, ident or title. A built-in choice (Status, Priority) is refused. Blocks holding one lose the value, so a retire with holders needs acknowledge-holders=true; preview with dry-run=true."
 +                                                                   :items {:type "string"}}}}
 +                                   :convert_values {:type "boolean"
-+                                                    :description "For a default (text) property: true turns its free-text values into the choices the call leaves, matched exactly, then ignoring case. Text that matches no choice refuses the call; add those choices under choices.add in the same call. Preview the mapping with dry-run=true."}}}
++                                                    :description "For a default (text) property: true turns its free-text values into the choices the call leaves, matched exactly, then ignoring case. Text that matches no choice refuses the call; add those choices under choices.add in the same call. Refused while the property has a default value, or when a text value has child blocks (deleting it would delete them); values cleared to the empty placeholder are left as they are. Preview the mapping with dry-run=true."}}}
      "encryptE2eeText" {:required ["key" "texts"]
                         :properties {:texts {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "string"}}
@@ -1260,10 +1280,10 @@ index c64cc9f..f95cd53 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..5ac8054
+index 0000000..d9401ec
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,1880 @@
+@@ -0,0 +1,2045 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -3144,6 +3164,171 @@ index 0000000..5ac8054
 +            (is (= 500 (:status converted)) (str (:body converted)))
 +            (is (= "the write did not store what was asked: text values not converted \"Active\""
 +                   (get-in converted [:body :error])))))))))
++
++;; Review round 1.
++
++(deftest tag-write-is-read-back-test
++  ;; createTag and updateTag read the tag back after the write. A listener that drops what the write
++  ;; stored as soon as it lands stands in for an outliner that didn't store it: both must answer 500
++  ;; naming what is missing, not success.
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client]}]
++        (let [tamper! (fn [attribute value-title]
++                        (d/listen! conn ::tamper
++                                   (fn [{:keys [db-after tx-data]}]
++                                     (when-let [datom (some #(when (and (:added %) (= attribute (:a %))
++                                                                        (= value-title (:block/title (d/entity db-after (:v %)))))
++                                                               %)
++                                                            tx-data)]
++                                       (d/unlisten! conn ::tamper)
++                                       (d/transact! conn [[:db/retract (:e datom) attribute (:v datom)]])))))]
++          (tamper! :logseq.property.class/extends "Organisation")
++          (p/let [created (request! self "POST" "/semantic/tags"
++                                    {:title "Portfolio" :extends ["Organisation"] :properties ["for-client"]})
++                  _ (tamper! :logseq.property.class/properties "engagement-partner")
++                  updated (request! self "PATCH" (tag-path (:block/uuid client))
++                                    {:properties {:add ["engagement-partner"]}})
++                  _ (tamper! :logseq.property.class/extends "Organisation")
++                  extended (request! self "PATCH" (tag-path (:block/uuid client)) {:extends ["Organisation"]})]
++            (d/unlisten! conn ::tamper)
++            (is (= 500 (:status created)) (str (:body created)))
++            (is (= "the write did not store what was asked: extends missing Organisation"
++                   (get-in created [:body :error])))
++            (is (= 500 (:status updated)) (str (:body updated)))
++            (is (= "the write did not store what was asked: properties missing engagement-partner"
++                   (get-in updated [:body :error])))
++            (is (= 500 (:status extended)) (str (:body extended)))
++            (is (string/starts-with? (str (get-in extended [:body :error]))
++                                     "the write did not store what was asked: extends missing Organisation"))))))))
++
++(deftest extends-built-in-tag-refused-test
++  ;; The app's extends picker hides the private and block-kind built-in tags (Tag, Page, Journal,
++  ;; Query, Template, ...); createTag and updateTag refuse them by title, ident or UUID. A user tag
++  ;; is still allowed.
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client]}]
++        (let [path (tag-path (:block/uuid client))
++              page-uuid (str (:block/uuid (d/entity @conn :logseq.class/Page)))]
++          (p/let [tag (request! self "PATCH" path {:extends ["Tag"]})
++                  page (request! self "PATCH" path {:extends [page-uuid]})
++                  journal (request! self "PATCH" path {:extends ["logseq.class/Journal"]})
++                  query (request! self "PATCH" path {:extends ["Organisation" "Query"]})
++                  template (request! self "PATCH" path {:extends ["Template"]})
++                  property (request! self "PATCH" path {:extends ["Property"]})
++                  created (request! self "POST" "/semantic/tags" {:title "Diary" :extends ["Page"]})
++                  unchanged (extends-titles conn (:block/uuid client))
++                  user-tag (request! self "PATCH" path {:extends ["Organisation"]})]
++            (is (= 400 (:status tag)) (str (:body tag)))
++            (is (= "extends 0: Tag is a built-in tag that other tags can't extend" (get-in tag [:body :error])))
++            (is (= "extends 0: Page is a built-in tag that other tags can't extend" (get-in page [:body :error])) "by UUID")
++            (is (= "extends 0: Journal is a built-in tag that other tags can't extend" (get-in journal [:body :error])) "by ident")
++            (is (= "extends 1: Query is a built-in tag that other tags can't extend" (get-in query [:body :error])) "a block-kind tag")
++            (is (= "extends 0: Template is a built-in tag that other tags can't extend" (get-in template [:body :error])))
++            (is (= "extends 0: Property is a built-in tag that other tags can't extend" (get-in property [:body :error])))
++            (is (= 400 (:status created)) (str (:body created)))
++            (is (= "extends 0: Page is a built-in tag that other tags can't extend" (get-in created [:body :error])))
++            (is (empty? (d/datoms @conn :avet :block/title "Diary")) "a refused create writes nothing")
++            (is (= #{"Company"} unchanged) "no refused call changed the tag")
++            (is (= 200 (:status user-tag)) (str (:body user-tag)))
++            (is (= #{"Organisation"} (extends-titles conn (:block/uuid client))))))))))
++
++(deftest choices-order-names-the-titles-the-call-leaves-test
++  ;; order names a choice by the title the call leaves it with, so a title a rename frees and an
++  ;; add takes names the new choice; a title the call frees and nothing takes still names its choice.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status]}]
++        (let [active (choice-uuid conn status "Active")
++              done-id (choice-uuid conn status "Done")]
++          (p/let [reused (choices! self status {:update [{:choice "Active" :title "Doing"}]
++                                                :add [{:title "Active"}]
++                                                :order ["Active" "Doing" "Done" "Backlog"]})
++                  new-active (choice-uuid conn status "Active")
++                  after-reused (choice-titles conn status)
++                  chain (choices! self status {:update [{:choice "Done" :title "Finished"}
++                                                        {:choice "Doing" :title "Done"}]
++                                               :order ["Done" "Finished" "Active" "Backlog"]})
++                  chain-ids [(choice-uuid conn status "Done") (choice-uuid conn status "Finished")]
++                  freed (choices! self status {:update [{:choice "Backlog" :title "Later"}]
++                                               :order ["Backlog" "Done" "Finished" "Active"]})]
++            (is (= 200 (:status reused)) (str (:body reused)))
++            (is (= ["Active" "Doing" "Done" "Backlog"] after-reused))
++            (is (not= active new-active) "Active is the choice added in the call")
++            (is (= 200 (:status chain)) (str (:body chain)))
++            (is (= [active done-id] chain-ids)
++                "a rename chain is ordered by its final titles")
++            (is (= 200 (:status freed)) (str (:body freed)))
++            (is (= ["Later" "Done" "Finished" "Active"] (choice-titles conn status))
++                "a title the call frees and nothing takes still names its choice")))))))
++
++(deftest convert-values-child-blocks-refused-test
++  ;; Deleting a text value block deletes the blocks under it, which the caller never named, so a
++  ;; value block with child blocks refuses the conversion, dry run included, naming its holder.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1] blocks
++              child (random-uuid)
++              grandchild (random-uuid)]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (hold! self b1 phase "Active")
++                  value (entity conn (stored conn b0 phase))
++                  _ (d/transact! conn [{:block/uuid child :block/title "a note" :block/parent (:db/id value)
++                                        :block/page (:db/id (:block/page value)) :block/order "a0"
++                                        :block/created-at 1 :block/updated-at 1}
++                                       {:block/uuid grandchild :block/title "more" :block/parent [:block/uuid child]
++                                        :block/page (:db/id (:block/page value)) :block/order "a0"
++                                        :block/created-at 1 :block/updated-at 1}])
++                  _ (add-choice! conn phase "Active")
++                  before (snapshot conn)
++                  dry (convert! self phase {} "dry-run=true")
++                  real (convert! self phase {})
++                  after (snapshot conn)]
++            (doseq [response [dry real]]
++              (is (= 400 (:status response)) (str (:body response)))
++              (is (= (str "convert_values: " b0 " value \"Active\" has 2 child blocks; move or delete them first")
++                     (get-in response [:body :error]))))
++            (is (true? (= before after)) "nothing was written")
++            (is (some? (entity conn grandchild)) "the child blocks are kept")))))))
++
++(deftest convert-values-default-value-refused-test
++  ;; A text property with a default value: the outliner's delete keeps a lone value block of such a
++  ;; property, and the default would stay text. The conversion is refused, dry run included, and
++  ;; nothing is written.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (p/let [_ (outliner-property/create-property-text-block! conn (:db/id (d/entity @conn phase))
++                                                                 :logseq.property/default-value "Open" {})
++                _ (hold! self (first blocks) phase "Active")
++                _ (add-choice! conn phase "Active")
++                before (snapshot conn)
++                dry (convert! self phase {:choices {:add [{:title "Open"}]}} "dry-run=true")
++                real (convert! self phase {:choices {:add [{:title "Open"}]}})
++                after (snapshot conn)]
++          (doseq [response [dry real]]
++            (is (= 400 (:status response)) (str (:body response)))
++            (is (= "convert_values: phase has a default value \"Open\"; clear it in the app's property settings first"
++                   (get-in response [:body :error]))))
++          (is (true? (= before after)) "nothing was written"))))))
++
++(deftest convert-values-leaves-empty-placeholder-test
++  ;; Logseq stores its empty placeholder as the value of a block that holds a property's default;
++  ;; a conversion leaves it as it is, as it does a value that is already a choice.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1] blocks]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn b1)) phase :logseq.property/empty-placeholder]])
++                  active (add-choice! conn phase "Active")
++                  converted (convert! self phase {})]
++            (is (= 200 (:status converted)) (str (:body converted)))
++            (is (= {:values 1 :holders 1} (get-in converted [:body :converted])))
++            (is (= active (stored conn b0 phase)))
++            (is (= :logseq.property/empty-placeholder (:db/ident (get (entity conn b1) phase))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 4d9e7d2..e1c9ab9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
