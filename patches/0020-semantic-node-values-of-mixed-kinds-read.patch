@@ -1,0 +1,320 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 10558ac..be1c577 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -127,6 +127,12 @@
+       (and (db-property/logseq-property? k)
+            (contains? db-property/public-built-in-properties k))))
+ 
++;; A many value's entities are listed by :block/order, then by db id. Blocks, property entities and
++;; pages under the Library or a namespace parent have an order key (a string); plain and journal
++;; pages have none. The key keeps the two kinds apart, as `compare` throws on a string and a number.
++(defn- property-value-sort-key [value]
++  [(if (:block/order value) 0 1) (str (:block/order value)) (:db/id value)])
++
+ (defn- entity-properties-response [db entity]
+   (->> (db-property/properties entity)
+        (filter (fn [[k _]] (shown-property? k)))
+@@ -137,7 +143,7 @@
+                   :title (:block/title property)
+                   :type (some-> (:logseq.property/type property) name)
+                   :value (if (set? v)
+-                           (mapv property-value-response (sort-by #(or (:block/order %) (:db/id %)) v))
++                           (mapv property-value-response (sort-by property-value-sort-key v))
+                            (property-value-response v))})))))
+ 
+ (defn- block-detail-response [db entity]
+@@ -784,6 +790,20 @@
+       :else
+       (resolve-ref-entity db property-ident value))))
+ 
++(defn- refused-by-type
++  "Why the property's type refuses an entity a value resolved to, as the outliner's own validator
++  would when writing it (a page for a text property, a non-journal page for a date one), or nil.
++  Found here, the call is refused up front, naming the property, not failed as a server error."
++  [db property values resolved]
++  (when (and (:logseq.property/type property) (not= :block/tags (:db/ident property)))
++    (some (fn [[value id]]
++            (when (number? id)
++              (when-let [errors (outliner-property/validate-property-value db property id)]
++                (str (or (:block/title property) (entity-ident property)) ": " (pr-str (str value)) " "
++                     (let [error (if (coll? errors) (first errors) errors)]
++                       (if (coll? error) (first error) error))))))
++          (map vector values resolved))))
++
+ (defn- prepare-property-value
+   "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
+   the value is for (an entity, or a map of the :block/tags a new block will have), which limits a
+@@ -800,7 +820,9 @@
+         (cond
+           (some ::error resolved) {:error (some ::error resolved)}
+           (every? some? resolved)
+-          {:value (if many-input? resolved (first resolved))}
++          (if-let [refused (refused-by-type db property values resolved)]
++            {:error refused}
++            {:value (if many-input? resolved (first resolved))})
+           :else
+           {:error (cond
+                     (= property-ident :block/tags)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 57b3b39..7672d86 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -127,9 +127,9 @@
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+    "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+-   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs."]
++   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A UUID naming an entity the property's type doesn't take (a page for a text property, a page that isn't a journal for a date property) is refused, naming the property."]
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+-   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link."]
++   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. A UUID naming an entity the property's type doesn't take (a page for a text property, a page that isn't a journal for a date property) is refused, naming the property. Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link."]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
+    "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
+new file mode 100644
+index 0000000..1d77da0
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
+@@ -0,0 +1,228 @@
++(ns logseq.db-sync.semantic-node-value-read-test
++  "A node (many) property can hold entities of different kinds: plain and journal pages, which
++  have no :block/order, and blocks, property entities and pages under the Library or a namespace
++  parent, which do. Every read that renders properties (getBlock, getBlocks, getPage,
++  getPageOutline) must return such a value set, whichever kinds it mixes and however it was
++  written. A default-type property given a page UUID is refused up front, naming the entry and
++  the property, and the refused batch writes nothing."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}. A body that isn't
++  JSON is kept as text so a failure shows it."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ident-id [property] (subs (str (:db/ident property)) 1))
++
++(defn- set-entry [block property value]
++  {:block-id (str block) :property-id property :value value})
++
++(defn- batch-set! [self & entries]
++  (request! self "POST" "/semantic/block-properties/batch-set" {:entries (vec entries)}))
++
++(defn- with-graph
++  "A journal page holding meeting blocks, and candidate values of every kind:
++  - plain pages Workflow Intelligence and Other plain (no :block/order);
++  - Areas/Operational Intelligence, made by the outliner's namespace split, so Areas sits under
++    the Library and Operational Intelligence under Areas, both with a :block/order;
++  - a block on another page (has :block/order)."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ journal-id] (outliner-page/create! conn "Nov 6th, 2026" {})
++              [_ host-id] (outliner-page/create! conn "Host page" {})
++              [_ notes-id] (outliner-page/create! conn "Notes page" {})
++              blocks (vec (repeatedly 12 random-uuid))
++              other-block (random-uuid)
++              _ (d/transact! conn (concat
++                                   (map-indexed (fn [index id]
++                                                  {:block/uuid id :block/title (str "Meeting " index)
++                                                   :block/page [:block/uuid journal-id]
++                                                   :block/parent [:block/uuid journal-id]
++                                                   :block/order (str "a" index)
++                                                   :block/created-at 1 :block/updated-at 1})
++                                                blocks)
++                                   [{:block/uuid other-block :block/title "A plain block"
++                                     :block/page [:block/uuid notes-id]
++                                     :block/parent [:block/uuid notes-id]
++                                     :block/order "a0"
++                                     :block/created-at 1 :block/updated-at 1}]))
++              [_ plain-a] (outliner-page/create! conn "Workflow Intelligence" {})
++              [_ plain-b] (outliner-page/create! conn "Other plain" {})
++              [_ ns-child] (outliner-page/create! conn "Areas/Operational Intelligence" {:split-namespace? true})
++              about (outliner-property/upsert-property!
++                     conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/many}
++                     {:property-name "about"})
++              topic (outliner-property/upsert-property!
++                     conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                     {:property-name "topic"})
++              objective (outliner-property/upsert-property!
++                         conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                         {:property-name "objective"})
++              project (outliner-property/upsert-property!
++                       conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                       {:property-name "project"})
++              due (outliner-property/upsert-property!
++                   conn nil {:logseq.property/type :date :db/cardinality :db.cardinality/one}
++                   {:property-name "due"})
++              points (outliner-property/upsert-property!
++                      conn nil {:logseq.property/type :number :db/cardinality :db.cardinality/one}
++                      {:property-name "points"})
++              ns-child-entity (d/entity @conn [:block/uuid ns-child])
++              areas (:block/parent ns-child-entity)
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self :journal-id journal-id :host-id host-id :blocks blocks
++              :other-block other-block :plain-a plain-a :plain-b plain-b :ns-child ns-child
++              :areas (:block/uuid areas)
++              :about about :topic topic :objective objective :project project :due due :points points}))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- value-uuids
++  "The UUIDs of the values `property` shows in a block or page response, in response order."
++  [response property]
++  (let [value (some #(when (= (ident-id property) (:ident %)) (:value %))
++                    (get-in response [:body :properties]))]
++    (mapv :uuid (if (map? value) [value] value))))
++
++(deftest mixed-order-node-values-read-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self journal-id host-id blocks other-block plain-a plain-b ns-child areas
++                   about]}]
++        (let [[b0 b1 b2 b3 b4 b5 b6 b7] blocks
++              about-id (ident-id about)
++              get-block #(request! self "GET" (str "/semantic/blocks/" %) nil)
++              ordered? #(some? (:block/order (d/entity @conn [:block/uuid %])))]
++          (testing "preconditions: the outliner gives Library and namespace pages an order, and plain and journal pages none"
++            (is (ordered? ns-child))
++            (is (ordered? areas))
++            (is (ordered? other-block))
++            (is (not (ordered? plain-a)))
++            (is (not (ordered? plain-b)))
++            (is (some? (:block/journal-day (d/entity @conn [:block/uuid journal-id]))) "the host page is a journal")
++            (is (not (ordered? journal-id))))
++          (p/let [;; The report: a plain page, then a namespace page appended by UUID.
++                  append-1 (batch-set! self (set-entry b0 about-id (str plain-a)))
++                  append-2 (batch-set! self (set-entry b0 about-id (str ns-child)))
++                  ;; The same pair appended the other way round.
++                  _ (batch-set! self (set-entry b1 about-id (str ns-child)))
++                  _ (batch-set! self (set-entry b1 about-id (str plain-a)))
++                  ;; The same pair by title.
++                  by-title-1 (batch-set! self (set-entry b2 about-id "Workflow Intelligence"))
++                  by-title-2 (batch-set! self (set-entry b2 about-id "Operational Intelligence"))
++                  ;; A plain page and a Library page in one list value.
++                  _ (batch-set! self (set-entry b3 about-id [(str plain-b) (str areas)]))
++                  ;; A journal page and a block in one list value.
++                  _ (batch-set! self (set-entry b4 about-id [(str journal-id) (str other-block)]))
++                  ;; Controls that already read: values of one kind, and one value.
++                  _ (batch-set! self (set-entry b5 about-id [(str plain-a) (str plain-b)]))
++                  _ (batch-set! self (set-entry b6 about-id [(str ns-child) (str other-block)]))
++                  _ (batch-set! self (set-entry b7 about-id (str ns-child)))
++                  ;; A page holding the mixed pair, for getPage.
++                  _ (batch-set! self (set-entry host-id about-id [(str plain-a) (str ns-child)]))
++                  reads (p/all (map get-block [b0 b1 b2 b3 b4 b5 b6 b7]))
++                  bulk (request! self "GET" (str "/semantic/blocks?ids=" (string/join "," [b5 b0 b4])) nil)
++                  page (request! self "GET" (str "/semantic/pages/" host-id) nil)
++                  outline (request! self "GET" (str "/semantic/pages/" journal-id "/outline") nil)]
++            (is (= [200 200 200 200] (mapv :status [append-1 append-2 by-title-1 by-title-2]))
++                (pr-str (mapv :body [append-1 append-2 by-title-1 by-title-2])))
++            (let [[r0 r1 r2 r3 r4 r5 r6 r7] reads
++                  pair #{(str plain-a) (str ns-child)}]
++              (testing "controls: one kind of value, or one value"
++                (is (= [200 200 200] (mapv :status [r5 r6 r7])) (pr-str (mapv :body [r5 r6 r7])))
++                (is (= #{(str plain-a) (str plain-b)} (set (value-uuids r5 about))))
++                (is (= [(str ns-child)] (value-uuids r7 about))))
++              (testing "getBlock returns every value whichever kinds the set mixes"
++                (doseq [[label r expected] [["plain page then namespace page, appended by UUID" r0 pair]
++                                            ["namespace page then plain page, appended by UUID" r1 pair]
++                                            ["plain page then namespace page, by title" r2 pair]
++                                            ["plain page and Library page in one list" r3 #{(str plain-b) (str areas)}]
++                                            ["journal page and block in one list" r4 #{(str journal-id) (str other-block)}]]]
++                  (is (= 200 (:status r)) (str label ": " (pr-str (:body r))))
++                  (is (= expected (set (value-uuids r about))) label)))
++              (testing "the order of values doesn't depend on the order they were written"
++                (is (= (value-uuids r0 about) (value-uuids r1 about) (value-uuids r2 about))
++                    (pr-str (mapv #(value-uuids % about) [r0 r1 r2])))))
++            (testing "getBlocks: one mixed block doesn't fail the bulk read"
++              (is (= 200 (:status bulk)) (pr-str (:body bulk))))
++            (testing "getPage on a page holding the mixed pair"
++              (is (= 200 (:status page)) (pr-str (:body page)))
++              (is (= #{(str plain-a) (str ns-child)} (set (value-uuids page about)))))
++            (testing "getPageOutline on the journal shows both values on the block's about line"
++              (is (= 200 (:status outline)) (pr-str (:body outline)))
++              (let [text (pr-str (:body outline))]
++                (is (re-find #"about:: [^\n\"]*\[\[Workflow Intelligence\]\]" text) text)
++                (is (re-find #"about:: [^\n\"]*\[\[Operational Intelligence\]\]" text) text)))))))))
++
++(deftest default-property-given-page-uuid-test
++  ;; The related report: one batch setting objective (text), project (default type, given a page
++  ;; UUID) and topic (node, given a page UUID) returned 500.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks journal-id plain-a plain-b objective project topic due points]}]
++        (let [[_ _ _ _ _ _ _ _ b8 b9 b10 b11] blocks
++              value-blocks (fn [property]
++                             (count (d/datoms @conn :avet :logseq.property/created-from-property
++                                              (:db/id (d/entity @conn (:db/ident property))))))
++              stored (fn [block property] (get (d/entity @conn [:block/uuid block]) (:db/ident property)))]
++          (p/let [batch (batch-set! self
++                                    (set-entry b8 (ident-id objective) "Ship it")
++                                    (set-entry b8 (ident-id project) (str plain-a))
++                                    (set-entry b8 (ident-id topic) (str plain-b)))
++                  put (request! self "PUT" (str "/semantic/blocks/" b9 "/properties/"
++                                                (js/encodeURIComponent (ident-id project)))
++                                {:value (str plain-a)})
++                  topic-only (batch-set! self (set-entry b10 (ident-id topic) (str plain-b)))
++                  topic-read (request! self "GET" (str "/semantic/blocks/" b10) nil)
++                  ;; Other types the outliner's validator refuses a page for.
++                  date-page (batch-set! self (set-entry b11 (ident-id due) (str plain-a)))
++                  number-page (batch-set! self (set-entry b11 (ident-id points) (str plain-a)))
++                  date-journal (batch-set! self (set-entry b11 (ident-id due) (str journal-id)))]
++            (testing "batch: refused up front, naming the entry and the property"
++              (is (= 400 (:status batch)) (pr-str (:body batch)))
++              (let [error (str (get-in batch [:body :error]))]
++                (is (string/starts-with? error "entry 1: ") error)
++                (is (string/includes? error "project") error)))
++            (testing "the refused batch writes nothing and leaves no value blocks"
++              (is (nil? (stored b8 objective)))
++              (is (nil? (stored b8 project)))
++              (is (nil? (stored b8 topic)))
++              (is (= 0 (value-blocks objective)))
++              (is (= 0 (value-blocks project))))
++            (testing "single set: refused with a message naming the property"
++              (is (= 400 (:status put)) (pr-str (:body put)))
++              (is (string/includes? (str (get-in put [:body :error])) "project") (pr-str (:body put)))
++              (is (nil? (stored b9 project))))
++            (testing "control: a node property given a page UUID is set and reads back"
++              (is (= 200 (:status topic-only)) (pr-str (:body topic-only)))
++              (is (= 200 (:status topic-read)) (pr-str (:body topic-read)))
++              (is (= [(str plain-b)] (value-uuids topic-read topic))))
++            (testing "other types given a page they don't take are refused, naming the entry and property"
++              (doseq [[label r property] [["date property given a plain page" date-page "due"]
++                                          ["number property given a page" number-page "points"]]]
++                (is (= 400 (:status r)) (str label ": " (pr-str (:body r))))
++                (is (string/starts-with? (str (get-in r [:body :error])) (str "entry 0: " property ": "))
++                    (str label ": " (pr-str (:body r)))))
++              (is (nil? (stored b11 points)))
++              (testing "control: a date property given a journal page is set"
++                (is (= 200 (:status date-journal)) (pr-str (:body date-journal)))
++                (is (= journal-id (:block/uuid (stored b11 due))))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index d69fbda..53363a1 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -15,6 +15,7 @@
+             [logseq.db-sync.semantic-index-health-test]
+             [logseq.db-sync.semantic-block-changes-test]
+             [logseq.db-sync.semantic-choice-values-test]
++            [logseq.db-sync.semantic-node-value-read-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-auth-test]
