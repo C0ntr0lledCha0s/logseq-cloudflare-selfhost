@@ -1,0 +1,314 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index d353090..ab26c42 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -954,6 +954,20 @@
+   {:error (str (or (:block/title property) (entity-ident property)) ": " reason)
+    ::refusal reason})
+ 
++(defn- tag-value-refusal
++  "Why the resolved :block/tags `values` for `scope` (see prepare-property-value) can't hold Tag, or
++  nil. The outliner refuses Tag as a tags value (validate-tags-property), which surfaced as a server
++  error. A page becomes a tag through promotePageToTag, which also gives it the :db/ident a tag
++  needs, so a page is pointed there; a tag already holds Tag."
++  [db scope values]
++  (when (some #{(:db/id (d/entity db :logseq.class/Tag))} values)
++    (let [target (some->> (:db/id scope) (d/entity db))]
++      (str "Tag marks a page as a tag and can't be set as a value; "
++           (cond
++             (entity-util/class? target) (str (:block/uuid target) " is already a tag")
++             (page? target) (str "use promote_page_to_tag on page " (:block/uuid target))
++             :else "use promote_page_to_tag")))))
++
+ (defn- prepare-property-value
+   "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
+   the value is for (an entity, or a map of the :block/tags a new block will have), which limits a
+@@ -974,7 +988,8 @@
+         (cond
+           (some ::error resolved) {:error (some ::error resolved)}
+           (every? some? resolved)
+-          (if-let [refused (refused-by-type db property values resolved)]
++          (if-let [refused (or (when (= :block/tags property-ident) (tag-value-refusal db scope resolved))
++                               (refused-by-type db property values resolved))]
+             (refusal property refused)
+             {:value (if many-input? resolved (first resolved))})
+           ;; Text that isn't a finite number (NaN, Infinity) for a number property without choices,
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
+new file mode 100644
+index 0000000..862ba0d
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
+@@ -0,0 +1,261 @@
++(ns logseq.db-sync.semantic-promote-page-to-tag-test
++  "Turning a page into a tag. Tag can't be set as a tags value, on any write path: the outliner
++  refuses it (Can't set tag with built-in #Tag), which the handler answered as a 500. It is refused
++  up front with a 400 that points a page at promote_page_to_tag, and nothing is written. Page and
++  other tags are still allowed. The graph has tags Food and Cuisine, an empty page Restaurant, a
++  page Diner with two blocks, and a page Notes with one."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid id]))
++
++(defn- tag-titles [conn id]
++  (set (map :block/title (:block/tags (entity conn id)))))
++
++(defn- seed-graph
++  "A conn from the initial data with the pages and tags the namespace docstring names, and the
++  handler context to call it through."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          food (request! self "POST" "/semantic/tags" {:title "Food"})
++          cuisine (request! self "POST" "/semantic/tags" {:title "Cuisine"})
++          [restaurant diner notes] (repeatedly 3 random-uuid)
++          blocks (vec (repeatedly 3 random-uuid))
++          page (fn [id title]
++                 {:block/uuid id :block/name (string/lower-case title) :block/title title
++                  :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1})
++          block (fn [id page-id title order]
++                  {:block/uuid id :block/title title
++                   :block/page [:block/uuid page-id] :block/parent [:block/uuid page-id]
++                   :block/order order :block/created-at 1 :block/updated-at 1})
++          _ (d/transact! conn [(page restaurant "Restaurant") (page diner "Diner") (page notes "Notes")])
++          _ (d/transact! conn [(block (blocks 0) diner "Menu" "a0")
++                               (block (blocks 1) diner "Opening hours" "a1")
++                               (block (blocks 2) notes "A note" "a0")])]
++    {:conn conn :self self
++     :food (uuid (get-in food [:body :uuid])) :cuisine (uuid (get-in cuisine [:body :uuid]))
++     :restaurant restaurant :diner diner :notes notes :note-block (blocks 2)}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(def ^:private tags-property (js/encodeURIComponent "block/tags"))
++
++(defn- set-tags! [self id value]
++  (request! self "PUT" (str "/semantic/blocks/" id "/properties/" tags-property) {:value value}))
++
++
++(def ^:private refusal "Tag marks a page as a tag and can't be set as a value")
++
++(defn- page-refusal [id] (str refusal "; use promote_page_to_tag on page " id))
++
++(def ^:private new-refusal (str refusal "; use promote_page_to_tag"))
++
++;; Before the fix (patch 0026 alone), a single Tag answered
++;;   500 {:error "server error", :debug-message "#error {:message \"Can't set tag with built-in #Tag\",
++;;        :data {:type :notification, ... :i18n-key :class.validation/cant-set-tag-built-in ...}}"}
++;; from the outliner's validate-tags-property, and a list holding Tag answered
++;;   500 {:error "server error", :debug-message "#error {:message \"Can't remove private tags\", ...}"}
++;; because setBlockProperty replaces a list, which first removes the page's Page tag.
++(deftest set-tags-to-tag-on-empty-page-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant]}]
++        (let [tag (d/entity @conn :logseq.class/Tag)]
++          (p/doseq [[kind value] [["title" "Tag"]
++                                  ["ident" "logseq.class/Tag"]
++                                  ["UUID" (str (:block/uuid tag))]
++                                  ["upper-case UUID" (string/upper-case (str (:block/uuid tag)))]
++                                  ["db id (bare integer)" (:db/id tag)]
++                                  ["list with another tag" ["Food" "Tag"]]
++                                  ["list with Page" ["Page" "Tag"]]]]
++            (p/let [before (snapshot conn)
++                    response (set-tags! self restaurant value)]
++              (testing kind
++                (is (= [400 (str "Tags: " (page-refusal restaurant))]
++                       [(:status response) (get-in response [:body :error])])
++                    (pr-str response))
++                (is (= before (snapshot conn)) "nothing is written")
++                (is (= #{"Page"} (tag-titles conn restaurant)))))))))))
++
++;; Before the fix: 500 "Can't set tag with built-in #Tag", the same as the empty page.
++(deftest set-tags-to-tag-on-page-with-blocks-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self diner]}]
++        (p/let [before (snapshot conn)
++                response (set-tags! self diner "Tag")]
++          (is (= [400 (str "Tags: " (page-refusal diner))]
++                 [(:status response) (get-in response [:body :error])])
++              (pr-str response))
++          (is (= before (snapshot conn)) "nothing is written")
++          (is (= #{"Page"} (tag-titles conn diner))))))))
++
++;; Before the fix: 500 "Can't set tag with built-in #Tag".
++(deftest set-tags-to-tag-on-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self note-block]}]
++        (p/let [before (snapshot conn)
++                response (set-tags! self note-block "Tag")]
++          (is (= [400 (str "Tags: " new-refusal)] [(:status response) (get-in response [:body :error])])
++              "a block isn't a page, so the message names no page to promote")
++          (is (= before (snapshot conn)) "nothing is written"))))))
++
++;; Before the fix: 500 "Can't set tag with built-in #Tag" (and "Can't remove private tags:
++;; :logseq.class/Tag." for a list), so re-sending Tag on a tag never worked.
++(deftest set-tags-to-tag-on-existing-tag-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self cuisine]}]
++        (p/doseq [[kind response] [["single" #(set-tags! self cuisine "Tag")]
++                                   ["list under reset"
++                                    #(request! self "POST" "/semantic/block-properties/batch-set"
++                                               {:isResetExistingValues true
++                                                :entries [{:block-id (str cuisine) :property-id "block/tags"
++                                                           :value ["Tag"]}]})]]]
++          (p/let [before (snapshot conn)
++                  ident (:db/ident (entity conn cuisine))
++                  response (response)]
++            (testing kind
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/ends-with? (str (get-in response [:body :error]))
++                                     (str refusal "; " cuisine " is already a tag"))
++                  (pr-str response))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= ident (:db/ident (entity conn cuisine))) "Cuisine keeps its ident"))))))))
++
++;; Before the fix: 500 "Can't set tag with built-in #Tag" for entry 1, after entry 0 was prepared.
++(deftest batch-set-tags-to-tag-names-entry-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant diner]}]
++        (p/doseq [reset? [false true]]
++          (p/let [before (snapshot conn)
++                  response (request! self "POST" "/semantic/block-properties/batch-set"
++                                     {:isResetExistingValues reset?
++                                      :entries [{:block-id (str diner) :property-id "block/tags" :value "Food"}
++                                                {:block-id (str restaurant) :property-id "block/tags"
++                                                 :value (str (:block/uuid (d/entity @conn :logseq.class/Tag)))}]})]
++            (testing (str "isResetExistingValues " reset?)
++              (is (= [400 (str "entry 1: Tags: " (page-refusal restaurant))]
++                     [(:status response) (get-in response [:body :error])])
++                  (pr-str response))
++              (is (= before (snapshot conn)) "entry 0 isn't written either")
++              (is (= #{"Page"} (tag-titles conn diner))))))))))
++
++;; updatePage takes only a title, so a page's tags are written through setBlockProperty (above)
++;; or a batch insert entry's properties (here). Before the fix: 500 "Can't set tag with built-in
++;; #Tag" for an existing page; a page the call creates answered the same.
++(deftest page-properties-tags-to-tag-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant]}]
++        (p/let [before (snapshot conn)
++                existing (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:target-id (str restaurant) :properties {"Tags" "Tag"}}]})
++                by-title (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "Restaurant" :properties {"Tags" ["Tag"]}}]})
++                created (request! self "POST" "/semantic/block-trees/batch"
++                                  {:entries [{:page "Bistro" :properties {"Tags" "logseq.class/Tag"}}]})]
++          (is (= [400 (str "entries[0]: Tags: " (page-refusal restaurant))]
++                 [(:status existing) (get-in existing [:body :error])])
++              "an existing page by target-id")
++          (is (= [400 (str "entries[0]: Tags: " (page-refusal restaurant))]
++                 [(:status by-title) (get-in by-title [:body :error])])
++              "an existing page by title")
++          (is (= [400 (str "entries[0]: Tags: " new-refusal)]
++                 [(:status created) (get-in created [:body :error])])
++              "a page the call would create has no UUID to name")
++          (is (= before (snapshot conn)) "nothing is written")
++          (is (nil? (ldb/get-page @conn "Bistro"))))))))
++
++;; Before the fix: 500 "Can't set tag with built-in #Tag" in both calls.
++(deftest insert-tree-with-tag-value-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [before (snapshot conn)
++                response (request! self "POST" "/semantic/block-trees"
++                                   {:target-id (str notes)
++                                    :blocks [{:title "Fine"}
++                                             {:title "Bistro" :properties {"Tags" ["Food" "Tag"]}}]})
++                nested (request! self "POST" "/semantic/block-trees/batch"
++                                 {:entries [{:target-id (str notes)
++                                             :blocks [{:title "Parent"
++                                                       :children [{:title "Bistro" :properties {"Tags" "Tag"}}]}]}]})]
++          (is (= [400 (str "blocks[1]: Tags: " new-refusal)]
++                 [(:status response) (get-in response [:body :error])])
++              "a new block has no UUID to name")
++          (is (= [400 (str "entries[0].blocks[0].children[0]: Tags: " new-refusal)]
++                 [(:status nested) (get-in nested [:body :error])]))
++          (is (= before (snapshot conn)) "nothing is written"))))))
++
++;; Passed before the fix too: it guards the refusal against catching Page and other tags.
++(deftest tags-page-and-other-tags-still-allowed-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant diner notes note-block]}]
++        (p/let [page-again (set-tags! self restaurant "Page")
++                added (request! self "POST" "/semantic/block-properties/batch-set"
++                                {:entries [{:block-id (str diner) :property-id "block/tags" :value ["Page" "Food"]}]})
++                block-tag (set-tags! self note-block "Food")
++                tree (request! self "POST" "/semantic/block-trees"
++                               {:target-id (str notes) :blocks [{:title "Bistro" :properties {"Tags" ["Food"]}}]})
++                new-page (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "Cafe" :properties {"Tags" "Food"}}]})]
++          (is (= 200 (:status page-again)) (pr-str page-again))
++          (is (= #{"Page"} (tag-titles conn restaurant)))
++          (is (= 200 (:status added)) (pr-str added))
++          (is (= #{"Page" "Food"} (tag-titles conn diner)))
++          (is (= 200 (:status block-tag)) (pr-str block-tag))
++          (is (= #{"Food"} (tag-titles conn note-block)))
++          (is (= 201 (:status tree)) (pr-str tree))
++          (is (= 201 (:status new-page)) (pr-str new-page))
++          (is (contains? (tag-titles conn (:block/uuid (ldb/get-page @conn "Cafe"))) "Food")))))))
++
++;; Passed before the fix too: the refusal is for the tags property only, so a node property can still
++;; name the Tag class as its value.
++(deftest tag-as-a-node-property-value-is-not-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant]}]
++        (p/let [related (outliner-property/upsert-property!
++                         conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                         {:property-name "related"})
++                tag (d/entity @conn :logseq.class/Tag)
++                response (request! self "PUT" (str "/semantic/blocks/" restaurant "/properties/"
++                                                   (js/encodeURIComponent (subs (str (:db/ident related)) 1)))
++                                   {:value (str (:block/uuid tag))})]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= :logseq.class/Tag (:db/ident (get (entity conn restaurant) (:db/ident related))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index e1c9ab9..75955cc 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -19,6 +19,7 @@
+             [logseq.db-sync.semantic-node-value-read-test]
+             [logseq.db-sync.semantic-today-tz-test]
+             [logseq.db-sync.semantic-property-schema-test]
++            [logseq.db-sync.semantic-promote-page-to-tag-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
