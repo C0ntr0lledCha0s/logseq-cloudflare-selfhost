@@ -1,7 +1,7 @@
 export const meta = {
   name: 'lane-review',
   description: 'Review the branch diff through correctness, data-integrity, tests, efficiency, security (and contract) lenses; skeptics verify each serious finding; open findings from earlier rounds are re-checked by id',
-  whenToUse: 'Before a PR, or called each round by lane-bug / lane-feature. args: {base?: "origin/main", brief?: object|string, context?: string, open?: finding[] (from the previous round), round?: number}',
+  whenToUse: 'Before a PR, or called each round by lane-bug / lane-feature. args: {base?: "origin/main", brief?: object|string, context?: string, open?: finding[] (from the previous round), round?: number, models?: {role: "opus"|"sonnet"|"inherit"}}',
   phases: [
     { title: 'Scope', detail: 'what changed, which lenses apply' },
     { title: 'Review', detail: 'one reviewer per lens, plus a re-check of every open finding id' },
@@ -18,6 +18,24 @@ export const meta = {
 // - Security is always a lens; an open security finding blocks the lane outright.
 
 const A = args || {}
+// Model per role. Opus where a wrong call costs a bad fix or a missed defect (root causes, code,
+// skeptics, the correctness/integrity/tests/security lenses, design, spec, plan). Sonnet where the
+// work is reading, sweeping, arithmetic or writing up (intake, research sweeps, docs, compound,
+// closeout, scope, the efficiency and contract lenses, per-stage checks that review rounds back up).
+// The same table is in every lane script; keep them in step. args.models overrides any role, e.g.
+// {"models": {"docs": "opus"}}; "inherit" uses the session's model. Nested lane-review calls get
+// args.models passed through.
+const MODELS = Object.assign({
+  intake: 'sonnet', closeout: 'sonnet', docs: 'sonnet', compound: 'sonnet',
+  investigate: 'opus', skeptic: 'opus', implement: 'opus',
+  design: 'opus', judge_risk: 'opus', judge_cost: 'sonnet', judge_fit: 'sonnet',
+  spec: 'opus', plan: 'opus', stage_check: 'sonnet',
+  scope: 'sonnet', recheck: 'opus',
+  lens_correctness: 'opus', lens_integrity: 'opus', lens_tests: 'opus', lens_security: 'opus',
+  lens_efficiency: 'sonnet', lens_contract: 'sonnet',
+  research: 'sonnet', writeup: 'opus', challenge: 'opus',
+}, A.models || {})
+const M = role => (MODELS[role] && MODELS[role] !== 'inherit' ? { model: MODELS[role] } : {})
 const BASE = A.base || 'origin/main'
 const ROUND = A.round || 1
 const CARRIED = (A.open || []).filter(f => f && f.id)
@@ -96,7 +114,7 @@ ${CONTEXT ? `Context from the lane:\n${CONTEXT}\n` : ''}Read the docs/solutions 
 phase('Scope')
 const scope = await agent(
   `${common}\n\nDon't review yet. Describe the change: HEAD's SHA (git rev-parse HEAD), the files, the areas, a three-sentence summary, and whether it touches storage or the tool contract. Set empty=true if there are no changes.`,
-  { label: `scope:r${ROUND}`, schema: SCOPE_SCHEMA, effort: 'low' },
+  { ...M('scope'), label: `scope:r${ROUND}`, schema: SCOPE_SCHEMA, effort: 'low' },
 )
 if (!scope || scope.empty) {
   log('No changes to review.')
@@ -127,14 +145,14 @@ const recheckThunk = async () => {
   if (!CARRIED.length) return { rechecks: [] }
   return agent(
     `Re-check these open review findings on HEAD (${scope.head_sha}). For each id, return status "fixed" only with evidence: the code that fixes it (file:line on HEAD) and the test that proves it, with its passing output. Otherwise return "open" and say what still fails. Raise the severity if it turns out worse. Fixers' notes are claims to check, not facts.\nOpen findings:\n${J(CARRIED)}`,
-    { label: `recheck:r${ROUND}`, phase: 'Review', agentType: 'adversarial-reviewer', schema: RECHECK_SCHEMA },
+    { ...M('recheck'), label: `recheck:r${ROUND}`, phase: 'Review', agentType: 'adversarial-reviewer', schema: RECHECK_SCHEMA },
   )
 }
 
 const reviewThunk = () =>
   pipeline(
     LENSES,
-    lens => agent(`${common}\n\n${lens.prompt}`, { label: `review:${lens.key}:r${ROUND}`, phase: 'Review', agentType: lens.agentType, schema: FINDINGS_SCHEMA }),
+    lens => agent(`${common}\n\n${lens.prompt}`, { ...M('lens_' + lens.key), label: `review:${lens.key}:r${ROUND}`, phase: 'Review', agentType: lens.agentType, schema: FINDINGS_SCHEMA }),
     (res, lens) =>
       parallel(
         ((res && res.findings) || []).map((f, i) => async () => {
@@ -144,7 +162,7 @@ const reviewThunk = () =>
           const votes = (
             await parallel(
               Array.from({ length: skeptics }, (_, k) => () =>
-                agent(verifyPrompt(tagged), { label: `verify:${tagged.id}:${k + 1}`, phase: 'Verify', agentType: 'adversarial-reviewer', schema: VERDICT_SCHEMA }),
+                agent(verifyPrompt(tagged), { ...M('skeptic'), label: `verify:${tagged.id}:${k + 1}`, phase: 'Verify', agentType: 'adversarial-reviewer', schema: VERDICT_SCHEMA }),
               ),
             )
           ).filter(Boolean)

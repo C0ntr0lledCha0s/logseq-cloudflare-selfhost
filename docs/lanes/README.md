@@ -55,6 +55,17 @@ review   Scope ─ Review (one agent per lens) ∥ Re-check open ids ─ Verify 
 
 The recipe skills (`add-upstream-patch`, `add-connector-tool`, `add-d1-migration`) are what the implementer follows for those kinds of change.
 
+## Models
+
+Each stage runs on the model that fits its job. The table is `MODELS` at the top of each lane script, and it is the same in all four.
+
+| Model | Roles |
+|---|---|
+| Opus | Investigate, root-cause skeptics, the implementer (test, fix, build stages, review fixes), design angles, the risk judge, spec, plan, the correctness, integrity, tests and security lenses, re-checks by id, finding skeptics, spike write-up and challenge |
+| Sonnet | Intake, closeout, docs, compound and retro, review scope, the efficiency and contract lenses, the cost and fit judges, per-stage checks in a feature build (the review rounds back them up), spike research sweeps |
+
+The rule: Opus where a wrong call ships a bad fix or lets a defect through, and Sonnet where the work is reading, sweeping, arithmetic or writing up. Override any role with `args.models`, e.g. `{"models": {"docs": "opus"}}`, or use `"inherit"` for the session's model. The bug and feature lanes pass `models` on to `lane-review`. Outside a workflow, `docs-steward`, `compounder` and `efficiency-reviewer` default to Sonnet through their frontmatter.
+
 ## Gates
 
 - **Preconditions.** Intake fetches `origin/main` and refuses a dirty tree or the default branch. It reports whether `connector/vendor` and `.upstream` exist, and warns when the connector suite will be skipped. Without the suite, a connector regression test can't be seen to fail.
