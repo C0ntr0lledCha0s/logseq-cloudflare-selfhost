@@ -5,6 +5,7 @@ tags: [identifiers, titles, closed-values, choices, node-property, classes, valu
 seen:
   - 2026-11-06 – item 25, patch 0019 (relationship-status "active" stored project-status's "active" choice)
   - 2026-11-06 – item 25, review rounds 2 and 3 (r2-correctness-1, r3-correctness-1, r3-integrity-1): the fix's own title ranking repeated the class
+  - 2026-11-06 – item 23, patch 0020, review round 3 (r3-correctness-1): a bare JSON integer is still read as a db id for node and text properties
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 

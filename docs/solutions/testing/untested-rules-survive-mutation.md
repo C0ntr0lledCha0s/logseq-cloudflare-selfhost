@@ -4,7 +4,8 @@ area: testing
 tags: [mutation, regression-test, ranking, scope, test-gap, test-that-never-failed]
 seen:
   - 2026-11-06 – item 25, patch 0019, review round 3 (r3-tests-1, r3-tests-2)
-promoted_to: []
+  - 2026-11-06 – item 23, patch 0020, review round 3 (r3-tests-1): removing `(js/isFinite n)` from `number-text` left 312 tests green, so "NaN" was stored and read back as null
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
