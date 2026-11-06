@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index fb155e0..089c12a 100644
+index fb155e0..5dc3e7d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -609,12 +609,34 @@
@@ -43,7 +43,44 @@ index fb155e0..089c12a 100644
      (or (ldb/get-journal-page-by-day @conn day)
          (let [formatter (:logseq.property.journal/title-format (d/entity @conn :logseq.class/Journal))
                title (date-time-util/int->journal-title day formatter)
-@@ -1681,11 +1703,14 @@
+@@ -1291,9 +1313,12 @@
+ 
+ (defn- delete-node!
+   "Deletes a page, tag or property through Logseq's page deletion rules once every loss it causes
+-  is acknowledged."
++  is acknowledged. Logseq clears today's journal instead of recycling it, so for a journal, today
++  is the owner's date (see owner-time-zone), not the Worker's."
+   [{:keys [^js self ^js url conn db]} entity]
+-  (let [flags (into {} (map (juxt identity #(flag-param url %))) delete-flags)
++  (let [journal? (some? (:block/journal-day entity))
++        time-zone (when journal? (owner-time-zone self))
++        flags (into {} (map (juxt identity #(flag-param url %))) delete-flags)
+         invalid (some #(when (= ::invalid (get flags %)) %) delete-flags)
+         kind (block-kind entity)
+         impact (delete-impact db kind entity)
+@@ -1304,6 +1329,7 @@
+     (cond
+       invalid (http/bad-request (str invalid " must be true or false"))
+       (ldb/built-in? entity) (http/bad-request (str "built-in " kind " cannot be deleted"))
++      (and journal? (nil? time-zone)) (invalid-time-zone-response self)
+       (get flags "dry-run") (http/json-response nil (merge {:dry-run true
+                                                             :uuid (uuid-string (:block/uuid entity))
+                                                             :kind kind
+@@ -1314,8 +1340,11 @@
+                                                     impact
+                                                     {:requires requires})
+                                          409)
+-      (outliner-page/delete! conn (:block/uuid entity)) (do (broadcast-change! self)
+-                                                            (js/Response. nil #js {:status 204}))
++      (if journal?
++        (outliner-page/delete! conn (:block/uuid entity) :today-day (today-journal-day time-zone))
++        (outliner-page/delete! conn (:block/uuid entity)))
++      (do (broadcast-change! self)
++          (js/Response. nil #js {:status 204}))
+       :else (http/bad-request (str kind " cannot be deleted")))))
+ 
+ (defn- atomic-write!
+@@ -1681,11 +1710,14 @@
      (p/let [body (body-clj request)]
        (if (or (not (sequential? (:blocks body))) (empty? (:blocks body)))
          (http/bad-request "missing blocks")
@@ -63,7 +100,7 @@ index fb155e0..089c12a 100644
  
      :semantic/tags-list
      (paginated-response url :tags (entities-by-avet db :block/tags :logseq.class/Tag) tag-response)
-@@ -1770,19 +1795,21 @@
+@@ -1770,19 +1802,21 @@
                                (resolve-property-choice db :logseq.property/priority
                                                         task-priority-idents priority task-scope))
              target (when-let [page-id (:page-id body)]
@@ -87,7 +124,7 @@ index fb155e0..089c12a 100644
                       inserted (first (insert-tree! temp-conn target [{:title (:title body)}] "append" e2ee?))
                       task-uuid (uuid (:uuid inserted))
                       task (d/entity @temp-conn [:block/uuid task-uuid])]
-@@ -1799,7 +1826,10 @@
+@@ -1799,7 +1833,10 @@
                           :when (some? value)]
                     (outliner-property/set-block-property! temp-conn (:db/id task) property-ident value)))))
              (broadcast-change! self)
@@ -99,7 +136,7 @@ index fb155e0..089c12a 100644
  
  (defn- handle-assets
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
-@@ -1819,6 +1849,7 @@
+@@ -1819,6 +1856,7 @@
            asset-type (when (string? file-name) (db-asset/asset-path->type file-name))
            page-id (.get (.-searchParams url) "page-id")
            target (when page-id (find-entity db page-id))
@@ -107,7 +144,7 @@ index fb155e0..089c12a 100644
            ^js bucket (some-> (.-env self) (aget "LOGSEQ_SYNC_ASSETS"))]
        (cond
          (or (not (seq file-name)) (not (seq asset-type))) (http/bad-request "invalid asset file-name")
-@@ -1828,6 +1859,7 @@
+@@ -1828,6 +1866,7 @@
          (http/bad-request "invalid asset checksum")
          (and encoding (not= "base64" encoding)) (http/bad-request "invalid asset encoding")
          (and page-id (not (page? target))) (http/bad-request "invalid asset page-id")
@@ -115,7 +152,7 @@ index fb155e0..089c12a 100644
          (nil? bucket) (http/error-response "missing assets bucket" 500)
          (seq (d/datoms db :avet :logseq.property.asset/checksum checksum))
          (http/error-response "asset checksum already exists" 409)
-@@ -1846,7 +1878,7 @@
+@@ -1846,7 +1885,7 @@
                                          :e2ee? e2ee?})]
                  (if-not (.-ok upload-response)
                    upload-response
@@ -124,7 +161,7 @@ index fb155e0..089c12a 100644
                                block {:block/uuid asset-id
                                       :block/title title
                                       :block/tags #{:logseq.class/Asset}
-@@ -1860,7 +1892,10 @@
+@@ -1860,7 +1899,10 @@
                                                                 :keep-uuid? true})
                                asset (d/entity @conn [:block/uuid asset-id])]
                          (broadcast-change! self)
@@ -137,7 +174,7 @@ index fb155e0..089c12a 100644
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index fed0673..7632102 100644
+index fed0673..c64cc9f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -111,6 +111,9 @@
@@ -150,6 +187,15 @@ index fed0673..7632102 100644
  (def ^:private heading-note
    "How a written block title's markdown heading is stored, shared by every operation that writes one."
    (str "A title starting with # to ###### and whitespace (## Section) is stored as the app stores a heading: the title without the prefix, and the level in logseq.property/heading, which getBlock and getBlocks show as a property and getPageOutline shows as the ## prefix (listPageBlocks titles don't show it)."
+@@ -128,7 +131,7 @@
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+-   "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
++   "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting.")]
+    "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
 @@ -144,9 +147,9 @@
     "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
     "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
@@ -240,22 +286,25 @@ index 76208b0..3a6e4ef 100644
  
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 new file mode 100644
-index 0000000..7a3266a
+index 0000000..c922306
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,267 @@
 +(ns logseq.db-sync.semantic-today-tz-test
 +  "'Today' is the owner's date, not the Worker's. Workers run in UTC, so for most of a New Zealand
 +  morning the UTC date is the day before. Every write that defaults to today's journal (capture,
 +  createTask with no page-id, createAsset with no page-id) must use the time zone the Worker is
 +  configured with (env TIMEZONE, an IANA zone), whatever the process's own zone is, and say which
-+  journal it wrote to (page-id and page-title)."
++  journal it wrote to (page-id and page-title). deletePage decides whether a journal is today's
++  (whose blocks Logseq clears but whose page it keeps) in the same zone."
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
 +            [logseq.db-sync.test-sql :as test-sql]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.frontend.entity-util :as entity-util]
 +            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
 +            [promesa.core :as p]))
 +
 +(def ^:private fake-date-ctor
@@ -421,6 +470,93 @@ index 0000000..7a3266a
 +              (is (= "Inbox" (get-in asset [:body :page-title]))))))
 +        (p/catch #(is false (str %)))
 +        (p/finally done))))
++
++;; deletePage: Logseq clears today's journal (hard-retracting its blocks) and keeps the page, and
++;; moves any other page, journals included, to the Recycle bin with its blocks. Which journal is
++;; today's must be the owner's date, or a New Zealand morning hard-deletes yesterday's blocks.
++
++(defn- journal-with-block!
++  "Creates the journal `title` with one block, through the outliner and the API."
++  [^js self title]
++  (p/let [conn (.-conn self)
++          [_ page-uuid] (outliner-page/create! conn title {:journal? true})
++          tree (request! self "POST" "/semantic/block-trees"
++                         {:target-id (str page-uuid) :blocks [{:title (str title " note")}]})]
++    {:page (str page-uuid) :block (get-in tree [:body :blocks 0 :uuid])}))
++
++(defn- delete-journals!
++  "On a fresh graph, creates the Nov 5 and Nov 6 2026 journals, deletes each through deletePage
++  and reports what happened to each page and its block, read from the db."
++  [timezone]
++  (p/let [^js self (make-self timezone)
++          conn (.-conn self)
++          nov5 (journal-with-block! self "Nov 5th, 2026")
++          nov6 (journal-with-block! self "Nov 6th, 2026")
++          _ (is (= [20261105 20261106]
++                   (map #(:block/journal-day (d/entity @conn [:block/uuid (uuid (:page %))]))
++                        [nov5 nov6]))
++                "setup: both pages are journals")
++          d5 (request! self "DELETE" (str "/semantic/pages/" (:page nov5)) nil)
++          d6 (request! self "DELETE" (str "/semantic/pages/" (:page nov6)) nil)
++          outcome (fn [{:keys [page block]} response]
++                    (let [page-e (d/entity @conn [:block/uuid (uuid page)])
++                          block-e (d/entity @conn [:block/uuid (uuid block)])]
++                      {:status (:status response)
++                       :error (get-in response [:body :error])
++                       :page (cond (nil? page-e) :gone
++                                   (entity-util/hidden? page-e) :recycled
++                                   :else :kept)
++                       :block (cond (nil? block-e) :hard-deleted
++                                    (= page (str (:block/uuid (:block/page block-e)))) :on-page
++                                    :else :moved)}))]
++    {:nov5 (outcome nov5 d5) :nov6 (outcome nov6 d6)}))
++
++(def ^:private recycled {:status 204 :error nil :page :recycled :block :on-page})
++(def ^:private truncated {:status 204 :error nil :page :kept :block :hard-deleted})
++
++(deftest delete-journal-decides-today-in-the-configured-zone-test
++  (async done
++    (-> (p/loop [cases [;; [timezone process-zone nov5 nov6 what it covers]
++                        ["Pacific/Auckland" "UTC" recycled truncated
++                         "10:00 NZDT: Nov 5 is yesterday, Nov 6 is today"]
++                        ["Pacific/Auckland" "Pacific/Auckland" recycled truncated
++                         "a process zone that matches the owner's"]
++                        ["Pacific/Auckland" "America/Los_Angeles" recycled truncated
++                         "a host zone that is neither UTC nor the owner's"]
++                        [nil "Pacific/Auckland" truncated recycled
++                         "no TIMEZONE: the UTC date, not the process zone's"]
++                        ["  " "Pacific/Auckland" truncated recycled "blank TIMEZONE: the UTC date"]]]
++          (when-let [[timezone process-tz nov5 nov6 label] (first cases)]
++            (p/let [result (with-clock "2026-11-05T21:00:00Z" process-tz
++                             #(delete-journals! timezone))]
++              (testing (str label " (TIMEZONE " (pr-str timezone) ", process TZ " process-tz ")")
++                (is (= nov5 (:nov5 result)) "Nov 5th journal")
++                (is (= nov6 (:nov6 result)) "Nov 6th journal"))
++              (p/recur (rest cases)))))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
++
++(deftest delete-journal-with-invalid-timezone-is-refused-test
++  (async done
++    (-> (with-clock
++         "2026-11-05T21:00:00Z" "UTC"
++         #(p/let [^js self (make-self "Mars/Olympus")
++                  conn (.-conn self)
++                  nov5 (journal-with-block! self "Nov 5th, 2026")
++                  response (request! self "DELETE" (str "/semantic/pages/" (:page nov5)) nil)
++                  ;; A page that isn't a journal needs no 'today', so the setting doesn't block it.
++                  page (request! self "POST" "/semantic/pages" {:title "Scratch"})
++                  page-response (request! self "DELETE"
++                                          (str "/semantic/pages/" (get-in page [:body :uuid])) nil)]
++            (is (= 500 (:status response)))
++            (is (= "invalid TIMEZONE setting: Mars/Olympus" (get-in response [:body :error])))
++            (let [page-e (d/entity @conn [:block/uuid (uuid (:page nov5))])]
++              (is (some? page-e))
++              (is (not (entity-util/hidden? page-e)) "the journal is not recycled")
++              (is (some? (d/entity @conn [:block/uuid (uuid (:block nov5))])) "its block is kept"))
++            (is (= 204 (:status page-response)) "a page that isn't a journal is still deleted")))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 6011943..4d9e7d2 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
@@ -465,3 +601,27 @@ index fcfe554..36b315e 100644
                 (doseq [[path method] [["/api/v1/graphs/{graph-id}/properties" :post]
                                        ["/api/v1/graphs/{graph-id}/properties/{property-id}" :patch]
                                        ["/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}" :put]
+diff --git a/deps/outliner/src/logseq/outliner/page.cljs b/deps/outliner/src/logseq/outliner/page.cljs
+index 4c0c84c..15186e4 100644
+--- a/deps/outliner/src/logseq/outliner/page.cljs
++++ b/deps/outliner/src/logseq/outliner/page.cljs
+@@ -106,15 +106,16 @@
+   Rules:
+   1. today page content is truncated but the page itself can't be deleted
+   2. properties and tags will be hard retracted
+-  3. other pages will be moved to Recycle"
+-  [conn page-uuid & {:keys [persist-op? rename? error-handler deleted-by-uuid now-ms]
++  3. other pages will be moved to Recycle
++  `today-day` (yyyymmdd) names today's journal; without it, today is the process's local date."
++  [conn page-uuid & {:keys [persist-op? rename? error-handler deleted-by-uuid now-ms today-day]
+                      :or {persist-op? true
+                           error-handler (fn [{:keys [msg]}] (js/console.error msg))}}]
+   (assert (uuid? page-uuid) (str ::delete! " wrong page-uuid: " (if page-uuid page-uuid "nil")))
+   (when page-uuid
+     (when-let [page (d/entity @conn [:block/uuid page-uuid])]
+       (let [today-page? (when-let [day (:block/journal-day page)]
+-                          (= (date-time-util/ms->journal-day (js/Date.)) day))
++                          (= (or today-day (date-time-util/ms->journal-day (js/Date.))) day))
+             tx-meta (cond-> (outliner-tx-meta/ensure-outliner-ops
+                              {:outliner-op :delete-page
+                               :deleted-page (:block/title page)
