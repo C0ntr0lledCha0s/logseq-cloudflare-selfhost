@@ -485,6 +485,15 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("only acknowledge a loss the user agreed to");
   });
 
+  it("update_property converts text values with convert_values, and says how", async () => {
+    const tools = await listTools();
+    const update = tools.find((t) => t.name === "update_property");
+    expect(update.inputSchema.properties.body.properties.convert_values.type).toBe("boolean");
+    expect(update.description).toContain("convert_values: true turns a free-text (default) property into a choice property");
+    expect(update.description).toContain("add those choices under choices.add in the same call");
+    expect(update.description).toContain("dry-run shows the mapping");
+  });
+
   it("create_tag and update_tag take extends and tag properties, and update_tag no longer needs a title", async () => {
     const tools = await listTools();
     const create = tools.find((t) => t.name === "create_tag");
@@ -528,6 +537,8 @@ describe("hand-written tools", () => {
       "properties.add",
       "choices.add",
       "choices.retire",
+      "convert_values",
+      "choices and convert_values are refused on E2EE graphs",
     ]) {
       expect(result.text).toContain(phrase);
     }
