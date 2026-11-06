@@ -1,0 +1,54 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(scripts/check.sh)",
+      "Bash(scripts/check.sh --upstream)",
+      "Bash(npm test)",
+      "Bash(npm --prefix connector test)",
+      "Bash(npm --prefix connector test:*)",
+      "Bash(npm --prefix connector run typecheck)",
+      "Bash(npm --prefix connector run update:manifest)",
+      "Bash(node connector/scripts/check-tools-manifest.mjs)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "mcp__Logseq__search_graph",
+      "mcp__Logseq__get_page_outline",
+      "mcp__Logseq__get_page",
+      "mcp__Logseq__get_block",
+      "mcp__Logseq__get_blocks",
+      "mcp__Logseq__list_tasks",
+      "mcp__Logseq__kb_index",
+      "mcp__Logseq__semantic_search",
+      "Bash(git rev-parse:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git blame:*)",
+      "Bash(git fetch origin main)",
+      "mcp__Logseq__list_graphs",
+      "Bash(git branch:*)"
+    ],
+    "deny": [
+      "Read(./.env.local)",
+      "Read(./infra/backend.hcl)",
+      "Bash(cat .env.local:*)",
+      "Bash(scripts/deploy.sh:*)",
+      "Bash(scripts/deploy-connector.sh:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
