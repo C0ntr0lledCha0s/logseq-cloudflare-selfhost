@@ -29,3 +29,4 @@ One file per lesson, under a folder for its area: `api/`, `sync/`, `connector/`,
 | [api/title-resolves-outside-allowed-values](api/title-resolves-outside-allowed-values.md) | A title must resolve only among the property's allowed values; the outliner won't check |
 | [testing/untested-rules-survive-mutation](testing/untested-rules-survive-mutation.md) | Each rule a fix adds needs a case where that rule decides the outcome |
 | [api/mixed-type-sort-key-500-on-read](api/mixed-type-sort-key-500-on-read.md) | A sort key mixing order strings and db ids made valid node values unreadable (500) |
+| [api/outliner-save-and-insert-disagree-on-heading](api/outliner-save-and-insert-disagree-on-heading.md) | `save-block!` strips a `## ` prefix without setting the heading and `insert-blocks!` keeps it; convert the prefix on every write, except for display-type blocks |

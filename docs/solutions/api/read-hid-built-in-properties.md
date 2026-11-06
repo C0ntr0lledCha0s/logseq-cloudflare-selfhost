@@ -5,6 +5,7 @@ tags: [read-path, built-in-properties, status, false-bug, investigation]
 seen:
   - 2026-11-06 – item 19, patch 0017, PR #33 (Status "dropped" on insert)
   - 2026-11-06 – item 23, patch 0020: write was valid, the read's sort threw (see mixed-type-sort-key-500-on-read)
+  - 2026-11-06 – item 32, patch 0022: get_block and get_blocks did not show `logseq.property/heading`, so a heading write could not be verified (see outliner-save-and-insert-disagree-on-heading)
 promoted_to: ["CLAUDE.md Gotchas", "REVIEW.md", ".claude/agents/investigator.md method"]
 ---
 
