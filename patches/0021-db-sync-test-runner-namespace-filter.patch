@@ -1,0 +1,24 @@
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 53363a1..d536c7b 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -38,7 +38,17 @@
+   (-> (env/get-test-data)
+       (env/reset-test-data!)))
+ 
+-(defn main [& _args]
++(defn- ns-pattern
++  "A regex matching every namespace whose name contains a match for `s`.
++  shadow.test/run-all-tests uses re-matches, so a bare `semantic-choice-values`
++  would match nothing without the surrounding `.*`."
++  [s]
++  (re-pattern (str ".*(?:" s ").*")))
++
++(defn main
++  "Runs every test namespace, or with a first arg, only the namespaces whose
++  name matches it as a regex (e.g. `semantic-choice-values`)."
++  [& args]
+   (reset-test-data!)
+   (let [test-env (ct/empty-env ::node)]
+-    (st/run-all-tests test-env nil)))
++    (st/run-all-tests test-env (some-> (first args) ns-pattern))))
