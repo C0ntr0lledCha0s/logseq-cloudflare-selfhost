@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..dc37577 100644
+index 5dc3e7d..2ca3f7c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -88,14 +88,46 @@
@@ -209,7 +209,7 @@ index 5dc3e7d..dc37577 100644
  
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
-@@ -1920,6 +1994,504 @@
+@@ -1920,6 +1994,600 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -321,8 +321,9 @@ index 5dc3e7d..dc37577 100644
 +(defn- verify-property-schema!
 +  "Re-reads the property from `db` after a write and throws, answered as a 500 by `rejecting`, when
 +  what the call asked for isn't stored. `expected` may hold :classes, a set of class UUIDs; :titles,
-+  a map of choice UUID to the title it should read; and :order, the choice UUIDs in editor order."
-+  [db property-uuid {:keys [classes titles order]}]
++  a map of choice UUID to the title it should read; :order, the choice UUIDs in editor order; and
++  :retired, the choices ({:uuid :id :text}) that must be gone, with no holder left pointing at them."
++  [db property-uuid {:keys [classes titles order retired]}]
 +  (let [property (d/entity db [:block/uuid property-uuid])
 +        stored (set (map :block/uuid (:logseq.property/classes property)))
 +        title (fn [id] (or (:block/title (d/entity db [:block/uuid id])) (str id)))
@@ -338,7 +339,16 @@ index 5dc3e7d..dc37577 100644
 +                                                                         (sort-by val titles)))))
 +                   (and (some? order) (not= order stored-order))
 +                   (conj (str "choices not in the order asked: "
-+                              (string/join ", " (map #(pr-str (or (content %) (str %))) stored-order)))))]
++                              (string/join ", " (map #(pr-str (or (content %) (str %))) stored-order))))
++                   (some #(d/entity db [:block/uuid (:uuid %)]) retired)
++                   (conj (str "choices not retired "
++                              (string/join ", " (keep #(when (d/entity db [:block/uuid (:uuid %)]) (pr-str (:text %))) retired)))))
++        problems (into problems
++                       (keep (fn [{:keys [id text]}]
++                               (let [n (choice-holders db (:db/ident property) id)]
++                                 (when (pos? n)
++                                   (str (pr-str text) " is still held by " n (if (= 1 n) " block" " blocks")))))
++                             retired))]
 +    (unverified! problems)))
 +
 +;; Choices (closed values) through createProperty's choices and updateProperty's choices.add, update
@@ -401,27 +411,35 @@ index 5dc3e7d..dc37577 100644
 +    "description must be non-blank text"))
 +
 +(defn- choices-shape-refusal
-+  "Why createProperty's choices (a list, `create?`) or updateProperty's ({add, update, order}) has the
-+  wrong shape, or nil."
++  "Why createProperty's choices (a list, `create?`) or updateProperty's ({add, update, order,
++  retire}) has the wrong shape, or nil."
 +  [create? choices]
 +  (if create?
 +    (when-not (sequential? choices) "choices: give a list of choices")
 +    (cond
-+      (not (and (map? choices) (seq choices) (every? #{:add :update :order} (keys choices))))
-+      "choices: give add, update or order"
++      (not (and (map? choices) (seq choices) (every? #{:add :update :order :retire} (keys choices))))
++      "choices: give add, update, order or retire"
 +      :else
 +      (some (fn [k] (when (and (contains? choices k) (not (sequential? (get choices k))))
 +                      (str "choices." (name k) ": give a list of "
-+                           (if (= :order k) "choice UUIDs, idents or titles" "choices"))))
-+            [:add :update :order]))))
++                           (if (#{:order :retire} k) "choice UUIDs, idents or titles" "choices"))))
++            [:add :update :order :retire]))))
++
++(defn- choice-holders
++  "How many entities hold the choice with db id `choice-id` as their value for the property
++  `property-ident`: one :avet range."
++  [db property-ident choice-id]
++  (count (distinct (map :e (d/datoms db :avet property-ident choice-id)))))
 +
 +(defn- validate-choices
 +  "Checks createProperty's `choices` (a list; `property` nil) or updateProperty's ({add, update,
-+  order}) for the property titled `title`, judged on `type`, its type once the call has applied.
-+  {:ok plan} or {:error message} naming every refused entry. The plan is {:add [{:uuid :text :icon
-+  :description}] :update [{:uuid :text? :icon? :description?}] :order [uuid ...]?}; a new choice's UUID
-+  is chosen here so order can name it. The plan's updates are in the order they apply: a rename after
-+  the rename that frees its title."
++  order, retire}) for the property titled `title`, judged on `type`, its type once the call has
++  applied. {:ok plan} or {:error message} naming every refused entry. The plan is {:add [{:uuid :text
++  :icon :description}] :update [{:uuid :text? :icon? :description?}] :order [uuid ...]? :retire [{:index
++  :uuid :id :text :holders}]?}; a new choice's UUID is chosen here so order can name it. The plan's updates
++  are in the order they apply: a rename after the rename that frees its title. A retired choice
++  must be the property's own, not built in, and not also updated or ordered in the call; its
++  holders are counted here, and the handler decides whether they may lose it."
 +  [db property title type choices e2ee?]
 +  (let [create? (nil? property)
 +        shape (choices-shape-refusal create? choices)]
@@ -526,8 +544,25 @@ index 5dc3e7d..dc37577 100644
 +                                                 (:icon entry) (assoc :icon (choice-icon (:icon entry)))
 +                                                 (:description entry) (assoc :description (:description entry)))))))
 +                          out))
-+            ;; order: a full permutation of the existing choices and the additions
 +            uuid-of (into {} (map (fn [choice] [(:db/id choice) (:block/uuid choice)]) existing))
++            ;; retire: the property's own choices, each once, none built in or also updated
++            retired (reduce
++                     (fn [retired [index ref]]
++                       (let [field (str "choices.retire " index)
++                             id (resolve-choice db property ref nil)
++                             choice (when id (d/entity db id))
++                             text (when choice (choice-content choice))]
++                         (cond
++                           (nil? id) (do (refuse! field (no-choice ref)) retired)
++                           (some #(= id (:id %)) retired) (do (refuse! field (str (pr-str text) " is listed twice")) retired)
++                           (ldb/built-in? choice) (do (refuse! field (str (pr-str text) " is built in and can't be retired")) retired)
++                           (contains? updated-ids id)
++                           (do (refuse! field (str (pr-str text) " is also changed in " (get updated-ids id))) retired)
++                           :else (conj retired {:index index :uuid (uuid-of id) :id id :text text
++                                                :holders (choice-holders db (:db/ident property) id)}))))
++                     [] (map-indexed vector (:retire choices)))
++            retired-uuids (set (map :uuid retired))
++            ;; order: a full permutation of the surviving choices and the additions
 +            label (merge (into {} (map (fn [{:keys [id text]}] [(uuid-of id) text]) final))
 +                         (into {} (map (fn [{:keys [uuid text]}] [uuid text]) additions)))
 +            by-key (into {} (map (fn [[u t]] [(choice-key type t) u]) label))
@@ -539,18 +574,21 @@ index 5dc3e7d..dc37577 100644
 +                                                (when-let [text (choice-text ref)] (get by-key (choice-key type text))))]
 +                                      (cond
 +                                        (nil? u) (do (refuse! field (no-choice ref)) listed)
++                                        (retired-uuids u) (do (refuse! field (str (pr-str (label u)) " is retired in this call")) listed)
 +                                        (some #{u} listed) (do (refuse! field (str (pr-str (label u)) " is listed twice")) listed)
 +                                        :else (conj listed u))))
 +                                  [] (map-indexed vector (:order choices)))
-+                          missing (remove (set listed) (concat (map (comp uuid-of :db/id) existing) (map :uuid additions)))]
++                          missing (remove (into (set listed) retired-uuids)
++                                          (concat (map (comp uuid-of :db/id) existing) (map :uuid additions)))]
 +                      (when (seq missing)
 +                        (refuse! "choices.order" (str "missing " (string/join ", " (map (comp pr-str label) missing)))))
 +                      listed))]
 +        (if (seq @refusals)
-+          ;; Named in request order: add, update, then order (sort-by is stable).
++          ;; Named in request order: add, update, order, then retire (sort-by is stable).
 +          {:error (refusals-message (sort-by (fn [{:keys [entry]}]
 +                                               (cond (string/starts-with? entry "choices.update") 1
 +                                                     (string/starts-with? entry "choices.order") 2
++                                                     (string/starts-with? entry "choices.retire") 3
 +                                                     :else 0))
 +                                             @refusals))}
 +          {:ok (cond-> {:add additions
@@ -560,17 +598,22 @@ index 5dc3e7d..dc37577 100644
 +                                          (contains? entry :icon) (assoc :icon (choice-icon (:icon entry)))
 +                                          (contains? entry :description) (assoc :description (:description entry))))
 +                                      @applied)}
-+                 order (assoc :order order))
-+           :expected {:titles (merge (into {} (map (fn [[id t]] [(uuid-of id) (choice-stored type t)]) renamed))
-+                                     (into {} (map (fn [{:keys [uuid text]}] [uuid (choice-stored type text)]) additions)))
-+                      :order (or order (into (mapv (comp uuid-of :db/id) existing) (map :uuid additions)))}})))))
++                 order (assoc :order order)
++                 (seq retired) (assoc :retire retired))
++           :expected (cond-> {:titles (merge (into {} (map (fn [[id t]] [(uuid-of id) (choice-stored type t)]) renamed))
++                                             (into {} (map (fn [{:keys [uuid text]}] [uuid (choice-stored type text)]) additions)))
++                              :order (or order (into (filterv (complement retired-uuids) (map (comp uuid-of :db/id) existing))
++                                                     (map :uuid additions)))}
++                       (seq retired) (assoc :retired retired))})))))
 +
 +(defn- apply-choices!
 +  "Inside atomic-write!: writes a validate-choices plan for the property with db id `property-id`:
-+  each update, then each addition, then the order. upsert-closed-value! builds and edits the
-+  choices as the app does; each new choice, and each choice in `order`, then takes a fresh key after
-+  the graph's max. A choice update without icon keeps its icon (upsert-closed-value! would drop it)."
-+  [tx-conn property-id {:keys [add update order]}]
++  each update, then each addition, then the order, then each retirement. upsert-closed-value! builds
++  and edits the choices as the app does; each new choice, and each choice in `order`, then takes a
++  fresh key after the graph's max. A choice update without icon keeps its icon (upsert-closed-value!
++  would drop it). A retired choice's holders lose it first, by explicit retractions, so no ref is
++  left to it whatever delete-closed-value! cleans up; then it is deleted."
++  [tx-conn property-id {:keys [add update order retire]}]
 +  (doseq [{:keys [uuid text icon description] :as change} update]
 +    (let [choice (d/entity @tx-conn [:block/uuid uuid])]
 +      (outliner-property/upsert-closed-value!
@@ -585,7 +628,13 @@ index 5dc3e7d..dc37577 100644
 +                                                                  description (assoc :description description)))
 +    (ldb/transact! tx-conn [[:db/add [:block/uuid uuid] :block/order (db-order/gen-key)]]))
 +  (when (seq order)
-+    (ldb/transact! tx-conn (mapv (fn [uuid] [:db/add [:block/uuid uuid] :block/order (db-order/gen-key)]) order))))
++    (ldb/transact! tx-conn (mapv (fn [uuid] [:db/add [:block/uuid uuid] :block/order (db-order/gen-key)]) order)))
++  (let [property-ident (:db/ident (d/entity @tx-conn property-id))]
++    (doseq [{:keys [id]} retire]
++      (let [held (mapv (fn [datom] [:db/retract (:e datom) property-ident id])
++                       (d/datoms @tx-conn :avet property-ident id))]
++        (when (seq held) (ldb/transact! tx-conn held)))
++      (outliner-property/delete-closed-value! tx-conn property-id id))))
 +
 +;; Tag schema writes (createTag, updateTag) take the same shape: every field is checked against the
 +;; graph first, then the tag, what it extends and its tag properties are written in one
@@ -711,10 +760,57 @@ index 5dc3e7d..dc37577 100644
 +       (seq (filter stored absent))
 +       (conj (str "properties not removed " (titles (filter stored absent))))))))
 +
++;; updateProperty's query flags. A retire whose choices have holders is refused with 409 unless
++;; acknowledge-holders=true; dry-run=true runs the whole update on a throwaway copy of the graph and
++;; answers what it would store, as the guarded deletes do.
++(def ^:private property-update-flags ["acknowledge-holders" "dry-run"])
++
++(defn- retire-held-message
++  "The 409 refusal for retired choices (validate-choices' :retire entries) that blocks hold."
++  [held]
++  (str (string/join "; " (map (fn [{:keys [index text holders]}]
++                                (str "choices.retire " index ": " (pr-str text)
++                                     " is held by " holders (if (= 1 holders) " block" " blocks")))
++                              held))
++       "; set acknowledge-holders=true to "
++       (if (= 1 (count held)) "remove it from them" "remove them from their holders")
++       ", or dry-run=true to preview"))
++
++(defn- run-property-update
++  "Writes an updateProperty request, already validated (`classes` and `choices` are the validate-*
++  results, or nil), to `conn`, the graph or a dry-run copy of it, in one atomic-write!. Reads the
++  property back from `conn` and returns the response body."
++  [conn creator property body e2ee? classes choices]
++  (let [{:keys [mode tags]} (:ok classes)
++        current (:logseq.property/classes property)
++        schema (cond-> {}
++                 (:type body) (assoc :logseq.property/type (keyword (:type body)))
++                 (:cardinality body) (assoc :db/cardinality (keyword (:cardinality body))))
++        _ (atomic-write! conn creator false :update-property
++                         (fn [tx-conn]
++                           (when (some (fn [k] (contains? body k)) [:title :name :type :cardinality])
++                             (outliner-property/upsert-property! tx-conn (:db/ident property) schema
++                                                                 (cond-> {:e2ee? e2ee? :encrypted-name (:name body)}
++                                                                   (:title body) (assoc :property-name (:title body)))))
++                           (let [tx (when classes (class-tx (:db/id property) current mode tags))]
++                             (when (seq tx) (ldb/transact! tx-conn tx)))
++                           (when choices (apply-choices! tx-conn (:db/id property) (:ok choices)))))
++        updated (d/entity @conn (:db/ident property))
++        retired (get-in choices [:ok :retire])]
++    (when (or classes choices)
++      (verify-property-schema! @conn (:block/uuid property)
++                               (cond-> (or (:expected choices) {})
++                                 classes (assoc :classes (expected-classes current mode tags)))))
++    (cond-> (property-response updated)
++      classes (assoc :out_of_class (out-of-class-count @conn updated))
++      (seq retired) (assoc :retired (mapv (fn [{:keys [uuid text holders]}]
++                                            {:uuid (uuid-string uuid) :title text :holders holders})
++                                          retired)))))
++
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2503,37 @@
+@@ -1931,14 +2599,37 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -760,7 +856,7 @@ index 5dc3e7d..dc37577 100644
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2543,43 @@
+@@ -1948,16 +2639,36 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -782,40 +878,33 @@ index 5dc3e7d..dc37577 100644
 +                        {:error "classes: give exactly one of set, add or remove"}))
 +            choices (when (and (property? property) (contains? body :choices))
 +                      (validate-choices db property (:block/title property) type (:choices body) e2ee?))
-+            {:keys [mode tags]} (:ok classes)
-+            current (:logseq.property/classes property)]
++            flags (into {} (map (juxt identity #(flag-param url %))) property-update-flags)
++            invalid (some #(when (= ::invalid (get flags %)) %) property-update-flags)
++            held (filter (comp pos? :holders) (get-in choices [:ok :retire]))]
 +        (cond
++          invalid (http/bad-request (str invalid " must be true or false"))
 +          (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
 +          (http/bad-request "invalid property-id or update")
 +          (or (:error classes) (:error choices))
 +          (http/bad-request (string/join "; " (keep :error [classes choices])))
++          (and (seq held) (not (get flags "acknowledge-holders")) (not (get flags "dry-run")))
++          (http/json-response nil {:error (retire-held-message held)
++                                   :retired (mapv (fn [{:keys [uuid text holders]}]
++                                                    {:choice (uuid-string uuid) :title text :holders holders})
++                                                  held)}
++                              409)
 +          :else
 +          (rejecting
-+           #(let [schema (cond-> {}
-+                           (:type body) (assoc :logseq.property/type (keyword (:type body)))
-+                           (:cardinality body) (assoc :db/cardinality (keyword (:cardinality body))))
-+                  _ (atomic-write! conn creator false :update-property
-+                     (fn [tx-conn]
-+                       (when (some (fn [k] (contains? body k)) [:title :name :type :cardinality])
-+                         (outliner-property/upsert-property! tx-conn (:db/ident property) schema
-+                                                             (cond-> {:e2ee? e2ee? :encrypted-name (:name body)}
-+                                                               (:title body) (assoc :property-name (:title body)))))
-+                       (let [tx (when classes (class-tx (:db/id property) current mode tags))]
-+                         (when (seq tx) (ldb/transact! tx-conn tx)))
-+                       (when choices (apply-choices! tx-conn (:db/id property) (:ok choices)))))
-+                  updated (d/entity @conn (:db/ident property))]
-+              (when (or classes choices)
-+                (verify-property-schema! @conn (:block/uuid property)
-+                                         (cond-> (or (:expected choices) {})
-+                                           classes (assoc :classes (expected-classes current mode tags)))))
-+              (broadcast-change! self)
-+              (http/json-response nil (cond-> (property-response updated)
-+                                        classes (assoc :out_of_class (out-of-class-count @conn updated)))))))))
++           #(let [dry-run? (get flags "dry-run")
++                  target (if dry-run? (dry-run-conn conn) conn)
++                  response (run-property-update target creator property body e2ee? classes choices)]
++              (when-not dry-run? (broadcast-change! self))
++              (http/json-response nil (cond-> response dry-run? (assoc :dry-run true))))))))
  
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..3996463 100644
+index c64cc9f..dfb6c0c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -845,11 +934,20 @@ index c64cc9f..3996463 100644
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
 +   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 +   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; order then lists only the surviving choices. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
-@@ -254,6 +254,20 @@
+@@ -248,12 +248,28 @@
+                 acknowledge-references-parameter
+                 dry-run-parameter]
+    "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
+-                     dry-run-parameter]})
++                     dry-run-parameter]
++   "updateProperty" [(delete-flag-parameter "acknowledge-holders" "Set true to retire choices (choices.retire) that blocks hold; those blocks lose the value. Omitted or false, a retire with holders is refused with 409 and nothing is changed.")
++                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired and dry-run: true. A retire with holders is previewed without acknowledge-holders.")]})
+ 
+ (def ^:private summary-prefix-parameter
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
     :description "Text a page's first top-level block starts with when it is the page's summary."})
  
@@ -870,7 +968,7 @@ index c64cc9f..3996463 100644
  (def ^:private encrypted-name-schema
    {:type "string"
     :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
-@@ -331,15 +345,52 @@
+@@ -331,15 +347,55 @@
                                 :priority {:$ref "#/components/schemas/TaskPrioritySelector"}
                                 :scheduled {:type "integer" :description "Scheduled date/time as a Unix timestamp in milliseconds."}
                                 :deadline {:type "integer" :description "Deadline date/time as a Unix timestamp in milliseconds."}}}
@@ -911,7 +1009,7 @@ index c64cc9f..3996463 100644
 +                                                          :add tag-selectors-schema
 +                                                          :remove tag-selectors-schema}}
 +                                   :choices {:type "object"
-+                                             :description "For a default (text), number or url property only. Give any of add, update and order; they apply in one transaction, and a choice is named by its UUID, ident or title."
++                                             :description "For a default (text), number or url property only. Give any of add, update, order and retire; they apply in that order in one transaction, and a choice is named by its UUID, ident or title."
 +                                             :properties {:add (assoc new-choices-schema
 +                                                                      :description "New choices, placed after the existing ones in the order given. A title already a choice on this property (ignoring case) is refused.")
 +                                                          :update {:type "array"
@@ -922,12 +1020,40 @@ index c64cc9f..3996463 100644
 +                                                                                        :icon {:anyOf [{:$ref "#/components/schemas/Icon"} {:type "null"}]}
 +                                                                                        :description {:type "string"}}}}
 +                                                          :order {:type "array"
-+                                                                  :description "Every choice, including any added in this call (by title), exactly once, in the order the editor should list them."
-+                                                                  :items {:type "string"}}}}}}
++                                                                  :description "Every choice that survives the call, including any added in this call (by title), exactly once, in the order the editor should list them."
++                                                                  :items {:type "string"}}
++                                                          :retire {:type "array"
++                                                                   :description "Choices to remove, each by UUID, ident or title. A built-in choice (Status, Priority) is refused. Blocks holding one lose the value, so a retire with holders needs acknowledge-holders=true; preview with dry-run=true."
++                                                                   :items {:type "string"}}}}}}
      "encryptE2eeText" {:required ["key" "texts"]
                         :properties {:texts {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "string"}}
-@@ -646,7 +697,18 @@
+@@ -486,6 +542,7 @@
+             "204" {:description "Deleted"}
+             "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
+            "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
++           "updateProperty" {"409" (entity-response "RetireRefusal" "Choices to retire are held by blocks and acknowledge-holders is not true; nothing was changed")}
+            "createTask"
+            {"201" (entity-response "CreatedTaskResponse" "The created DB Task object and the page it is on")}
+            "createAsset"
+@@ -517,7 +574,15 @@
+                                           :description "The acknowledge-* flags the delete still needs; empty when it would proceed."}}}
+    :DeleteRefusal {:allOf [{:$ref "#/components/schemas/DeleteImpact"}
+                            {:type "object" :required ["error"]
+-                            :properties {:error {:type "string"}}}]}))
++                            :properties {:error {:type "string"}}}]}
++   :RetireRefusal {:type "object" :required ["error" "retired"]
++                   :properties {:error {:type "string"}
++                                :retired {:type "array"
++                                          :description "Each retired choice that blocks hold, with how many."
++                                          :items {:type "object" :required ["choice" "title" "holders"]
++                                                  :properties {:choice {:type "string" :description "The choice's UUID."}
++                                                               :title {:type "string"}
++                                                               :holders {:type "integer"}}}}}}))
+ 
+ (def ^:private bulk-schemas
+   "Schemas of block tree properties and of the bulk and insert operations' responses."
+@@ -646,7 +711,18 @@
                 :TagResponse {:type "object" :required ["uuid" "title"]
                               :properties {:uuid {:type "string"}
                                            :title {:type "string"}
@@ -947,7 +1073,7 @@ index c64cc9f..3996463 100644
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
-@@ -679,11 +741,18 @@
+@@ -679,11 +755,18 @@
                 {:description "A built-in priority alias or one of the Priority property's own choices, selected by UUID, ident, or title (ignoring case). A choice limited to other tags than Task is refused."
                  :anyOf [{:type "string" :enum ["low" "medium" "high" "urgent"]}
                          {:$ref "#/components/schemas/EntitySelector"}]}
@@ -967,7 +1093,7 @@ index c64cc9f..3996463 100644
                 :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
                                    :properties {:uuid {:type "string"}
                                                 :ident {:type "string"}
-@@ -691,8 +760,16 @@
+@@ -691,8 +774,24 @@
                                                 :type {:type "string"}
                                                 :cardinality {:type "string"}
                                                 :choices {:type "array"
@@ -982,16 +1108,24 @@ index c64cc9f..3996463 100644
 +                                                                              :title {:type "string"}
 +                                                                              :ident {:type "string"}}}}
 +                                               :out_of_class {:type "integer"
-+                                                              :description "On updateProperty with classes: how many holders have a value that is an object of none of the classes."}}}
++                                                              :description "On updateProperty with classes: how many holders have a value that is an object of none of the classes."}
++                                               :retired {:type "array"
++                                                         :description "On updateProperty with choices.retire: each retired choice and how many blocks held it (they no longer do)."
++                                                         :items {:type "object" :required ["uuid" "title" "holders"]
++                                                                 :properties {:uuid {:type "string"}
++                                                                              :title {:type "string"}
++                                                                              :holders {:type "integer"}}}}
++                                               :dry-run {:type "boolean"
++                                                         :description "On updateProperty with dry-run=true: true; nothing was stored."}}}
                 :PropertyType {:type "string"
                                :enum ["default" "number" "date" "datetime" "checkbox" "url" "node" "asset"
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..cf7db1d
+index 0000000..9c38820
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1508 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -1005,6 +1139,7 @@ index 0000000..cf7db1d
 +            [logseq.db-sync.test-sql :as test-sql]
 +            [logseq.db-sync.worker.handler.semantic :as semantic]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
 +            [logseq.db.common.normalize :as db-normalize]
 +            [logseq.db.common.order :as db-order]
 +            [logseq.db.frontend.property :as db-property]
@@ -2065,8 +2200,8 @@ index 0000000..cf7db1d
 +                  "refusals are named add, update, then order")
 +              (is (= "classes 0: no tag \"Clinet\"; choices: partner is a node property and can't have choices"
 +                     (get-in create-both [:body :error])))
-+              (is (= "choices: give add, update or order" (get-in empty-choices [:body :error])))
-+              (is (= "choices: give add, update or order" (get-in unknown-field [:body :error])))
++              (is (= "choices: give add, update, order or retire" (get-in empty-choices [:body :error])))
++              (is (= "choices: give add, update, order or retire" (get-in unknown-field [:body :error])))
 +              (is (= "choices.add: give a list of choices" (get-in not-list [:body :error])))
 +              (is (= "choices: give a list of choices" (get-in create-not-list [:body :error]))))
 +            (testing "a type change is judged on the new type"
@@ -2187,6 +2322,318 @@ index 0000000..cf7db1d
 +            (is (= (str "the write did not store what was asked: choices not in the order asked: "
 +                        "\"Proposal\", \"Active\", \"Done\", \"Backlog\"")
 +                   (get-in updated [:body :error])))))))))
++
++;; Retiring choices: updateProperty's choices.retire, with the acknowledge-holders and dry-run query
++;; flags. Holders are counted with one :avet range on the property and the choice; a retire with
++;; holders is refused with 409 unless acknowledge-holders=true, and dry-run=true stores nothing.
++
++(defn- retire! [self property refs & [query]]
++  (request! self "PATCH" (str (property-path property) (when query (str "?" query))) {:choices {:retire refs}}))
++
++(defn- snapshot [conn]
++  (set (map (juxt :e :a :v) (d/datoms @conn :eavt))))
++
++(defn- hold! [self block-id property value]
++  (request! self "PUT" (value-path block-id property) {:value value}))
++
++(defn- pointing-at
++  "Every datom whose value is the db id `id`, on the property `property` or :block/refs."
++  [conn property id]
++  (concat (d/datoms @conn :avet property id) (d/datoms @conn :avet :block/refs id)))
++
++(deftest retire-without-holders-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status score site quadrant]}]
++        (let [backlog (choice-uuid conn status "Backlog")
++              done-id (choice-uuid conn status "Done")
++              quadrant-active (choice-uuid conn quadrant "Active")]
++          (p/let [by-title (retire! self status ["backlog"])
++                  by-uuid (retire! self status [(str done-id)])
++                  _ (choices! self score {:add [{:title "2"}]})
++                  number (retire! self score ["1" 2])
++                  url (retire! self site ["https://a.example.com"])
++                  got (request! self "GET" (property-path status) nil)]
++            (is (= 200 (:status by-title)) (str (:body by-title)))
++            (is (= [{:uuid (str backlog) :title "Backlog" :holders 0}] (get-in by-title [:body :retired]))
++                "a title matches ignoring case, and the response names the retired choice")
++            (is (nil? (entity conn backlog)) "the choice is gone")
++            (is (= 200 (:status by-uuid)) (str (:body by-uuid)))
++            (is (nil? (entity conn done-id)))
++            (is (= ["Active"] (mapv :title (get-in got [:body :choices]))) "getProperty no longer lists them")
++            (is (= ["Active"] (choice-titles conn status)))
++            (is (= 200 (:status number)) (str (:body number)))
++            (is (= [] (choice-titles conn score)) "a number property's choice is named by its number, as text or a number")
++            (is (= 200 (:status url)) (str (:body url)))
++            (is (= [] (choice-titles conn site)) "a URL property's choice is named by its URL")
++            (is (some? (entity conn quadrant-active)) "quadrant's Active is not touched")
++            (is (nil? (get-in by-title [:body :dry-run])))))))))
++
++(deftest retire-with-holders-refused-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (let [[b0 b1 b2] blocks
++              backlog (choice-uuid conn status "Backlog")
++              done-id (choice-uuid conn status "Done")]
++          (p/let [_ (hold! self b0 status "Backlog")
++                  _ (hold! self b1 status "Backlog")
++                  _ (hold! self b2 status "Done")
++                  before (snapshot conn)
++                  refused (request! self "PATCH" (property-path status)
++                                    {:choices {:add [{:title "Proposal"}] :retire ["Backlog"]}})
++                  both (retire! self status ["Backlog" "Done" "Active"])
++                  declined (retire! self status ["Backlog"] "acknowledge-holders=false")
++                  invalid (retire! self status ["Backlog"] "acknowledge-holders=yes")
++                  invalid-dry (retire! self status ["Backlog"] "dry-run=1")]
++            (is (= 409 (:status refused)) (str (:body refused)))
++            (is (= (str "choices.retire 0: \"Backlog\" is held by 2 blocks; set acknowledge-holders=true "
++                        "to remove it from them, or dry-run=true to preview")
++                   (get-in refused [:body :error])))
++            (is (= [{:choice (str backlog) :title "Backlog" :holders 2}] (get-in refused [:body :retired])))
++            (is (= 409 (:status both)) (str (:body both)))
++            (is (= (str "choices.retire 0: \"Backlog\" is held by 2 blocks; choices.retire 1: \"Done\" is held by 1 block; "
++                        "set acknowledge-holders=true to remove them from their holders, or dry-run=true to preview")
++                   (get-in both [:body :error]))
++                "every retired choice with holders is named, with its count")
++            (is (= [{:choice (str backlog) :title "Backlog" :holders 2} {:choice (str done-id) :title "Done" :holders 1}]
++                   (get-in both [:body :retired]))
++                "a choice without holders is not listed in the refusal")
++            (is (= 409 (:status declined)) (str (:body declined)))
++            (is (= 400 (:status invalid)) (str (:body invalid)))
++            (is (= "acknowledge-holders must be true or false" (get-in invalid [:body :error])))
++            (is (= 400 (:status invalid-dry)) (str (:body invalid-dry)))
++            (is (= "dry-run must be true or false" (get-in invalid-dry [:body :error])))
++            (is (= before (snapshot conn)) "nothing was written")
++            (is (= backlog (stored conn b0 status)))))))))
++
++(deftest retire-with-acknowledge-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (let [[b0 b1 b2 b3 b4] blocks
++              backlog (choice-uuid conn status "Backlog")
++              backlog-id (:db/id (entity conn backlog))]
++          (p/let [_ (hold! self b0 status "Backlog")
++                  _ (hold! self b1 status "Backlog")
++                  _ (hold! self b4 status "Active")
++                  created (request! self "POST" "/semantic/properties"
++                                    {:title "labels" :cardinality "db.cardinality/many"
++                                     :choices [{:title "Red"} {:title "Green"} {:title "Blue"}]})
++                  labels (keyword (get-in created [:body :ident]))
++                  red (choice-uuid conn labels "Red")
++                  green (choice-uuid conn labels "Green")
++                  red-id (:db/id (entity conn red))
++                  _ (hold! self b2 labels ["Red" "Green"])
++                  _ (hold! self b3 labels ["Red"])
++                  retired (retire! self status ["Backlog"] "acknowledge-holders=true")
++                  many (retire! self labels ["Red"] "acknowledge-holders=true")]
++            (is (= 200 (:status retired)) (str (:body retired)))
++            (is (= [{:uuid (str backlog) :title "Backlog" :holders 2}] (get-in retired [:body :retired])))
++            (is (nil? (entity conn backlog)) "the choice is gone")
++            (is (nil? (stored conn b0 status)) "neither holder has a value")
++            (is (nil? (stored conn b1 status)))
++            (is (empty? (pointing-at conn status backlog-id)) "no datom points at the retired choice")
++            (is (= (choice-uuid conn status "Active") (stored conn b4 status)) "another choice's holder keeps it")
++            (is (= 200 (:status many)) (str (:body many)))
++            (is (= [{:uuid (str red) :title "Red" :holders 2}] (get-in many [:body :retired])))
++            (is (= #{green} (stored conn b2 labels)) "a holder keeps the choice that survives")
++            (is (empty? (stored conn b3 labels)))
++            (is (empty? (pointing-at conn labels red-id)))
++            (is (= ["Green" "Blue"] (choice-titles conn labels)))))))))
++
++(deftest retire-dry-run-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (let [[b0 b1] blocks
++              backlog (choice-uuid conn status "Backlog")
++              sent (atom 0)]
++          (p/let [_ (hold! self b0 status "Backlog")
++                  _ (hold! self b1 status "Backlog")
++                  ;; A connected client, to see which calls announce a change.
++                  _ (set! (.-state self) #js {:getWebSockets (fn [] #js [#js {:readyState 1 :send #(swap! sent inc)}])})
++                  before (snapshot conn)
++                  dry (retire! self status ["Backlog"] "dry-run=true")
++                  dry-ack (retire! self status ["Backlog"] "dry-run=true&acknowledge-holders=true")
++                  dry-mixed (request! self "PATCH" (str (property-path status) "?dry-run=true")
++                                      {:title "project-state"
++                                       :choices {:add [{:title "Proposal"}] :order ["Proposal" "Done" "Active"]
++                                                 :retire ["Backlog"]}})
++                  dry-refused (request! self "PATCH" (str (property-path status) "?dry-run=true")
++                                        {:choices {:retire ["Foo"]}})
++                  after (snapshot conn)
++                  dry-sent @sent
++                  real (retire! self status ["Backlog"] "acknowledge-holders=true")]
++            (is (= 200 (:status dry)) (str (:body dry)))
++            (is (true? (get-in dry [:body :dry-run])))
++            (is (= [{:uuid (str backlog) :title "Backlog" :holders 2}] (get-in dry [:body :retired])))
++            (is (= ["Active" "Done"] (mapv :title (get-in dry [:body :choices])))
++                "the response shows the choices the call would leave")
++            (is (= (dissoc (:body dry-ack) :dry-run) (dissoc (:body real) :dry-run))
++                "with acknowledge-holders the dry run answers what the real call does")
++            (is (= (:body dry) (:body dry-ack)) "with or without acknowledge-holders")
++            (is (= 200 (:status dry-mixed)) (str (:body dry-mixed)))
++            (is (= "project-state" (get-in dry-mixed [:body :title])))
++            (is (= ["Proposal" "Done" "Active"] (mapv :title (get-in dry-mixed [:body :choices]))))
++            (is (= 400 (:status dry-refused)) "a dry run is validated as a real one")
++            (is (= before after) "a dry run stores nothing")
++            (is (= 0 dry-sent) "and announces no change to clients")
++            (is (pos? @sent) "a real one does")
++            (is (= 200 (:status real)) (str (:body real)))))))))
++
++(deftest retire-built-in-choice-refused-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self]}]
++        (p/let [before (snapshot conn)
++                by-title (retire! self :logseq.property/status ["Done"] "acknowledge-holders=true")
++                by-ident (retire! self :logseq.property/status ["Backlog" "logseq.property/status.doing"])
++                priority (retire! self :logseq.property/priority ["urgent"])]
++          (is (= 400 (:status by-title)) (str (:body by-title)))
++          (is (= "choices.retire 0: \"Done\" is built in and can't be retired" (get-in by-title [:body :error])))
++          (is (= (str "choices.retire 0: \"Backlog\" is built in and can't be retired; "
++                      "choices.retire 1: \"Doing\" is built in and can't be retired")
++                 (get-in by-ident [:body :error])))
++          (is (= "choices.retire 0: \"Urgent\" is built in and can't be retired" (get-in priority [:body :error])))
++          (is (= before (snapshot conn)) "nothing was written"))))))
++
++(deftest retire-unknown-choice-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status quadrant for-client]}]
++        (let [decoy (choice-uuid conn quadrant "Active")
++              before (snapshot conn)]
++          (p/let [unknown (retire! self status ["X"])
++                  other-title (retire! self status ["Proposal"])
++                  other-uuid (retire! self status [(str decoy)])
++                  twice (retire! self status ["Backlog" "backlog"])
++                  not-text (retire! self status [{:title "Backlog"}])
++                  not-list (request! self "PATCH" (property-path status) {:choices {:retire "Backlog"}})
++                  updated (request! self "PATCH" (property-path status)
++                                    {:choices {:update [{:choice "Backlog" :title "Later"}] :retire ["Backlog"]}})
++                  ordered (request! self "PATCH" (property-path status)
++                                    {:choices {:order ["Active" "Backlog" "Done"] :retire ["Backlog"]}})
++                  node (retire! self for-client ["Acme"])
++                  mixed (request! self "PATCH" (property-path status)
++                                  {:choices {:update [{:choice "Foo" :title "y"}] :retire ["X"]}})
++                  refused-state (snapshot conn)
++                  survivors (request! self "PATCH" (property-path status)
++                                      {:choices {:order ["Done" "Active"] :retire ["Backlog"]}})]
++            (is (= "choices.retire 0: no choice \"X\" on project-status" (get-in unknown [:body :error])))
++            (is (= "choices.retire 0: no choice \"Proposal\" on project-status" (get-in other-title [:body :error]))
++                "another property's choice title is not found")
++            (is (= (str "choices.retire 0: no choice \"" decoy "\" on project-status") (get-in other-uuid [:body :error]))
++                "nor is its UUID")
++            (is (= "choices.retire 1: \"Backlog\" is listed twice" (get-in twice [:body :error])))
++            (is (= "choices.retire 0: no choice \"{:title \\\"Backlog\\\"}\" on project-status" (get-in not-text [:body :error])))
++            (is (= "choices.retire: give a list of choice UUIDs, idents or titles" (get-in not-list [:body :error])))
++            (is (= "choices.retire 0: \"Backlog\" is also changed in choices.update 0" (get-in updated [:body :error])))
++            (is (= "choices.order 1: \"Backlog\" is retired in this call" (get-in ordered [:body :error])))
++            (is (= "choices: for-client is a node property and can't have choices" (get-in node [:body :error])))
++            (is (= "choices.update 0: no choice \"Foo\" on project-status; choices.retire 0: no choice \"X\" on project-status"
++                   (get-in mixed [:body :error]))
++                "refusals are named add, update, order, then retire")
++            (is (= before refused-state) "no refused call wrote anything")
++            (doseq [response [unknown other-title other-uuid twice not-text not-list updated ordered node mixed]]
++              (is (= 400 (:status response)) (str (:body response))))
++            (is (= 200 (:status survivors)) (str "order names only the surviving choices: " (:body survivors)))
++            (is (= ["Done" "Active"] (choice-titles conn status)))
++            (is (some? (entity conn decoy)) "the decoy's choice is untouched")))))))
++
++(deftest add-order-retire-one-transaction-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (let [[b0] blocks]
++          (p/let [_ (hold! self b0 status "Backlog")
++                  client (d/conn-from-db @conn)
++                  reports (atom [])
++                  _ (d/listen! conn ::reports
++                               (fn [{:keys [db-after db-before tx-data] :as report}]
++                                 (when (seq tx-data)
++                                   (swap! reports conj (assoc report :normalized
++                                                              (db-normalize/normalize-tx-data db-after db-before tx-data))))))
++                  updated (request! self "PATCH" (str (property-path status) "?acknowledge-holders=true")
++                                    {:choices {:add [{:title "Proposal"}]
++                                               :update [{:choice "Done" :title "Closed"}]
++                                               :order ["Proposal" "Active" "Closed"]
++                                               :retire ["Backlog"]}})
++                  _ (d/unlisten! conn ::reports)
++                  _ (doseq [{:keys [normalized]} @reports] (d/transact! client normalized))
++                  shape (fn [db]
++                          (mapv (juxt :block/uuid :block/title :block/order)
++                                (sort-by :block/order (:block/_closed-value-property (d/entity db status)))))]
++            (is (= 200 (:status updated)) (str (:body updated)))
++            (is (= 1 (count @reports)) "add, update, order and retire are one transaction")
++            (is (= 1 (count (distinct (map :tx (mapcat :tx-data @reports))))) "one tx id")
++            (is (= ["Proposal" "Active" "Closed"] (choice-titles conn status)))
++            (is (= (shape @conn) (shape @client)) "a client replaying the log has the same choices")
++            (is (nil? (get (d/entity @client [:block/uuid b0]) status)) "and the holder has no value there either")))))))
++
++(deftest retire-read-back-test
++  ;; After a retire the property is read back: a retired choice still there, or a holder still
++  ;; pointing at it, answers 500 rather than success.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (p/let [_ (hold! self (first blocks) status "Backlog")]
++          (let [verify! #'semantic/verify-property-schema!
++                property-uuid (:block/uuid (d/entity @conn status))
++                backlog (choice-uuid conn status "Backlog")
++                backlog-id (:db/id (entity conn backlog))
++                done-id (choice-uuid conn status "Done")
++                thrown (fn [db expected]
++                         (try (verify! db property-uuid expected) nil
++                              (catch :default e (ex-message e))))
++                ;; Without the choice entity but with a holder's datom still on its db id.
++                dangling (d/db-with @conn [[:db/retract backlog-id :block/uuid backlog]
++                                           [:db/retract backlog-id :block/closed-value-property (:db/id (d/entity @conn status))]])]
++            (is (= "the write did not store what was asked: choices not retired \"Done\""
++                   (thrown @conn {:retired [{:uuid done-id :id (:db/id (entity conn done-id)) :text "Done"}]}))
++                "a choice still there")
++            (is (= "the write did not store what was asked: \"Backlog\" is still held by 1 block"
++                   (thrown dangling {:retired [{:uuid backlog :id backlog-id :text "Backlog"}]}))
++                "a holder still pointing at a deleted choice")))))))
++
++(deftest openapi-documents-retire-test
++  (let [operation (get-in (semantic-routes/openapi-document "https://issuer.example")
++                          [:paths "/api/v1/graphs/{graph-id}/properties/{property-id}" :patch])
++        flags (->> (:parameters operation)
++                   (filter #(= "query" (:in %)))
++                   (map (juxt :name (comp :type :schema)))
++                   (into {}))
++        choices (get-in operation [:requestBody :content "application/json" :schema :properties :choices :properties])]
++    (is (= {"acknowledge-holders" "boolean" "dry-run" "boolean"} flags))
++    (is (= "string" (get-in choices [:retire :items :type])))
++    (is (= "#/components/schemas/RetireRefusal"
++           (get-in operation [:responses "409" :content "application/json" :schema :$ref])))
++    (is (string/includes? (:description operation) "acknowledge-holders=true"))))
++
++(deftest retire-does-not-rely-on-the-outliner-delete-test
++  ;; Today delete-closed-value! retracts the whole choice entity, which also drops every ref to it.
++  ;; The handler retracts each holder's datom itself, so the retire stays clean if an upstream bump
++  ;; makes that delete leave refs behind: here a delete that removes only the choice's own datoms
++  ;; stands in for such an outliner. Holders must still lose the value, and the call succeeds.
++  (async done
++    (let [real outliner-property/delete-closed-value!]
++      (set! outliner-property/delete-closed-value!
++            (fn [conn _property-id choice-id]
++              (ldb/transact! conn (mapv (fn [datom] [:db/retract (:e datom) (:a datom) (:v datom)])
++                                        (d/datoms @conn :eavt choice-id)))))
++      (with-choices (fn [] (set! outliner-property/delete-closed-value! real) (done))
++        (fn [{:keys [conn self status blocks]}]
++          (let [[b0 b1] blocks
++                backlog (choice-uuid conn status "Backlog")
++                backlog-id (:db/id (entity conn backlog))]
++            (p/let [_ (hold! self b0 status "Backlog")
++                    _ (hold! self b1 status "Backlog")
++                    retired (retire! self status ["Backlog"] "acknowledge-holders=true")]
++              (is (= 200 (:status retired)) (str (:body retired)))
++              (is (nil? (entity conn backlog)) "the choice is gone")
++              (is (empty? (d/datoms @conn :avet status backlog-id)) "no holder still points at it")
++              (is (nil? (stored conn b0 status)))
++              (is (nil? (stored conn b1 status))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 4d9e7d2..e1c9ab9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

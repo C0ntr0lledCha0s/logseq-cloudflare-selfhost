@@ -464,7 +464,7 @@ describe("hand-written tools", () => {
     expect(created.items.required).toEqual(["title"]);
     expect(Object.keys(created.items.properties.icon.properties).sort()).toEqual(["id", "type"]);
     const choices = update.inputSchema.properties.body.properties.choices;
-    expect(Object.keys(choices.properties).sort()).toEqual(["add", "order", "update"]);
+    expect(Object.keys(choices.properties).sort()).toEqual(["add", "order", "retire", "update"]);
     expect(choices.properties.update.items.required).toEqual(["choice"]);
     const icon = choices.properties.update.items.properties.icon;
     expect(icon.anyOf.map((s: { type: string }) => s.type).sort()).toEqual(["null", "object"]);
@@ -472,6 +472,17 @@ describe("hand-written tools", () => {
     expect(create.description).toContain("Give a property its choices when creating it");
     expect(update.description).toContain("choices.add, choices.update and choices.order");
     expect(update.description).toContain("icon: null");
+  });
+
+  it("update_property retires choices behind acknowledge-holders and previews with dry-run", async () => {
+    const tools = await listTools();
+    const update = tools.find((t) => t.name === "update_property");
+    expect(update.inputSchema.properties["dry-run"].type).toBe("boolean");
+    expect(update.inputSchema.properties["acknowledge-holders"].type).toBe("boolean");
+    expect(update.inputSchema.properties.body.properties.choices.properties.retire.items.type).toBe("string");
+    expect(update.description).toContain("choices.retire");
+    expect(update.description).toContain("run it with dry-run first");
+    expect(update.description).toContain("only acknowledge a loss the user agreed to");
   });
 
   it("create_tag and update_tag take extends and tag properties, and update_tag no longer needs a title", async () => {
@@ -516,6 +527,7 @@ describe("hand-written tools", () => {
       "restricted to classes",
       "properties.add",
       "choices.add",
+      "choices.retire",
     ]) {
       expect(result.text).toContain(phrase);
     }
