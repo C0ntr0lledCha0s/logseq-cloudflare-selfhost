@@ -46,9 +46,9 @@ const HINTS: Record<string, string> = {
     "Prefer this for whole notes such as meeting notes: one write call instead of many (writes are rate-limited).",
   create_task: "Use this for every task or action item.",
   create_property:
-    "Give a node property its classes when creating it (classes: tag UUIDs, idents or titles), so the app's picker and every value write accept only objects of those tags.",
+    "Give a property its choices when creating it (choices: [{title, icon?, description?}], in the order the editor should list them); choices are for default (text), number and url properties. Give a node property its classes when creating it (classes: tag UUIDs, idents or titles), so the app's picker and every value write accept only objects of those tags. The response lists each choice's UUID.",
   update_property:
-    "To restrict a node property to classes, give classes exactly one of set, add or remove (each a list of tag UUIDs, idents or titles); {set: []} clears the restriction. Existing values are kept: out_of_class counts the holders whose value the classes would now refuse.",
+    "Change a property's choices with choices.add, choices.update and choices.order, in one call: add puts new choices after the existing ones; update renames, re-icons or describes a choice named by UUID, ident or title (icon: null clears its icon); order lists every choice once, including ones added in the same call (by title). A title already a choice (ignoring case) is refused, and the response lists every choice's UUID. To restrict a node property to classes, give classes exactly one of set, add or remove (each a list of tag UUIDs, idents or titles); {set: []} clears the restriction. Existing values are kept: out_of_class counts the holders whose value the classes would now refuse.",
   create_tag:
     "Give the tag its extends and properties in the same call (tag and property UUIDs, idents or titles), so it is set up in one write.",
   update_tag:

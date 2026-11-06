@@ -455,6 +455,25 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("out_of_class");
   });
 
+  it("create_property and update_property take choices, and say how", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_property");
+    const update = tools.find((t) => t.name === "update_property");
+    const created = create.inputSchema.properties.body.properties.choices;
+    expect(created.type).toBe("array");
+    expect(created.items.required).toEqual(["title"]);
+    expect(Object.keys(created.items.properties.icon.properties).sort()).toEqual(["id", "type"]);
+    const choices = update.inputSchema.properties.body.properties.choices;
+    expect(Object.keys(choices.properties).sort()).toEqual(["add", "order", "update"]);
+    expect(choices.properties.update.items.required).toEqual(["choice"]);
+    const icon = choices.properties.update.items.properties.icon;
+    expect(icon.anyOf.map((s: { type: string }) => s.type).sort()).toEqual(["null", "object"]);
+    expect(choices.properties.order.items.type).toBe("string");
+    expect(create.description).toContain("Give a property its choices when creating it");
+    expect(update.description).toContain("choices.add, choices.update and choices.order");
+    expect(update.description).toContain("icon: null");
+  });
+
   it("create_tag and update_tag take extends and tag properties, and update_tag no longer needs a title", async () => {
     const tools = await listTools();
     const create = tools.find((t) => t.name === "create_tag");
@@ -496,6 +515,7 @@ describe("hand-written tools", () => {
       "delete_page on today's journal",
       "restricted to classes",
       "properties.add",
+      "choices.add",
     ]) {
       expect(result.text).toContain(phrase);
     }

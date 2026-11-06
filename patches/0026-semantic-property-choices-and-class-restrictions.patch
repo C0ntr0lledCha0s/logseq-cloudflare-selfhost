@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..c90b5a1 100644
+index 5dc3e7d..d1de9ec 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -88,14 +88,46 @@
@@ -209,7 +209,7 @@ index 5dc3e7d..c90b5a1 100644
  
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
-@@ -1920,6 +1994,250 @@
+@@ -1920,6 +1994,478 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -320,18 +320,246 @@ index 5dc3e7d..c90b5a1 100644
 +
 +(defn- verify-property-schema!
 +  "Re-reads the property from `db` after a write and throws, answered as a 500 by `rejecting`, when
-+  what the call asked for isn't stored. `expected` may hold :classes, a set of class UUIDs."
-+  [db property-uuid {:keys [classes]}]
++  what the call asked for isn't stored. `expected` may hold :classes, a set of class UUIDs; :titles,
++  a map of choice UUID to the title it should read; and :order, the choice UUIDs in editor order."
++  [db property-uuid {:keys [classes titles order]}]
 +  (let [property (d/entity db [:block/uuid property-uuid])
 +        stored (set (map :block/uuid (:logseq.property/classes property)))
 +        title (fn [id] (or (:block/title (d/entity db [:block/uuid id])) (str id)))
-+        problems (when (and (some? classes) (not= classes stored))
-+                   (cond-> []
-+                     (seq (remove stored classes))
-+                     (conj (str "classes missing " (string/join ", " (map title (remove stored classes)))))
-+                     (seq (remove classes stored))
-+                     (conj (str "classes not removed " (string/join ", " (map title (remove classes stored)))))))]
++        content (fn [id] (some-> (d/entity db [:block/uuid id]) choice-content))
++        stored-order (mapv :block/uuid (property-choices property))
++        problems (cond-> []
++                   (and (some? classes) (seq (remove stored classes)))
++                   (conj (str "classes missing " (string/join ", " (map title (remove stored classes)))))
++                   (and (some? classes) (seq (remove classes stored)))
++                   (conj (str "classes not removed " (string/join ", " (map title (remove classes stored)))))
++                   (some (fn [[id t]] (not= t (content id))) titles)
++                   (conj (str "choices missing " (string/join ", " (keep (fn [[id t]] (when (not= t (content id)) (pr-str t)))
++                                                                         (sort-by val titles)))))
++                   (and (some? order) (not= order stored-order))
++                   (conj (str "choices not in the order asked: "
++                              (string/join ", " (map #(pr-str (or (content %) (str %))) stored-order)))))]
 +    (unverified! problems)))
++
++;; Choices (closed values) through createProperty's choices and updateProperty's choices.add, update
++;; and order. Titles are checked before anything is written: duplicates ignoring case, against the
++;; property's own choices only (another property's choice with the same title is no duplicate) and
++;; within the request, and the number or URL a number or URL property needs. Each new or reordered
++;; choice is keyed with db-order/gen-key after the graph's max key (seeded by `handle`), never the
++;; key the outliner takes from the property's own last choice, which another block can hold.
++
++(def ^:private choice-icon-types #{"emoji" "tabler-icon"})
++
++(defn- text? [v]
++  (and (string? v) (not (string/blank? v))))
++
++(defn- choice-text
++  "A choice title as given: text trimmed, or a JSON number as text; nil when blank or neither."
++  [title]
++  (cond
++    (number? title) (str title)
++    (text? title) (string/trim title)
++    :else nil))
++
++(defn- choice-key
++  "What two choice titles of a property of `type` compare by: a number property's numbers, else the
++  text ignoring case."
++  [type text]
++  (if (= :number type)
++    (str (parse-double text))
++    (string/lower-case text)))
++
++(defn- choice-stored
++  "The content a choice of a property of `type` given `text` reads back as."
++  [type text]
++  (if (= :number type) (str (parse-double text)) text))
++
++(defn- choice-title-refusal [type title]
++  (let [text (choice-text title)]
++    (cond
++      (nil? text) "give a title"
++      (and (= :number type) (not (some-> (parse-double text) js/isFinite)))
++      (str (pr-str text) " is not a number")
++      (and (= :url type) (not (db-property-type/url? text)))
++      (str (pr-str text) " is not a URL"))))
++
++(defn- choice-icon
++  "An icon as given, as stored ({:type :emoji :id ...}), nil for null, or ::invalid."
++  [icon]
++  (cond
++    (nil? icon) nil
++    (and (map? icon) (contains? choice-icon-types (:type icon)) (text? (:id icon)))
++    {:type (keyword (:type icon)) :id (:id icon)}
++    :else ::invalid))
++
++(defn- choice-fields-refusal
++  "Why a choice entry's icon or description is refused, or nil."
++  [entry]
++  (cond
++    (= ::invalid (choice-icon (:icon entry))) "icon needs type emoji or tabler-icon and an id"
++    (and (contains? entry :description) (not (text? (:description entry))))
++    "description must be non-blank text"))
++
++(defn- choices-shape-refusal
++  "Why createProperty's choices (a list, `create?`) or updateProperty's ({add, update, order}) has the
++  wrong shape, or nil."
++  [create? choices]
++  (if create?
++    (when-not (sequential? choices) "choices: give a list of choices")
++    (cond
++      (not (and (map? choices) (seq choices) (every? #{:add :update :order} (keys choices))))
++      "choices: give add, update or order"
++      :else
++      (some (fn [k] (when (and (contains? choices k) (not (sequential? (get choices k))))
++                      (str "choices." (name k) ": give a list of "
++                           (if (= :order k) "choice UUIDs, idents or titles" "choices"))))
++            [:add :update :order]))))
++
++(defn- validate-choices
++  "Checks createProperty's `choices` (a list; `property` nil) or updateProperty's ({add, update,
++  order}) for the property titled `title`, judged on `type`, its type once the call has applied.
++  {:ok plan} or {:error message} naming every refused entry. The plan is {:add [{:uuid :text :icon
++  :description}] :update [{:uuid :text? :icon? :description?}] :order [uuid ...]?}; a new choice's UUID
++  is chosen here so order can name it."
++  [db property title type choices e2ee?]
++  (let [create? (nil? property)
++        shape (choices-shape-refusal create? choices)]
++    (cond
++      (not (contains? db-property-type/closed-value-property-types type))
++      {:error (str "choices: " title " is a " (name type) " property and can't have choices")}
++      e2ee? {:error "choices: not on an E2EE graph, where choice titles would be stored as plain text"}
++      shape {:error shape}
++      :else
++      (let [add-field (if create? "choices" "choices.add")
++            adds (if create? choices (:add choices))
++            existing (if property (property-choices property) [])
++            no-choice (fn [ref] (str "no choice " (pr-str (str ref)) " on " title))
++            refusals (volatile! [])
++            refuse! (fn [entry reason] (vswap! refusals conj {:entry entry :reason reason}))
++            ;; updates
++            updates (vec (map-indexed
++                          (fn [index entry]
++                            (let [field (str "choices.update " index)
++                                  id (when (map? entry) (resolve-choice db property (:choice entry) nil))]
++                              (cond
++                                (not (map? entry)) (refuse! field "give {choice, title?, icon?, description?}")
++                                (nil? id) (refuse! field (no-choice (:choice entry)))
++                                (not (some #(contains? entry %) [:title :icon :description]))
++                                (refuse! field "give title, icon or description")
++                                :else
++                                (if-let [reason (or (when (contains? entry :title) (choice-title-refusal type (:title entry)))
++                                                    (choice-fields-refusal entry))]
++                                  (refuse! field reason)
++                                  {:field field :id id :entry entry}))))
++                          (:update choices)))
++            updates (filterv map? updates)
++            updated-ids (reduce (fn [seen {:keys [field id]}]
++                                  (if-let [earlier (get seen id)]
++                                    (do (refuse! field (str (pr-str (choice-content (d/entity db id)))
++                                                            " is already updated in " earlier))
++                                        seen)
++                                    (assoc seen id field)))
++                                {} updates)
++            renamed (into {} (keep (fn [{:keys [id entry field]}]
++                                     (when (and (contains? entry :title) (= field (get updated-ids id)))
++                                       [id (choice-text (:title entry))]))
++                                   updates))
++            ;; what each existing choice is titled once the call has applied
++            final (mapv (fn [choice] {:id (:db/id choice)
++                                      :text (get renamed (:db/id choice) (choice-content choice))})
++                        existing)
++            _ (doseq [{:keys [id field]} updates
++                      :when (and (renamed id) (= field (get updated-ids id)))]
++                (let [k (choice-key type (renamed id))]
++                  (when (some #(and (not= id (:id %)) (= k (choice-key type (:text %)))) final)
++                    (refuse! field (str (pr-str (renamed id)) " is already a choice on " title)))))
++            ;; additions
++            given (into {} (keep (fn [{:keys [id field]}]
++                                   (when-let [t (renamed id)] [(choice-key type t) field]))
++                                 updates))
++            taken (set (keep (fn [{:keys [id text]}] (when-not (renamed id) (choice-key type text))) final))
++            additions (loop [index 0 entries adds given given out []]
++                        (if-let [entry (first entries)]
++                          (let [field (str add-field " " index)
++                                reason (if (map? entry)
++                                         (or (choice-title-refusal type (:title entry)) (choice-fields-refusal entry))
++                                         "give {title, icon?, description?}")
++                                text (when-not reason (choice-text (:title entry)))
++                                k (when text (choice-key type text))]
++                            (cond
++                              reason (do (refuse! field reason) (recur (inc index) (rest entries) given out))
++                              (contains? taken k)
++                              (do (refuse! field (str (pr-str text) " is already a choice on " title))
++                                  (recur (inc index) (rest entries) given out))
++                              (contains? given k)
++                              (do (refuse! field (str (pr-str text) " is already given in " (get given k)))
++                                  (recur (inc index) (rest entries) given out))
++                              :else
++                              (recur (inc index) (rest entries) (assoc given k field)
++                                     (conj out (cond-> {:uuid (random-uuid) :text text}
++                                                 (:icon entry) (assoc :icon (choice-icon (:icon entry)))
++                                                 (:description entry) (assoc :description (:description entry)))))))
++                          out))
++            ;; order: a full permutation of the existing choices and the additions
++            uuid-of (into {} (map (fn [choice] [(:db/id choice) (:block/uuid choice)]) existing))
++            label (merge (into {} (map (fn [{:keys [id text]}] [(uuid-of id) text]) final))
++                         (into {} (map (fn [{:keys [uuid text]}] [uuid text]) additions)))
++            by-key (into {} (map (fn [[u t]] [(choice-key type t) u]) label))
++            order (when (contains? choices :order)
++                    (let [listed (reduce
++                                  (fn [listed [index ref]]
++                                    (let [field (str "choices.order " index)
++                                          u (or (some-> (resolve-choice db property ref nil) uuid-of)
++                                                (when-let [text (choice-text ref)] (get by-key (choice-key type text))))]
++                                      (cond
++                                        (nil? u) (do (refuse! field (no-choice ref)) listed)
++                                        (some #{u} listed) (do (refuse! field (str (pr-str (label u)) " is listed twice")) listed)
++                                        :else (conj listed u))))
++                                  [] (map-indexed vector (:order choices)))
++                          missing (remove (set listed) (concat (map (comp uuid-of :db/id) existing) (map :uuid additions)))]
++                      (when (seq missing)
++                        (refuse! "choices.order" (str "missing " (string/join ", " (map (comp pr-str label) missing)))))
++                      listed))]
++        (if (seq @refusals)
++          ;; Named in request order: add, update, then order (sort-by is stable).
++          {:error (refusals-message (sort-by (fn [{:keys [entry]}]
++                                               (cond (string/starts-with? entry "choices.update") 1
++                                                     (string/starts-with? entry "choices.order") 2
++                                                     :else 0))
++                                             @refusals))}
++          {:ok (cond-> {:add additions
++                        :update (mapv (fn [{:keys [id entry]}]
++                                        (cond-> {:uuid (uuid-of id)}
++                                          (contains? entry :title) (assoc :text (choice-text (:title entry)))
++                                          (contains? entry :icon) (assoc :icon (choice-icon (:icon entry)))
++                                          (contains? entry :description) (assoc :description (:description entry))))
++                                      updates)}
++                 order (assoc :order order))
++           :expected {:titles (merge (into {} (map (fn [[id t]] [(uuid-of id) (choice-stored type t)]) renamed))
++                                     (into {} (map (fn [{:keys [uuid text]}] [uuid (choice-stored type text)]) additions)))
++                      :order (or order (into (mapv (comp uuid-of :db/id) existing) (map :uuid additions)))}})))))
++
++(defn- apply-choices!
++  "Inside atomic-write!: writes a validate-choices plan for the property with db id `property-id`:
++  each update, then each addition, then the order. upsert-closed-value! builds and edits the
++  choices as the app does; each new choice, and each choice in `order`, then takes a fresh key after
++  the graph's max. A choice update without icon keeps its icon (upsert-closed-value! would drop it)."
++  [tx-conn property-id {:keys [add update order]}]
++  (doseq [{:keys [uuid text icon description] :as change} update]
++    (let [choice (d/entity @tx-conn [:block/uuid uuid])]
++      (outliner-property/upsert-closed-value!
++       tx-conn property-id
++       (cond-> {:id uuid
++                :value (or text (:logseq.property/value choice) (:block/title choice))
++                :icon (if (contains? change :icon) icon (:logseq.property/icon choice))}
++         description (assoc :description description)))))
++  (doseq [{:keys [uuid text icon description]} add]
++    (outliner-property/upsert-closed-value! tx-conn property-id (cond-> {:id uuid :value text}
++                                                                  icon (assoc :icon icon)
++                                                                  description (assoc :description description)))
++    (ldb/transact! tx-conn [[:db/add [:block/uuid uuid] :block/order (db-order/gen-key)]]))
++  (when (seq order)
++    (ldb/transact! tx-conn (mapv (fn [uuid] [:db/add [:block/uuid uuid] :block/order (db-order/gen-key)]) order))))
 +
 +;; Tag schema writes (createTag, updateTag) take the same shape: every field is checked against the
 +;; graph first, then the tag, what it extends and its tag properties are written in one
@@ -460,7 +688,7 @@ index 5dc3e7d..c90b5a1 100644
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2249,31 @@
+@@ -1931,14 +2477,37 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -475,11 +703,14 @@ index 5dc3e7d..c90b5a1 100644
 +      (let [type (keyword (or (:type body) "default"))
 +            classes (when (contains? body :classes)
 +                      (validate-property-classes db (:title body) type nil (:classes body)))
++            choices (when (contains? body :choices)
++                      (validate-choices db nil (:title body) type (:choices body) e2ee?))
 +            {:keys [mode tags]} (:ok classes)]
 +        (cond
 +          (or (not (non-blank-string? (:title body))) (not (valid-property-schema? body)))
 +          (http/bad-request "invalid property schema")
-+          (:error classes) (http/bad-request (:error classes))
++          (or (:error classes) (:error choices))
++          (http/bad-request (string/join "; " (keep :error [classes choices])))
 +          :else
 +          (rejecting
 +           #(let [ident (atomic-write! conn creator false :upsert-property
@@ -491,16 +722,19 @@ index 5dc3e7d..c90b5a1 100644
 +                                           {:property-name (:title body) :e2ee? e2ee? :encrypted-name (:name body)})
 +                                 tx (when classes (class-tx (:db/id property) nil mode tags))]
 +                             (when (seq tx) (ldb/transact! tx-conn tx))
++                             (when choices (apply-choices! tx-conn (:db/id property) (:ok choices)))
 +                             (:db/ident property))))
 +                  property (d/entity @conn ident)]
-+              (when classes
-+                (verify-property-schema! @conn (:block/uuid property) {:classes (expected-classes nil mode tags)}))
++              (when (or classes choices)
++                (verify-property-schema! @conn (:block/uuid property)
++                                         (cond-> (or (:expected choices) {})
++                                           classes (assoc :classes (expected-classes nil mode tags)))))
 +              (broadcast-change! self)
 +              (http/json-response nil (property-response property) 201))))))
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2283,37 @@
+@@ -1948,16 +2517,43 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -520,12 +754,15 @@ index 5dc3e7d..c90b5a1 100644
 +                      (if change
 +                        (validate-property-classes db (:block/title property) type (first change) (second change))
 +                        {:error "classes: give exactly one of set, add or remove"}))
++            choices (when (and (property? property) (contains? body :choices))
++                      (validate-choices db property (:block/title property) type (:choices body) e2ee?))
 +            {:keys [mode tags]} (:ok classes)
 +            current (:logseq.property/classes property)]
 +        (cond
 +          (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
 +          (http/bad-request "invalid property-id or update")
-+          (:error classes) (http/bad-request (:error classes))
++          (or (:error classes) (:error choices))
++          (http/bad-request (string/join "; " (keep :error [classes choices])))
 +          :else
 +          (rejecting
 +           #(let [schema (cond-> {}
@@ -538,10 +775,13 @@ index 5dc3e7d..c90b5a1 100644
 +                                                             (cond-> {:e2ee? e2ee? :encrypted-name (:name body)}
 +                                                               (:title body) (assoc :property-name (:title body)))))
 +                       (let [tx (when classes (class-tx (:db/id property) current mode tags))]
-+                         (when (seq tx) (ldb/transact! tx-conn tx)))))
++                         (when (seq tx) (ldb/transact! tx-conn tx)))
++                       (when choices (apply-choices! tx-conn (:db/id property) (:ok choices)))))
 +                  updated (d/entity @conn (:db/ident property))]
-+              (when classes
-+                (verify-property-schema! @conn (:block/uuid property) {:classes (expected-classes current mode tags)}))
++              (when (or classes choices)
++                (verify-property-schema! @conn (:block/uuid property)
++                                         (cond-> (or (:expected choices) {})
++                                           classes (assoc :classes (expected-classes current mode tags)))))
 +              (broadcast-change! self)
 +              (http/json-response nil (cond-> (property-response updated)
 +                                        classes (assoc :out_of_class (out-of-class-count @conn updated)))))))))
@@ -549,7 +789,7 @@ index 5dc3e7d..c90b5a1 100644
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..0247d81 100644
+index c64cc9f..f42cd5a 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -577,13 +817,13 @@ index c64cc9f..0247d81 100644
 -   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 -   "getProperty" ["Get a property definition" "Returns one property definition by UUID."]
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
-+   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, and for a node property the classes (tags) it is limited to, in one transaction. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
++   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 +   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, and a node property's classes: classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call by title); a choice is named by its UUID, ident or title, and only the property's own choices count. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
-@@ -254,6 +254,12 @@
+@@ -254,6 +254,20 @@
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
     :description "Text a page's first top-level block starts with when it is the page's summary."})
  
@@ -593,10 +833,18 @@ index c64cc9f..0247d81 100644
 +(def ^:private property-selectors-schema
 +  {:type "array" :items {:type "string"} :description "Property UUIDs, idents or titles."})
 +
++(def ^:private new-choices-schema
++  {:type "array"
++   :items {:type "object" :required ["title"]
++           :properties {:title {:type "string"
++                                :description "The choice's title: text for a text property, a number for a number property, a URL for a URL property."}
++                        :icon {:$ref "#/components/schemas/Icon"}
++                        :description {:type "string"}}}})
++
  (def ^:private encrypted-name-schema
    {:type "string"
     :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
-@@ -331,15 +337,36 @@
+@@ -331,15 +345,52 @@
                                 :priority {:$ref "#/components/schemas/TaskPrioritySelector"}
                                 :scheduled {:type "integer" :description "Scheduled date/time as a Unix timestamp in milliseconds."}
                                 :deadline {:type "integer" :description "Deadline date/time as a Unix timestamp in milliseconds."}}}
@@ -624,7 +872,9 @@ index c64cc9f..0247d81 100644
 -                                   :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}}}
 +                                   :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}
 +                                   :classes (assoc tag-selectors-schema
-+                                                   :description "For a node property only: the tags whose objects it takes, each by UUID, ident or title.")}}
++                                                   :description "For a node property only: the tags whose objects it takes, each by UUID, ident or title.")
++                                   :choices (assoc new-choices-schema
++                                                   :description "For a default (text), number or url property only: its choices, in the order the editor lists them. Titles must differ ignoring case.")}}
      "updateProperty" {:properties {:title {:type "string"} :name encrypted-name-schema
                                     :type {:$ref "#/components/schemas/PropertyType"}
 -                                    :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}}}
@@ -633,11 +883,25 @@ index c64cc9f..0247d81 100644
 +                                             :description "For a node property only: give exactly one of set (replace the classes; [] removes the limit), add or remove."
 +                                             :properties {:set tag-selectors-schema
 +                                                          :add tag-selectors-schema
-+                                                          :remove tag-selectors-schema}}}}
++                                                          :remove tag-selectors-schema}}
++                                   :choices {:type "object"
++                                             :description "For a default (text), number or url property only. Give any of add, update and order; they apply in one transaction, and a choice is named by its UUID, ident or title."
++                                             :properties {:add (assoc new-choices-schema
++                                                                      :description "New choices, placed after the existing ones in the order given. A title already a choice on this property (ignoring case) is refused.")
++                                                          :update {:type "array"
++                                                                   :description "Changes to existing choices: a new title, icon (null clears it) or description. A choice keeps its UUID, place and icon unless changed."
++                                                                   :items {:type "object" :required ["choice"]
++                                                                           :properties {:choice {:type "string" :description "The choice's UUID, ident or title."}
++                                                                                        :title {:type "string"}
++                                                                                        :icon {:anyOf [{:$ref "#/components/schemas/Icon"} {:type "null"}]}
++                                                                                        :description {:type "string"}}}}
++                                                          :order {:type "array"
++                                                                  :description "Every choice, including any added in this call (by title), exactly once, in the order the editor should list them."
++                                                                  :items {:type "string"}}}}}}
      "encryptE2eeText" {:required ["key" "texts"]
                         :properties {:texts {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "string"}}
-@@ -646,7 +673,18 @@
+@@ -646,7 +697,18 @@
                 :TagResponse {:type "object" :required ["uuid" "title"]
                               :properties {:uuid {:type "string"}
                                            :title {:type "string"}
@@ -657,21 +921,27 @@ index c64cc9f..0247d81 100644
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
-@@ -683,7 +721,12 @@
+@@ -679,11 +741,18 @@
+                {:description "A built-in priority alias or one of the Priority property's own choices, selected by UUID, ident, or title (ignoring case). A choice limited to other tags than Task is refused."
+                 :anyOf [{:type "string" :enum ["low" "medium" "high" "urgent"]}
+                         {:$ref "#/components/schemas/EntitySelector"}]}
++               :Icon {:type "object" :required ["type" "id"]
++                      :description "An icon: an emoji by its id (such as rocket) or a Tabler icon by its name."
++                      :properties {:type {:type "string" :enum ["emoji" "tabler-icon"]}
++                                   :id {:type "string"}}}
+                :PropertyChoice {:type "object" :required ["uuid" "title"]
                                  :properties {:uuid {:type "string"}
                                               :ident {:type "string"}
                                               :title {:type "string"}
 -                                             :value {}}}
 +                                             :value {}
-+                                             :icon {:type "object"
-+                                                    :description "The choice's icon, when set (getProperty and listProperties)."
-+                                                    :properties {:type {:type "string"} :id {:type "string"}}}
++                                             :icon {:$ref "#/components/schemas/Icon"}
 +                                             :description {:type "string"
 +                                                           :description "The choice's description, when set (getProperty and listProperties)."}}}
                 :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
                                    :properties {:uuid {:type "string"}
                                                 :ident {:type "string"}
-@@ -691,8 +734,16 @@
+@@ -691,8 +760,16 @@
                                                 :type {:type "string"}
                                                 :cardinality {:type "string"}
                                                 :choices {:type "array"
@@ -692,10 +962,10 @@ index c64cc9f..0247d81 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..0c4e04b
+index 0000000..02b952e
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,1111 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -705,9 +975,13 @@ index 0000000..0c4e04b
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
++            [logseq.db :as ldb]
 +            [logseq.db-sync.test-sql :as test-sql]
 +            [logseq.db-sync.worker.handler.semantic :as semantic]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.common.normalize :as db-normalize]
++            [logseq.db.common.order :as db-order]
++            [logseq.db.frontend.property :as db-property]
 +            [logseq.db.sqlite.export :as sqlite-export]
 +            [logseq.outliner.property :as outliner-property]
 +            [promesa.core :as p]))
@@ -1421,6 +1695,388 @@ index 0000000..0c4e04b
 +                      "properties not removed for-service")
 +                 (thrown {:extends #{(:block/uuid organisation)}
 +                          :present #{(uuid-of partner)} :absent #{(uuid-of for-service)}}))))))))
++
++;; Choices: createProperty's choices and updateProperty's choices.add, update and order. The graph
++;; adds project-status (text) with choices Active, Done and Backlog, keyed a0 < a1 < a2, Active and
++;; Done with icons; a decoy property quadrant whose choices Proposal and Active must never count as
++;; project-status's; score (number) with choice 1; and site (URL) with one choice.
++
++(defn- choice-titles [conn property]
++  (mapv (comp str db-property/property-value-content)
++        (sort-by (juxt :block/order :db/id) (:block/_closed-value-property (d/entity @conn property)))))
++
++(defn- choice-uuid [conn property title]
++  (some #(when (= title (str (db-property/property-value-content %))) (:block/uuid %))
++        (:block/_closed-value-property (d/entity @conn property))))
++
++(defn- with-choices
++  [done run]
++  (with-graph done
++    (fn [{:keys [conn] :as graph}]
++      (p/let [property! (fn [title type choices]
++                          (let [ident (:db/ident (outliner-property/upsert-property!
++                                                  conn nil {:logseq.property/type type :db/cardinality :db.cardinality/one}
++                                                  {:property-name title}))]
++                            (doseq [[value icon order] choices]
++                              (let [id (random-uuid)]
++                                (outliner-property/upsert-closed-value! conn ident (cond-> {:id id :value value}
++                                                                                     icon (assoc :icon icon)))
++                                (d/transact! conn [[:db/add [:block/uuid id] :block/order order]])))
++                            ident))
++              status (property! "project-status" :default [["Active" {:type :emoji :id "rocket"} "a0"]
++                                                           ["Done" {:type :emoji :id "check"} "a1"]
++                                                           ["Backlog" nil "a2"]])
++              quadrant (property! "quadrant" :default [["Proposal" nil "a0"] ["Active" nil "a1"]])
++              score (property! "score" :number [["1" nil "a0"]])
++              site (property! "site" :url [["https://a.example.com" nil "a0"]])
++              phase (property! "phase" :default [])]
++        (run (assoc graph :status status :quadrant quadrant :score score :site site :phase phase))))))
++
++(defn- choices! [self property choices]
++  (request! self "PATCH" (property-path property) {:choices choices}))
++
++(deftest create-property-with-choices-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self blocks]}]
++        (p/let [created (request! self "POST" "/semantic/properties"
++                                  {:title "stage" :type "default"
++                                   :choices [{:title " Plan " :icon {:type "emoji" :id "memo"} :description "Scoping"}
++                                             {:title "Build" :icon {:type "tabler-icon" :id "hammer"}}
++                                             {:title "Ship"}]})
++                numbers (request! self "POST" "/semantic/properties"
++                                  {:title "rating" :type "number" :choices [{:title "1"} {:title "2.5"} {:title 3}]})
++                urls (request! self "POST" "/semantic/properties"
++                               {:title "homepage" :type "url" :cardinality "db.cardinality/many"
++                                :choices [{:title "https://b.example.com"} {:title "https://c.example.com/x"}]})
++                got (request! self "GET" (str "/semantic/properties/" (get-in created [:body :uuid])) nil)]
++          (is (= 201 (:status created)) (str (:body created)))
++          (let [property (entity conn (uuid (get-in created [:body :uuid])))
++                choices (get-in created [:body :choices])
++                blocks-of (fn [uuids] (mapv #(entity conn (uuid %)) uuids))
++                choice-blocks (blocks-of (map :uuid choices))
++                orders (mapv :block/order choice-blocks)]
++            (is (= ["Plan" "Build" "Ship"] (mapv :title choices)) "titles are trimmed and kept in the order given")
++            (is (= 3 (count (distinct (keep :uuid choices)))) "each choice has its own UUID")
++            (is (every? #(= #{(:db/id property)} (set (map :db/id (:block/closed-value-property %)))) choice-blocks)
++                "each is a closed value of the property")
++            (is (every? #(= (:db/id property) (:db/id (:block/parent %))) choice-blocks)
++                "and a child of it")
++            (is (= 3 (count (distinct orders))) "order keys are distinct")
++            (is (= orders (sort orders)) "and increase in the order given")
++            (is (= ["Plan" "Build" "Ship"]
++                   (mapv :block/title (db-property/scoped-closed-values property (entity conn (first blocks)))))
++                "the app's picker lists them in order")
++            (is (= 200 (:status got)) (str (:body got)))
++            (is (= ["Plan" "Build" "Ship"] (mapv :title (get-in got [:body :choices]))))
++            (is (= {:type "emoji" :id "memo"} (:icon (first (get-in got [:body :choices])))))
++            (is (= {:type "tabler-icon" :id "hammer"} (:icon (second (get-in got [:body :choices])))))
++            (is (= "Scoping" (:description (first (get-in got [:body :choices]))))))
++          (is (= 201 (:status numbers)) (str (:body numbers)))
++          (is (= [1 2.5 3] (mapv :value (get-in numbers [:body :choices])))
++              "a number property's choices are numbers, given as text or as a number")
++          (is (= 201 (:status urls)) (str (:body urls)))
++          (is (= ["https://b.example.com" "https://c.example.com/x"]
++                 (choice-titles conn (keyword (get-in urls [:body :ident]))))
++              "a URL property's choices are its URLs"))))))
++
++(deftest choices-add-returns-uuid-and-unique-key-test
++  ;; Upstream keys a new choice after the property's own last choice. 200 blocks keyed after that
++  ;; key (the 0008 shape) mean that key is already held, so the handler must take the next key
++  ;; after the graph's max instead.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id status quadrant]}]
++        (p/let [keys (db-order/gen-n-keys 200 "a2" nil :max-key-atom (atom nil))
++                _ (d/transact! conn (map-indexed (fn [index order]
++                                                   {:block/uuid (random-uuid) :block/title (str "Filler " index)
++                                                    :block/page [:block/uuid page-id]
++                                                    :block/parent [:block/uuid page-id]
++                                                    :block/order order
++                                                    :block/created-at 1 :block/updated-at 1})
++                                                 keys))
++                added (choices! self status {:add [{:title "Proposal"} {:title "Review"}]})
++                proposal (choice-uuid conn status "Proposal")
++                review (choice-uuid conn status "Review")]
++          (is (= 200 (:status added)) (str (:body added)))
++          (is (= ["Active" "Done" "Backlog" "Proposal" "Review"] (mapv :title (get-in added [:body :choices])))
++              "the new choices are ordered after the existing ones")
++          (is (= [(str proposal) (str review)] (mapv :uuid (drop 3 (get-in added [:body :choices]))))
++              "the response gives each new choice's UUID")
++          (is (some? (choice-uuid conn quadrant "Proposal")) "quadrant's Proposal is no duplicate")
++          (doseq [id [proposal review]]
++            (let [order (:block/order (entity conn id))]
++              (is (= 1 (count (d/datoms @conn :avet :block/order order)))
++                  (str "the key " order " is held by no other block"))))
++          (is (neg? (compare (:block/order (entity conn proposal)) (:block/order (entity conn review))))))))))
++
++(deftest choices-update-and-order-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status]}]
++        (let [active (choice-uuid conn status "Active")
++              done-id (choice-uuid conn status "Done")]
++          (p/let [updated (choices! self status
++                                    {:update [{:choice "active" :title "In progress"}
++                                              {:choice (str done-id) :icon nil :description "Finished"}
++                                              {:choice "Backlog" :icon {:type "tabler-icon" :id "inbox"}}]})
++                  after-update (choice-titles conn status)
++                  ordered (choices! self status {:add [{:title "Proposal"}]
++                                                 :order ["proposal" "Backlog" (str done-id) "In progress"]})
++                  got (request! self "GET" (property-path status) nil)]
++            (is (= 200 (:status updated)) (str (:body updated)))
++            (is (= ["In progress" "Done" "Backlog"] after-update) "a rename keeps the choice's place")
++            (is (= active (choice-uuid conn status "In progress")) "and its UUID")
++            (is (= {:type :emoji :id "rocket"} (:logseq.property/icon (entity conn active)))
++                "a rename without an icon keeps the icon")
++            (is (nil? (:logseq.property/icon (entity conn done-id))) "icon null clears it")
++            (is (= "Finished" (some-> (entity conn done-id) :logseq.property/description db-property/property-value-content)))
++            (is (= {:type :tabler-icon :id "inbox"} (:logseq.property/icon (entity conn (choice-uuid conn status "Backlog")))))
++            (is (= 200 (:status ordered)) (str (:body ordered)))
++            (is (= ["Proposal" "Backlog" "Done" "In progress"] (mapv :title (get-in ordered [:body :choices])))
++                "order may name a choice added in the same call")
++            (is (= ["Proposal" "Backlog" "Done" "In progress"] (mapv :title (get-in got [:body :choices]))))
++            (is (= ["Proposal" "Backlog" "Done" "In progress"] (choice-titles conn status)))
++            (let [orders (map #(:block/order (entity conn (uuid (:uuid %)))) (get-in got [:body :choices]))]
++              (is (every? #(= 1 (count (d/datoms @conn :avet :block/order %))) orders)
++                  "every reordered choice has a key no other block holds"))))))))
++
++(deftest choices-rename-frees-its-title-test
++  ;; A title is judged against the choices as the call leaves them: a renamed choice's old title
++  ;; may be added back in the same call.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status]}]
++        (let [done-id (choice-uuid conn status "Done")]
++          (p/let [response (choices! self status {:update [{:choice "Done" :title "Closed"}] :add [{:title "Done"}]})]
++            (is (= 200 (:status response)) (str (:body response)))
++            (is (= ["Active" "Closed" "Backlog" "Done"] (choice-titles conn status)))
++            (is (= done-id (choice-uuid conn status "Closed")) "the renamed choice keeps its UUID")))))))
++
++(deftest choices-update-number-and-url-test
++  ;; The other choice types go through the same update path: a number choice is renamed to a
++  ;; number, a URL choice to a URL.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self score site]}]
++        (p/let [number (choices! self score {:update [{:choice "1" :title "10"}] :add [{:title "2"}]})
++                url (choices! self site {:update [{:choice "https://a.example.com" :title "https://z.example.com"}]})]
++          (is (= 200 (:status number)) (str (:body number)))
++          (is (= [10 2] (mapv :value (get-in number [:body :choices]))))
++          (is (= 200 (:status url)) (str (:body url)))
++          (is (= ["https://z.example.com"] (choice-titles conn site))))))))
++
++(deftest choices-refusals-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status quadrant score site phase grade for-client]}]
++        (let [before (fn [] (mapv #(choice-titles conn %) [status quadrant score site phase grade]))
++              initial (before)
++              decoy (choice-uuid conn quadrant "Active")]
++          (p/let [dup-existing (choices! self status {:add [{:title "Proposal"} {:title "Review"} {:title "active"}]})
++                  dup-request (choices! self status {:add [{:title "Paused"} {:title "PAUSED"}]})
++                  dup-rename (choices! self status {:update [{:choice "Done" :title "ACTIVE"}]})
++                  dup-add-rename (choices! self status {:update [{:choice "Done" :title "Closed"}] :add [{:title "closed"}]})
++                  unknown (choices! self status {:update [{:choice "Active" :title "Live"} {:choice "Foo" :title "Bar"}]})
++                  other-property (choices! self status {:update [{:choice (str decoy) :title "Live"}]})
++                  twice (choices! self status {:update [{:choice "Active" :title "Live"} {:choice "active" :icon nil}]})
++                  nothing (choices! self status {:update [{:choice "Done"}]})
++                  missing (choices! self status {:order ["Active"]})
++                  repeated (choices! self status {:order ["Active" "Done" "Backlog" "active"]})
++                  order-unknown (choices! self status {:order ["Active" "Foo" "Done" "Backlog"]})
++                  not-number (choices! self score {:add [{:title "abc"} {:title "Infinity"} {:title "2"}]})
++                  number-dup (choices! self score {:add [{:title "1.0"} {:title "2"} {:title 2}]})
++                  not-url (choices! self site {:add [{:title "not a url"}]})
++                  node (choices! self for-client {:add [{:title "Acme"}]})
++                  bad-icons (choices! self status {:add [{:title "A" :icon {:type "emoji" :id " "}}
++                                                         {:title "B" :icon {:type "image" :id "x"}}
++                                                         {:title "C" :icon "rocket"}]})
++                  blank (choices! self status {:add [{:title " "} {:description "no title"}]})
++                  bad-description (choices! self status {:add [{:title "A" :description " "} {:title "B" :description 3}]})
++                  bad-update (choices! self score {:update [{:choice "1" :title "x"}]})
++                  bad-update-icon (choices! self status {:update [{:choice "Done" :icon {:type "emoji"}}]})
++                  not-objects (choices! self status {:add ["Proposal"] :update ["Done"]})
++                  mixed (choices! self status {:order ["Foo"] :update [{:choice "Foo" :title "x"}] :add [{:title " "}]})
++                  create-both (request! self "POST" "/semantic/properties"
++                                        {:title "partner" :type "node" :classes ["Clinet"] :choices [{:title "A"}]})
++                  empty-choices (choices! self status {})
++                  unknown-field (choices! self status {:remove ["Done"]})
++                  not-list (choices! self status {:add {:title "X"}})
++                  to-node (request! self "PATCH" (property-path grade) {:type "node" :choices {:add [{:title "A"}]}})
++                  from-node (request! self "PATCH" (property-path for-client) {:type "default" :choices {:add [{:title "A"}]}})
++                  create-dup (request! self "POST" "/semantic/properties"
++                                       {:title "level" :choices [{:title "Low"} {:title "low"}]})
++                  create-type (request! self "POST" "/semantic/properties"
++                                        {:title "flag" :type "checkbox" :choices [{:title "Yes"}]})
++                  create-not-list (request! self "POST" "/semantic/properties"
++                                            {:title "tier" :choices {:add [{:title "Gold"}]}})]
++            (testing "a title already a choice, ignoring case, in the graph or the request"
++              (is (= 400 (:status dup-existing)) (str (:body dup-existing)))
++              (is (= "choices.add 2: \"active\" is already a choice on project-status" (get-in dup-existing [:body :error])))
++              (is (= "choices.add 1: \"PAUSED\" is already given in choices.add 0" (get-in dup-request [:body :error])))
++              (is (= "choices.update 0: \"ACTIVE\" is already a choice on project-status" (get-in dup-rename [:body :error])))
++              (is (= "choices.add 0: \"closed\" is already given in choices.update 0" (get-in dup-add-rename [:body :error]))))
++            (testing "a choice reference resolves only among the property's own choices"
++              (is (= "choices.update 1: no choice \"Foo\" on project-status" (get-in unknown [:body :error])))
++              (is (= (str "choices.update 0: no choice \"" decoy "\" on project-status") (get-in other-property [:body :error])))
++              (is (= "choices.update 1: \"Active\" is already updated in choices.update 0" (get-in twice [:body :error])))
++              (is (= "choices.update 0: give title, icon or description" (get-in nothing [:body :error]))))
++            (testing "order names every choice once"
++              (is (= "choices.order: missing \"Done\", \"Backlog\"" (get-in missing [:body :error])))
++              (is (= "choices.order 3: \"Active\" is listed twice" (get-in repeated [:body :error])))
++              (is (= "choices.order 1: no choice \"Foo\" on project-status" (get-in order-unknown [:body :error]))))
++            (testing "a title the property's type can't hold"
++              (is (= "choices.add 0: \"abc\" is not a number; choices.add 1: \"Infinity\" is not a number"
++                     (get-in not-number [:body :error])))
++              (is (= "choices.add 0: \"1.0\" is already a choice on score; choices.add 2: \"2\" is already given in choices.add 1"
++                     (get-in number-dup [:body :error]))
++                  "a number property's choices compare as numbers")
++              (is (= "choices.add 0: \"not a url\" is not a URL" (get-in not-url [:body :error])))
++              (is (= "choices: for-client is a node property and can't have choices" (get-in node [:body :error])))
++              (is (= "choices: flag is a checkbox property and can't have choices" (get-in create-type [:body :error]))))
++            (testing "icons, titles and shapes"
++              (is (= (str "choices.add 0: icon needs type emoji or tabler-icon and an id; "
++                          "choices.add 1: icon needs type emoji or tabler-icon and an id; "
++                          "choices.add 2: icon needs type emoji or tabler-icon and an id")
++                     (get-in bad-icons [:body :error])))
++              (is (= "choices.add 0: give a title; choices.add 1: give a title" (get-in blank [:body :error])))
++              (is (= (str "choices.add 0: description must be non-blank text; "
++                          "choices.add 1: description must be non-blank text")
++                     (get-in bad-description [:body :error])))
++              (is (= "choices.update 0: \"x\" is not a number" (get-in bad-update [:body :error])))
++              (is (= "choices.update 0: icon needs type emoji or tabler-icon and an id" (get-in bad-update-icon [:body :error])))
++              (is (= (str "choices.add 0: give {title, icon?, description?}; "
++                          "choices.update 0: give {choice, title?, icon?, description?}")
++                     (get-in not-objects [:body :error])))
++              (is (= (str "choices.add 0: give a title; choices.update 0: no choice \"Foo\" on project-status; "
++                          "choices.order 0: no choice \"Foo\" on project-status; "
++                          "choices.order: missing \"Active\", \"Done\", \"Backlog\"")
++                     (get-in mixed [:body :error]))
++                  "refusals are named add, update, then order")
++              (is (= "classes 0: no tag \"Clinet\"; choices: partner is a node property and can't have choices"
++                     (get-in create-both [:body :error])))
++              (is (= "choices: give add, update or order" (get-in empty-choices [:body :error])))
++              (is (= "choices: give add, update or order" (get-in unknown-field [:body :error])))
++              (is (= "choices.add: give a list of choices" (get-in not-list [:body :error])))
++              (is (= "choices: give a list of choices" (get-in create-not-list [:body :error]))))
++            (testing "a type change is judged on the new type"
++              (is (= "choices: grade is a node property and can't have choices" (get-in to-node [:body :error])))
++              (is (= :default (:logseq.property/type (d/entity @conn grade))) "the refused type change isn't written")
++              (is (= 200 (:status from-node)) (str (:body from-node)))
++              (is (= ["A"] (choice-titles conn for-client))))
++            (is (= "choices 1: \"low\" is already given in choices 0" (get-in create-dup [:body :error])))
++            (doseq [response [dup-existing dup-request dup-rename dup-add-rename unknown other-property twice
++                              nothing missing repeated order-unknown not-number number-dup not-url node bad-icons blank
++                              bad-description bad-update bad-update-icon not-objects mixed create-both empty-choices unknown-field not-list to-node create-dup create-type create-not-list]]
++              (is (= 400 (:status response)) (str (:body response))))
++            (is (= initial (before)) "no refused call changed any choices")
++            (is (every? #(empty? (d/datoms @conn :avet :block/title %)) ["level" "flag" "tier" "partner"])
++                "a refused create writes nothing")))))))
++
++(deftest choices-refused-on-e2ee-graph-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status for-client]}]
++        (let [package (ldb/write-transit-str [(js/Uint8Array. 12) (js/Uint8Array. 16)])]
++          (p/let [refused (request! self "PATCH" (str (property-path status) "?graph-e2ee=true")
++                                    {:choices {:add [{:title "Proposal"}]}})
++                  created (request! self "POST" "/semantic/properties?graph-e2ee=true"
++                                    {:title package :name package :choices [{:title "Plain"}]})
++                  classes (request! self "PATCH" (str (property-path for-client) "?graph-e2ee=true")
++                                    {:classes {:set ["Client"]}})]
++            (is (= 400 (:status refused)) (str (:body refused)))
++            (is (= "choices: not on an E2EE graph, where choice titles would be stored as plain text"
++                   (get-in refused [:body :error])))
++            (is (= ["Active" "Done" "Backlog"] (choice-titles conn status)))
++            (is (= 400 (:status created)) (str (:body created)))
++            (is (empty? (d/datoms @conn :avet :block/title package)) "the property isn't created")
++            (is (= 200 (:status classes)) (str "classes carry no text and are allowed: " (:body classes)))))))))
++
++(deftest choices-write-is-one-transaction-test
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status]}]
++        (let [client (d/conn-from-db @conn)
++              reports (atom [])
++              listen! #(d/listen! conn ::reports
++                                  (fn [{:keys [db-after db-before tx-data] :as report}]
++                                    (when (seq tx-data)
++                                      (swap! reports conj (assoc report :normalized
++                                                                 (db-normalize/normalize-tx-data db-after db-before tx-data))))))
++              take! (fn [] (d/unlisten! conn ::reports) (let [r @reports] (reset! reports []) r))]
++          (listen!)
++          (p/let [created (request! self "POST" "/semantic/properties"
++                                    {:title "stage" :choices [{:title "Plan" :description "Scoping"} {:title "Build"}]})
++                  created-reports (take!)
++                  _ (listen!)
++                  updated (choices! self status {:update [{:choice "Done" :title "Closed"}]
++                                                 :add [{:title "Proposal"}]
++                                                 :order ["Proposal" "Active" "Closed" "Backlog"]})
++                  updated-reports (take!)
++                  _ (doseq [{:keys [normalized]} (concat created-reports updated-reports)]
++                      (d/transact! client normalized))
++                  stage (keyword (get-in created [:body :ident]))
++                  shape (fn [db property]
++                          (mapv (juxt :block/uuid :block/title :block/order)
++                                (sort-by :block/order (:block/_closed-value-property (d/entity db property)))))]
++            (is (= 201 (:status created)) (str (:body created)))
++            (is (= 1 (count created-reports)) "createProperty with choices is one transaction")
++            (is (= 1 (count (distinct (map :tx (mapcat :tx-data created-reports))))) "one tx id")
++            (is (= 200 (:status updated)) (str (:body updated)))
++            (is (= 1 (count updated-reports)) "update, add and order are one transaction")
++            (is (= 1 (count (distinct (map :tx (mapcat :tx-data updated-reports))))) "one tx id")
++            (is (= ["Proposal" "Active" "Closed" "Backlog"] (choice-titles conn status)))
++            (is (= (shape @conn stage) (shape @client stage)) "a client replaying the log has the same choices")
++            (is (= (shape @conn status) (shape @client status)) "in the same order")))))))
++
++(deftest choices-read-back-test
++  ;; After a choices write the property is read back; a title or an order that isn't stored as
++  ;; asked answers 500, naming it, rather than success.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn status]}]
++        (let [verify! #'semantic/verify-property-schema!
++              property-uuid (:block/uuid (d/entity @conn status))
++              [active done-id backlog] (map #(choice-uuid conn status %) ["Active" "Done" "Backlog"])
++              thrown (fn [expected]
++                       (try (verify! @conn property-uuid expected) nil
++                            (catch :default e (ex-message e))))]
++          (is (nil? (thrown {:titles {active "Active"} :order [active done-id backlog]})) "what was asked is stored")
++          (is (= "the write did not store what was asked: choices missing \"Live\""
++                 (thrown {:titles {active "Live" done-id "Done"}})))
++          (is (= "the write did not store what was asked: choices not in the order asked: \"Active\", \"Done\", \"Backlog\""
++                 (thrown {:order [backlog active done-id]}))))))))
++
++(deftest choices-write-is-read-back-test
++  ;; The handlers read the property back after the write. A listener that moves the choice titled
++  ;; `title` (one of the property's own) first as soon as the write lands stands in for an outliner that didn't store the order
++  ;; asked: createProperty and updateProperty must answer 500 naming it, not success.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status]}]
++        (let [tamper! (fn [property-title title]
++                        (d/listen! conn ::tamper
++                                   (fn [{:keys [db-after tx-data]}]
++                                     (when-let [choice (some->> (d/datoms db-after :avet :block/title title)
++                                                                (map #(d/entity db-after (:e %)))
++                                                                (filter #(= property-title (:block/title (:block/parent %))))
++                                                                (filter :block/closed-value-property)
++                                                                first)]
++                                       (when (seq tx-data)
++                                         (d/unlisten! conn ::tamper)
++                                         (d/transact! conn [[:db/add (:db/id choice) :block/order "0"]]))))))]
++          (tamper! "stage" "Build")
++          (p/let [created (request! self "POST" "/semantic/properties"
++                                    {:title "stage" :choices [{:title "Plan"} {:title "Build"}]})
++                  _ (tamper! "project-status" "Proposal")
++                  updated (choices! self status {:add [{:title "Proposal"}]})]
++            (is (= 500 (:status created)) (str (:body created)))
++            (is (= "the write did not store what was asked: choices not in the order asked: \"Build\", \"Plan\""
++                   (get-in created [:body :error])))
++            (is (= 500 (:status updated)) (str (:body updated)))
++            (is (= (str "the write did not store what was asked: choices not in the order asked: "
++                        "\"Proposal\", \"Active\", \"Done\", \"Backlog\"")
++                   (get-in updated [:body :error])))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 4d9e7d2..e1c9ab9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
