@@ -1,0 +1,108 @@
+diff --git a/deps/db-sync/test/logseq/db_sync/normalize_test.cljs b/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
+index 8cc241e21c..d267e479b4 100644
+--- a/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
+@@ -412,3 +412,36 @@
+                   "\nnormalized=" (pr-str normalized)
+                   "\nexpected-count=" (count expected)
+                   " actual-count=" (count actual))))))))
++
++(deftest normalize-tx-data-replays-batch-that-re-adds-and-retracts-a-value-test
++  (testing "a batch that resets two classes' extends to another class replays to the same db"
++    ;; Each class: reset extends to Root, then add Org and drop the now-redundant Root. When the
++    ;; batch replayed its temp conn's datoms with their own tx ids, the second class's last Root
++    ;; retract kept an earlier tx id than the add it undid, and normalize-tx-data, which keeps one
++    ;; change per [e a v tx] and sorts by tx, logged "retract Root, then add Root".
++    (let [conn (db-test/create-conn-with-blocks
++                {:classes {:Org {}
++                           :Business {}
++                           :Department {}}})
++          db-before @conn
++          ident (fn [title] (:db/ident (ldb/get-case-page db-before title)))
++          classes (mapv ident ["Business" "Department"])
++          org (ident "Org")
++          reports (atom [])
++          _ (d/listen! conn ::capture #(swap! reports conj %))
++          _ (ldb/batch-transact-with-temp-conn!
++             conn {:outliner-op :batch-set-property}
++             (fn [temp-conn]
++               (doseq [ident classes]
++                 (d/transact! temp-conn [[:db/retract ident :logseq.property.class/extends]
++                                         [:db/add ident :logseq.property.class/extends :logseq.class/Root]])
++                 (d/transact! temp-conn [[:db/add ident :logseq.property.class/extends org]
++                                         [:db/retract ident :logseq.property.class/extends :logseq.class/Root]]))))
++          _ (d/unlisten! conn ::capture)
++          {:keys [db-after tx-data]} (first @reports)
++          replayed (:db-after (d/with db-before (db-normalize/normalize-tx-data db-after db-before tx-data)))
++          extends (fn [db] (mapv #(set (map :db/ident (:logseq.property.class/extends (d/entity db %)))) classes))]
++      (is (= 1 (count @reports)))
++      (is (= [#{:logseq.class/Root} #{:logseq.class/Root}] (extends db-before)))
++      (is (= [#{org} #{org}] (extends db-after)))
++      (is (= (extends db-after) (extends replayed))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+index fe61eef73b..76208b0671 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+@@ -11,6 +11,7 @@
+             [logseq.db-sync.worker.dispatch :as dispatch]
+             [logseq.db-sync.worker.handler.index :as index-handler]
+             [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.common.normalize :as db-normalize]
+             [logseq.db.sqlite.export :as sqlite-export]
+             [logseq.outliner.property :as outliner-property]
+             [promesa.core :as p]))
+@@ -470,3 +471,35 @@
+           (is (= 201 (:status batch)))
+           (is (= ["#Unknown"] (:escaped batched)) "batch inserts escape and report like single inserts")
+           (is (= "See \\#Unknown" (:block/title (entity conn (:uuid batched))))))))))
++
++(deftest batch-reset-of-two-tags-extends-syncs-to-clients-test
++  ;; A reset removes extends (Logseq puts Root back), then adds the new parent, which drops Root as
++  ;; redundant. Clients replay the logged, normalized tx-data and must end up as the server did.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [tag! (fn [title] (p/let [r (request! self "POST" "/semantic/tags" {:title title})]
++                                   (get-in r [:body :uuid])))
++                thing (tag! "Thing")
++                org (tag! "Org")
++                _ (request! self "PUT" (str "/semantic/blocks/" org "/properties/logseq.property.class%2Fextends")
++                            {:value thing})
++                business (tag! "Business")
++                department (tag! "Department")
++                client (d/conn-from-db @conn)
++                logged (atom [])
++                _ (d/listen! conn ::log (fn [{:keys [db-after db-before tx-data]}]
++                                          (swap! logged conj (db-normalize/normalize-tx-data db-after db-before tx-data))))
++                response (request! self "POST" "/semantic/block-properties/batch-set"
++                                   {:isResetExistingValues true
++                                    :entries (mapv (fn [id] {:block-id id :property-id "logseq.property.class/extends"
++                                                             :value [org]})
++                                                   [business department])})
++                _ (d/unlisten! conn ::log)
++                _ (doseq [tx-data @logged] (d/transact! client tx-data))
++                extends (fn [db] (mapv (fn [id] (set (map :block/title (:logseq.property.class/extends
++                                                                         (d/entity db [:block/uuid (uuid id)])))))
++                                       [business department]))]
++          (is (= 200 (:status response)))
++          (is (= [#{"Org"} #{"Org"}] (extends @conn)))
++          (is (= (extends @conn) (extends @client))))))))
+diff --git a/deps/db/src/logseq/db.cljs b/deps/db/src/logseq/db.cljs
+index c23ffc7ca2..de19a9c6fa 100644
+--- a/deps/db/src/logseq/db.cljs
++++ b/deps/db/src/logseq/db.cljs
+@@ -297,8 +297,12 @@
+       (vreset! *complete? true)
+       (let [tx-data @*batch-tx-data]
+         (when (and @*complete? (seq tx-data))
+-          ;; transact tx-data to `conn` and validate db
+-          (transact! conn tx-data (transform-tx-meta tx-meta))))
++          ;; transact tx-data to `conn` and validate db. The temp conn's datoms carry its own tx
++          ;; ids; replay them as plain ops so the batch is one transaction with one tx id, as
++          ;; sync's normalize-tx-data expects of a tx report.
++          (transact! conn
++                     (mapv (fn [d] [(if (:added d) :db/add :db/retract) (:e d) (:a d) (:v d)]) tx-data)
++                     (transform-tx-meta tx-meta))))
+       (finally
+         (d/unlisten! temp-conn ::temp-conn-batch-tx)
+         (reset! temp-conn nil)

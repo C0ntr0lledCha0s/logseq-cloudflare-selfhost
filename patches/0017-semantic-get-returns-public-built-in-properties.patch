@@ -1,0 +1,161 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 80383938b7..b3bd63ccb5 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -104,8 +104,9 @@
+    :size (:logseq.property.asset/size entity)
+    :checksum (:logseq.property.asset/checksum entity)})
+ 
+-;; getPage and getBlock also return the entity's tags and its user and library property values
+-;; (e.g. schema.property/genre). Built-in logseq.* properties and DB attributes are left out.
++;; getPage and getBlock also return the entity's tags and its property values: user and library
++;; properties (e.g. schema.property/genre) and the built-in ones the editor shows, such as a task's
++;; status, priority and deadline. Hidden built-ins and DB attributes are left out.
+ (defn- property-value-response
+   "Text and number values (value blocks) become their content. References to pages, nodes and
+   choices become {uuid title ident?}."
+@@ -118,9 +119,17 @@
+                    :title (db-property/property-value-content value)}
+             (:db/ident value) (assoc :ident (entity-ident value)))))
+ 
++(defn- shown-property?
++  "Whether a property value is shown in a response: a user or library property, or a built-in
++  one Logseq marks public, as the editor shows it."
++  [k]
++  (or (not (db-property/internal-property? k))
++      (and (db-property/logseq-property? k)
++           (contains? db-property/public-built-in-properties k))))
++
+ (defn- entity-properties-response [db entity]
+   (->> (db-property/properties entity)
+-       (remove (fn [[k _]] (db-property/internal-property? k)))
++       (filter (fn [[k _]] (shown-property? k)))
+        (sort-by (fn [[k _]] (str k)))
+        (mapv (fn [[k v]]
+                (let [property (d/entity db k)]
+@@ -333,7 +342,9 @@
+ (def ^:private max-outline-blocks 2000)
+ 
+ (defn- outline-property-lines [db entity indent]
+-  (for [{:keys [title value]} (entity-properties-response db entity)
++  (for [{:keys [ident title value]} (entity-properties-response db entity)
++        ;; A block's status is its line's [Status] marker.
++        :when (not= "logseq.property/status" ident)
+         :let [values (if (vector? value) value [value])
+               text (string/join ", " (map #(if (map? %) (page-ref/->page-ref (:title %)) (str %)) values))]]
+     (str indent "  " title ":: " text)))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 3e8088a03d..7f4a34e860 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -108,19 +108,19 @@
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+    "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree."]
+-   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and user and library block properties as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
++   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+    "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order: orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix) and pages-without-tags (non-journal user pages with no tag). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+-   "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
++   "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
+-   "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and user and library property values but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
++   "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
+    "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+-   "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and user and library property values, without loading an unbounded tree."]
++   "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
+    "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
+    "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
+@@ -570,7 +570,7 @@
+                                              {:type "object"
+                                               :properties {:tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
+                                                            :properties {:type "array"
+-                                                                        :description "User and library property values. Built-in logseq.* properties are omitted."
++                                                                        :description "User and library property values, and the built-in ones the editor shows, such as Status, Priority and Deadline. Hidden built-ins are omitted."
+                                                                         :items {:$ref "#/components/schemas/EntityProperty"}}}}]}
+                :PageResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}]}
+                :PageDetailResponse {:allOf [{:$ref "#/components/schemas/BlockDetailResponse"}]}
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index 801c268ae7..2fb5c14816 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -898,6 +898,7 @@
+                    author-id (random-uuid)
+                    page-id (random-uuid)
+                    block-id (random-uuid)
++                   task-id (random-uuid)
+                    fantasy-id (random-uuid)
+                    mystery-id (random-uuid)
+                    {:keys [init-tx block-props-tx]}
+@@ -917,7 +918,12 @@
+                                                   :user.property/author [:block/uuid author-id]
+                                                   :user.property/pages 400}}
+                         :blocks [{:block/title "A note" :block/uuid block-id :build/keep-uuid? true
+-                                  :build/properties {:user.property/genre #{[:block/uuid mystery-id]}}}]}]})
++                                  :build/properties {:user.property/genre #{[:block/uuid mystery-id]}}}
++                                 {:block/title "Ship it" :block/uuid task-id :build/keep-uuid? true
++                                  :build/tags [:logseq.class/Task]
++                                  :build/properties {:logseq.property/status :logseq.property/status.done
++                                                     :logseq.property/priority :logseq.property/priority.high
++                                                     :logseq.property/deadline 1793800000000}}]}]})
+                    _ (d/transact! conn init-tx)
+                    _ (d/transact! conn block-props-tx)
+                    self #js {:sql sql :conn conn :schema-ready true}]
+@@ -927,13 +933,15 @@
+                             block-response (sync-handler/handle-http
+                                             self (semantic-json-request (str "/semantic/blocks/" block-id "?graph-id=graph-1") "GET" nil))
+                             block-body (json-body block-response)
++                            task-body (json-body (sync-handler/handle-http
++                                                  self (semantic-json-request (str "/semantic/blocks/" task-id "?graph-id=graph-1") "GET" nil)))
+                             by-ident (fn [body] (into {} (map (juxt :ident identity)) (:properties body)))
+                             page-props (by-ident page-body)]
+                      (is (= [200 200] [(.-status page-response) (.-status block-response)]))
+                      (is (= "Sunlit Man" (:title page-body)))
+                      (is (some #(= "user.class/Book" (:ident %)) (:tags page-body)) "page tags include Book")
+                      (is (= #{"user.property/author" "user.property/genre" "user.property/pages"} (set (keys page-props)))
+-                         "only user properties, no built-ins")
++                         "user properties, and no hidden built-ins")
+                      (is (= [{:uuid (str fantasy-id) :title "Fantasy"}] (get-in page-props ["user.property/genre" :value]))
+                          "choices are returned as references")
+                      (is (= {:uuid (str author-id) :title "Brandon Sanderson"}
+@@ -941,7 +949,13 @@
+                      (is (= "node" (get-in page-props ["user.property/author" :type])))
+                      (is (= 400 (get-in page-props ["user.property/pages" :value])))
+                      (is (= ["Mystery"] (mapv :title (get-in (by-ident block-body) ["user.property/genre" :value]))))
+-                     (is (= (str page-id) (:page-id block-body))))
++                     (is (= (str page-id) (:page-id block-body)))
++                     (is (= {"logseq.property/deadline" 1793800000000
++                             "logseq.property/priority" {:title "High" :ident "logseq.property/priority.high"}
++                             "logseq.property/status" {:title "Done" :ident "logseq.property/status.done"}}
++                            (update-vals (by-ident task-body)
++                                         #(let [v (:value %)] (if (map? v) (select-keys v [:title :ident]) v))))
++                         "built-in properties the editor shows, such as a task's status, are returned"))
+                    (p/then (fn [] (done)))
+                    (p/catch (fn [error]
+                               (is false (str error))
+@@ -971,7 +985,8 @@
+                                  :build/children [{:block/title "Nested note"
+                                                    :build/properties {:user.property/genre #{[:block/uuid fantasy-id]}}}]}
+                                 {:block/title "Finish the book"
+-                                 :build/properties {:logseq.property/status :logseq.property/status.doing}}]}]})
++                                 :build/properties {:logseq.property/status :logseq.property/status.doing
++                                                    :logseq.property/priority :logseq.property/priority.high}}]}]})
+                    _ (d/transact! conn init-tx)
+                    _ (d/transact! conn block-props-tx)
+                    self #js {:sql sql :conn conn :schema-ready true}]
+@@ -988,7 +1003,8 @@
+                      (is (= (string/join "\n" ["- Written by [[Brandon Sanderson]]"
+                                                 "  - Nested note"
+                                                 "    genre:: [[Fantasy]]"
+-                                                "- [Doing] Finish the book"])
++                                                "- [Doing] Finish the book"
++                                                "  Priority:: [[High]]"])
+                             (:markdown body)))
+                      (is (= 3 (:block-count body)))
+                      (is (false? (:truncated body))))

@@ -62,6 +62,6 @@ else
   echo "note: SMOKE_PAT is not set, so the allow-list was not checked end to end"
 fi
 
-# Upstream's /mcp answered anyone without a token; patch 0017 removes it, so the
+# Upstream's /mcp answered anyone without a token; patch 0020 removes it, so the
 # path falls through to the sync worker's not-found response.
 expect_status upstream-mcp-off 404 -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"

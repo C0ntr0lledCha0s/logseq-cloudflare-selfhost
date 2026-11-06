@@ -5,8 +5,8 @@
 **Goal:** The sync server serves only Logseq users listed in a private secret, `DB_SYNC_ALLOWED_USERS`, failing closed. Upstream's unauthenticated `/mcp` endpoint is removed on both plans.
 
 **Architecture:**
-- **Patch `0016`** filters the two identity functions in upstream's `auth.cljs`.
-- **Patch `0017`** removes the `/mcp` routes from upstream's `entry.mjs`.
+- **Patch `0019`** filters the two identity functions in upstream's `auth.cljs`.
+- **Patch `0020`** removes the `/mcp` routes from upstream's `entry.mjs`.
 - **A new Node module, `scripts/allowed-users.mjs`,** owns the value's format rule, the known-user check (it reads D1 through Cloudflare's HTTP API) and the local user listing.
 - **`deploy.sh`** checks the value, then deploys the code and all three secrets in one `wrangler deploy --secrets-file`.
 
@@ -23,7 +23,7 @@
 
 - **Names, exactly:**
   - the secret is `DB_SYNC_ALLOWED_USERS`;
-  - the patches are `patches/0016-allowed-users.patch` and `patches/0017-remove-upstream-mcp.patch`;
+  - the patches are `patches/0019-allowed-users.patch` and `patches/0020-remove-upstream-mcp.patch`;
   - the log events are `:db-sync/user-not-allowed` (warn) and `:db-sync/allowed-users-malformed` (error);
   - the smoke checks are `jwt-garbage-refused` and `upstream-mcp-off`.
 - **The value's format:**
@@ -78,10 +78,10 @@ These are the inputs the spec implies but no headline test exercises. Each one i
 
 ---
 
-### Task 1: Patch 0016, the allow-list in the sync server, with CI running upstream's tests
+### Task 1: Patch 0019, the allow-list in the sync server, with CI running upstream's tests
 
 **Files:**
-- Create: `patches/0016-allowed-users.patch`. Inside upstream it changes:
+- Create: `patches/0019-allowed-users.patch`. Inside upstream it changes:
   - `deps/db-sync/src/logseq/db_sync/worker/auth.cljs`;
   - a new test file, `deps/db-sync/test/logseq/db_sync/worker_allowed_users_test.cljs`;
   - `deps/db-sync/test/logseq/db_sync/test_runner.cljs` (requires the new namespace);
@@ -151,10 +151,10 @@ These are the inputs the spec implies but no headline test exercises. Each one i
 
 - [ ] **Step 7: Commit.** Message: `feat: refuse Logseq users missing from DB_SYNC_ALLOWED_USERS`.
 
-### Task 2: Patch 0017, remove upstream `/mcp`; drop the Worker Loader on both plans
+### Task 2: Patch 0020, remove upstream `/mcp`; drop the Worker Loader on both plans
 
 **Files:**
-- Create: `patches/0017-remove-upstream-mcp.patch`. It changes only `deps/db-sync/worker/entry.mjs`:
+- Create: `patches/0020-remove-upstream-mcp.patch`. It changes only `deps/db-sync/worker/entry.mjs`:
   - remove the `/mcp`, `/mcp/icon.png`, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp` branches;
   - remove `handleMcp`, `protectedResourceMetadata`, `semanticSpec` and the imports only they used.
   - Keep `semantic_api_tools.mjs` and every other upstream file, because `scripts/vendor-upstream-api.sh` copies `semantic_api_tools.mjs` for the connector.
@@ -174,7 +174,7 @@ These are the inputs the spec implies but no headline test exercises. Each one i
 
 - [ ] **Step 3: Implement the render and smoke changes.** The smoke check is `expect_status upstream-mcp-off 404 -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"`.
 
-- [ ] **Step 4: Make patch 0017** (procedure in Global constraints).
+- [ ] **Step 4: Make patch 0020** (procedure in Global constraints).
   - Confirm `node --check deps/db-sync/worker/entry.mjs` passes.
   - Confirm the build is clean: `pnpm release && pnpm build:api-docs`.
   - Confirm `node --test worker/entry_test.mjs` still passes (it imports helpers, not `entry.mjs`).

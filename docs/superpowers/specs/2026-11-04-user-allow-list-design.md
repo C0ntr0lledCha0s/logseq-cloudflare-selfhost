@@ -83,7 +83,7 @@ Each of these is the designer's call.
 
 ### D1. Enforce inside the sync server, at the two identity functions
 
-A new patch, `patches/0016-allowed-users.patch`, changes `auth.cljs`:
+A new patch, `patches/0019-allowed-users.patch`, changes `auth.cljs`:
 
 - After `auth-claims` has produced claims (verified, or unverified when that flag is on), it returns `nil` unless the claims' `sub` is on the list.
 - `semantic-auth-claims` does the same for the PAT branch, checking the PAT's `user-id`.
@@ -207,7 +207,7 @@ The owner decided this on 2026-11-05. The connector replaces this endpoint. What
 
 The owner accepts losing these. The connector already returns images to Claude as image content through `read_file`.
 
-- **A small patch, `patches/0017-remove-upstream-mcp.patch`, to `deps/db-sync/worker/entry.mjs`,** kept separate from the auth patch, removes the routes `/mcp`, `/mcp/icon.png`, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+- **A small patch, `patches/0020-remove-upstream-mcp.patch`, to `deps/db-sync/worker/entry.mjs`,** kept separate from the auth patch, removes the routes `/mcp`, `/mcp/icon.png`, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
   - Those paths then fall through to the sync worker, which must answer them with its normal not-found response and no MCP work. The builder confirms the status code.
   - Everything else in `entry.mjs` stays as upstream has it.
 - **`render-wrangler.mjs` drops `worker_loaders` on both plans.** The paid plan then differs from Free only in `[limits]`. Nothing else may bind `LOADER`.
