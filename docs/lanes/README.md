@@ -99,8 +99,45 @@ Run `/compound` to capture a lesson from work done outside a lane.
 ## Setting up
 
 1. Copy `.claude/lanes.local.example.json` to `.claude/lanes.local.json` and set the graph alias and issues page title. It is gitignored. Without it, `/lane` uses the only connected graph.
-2. The SessionStart hook (`.claude/hooks/session-start.sh`) installs Node dependencies and reports whether `connector/vendor` exists.
+2. The SessionStart hook (`.claude/hooks/session-start.sh`) installs Node dependencies and reports whether `connector/vendor` exists. It warns when the `clojure` command is missing, because the upstream build and its tests need it.
 3. For connector or patch work, build the vendored API once per container: `scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream`.
+
+### Cloud sessions (claude.ai/code)
+
+A cloud container starts from a fresh clone, so the environment has to bring the toolchain itself. Without it, `scripts/check.sh` skips the connector suite and the upstream tests, and a lane can't see a regression test fail. Set two things on the environment.
+
+**Network access.** Allow `repo.clojars.org`. The upstream build resolves some Clojure dependencies from Clojars, and the default allowlist doesn't include it. The build also needs `repo1.maven.org`, `download.clojure.org`, `github.com` and the npm registry. These are usually allowed already, but check them if the build fails to fetch.
+
+**Setup script.** It runs as root before the session starts. Set the graph alias in the last step to your own. It stays in the environment's settings and never reaches the repo.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. The Clojure CLI (Java and pnpm already come with the image).
+if ! command -v clojure >/dev/null 2>&1; then
+  curl -fsSL https://download.clojure.org/install/linux-install.sh -o /tmp/clojure-install.sh
+  bash /tmp/clojure-install.sh
+fi
+
+cd /home/user/logseq-cloudflare-selfhost   # where cloud containers check the repo out
+
+# 2. Node dependencies for the scripts and the connector.
+npm ci
+npm --prefix connector ci
+
+# 3. Patched upstream, its build, and the vendored API the connector checks need.
+scripts/fetch-upstream.sh .upstream
+scripts/build.sh .upstream
+scripts/vendor-upstream-api.sh .upstream
+
+# 4. The lanes' tracker (gitignored).
+cat > .claude/lanes.local.json <<'JSON'
+{ "graph": "your-graph-alias", "page": "Logseq Connector Issues" }
+JSON
+```
+
+Check a new container with `clojure --version`, `ls connector/vendor/openapi.json .claude/lanes.local.json` and `scripts/check.sh --upstream`. The summary should list the connector tests, typecheck, tools manifest and upstream db-sync tests as `ok`. Only `tofu fmt` may be skipped, and CI runs it.
 
 ## Running a lane by hand
 
