@@ -309,7 +309,7 @@ for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
   if (!open.length || round > MAX_FIX_ROUNDS) break
   log(`Review round ${round}: ${open.length} open finding(s); fixing.`)
   const next = await agent(
-    `Address these open review findings by id. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. Take the cheap should-fix items too. Keep the docs true in the same commit. Run the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
+    `Address these open review findings by id. Stay inside the spec's scope: record anything beyond it in notes as a backlog item rather than building it. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. Take the cheap should-fix items too. Keep the docs true in the same commit. Run the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
     { ...M('implement'), label: `address-review:r${round}`, phase: 'Review', agentType: 'implementer', schema: CHANGE_SCHEMA },
   )
   if (next) open = open.map(f => ({ ...f, fixer_note: ((next.addressed || []).find(a => a.id === f.id) || {}).note }))
@@ -334,6 +334,7 @@ phase('Closeout')
 const closeout = await agent(
   `Prepare the closeout for this feature. Don't push, open a PR or write to Logseq; return the texts.
 - Run scripts/check.sh (add --upstream if patches/ changed) once on HEAD, and report the SHA and summary, skips included.
+- If any findings are still open, start pr_body with "> **Draft:** N review findings are still open" naming the ids, and say the same in logseq_update. The PR should be opened as a draft.
 - pr_title: "feat(<scope>): <what it adds>".
 - pr_body sections: Summary; Design (the chosen approach and why, linking the spec and plan); Changes by stage; Tests (each with its quoted fail-before); Cost on the Free plan; Review (lenses, rounds, findings closed, findings refuted, and "Open review findings — for your call" listing any open id); Docs; Learnings; Retro proposals (not applied); Logseq skill note; Verification (only checks run on the HEAD SHA you report); Live verification.
 - logseq_update: a markdown block tree for item ${brief.issue_number ?? '(no issue)'} on ${PAGE}, in that page's style, led by "**Built ${TODAY}** –".
@@ -343,4 +344,5 @@ Feature:\n${BRIEF}\nSpec: ${spec.path}\nPlan: ${plan.path}\nStages:\n${J(built.m
 )
 
 const status = securityOpen ? 'blocked-security' : !closeout || !closeout.gate_green ? 'needs-human' : open.length ? 'ready-with-open-findings' : 'ready'
-return { status, brief, spec, plan, built, review: { rounds, open, should_fix: review && review.should_fix, nits: review && review.nits, refuted: review && review.refuted }, docs, compound, closeout }
+const followup = open.length ? { open, next_round: (rounds.length ? rounds[rounds.length - 1].round : 0) + 1, pr_draft: true } : null
+return { status, followup, brief, spec, plan, built, review: { rounds, open, should_fix: review && review.should_fix, nits: review && review.nits, refuted: review && review.refuted }, docs, compound, closeout }

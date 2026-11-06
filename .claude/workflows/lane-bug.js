@@ -191,7 +191,7 @@ const BRIEF = J(brief)
 // ---------- investigate ----------
 const LENSES = [
   { key: 'trace', prompt: 'Lens: trace the code path. Follow the call from the tool through the connector, the service binding, the router, the handler and the outliner to the sync log, and find where behaviour first diverges from what is expected.' },
-  { key: 'reproduce', prompt: 'Lens: reproduce. Try to make the bug happen with the existing suites, a scratch test, or the patched upstream in .upstream. Check recent git history in the area. Consider that it may not reproduce, or that a read is hiding a correct write.' },
+  { key: 'reproduce', prompt: 'Lens: reproduce. Try to make the bug happen with the existing suites, a scratch test, or the patched upstream in .upstream. Save a real-handler scratch repro under the session scratchpad at lane-repro/<slug>/ and cite its absolute path in evidence, so the failing-test stage can start from it. Check recent git history in the area. Consider that it may not reproduce, or that a read is hiding a correct write.' },
 ]
 let cause = null
 const investigation = []
@@ -244,7 +244,7 @@ if (cause.layer === 'not_a_bug') {
 // ---------- reproduce ----------
 phase('Reproduce')
 const repro = await agent(
-  `Write the regression test(s) for this bug, and nothing else yet. They must fail on the current code for the reason in the root cause. Quote each failure as fail_before. Cover the class of input, not only the reported instance. Put each test in the suite for its layer (patch -> an upstream test in a new patch; connector -> connector/test; scripts -> scripts/*.test.mjs). If the suite can't run here, write the test anyway, set ran=false and say what is missing. Don't commit yet.\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}`,
+  `Write the regression test(s) for this bug, and nothing else yet. They must fail on the current code for the reason in the root cause. Quote each failure as fail_before. Cover the class of input, not only the reported instance. If the root cause's evidence cites a scratch repro under lane-repro/, start from its setup rather than rebuilding it. Put each test in the suite for its layer (patch -> an upstream test in a new patch; connector -> connector/test; scripts -> scripts/*.test.mjs). If the suite can't run here, write the test anyway, set ran=false and say what is missing. Don't commit yet.\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}`,
   { ...M('implement'), label: 'reproduce', agentType: 'implementer', schema: REPRO_SCHEMA },
 )
 if (!repro) return { status: 'blocked', stage: 'reproduce', brief, cause }
@@ -254,7 +254,7 @@ if (!repro.ran) log('Warning: the regression test was not run here; its fail-bef
 // ---------- fix ----------
 phase('Fix')
 let change = await agent(
-  `Fix this bug with the smallest change that meets the acceptance criteria and makes the regression test(s) pass. Update the tool's description, connector_help and manifest in the same change if behaviour visible to Claude changed. Run the gate, then commit the test and the fix together as "fix(<scope>): <what changed>", with a body giving the cause, the fix and what the tests prove.${TRAILER}\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}\nRegression tests:\n${J(repro)}`,
+  `Fix this bug with the smallest change that meets the acceptance criteria and makes the regression test(s) pass. Stay inside the issue's defect class. If you find a neighbouring class, don't fix it: list it in notes as out of scope, and the docs stage records it as a backlog item. A review finding widens the scope only when it is about this change's own behaviour. Update the tool's description, connector_help and manifest in the same change if behaviour visible to Claude changed. Run the gate, then commit the test and the fix together as "fix(<scope>): <what changed>", with a body giving the cause, the fix and what the tests prove.${TRAILER}\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}\nRegression tests:\n${J(repro)}`,
   { ...M('implement'), label: 'fix', agentType: 'implementer', schema: CHANGE_SCHEMA },
 )
 if (!change) return { status: 'blocked', stage: 'fix', brief, cause, repro }
@@ -280,7 +280,7 @@ for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
   log(`Review round ${round}: ${open.length} open finding(s) (${open.map(f => f.id).join(', ')}); fixing.`)
   phase('Fix')
   const next = await agent(
-    `Address these open review findings by id. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. Take the cheap should-fix items too. Keep the docs true in the same commit. Run the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nBrief:\n${BRIEF}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
+    `Address these open review findings by id. Stay inside the issue's defect class. If you find a neighbouring class, don't fix it: list it in notes as out of scope, and the docs stage records it as a backlog item. A review finding widens the scope only when it is about this change's own behaviour. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. Take the cheap should-fix items too. Keep the docs true in the same commit. Run the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nBrief:\n${BRIEF}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
     { ...M('implement'), label: `address-review:r${round}`, phase: 'Fix', agentType: 'implementer', schema: CHANGE_SCHEMA },
   )
   if (next) {
@@ -313,6 +313,7 @@ phase('Closeout')
 const closeout = await agent(
   `Prepare the closeout for this bug fix. Don't push, open a PR or write to Logseq; return the texts.
 - Run scripts/check.sh (add --upstream if patches/ changed) once on HEAD, and report the SHA and summary, skips included.
+- If any findings are still open, start pr_body with "> **Draft:** N review findings are still open" naming the ids, and say the same in logseq_update. The PR should be opened as a draft.
 - pr_title: the fix commit's subject.
 - pr_body sections: Summary; Cause; Fix; Tests (each regression test with its quoted fail-before); Review (lenses, rounds, findings closed, findings refuted by skeptics, and "Open review findings — for your call" listing any open id with its severity, claim and evidence); Docs; Learnings (docs/solutions entries and promotions); Retro proposals (not applied); Logseq skill note; Verification (only checks run on the HEAD SHA you report, with their skips); Live verification (steps for the owner after deploy).
 - logseq_update: a markdown block tree to add under item ${brief.issue_number ?? '(no issue)'} on ${PAGE}, in that page's style: "**Built ${TODAY}** – <patch/PR>, <one-line cause and fix>", with child blocks for anything not covered or still open.
@@ -322,4 +323,6 @@ Brief:\n${BRIEF}\nRoot cause:\n${J(cause)}\nTests:\n${J([...repro.tests, ...(cha
 )
 
 const status = securityOpen ? 'blocked-security' : !closeout || !closeout.gate_green ? 'needs-human' : open.length ? 'ready-with-open-findings' : 'ready'
-return { status, brief, cause, refutations, repro, change, review: { rounds, open, should_fix: review && review.should_fix, nits: review && review.nits, refuted: review && review.refuted }, docs, compound, closeout }
+// Open findings at the end: propose a follow-up run seeded with them (one fixer, then lane-review with open and round).
+const followup = open.length ? { open, next_round: (rounds.length ? rounds[rounds.length - 1].round : 0) + 1, pr_draft: true } : null
+return { status, followup, brief, cause, refutations, repro, change, review: { rounds, open, should_fix: review && review.should_fix, nits: review && review.nits, refuted: review && review.refuted }, docs, compound, closeout }

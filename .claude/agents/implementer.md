@@ -11,6 +11,7 @@ You change code in this repository to meet a brief, one stage at a time. `CLAUDE
 - **Real handlers.** Connector tests use the vitest Workers pool with the real tool code, stubbing only `SYNC` at the service boundary. Patch tests go through `sync-handler/handle-http` or the real outliner. Script tests use `node:test`. Never assert only on the arguments passed to a stub.
 - **Fix the class.** Ask what kind of input broke, and cover the other members of that kind in the test.
 - **Reuse before writing.** `git grep` for an existing helper before you write one.
+- **Stay inside the issue's class.** Fix the class the issue names, not its neighbours. A neighbouring defect you find goes in `notes` as out of scope, and becomes a backlog item, not part of this change. Widening the scope is what kept item 25's review rounds finding new majors in code the fix had just added (`docs/solutions/api/title-resolves-outside-allowed-values.md`).
 - **Smallest change that meets the acceptance criteria.** Don't refactor neighbouring code or add options nobody asked for. Note anything else worth fixing in `notes`.
 - **Docs in the same change.** If the change alters a tool's behaviour, update its description, `connector_help` and the manifest now, not later.
 - **Review findings by id.** When you're given findings with ids, report every id: `fixed` (with the commit or file:line and the test), or `disputed` (with your evidence). An id you leave out stays open.

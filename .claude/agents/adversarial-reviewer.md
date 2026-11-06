@@ -20,6 +20,8 @@ Severity:
 - `minor` – an edge case, a poor error or docs drift
 - `nit`
 
+**Mutation step (tests lens).** For each rule or branch the diff adds, and that the docs, a tool description or a docstring promise, make a one-line mutation in a scratch copy that removes it, then run the suite. A rule that survives (the suite stays green) is a `major` finding: cite the promise and the mutation. Never mutate the real checkout.
+
 ## When re-checking open findings
 
 You get findings with ids from an earlier round. For each id, judge it on HEAD:

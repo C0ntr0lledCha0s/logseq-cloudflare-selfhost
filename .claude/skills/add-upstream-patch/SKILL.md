@@ -43,4 +43,5 @@ The sync server is upstream `logseq/logseq` at the commit in `UPSTREAM_REF`. `sc
 - **Shipped patches are history.** Amend a patch only before its PR merges. After that, fix forward with a new patch.
 - **One concern per patch.** A patch is the unit an upstream PR would take. Note in the PR body if the fix belongs upstream, since the owner keeps a fork for upstream PRs.
 - **Don't edit `.upstream` and forget it.** It's gitignored, so only `patches/` carries the change.
+- **Name the allowed set for every lookup.** A title or ident lookup resolves only inside a named set: the property's choices, its classes, its own value blocks, or pages. Don't rely on the outliner to check closed values on server writes. Tests need a decoy created first, and a value that is legitimately duplicated (a URL held by two blocks, a journal title). See `docs/solutions/api/title-resolves-outside-allowed-values.md`.
 - **Errors name the entry and reason, and reads must show what writes stored.** See REVIEW.md, *API and patches*.
