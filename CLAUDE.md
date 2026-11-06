@@ -57,6 +57,7 @@ Traps anyone changing the code would hit. The compound step adds an entry when a
 - Path parameters are decoded by the router. Re-encode them when forwarding, because qualified idents contain `/` (`docs/solutions/api/qualified-ident-path-params-404.md`).
 - A batch must replay as one transaction with one tx id. Mixed tx ids make clients replay retract and add in the wrong order (`docs/solutions/sync/batch-replayed-with-mixed-tx-ids.md`).
 - "It doesn't reproduce" and "the read hid it" are common outcomes. Check the read path before you blame the write (`docs/solutions/api/read-hid-built-in-properties.md`).
+- The outliner does not check closed values (choices) or a property's classes on server writes (`*closed-values-validate?*` defaults to false), so the semantic handler must resolve a title inside the property's allowed values itself (`docs/solutions/api/title-resolves-outside-allowed-values.md`).
 - Feeds end with a null next-cursor, and `count(*)` scans rows on D1. Both have cost the Free plan before (`docs/solutions/cost/d1-reads-from-indexer-scans.md`).
 
 ## Lanes

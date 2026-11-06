@@ -26,3 +26,5 @@ One file per lesson, under a folder for its area: `api/`, `sync/`, `connector/`,
 | [api/read-hid-built-in-properties](api/read-hid-built-in-properties.md) | "The write dropped it" was the read hiding it; check the read path first |
 | [api/one-error-for-every-failure](api/one-error-for-every-failure.md) | One generic error for many causes makes a malformed call look like a server bug |
 | [cost/d1-reads-from-indexer-scans](cost/d1-reads-from-indexer-scans.md) | Cron jobs that scan or never finish burn the Free plan's D1 reads |
+| [api/title-resolves-outside-allowed-values](api/title-resolves-outside-allowed-values.md) | A title must resolve only among the property's allowed values; the outliner won't check |
+| [testing/untested-rules-survive-mutation](testing/untested-rules-survive-mutation.md) | Each rule a fix adds needs a case where that rule decides the outcome |

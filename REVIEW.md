@@ -14,6 +14,7 @@ A finding needs evidence you reproduced: a failing test, a command and its outpu
 ## API and patches
 
 - **No silent success.** A call that returns success must have stored what it said, and the value must read back the same through every read tool (`get_block`, `get_blocks`, `get_page_outline`, `list_page_blocks`). If a value can't be applied, refuse the whole call up front. (`docs/solutions/api/read-hid-built-in-properties.md`)
+- **Titles resolve inside the allowed set.** A value given by title resolves only among what the property allows (its own choices, its classes, its value blocks), never `first` of a graph-wide title match, and the outliner won't refuse a wrong pick. Test with a decoy that shares the title and was created first, and with values that are legitimately duplicated (a URL held by two blocks). (`docs/solutions/api/title-resolves-outside-allowed-values.md`)
 - **Errors name the entry and the reason.** One generic message for several causes makes a malformed call look like a server bug. (`docs/solutions/api/one-error-for-every-failure.md`)
 - **Path parameters survive forwarding.** Anything decoded by the router and forwarded internally is encoded again. Test with an ident containing `/` through the public route. (`docs/solutions/api/qualified-ident-path-params-404.md`)
 - **Server writes keep order keys unique.** Any new path that creates blocks seeds the max order key and is tested against a page that already has blocks. (`docs/solutions/sync/order-key-not-seeded-for-server-writes.md`)
