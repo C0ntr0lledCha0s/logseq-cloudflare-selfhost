@@ -21,6 +21,7 @@ export const CONNECTOR_HELP = [
   "create_page and create_tag refuse a title that a page, journal, tag or property already uses (ignoring case) and name it with its UUID, so create without searching first and use the named one when refused.",
   "delete_page, delete_tag and delete_property refuse while the delete would lose references, tag holders, child tags or property values, and say which acknowledge-* flag to pass; pass dry-run to see the counts first, and only acknowledge a loss the user agreed to.",
   "Tag a block with an existing tag by writing #Tag or #[[Multi Word Tag]] in its title. Any other # that Logseq would read as a tag, such as an issue number or an unknown name, is stored escaped (\\#) so it stays text, and the write's response lists those tags under escaped; create the tag first with create_tag if you want it. refresh_refs applies the same handling to blocks written before it existed.",
+  "Make a block a heading by starting its title with # to ###### and a space (## Section), in update_block or any insert tool: it is stored as the app stores a heading, the title without the prefix and the level in logseq.property/heading, which get_block shows. update_block with a title that has no prefix keeps the block's heading. Seven or more #, or # with nothing after it, is not a heading and stays as text (the first # stored escaped as \\#).",
   "Create tasks and action items with create_task, never as TODO text.",
   "Add to today's journal with capture_to_today.",
   "Make flashcards by tagging each card block with the Card tag.",
