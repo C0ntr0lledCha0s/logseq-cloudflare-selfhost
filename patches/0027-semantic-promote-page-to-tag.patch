@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d353090..ab26c42 100644
+index d353090..da8bd6c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -954,6 +954,20 @@
+@@ -954,6 +954,21 @@
    {:error (str (or (:block/title property) (entity-ident property)) ": " reason)
     ::refusal reason})
  
@@ -10,20 +10,21 @@ index d353090..ab26c42 100644
 +  "Why the resolved :block/tags `values` for `scope` (see prepare-property-value) can't hold Tag, or
 +  nil. The outliner refuses Tag as a tags value (validate-tags-property), which surfaced as a server
 +  error. A page becomes a tag through promotePageToTag, which also gives it the :db/ident a tag
-+  needs, so a page is pointed there; a tag already holds Tag."
++  needs, so a page is pointed there. A tag already holds Tag, so re-sending it is allowed, and
++  set-prepared-property! doesn't set it again."
 +  [db scope values]
-+  (when (some #{(:db/id (d/entity db :logseq.class/Tag))} values)
-+    (let [target (some->> (:db/id scope) (d/entity db))]
++  (let [target (some->> (:db/id scope) (d/entity db))]
++    (when (and (some #{(:db/id (d/entity db :logseq.class/Tag))} values)
++               (not (entity-util/class? target)))
 +      (str "Tag marks a page as a tag and can't be set as a value; "
-+           (cond
-+             (entity-util/class? target) (str (:block/uuid target) " is already a tag")
-+             (page? target) (str "use promote_page_to_tag on page " (:block/uuid target))
-+             :else "use promote_page_to_tag")))))
++           (if (page? target)
++             (str "use promote_page_to_tag on page " (:block/uuid target))
++             "use promote_page_to_tag")))))
 +
  (defn- prepare-property-value
    "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
    the value is for (an entity, or a map of the :block/tags a new block will have), which limits a
-@@ -974,7 +988,8 @@
+@@ -974,7 +989,8 @@
          (cond
            (some ::error resolved) {:error (some ::error resolved)}
            (every? some? resolved)
@@ -33,18 +34,54 @@ index d353090..ab26c42 100644
              (refusal property refused)
              {:value (if many-input? resolved (first resolved))})
            ;; Text that isn't a finite number (NaN, Infinity) for a number property without choices,
+@@ -994,13 +1010,34 @@
+                     :else
+                     "property value must resolve to an existing entity by UUID, ident, or title")})))))
+ 
++(defn- set-prepared-tags!
++  "Writes a resolved :block/tags `value` (one id or several) on `block-id`. A tag the block already
++  holds isn't set again, because the outliner refuses Tag even on a tag that holds it. Under reset a
++  list replaces the block's tags, so only the tags it leaves out are removed: removing them all first
++  would remove Page or Tag, which the outliner refuses. So sending a page's or tag's own tags back is
++  a no-op, not a server error."
++  [conn block-id value reset-existing-values?]
++  (let [ids (if (coll? value) value [value])
++        held #(set (map :db/id (:block/tags (d/entity @conn block-id))))]
++    (when (and reset-existing-values? (coll? value))
++      (doseq [id (remove (set ids) (held))]
++        (outliner-property/delete-property-value! conn block-id :block/tags id)))
++    (doseq [id ids :when (not (contains? (held) id))]
++      (if (coll? value)
++        (outliner-property/batch-set-property! conn [block-id] :block/tags id {:entity-id? true})
++        (outliner-property/set-block-property! conn block-id :block/tags id)))))
++
+ (defn- set-prepared-property! [conn block-id property-ident value reset-existing-values?]
+-  (if (coll? value)
++  (cond
++    (= :block/tags property-ident)
++    (set-prepared-tags! conn block-id value reset-existing-values?)
++    (coll? value)
+     (do
+       (when reset-existing-values?
+         (outliner-property/remove-block-property! conn block-id property-ident))
+       (doseq [item value]
+         (outliner-property/batch-set-property! conn [block-id] property-ident item {:entity-id? true})))
++    :else
+     (outliner-property/set-block-property! conn block-id property-ident value)))
+ 
+ ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
 new file mode 100644
-index 0000000..862ba0d
+index 0000000..94ee2c7
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,316 @@
 +(ns logseq.db-sync.semantic-promote-page-to-tag-test
 +  "Turning a page into a tag. Tag can't be set as a tags value, on any write path: the outliner
 +  refuses it (Can't set tag with built-in #Tag), which the handler answered as a 500. It is refused
-+  up front with a 400 that points a page at promote_page_to_tag, and nothing is written. Page and
-+  other tags are still allowed. The graph has tags Food and Cuisine, an empty page Restaurant, a
-+  page Diner with two blocks, and a page Notes with one."
++  up front with a 400 that points a page at promote_page_to_tag, and nothing is written. Page, other
++  tags and a re-sent Tag on a tag are still allowed. The graph has tags Food and Cuisine, an empty
++  page Restaurant, a page Diner with two blocks, and a page Notes with one."
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
@@ -173,28 +210,83 @@ index 0000000..862ba0d
 +              "a block isn't a page, so the message names no page to promote")
 +          (is (= before (snapshot conn)) "nothing is written"))))))
 +
-+;; Before the fix: 500 "Can't set tag with built-in #Tag" (and "Can't remove private tags:
-+;; :logseq.class/Tag." for a list), so re-sending Tag on a tag never worked.
-+(deftest set-tags-to-tag-on-existing-tag-test
++;; Re-sending Tag on an entity that already holds it is a no-op that succeeds, on every write path,
++;; so a retried promotion or a write that sends a tag's own tags back doesn't fail. Before this
++;; change (Tag refused up front) every case answered 400 "... is already a tag"; before patch 0027,
++;; 500 "Can't set tag with built-in #Tag", or "Can't remove private tags" for a list under reset.
++(deftest re-sent-tag-on-existing-tag-is-a-no-op-test
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self cuisine]}]
-+        (p/doseq [[kind response] [["single" #(set-tags! self cuisine "Tag")]
-+                                   ["list under reset"
-+                                    #(request! self "POST" "/semantic/block-properties/batch-set"
-+                                               {:isResetExistingValues true
-+                                                :entries [{:block-id (str cuisine) :property-id "block/tags"
-+                                                           :value ["Tag"]}]})]]]
-+          (p/let [before (snapshot conn)
-+                  ident (:db/ident (entity conn cuisine))
-+                  response (response)]
-+            (testing kind
-+              (is (= 400 (:status response)) (pr-str response))
-+              (is (string/ends-with? (str (get-in response [:body :error]))
-+                                     (str refusal "; " cuisine " is already a tag"))
-+                  (pr-str response))
-+              (is (= before (snapshot conn)) "nothing is written")
-+              (is (= ident (:db/ident (entity conn cuisine))) "Cuisine keeps its ident"))))))))
++        (let [batch-set (fn [reset? value]
++                          #(request! self "POST" "/semantic/block-properties/batch-set"
++                                     {:isResetExistingValues reset?
++                                      :entries [{:block-id (str cuisine) :property-id "block/tags" :value value}]}))]
++          (p/doseq [[kind call status] [["set_block_property, title" #(set-tags! self cuisine "Tag") 200]
++                                        ["set_block_property, ident" #(set-tags! self cuisine "logseq.class/Tag") 200]
++                                        ["set_block_property, list (replaces)" #(set-tags! self cuisine ["Tag"]) 200]
++                                        ["batch set" (batch-set false "Tag") 200]
++                                        ["batch set, list" (batch-set false ["Tag"]) 200]
++                                        ["batch set, list under reset" (batch-set true ["Tag"]) 200]
++                                        ["batch insert properties by target-id"
++                                         #(request! self "POST" "/semantic/block-trees/batch"
++                                                    {:entries [{:target-id (str cuisine) :properties {"Tags" "Tag"}}]})
++                                         201]]]
++            (p/let [ident (:db/ident (entity conn cuisine))
++                    response (call)]
++              (testing kind
++                (is (= status (:status response)) (pr-str response))
++                (is (= #{"Tag"} (tag-titles conn cuisine)))
++                (is (ldb/class? (entity conn cuisine)))
++                (is (= ident (:db/ident (entity conn cuisine))) "Cuisine keeps its ident")))))))))
++
++;; A re-sent Tag in a list with another tag adds the other tag and keeps Tag. Before this change:
++;; 400 "... is already a tag" for both.
++(deftest re-sent-tag-with-another-tag-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self cuisine food]}]
++        (p/let [added (request! self "POST" "/semantic/block-properties/batch-set"
++                                {:entries [{:block-id (str cuisine) :property-id "block/tags"
++                                            :value ["Tag" (str food)]}]})
++                _ (is (= 200 (:status added)) (pr-str added))
++                _ (is (= #{"Tag" "Food"} (tag-titles conn cuisine)))
++                replaced (set-tags! self cuisine ["Tag"])]
++          (is (= 200 (:status replaced)) (pr-str replaced))
++          (is (= #{"Tag"} (tag-titles conn cuisine)) "a list replaces: Food is removed, Tag kept"))))))
++
++;; A replace-style tags write on a page that sends Page back keeps Page. Before this change:
++;;   500 {:error "server error", :debug-message "#error {:message \"Can't remove private tags\", ...}"}
++;; because a reset removed every tag, Page included, before adding the list.
++(deftest replace-style-tags-write-sending-page-back-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self diner restaurant]}]
++        (p/let [set-list (set-tags! self diner ["Page" "Food"])
++                _ (is (= 200 (:status set-list)) (pr-str set-list))
++                _ (is (= #{"Page" "Food"} (tag-titles conn diner)))
++                reset (request! self "POST" "/semantic/block-properties/batch-set"
++                                {:isResetExistingValues true
++                                 :entries [{:block-id (str diner) :property-id "block/tags" :value ["Page"]}
++                                           {:block-id (str restaurant) :property-id "block/tags"
++                                            :value ["Page" "Cuisine"]}]})]
++          (is (= 200 (:status reset)) (pr-str reset))
++          (is (= #{"Page"} (tag-titles conn diner)) "Food is removed, Page kept")
++          (is (= #{"Page" "Cuisine"} (tag-titles conn restaurant))))))))
++
++;; updatePage takes only a title (and an encrypted name): a tags field is ignored, so Tag sent there
++;; changes nothing and the page stays a page. Passed before this change too; it pins that update_page
++;; is not a tags write path, so a later stage can't come to depend on it.
++(deftest update-page-ignores-tags-field-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant]}]
++        (p/let [response (request! self "PATCH" (str "/semantic/pages/" restaurant)
++                                   {:title "Restaurant" :tags ["Tag"]})]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{"Page"} (tag-titles conn restaurant)))
++          (is (not (ldb/class? (entity conn restaurant))))
++          (is (nil? (:db/ident (entity conn restaurant)))))))))
 +
 +;; Before the fix: 500 "Can't set tag with built-in #Tag" for entry 1, after entry 0 was prepared.
 +(deftest batch-set-tags-to-tag-names-entry-test
