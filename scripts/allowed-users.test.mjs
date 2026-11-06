@@ -443,7 +443,7 @@ test("cli: runs, and fails closed, when invoked through a symlink", () => {
   return new Promise((resolveTest, reject) => {
     const link = join(dir, "link.mjs");
     symlinkSync(script, link);
-    const child = spawn(process.execPath, [link, "check-format"], { cwd: root, env: { ...process.env, DB_SYNC_ALLOWED_USERS: "bob" } });
+    const child = spawn(process.execPath, [link, "check-format"], { cwd: root, env: { ...process.env, GITHUB_ACTIONS: "", DB_SYNC_ALLOWED_USERS: "bob" } });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d));
     child.on("error", reject);

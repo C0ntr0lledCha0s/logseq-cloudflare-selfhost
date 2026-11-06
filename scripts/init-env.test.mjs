@@ -597,19 +597,22 @@ for (const [name, value] of [
   ["an empty entry", `${USER_A},,${USER_B}`],
   ["a trailing comma", `${USER_A},`],
 ]) {
-  test(`--add-missing --push rejects ${name} in DB_SYNC_ALLOWED_USERS, writing and pushing nothing`, { timeout: 60000 }, async () => {
-    await withDir(async (dir) => {
-      const existing = SIX_ONLY + CONNECTOR_PRESENT;
-      writeExisting(dir, existing);
-      const { bin, log } = stubGh(dir);
-      const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: value, PATH: `${bin}:${process.env.PATH}` });
-      assert.equal(r.status, 1, r.stdout + r.stderr);
-      assert.match(r.stderr, /^error: DB_SYNC_ALLOWED_USERS entry \d+ of \d+ is not a lowercase UUID/m);
-      assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), existing, "file must be byte-identical");
-      assert.equal(existsSync(log), false, "gh must not be called");
-      assert.ok(!(r.stdout + r.stderr).includes(value), "the value must not be printed");
+  // GITHUB_ACTIONS=true switches check-format to `::error::` on stdout; init-env must still show the error.
+  for (const actions of ["", "true"]) {
+    test(`--add-missing --push rejects ${name} in DB_SYNC_ALLOWED_USERS, writing and pushing nothing (GITHUB_ACTIONS=${actions || "unset"})`, { timeout: 60000 }, async () => {
+      await withDir(async (dir) => {
+        const existing = SIX_ONLY + CONNECTOR_PRESENT;
+        writeExisting(dir, existing);
+        const { bin, log } = stubGh(dir);
+        const r = await run(dir, ["--add-missing", "--push"], { DB_SYNC_ALLOWED_USERS: value, GITHUB_ACTIONS: actions, PATH: `${bin}:${process.env.PATH}` });
+        assert.equal(r.status, 1, r.stdout + r.stderr);
+        assert.match(r.stderr, /^error: DB_SYNC_ALLOWED_USERS entry \d+ of \d+ is not a lowercase UUID/m);
+        assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), existing, "file must be byte-identical");
+        assert.equal(existsSync(log), false, "gh must not be called");
+        assert.ok(!(r.stdout + r.stderr).includes(value), "the value must not be printed");
+      });
     });
-  });
+  }
 }
 
 test("--add-missing without a terminal lists DB_SYNC_ALLOWED_USERS with the other unset inputs", { timeout: 60000 }, async () => {

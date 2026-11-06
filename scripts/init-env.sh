@@ -220,8 +220,9 @@ for name in $need_inputs; do
       value="${value//[[:space:]]/}"
       DB_SYNC_ALLOWED_USERS="$value"
       # The same rule the deploy and the Worker apply. The value goes through the environment, never
-      # argv, and its error message gives entry positions, never the entry.
-      check_error="$(DB_SYNC_ALLOWED_USERS="$value" node "$script_dir/allowed-users.mjs" check-format 2>&1 >/dev/null)" || {
+      # argv, and its error message gives entry positions, never the entry. GITHUB_ACTIONS is cleared
+      # because this script prints the message itself: in Actions form it would go to stdout and be lost.
+      check_error="$(GITHUB_ACTIONS= DB_SYNC_ALLOWED_USERS="$value" node "$script_dir/allowed-users.mjs" check-format 2>&1 >/dev/null)" || {
         echo "$check_error" >&2
         exit 1
       }
