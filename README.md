@@ -597,6 +597,7 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 | The client syncs to Logseq's servers again | You logged out, which clears the custom URL. Re-enter it, then sign in. |
 | `exceededCpu` / "Worker exceeded CPU time limit" in the Worker logs, or sync stalls on large graphs | The Free plan's 10 ms CPU per request is too little. Switch to paid (section 8). |
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
+| `settings.timeZone is not an IANA time zone` at deploy, or `500 invalid TIMEZONE setting: <zone>` from a capture, task or upload with no page | `timeZone` in `config/settings.json` (or the sync Worker's `TIMEZONE`) isn't a zone the runtime knows. Use an IANA name such as `Pacific/Auckland`. The server refuses before it writes anything, so no journal is created. Calls that name a page are unaffected. |
 | `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
 | Backups, the weekly bump or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` / `gh workflow enable usage.yml` (section 7). |
@@ -877,6 +878,8 @@ To turn it on, with the connector already on (11.5):
 9. **Bare integers read as db ids.** `resolve-ref-entity` still reads a JSON integer given to a node, date or other ref property as a db id, so `about: 230` sets whatever entity has db id 230 if the type check accepts it. Patch 0022 closed this for number properties only.
 10. **Escaping of unknown `#words` in code and math blocks.** `update_block` and `refresh_refs` still escape an unknown `#word` inside a code or math block's text (`echo #Unknownword` becomes `echo \#Unknownword`), and `refresh_refs` doesn't skip display-typed blocks. It predates patch 0024 and is the inline-tag class, not headings.
 11. **Heading level in block lists.** `list_page_blocks` and the insert tools' responses (`block-response`) carry no heading level. `get_block`, `get_blocks` and `get_page_outline` show it. Adding a field changes a response schema shared by many operations.
+12. **Page titles on task reads.** `capture_to_today`, `create_task` and the file tools name the journal they wrote to, but `list_tasks` and `get_block` still return only the page id. A response schema change shared by several operations.
+13. **Fixed-offset time zones.** `timeZone` accepts `+13:00` as well as an IANA name because `Intl` does, but a fixed offset ignores daylight saving. Refuse it in `render-wrangler` and the server if it causes a mistake.
 
 ## Licence and credits
 
