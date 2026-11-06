@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5dc3e7d..d933fab 100644
+index 5dc3e7d..d353090 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -88,14 +88,46 @@
@@ -209,7 +209,7 @@ index 5dc3e7d..d933fab 100644
  
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
-@@ -1920,6 +1994,743 @@
+@@ -1920,6 +1994,758 @@
            (http/json-response nil (merge (asset-response asset) link))))
        (http/not-found))))
  
@@ -298,15 +298,18 @@ index 5dc3e7d..d933fab 100644
 +
 +(defn- out-of-class-count
 +  "How many visible holders of `property` hold a value that is an object of none of its classes,
-+  which the app's picker and value writes would now refuse; 0 when it has no classes. One :avet
-+  scan of the property's datoms."
++  which the app's picker and value writes would now refuse; 0 when it has no classes. The empty
++  placeholder (a holder the app left empty) is no value, so it isn't counted. One :avet scan of the
++  property's datoms."
 +  [db property]
 +  (let [classes (:logseq.property/classes property)]
 +    (if (empty? classes)
 +      0
 +      (->> (d/datoms db :avet (:db/ident property))
-+           (remove (fn [datom] (some #(db-db/class-instance? % (d/entity db (:v datom))) classes)))
-+           (map :e)
++           (map (fn [datom] [(:e datom) (d/entity db (:v datom))]))
++           (remove (fn [[_ value]] (= :logseq.property/empty-placeholder (:db/ident value))))
++           (remove (fn [[_ value]] (some #(db-db/class-instance? % value) classes)))
++           (map first)
 +           distinct
 +           (remove #(entity-util/hidden? (d/entity db %)))
 +           count))))
@@ -450,10 +453,11 @@ index 5dc3e7d..d933fab 100644
 +  order, retire}) for the property titled `title`, judged on `type`, its type once the call has
 +  applied. {:ok plan} or {:error message} naming every refused entry. The plan is {:add [{:uuid :text
 +  :icon :description}] :update [{:uuid :text? :icon? :description?}] :order [uuid ...]? :retire [{:index
-+  :uuid :id :text :holders}]?}; a new choice's UUID is chosen here so order can name it. The plan's updates
++  :uuid :id :text :holders :default?}]?}; a new choice's UUID is chosen here so order can name it. The plan's updates
 +  are in the order they apply: a rename after the rename that frees its title. A retired choice
 +  must be the property's own, not built in, and not also updated or ordered in the call; its
-+  holders are counted here, and the handler decides whether they may lose it."
++  holders are counted here, and it is marked :default when it is the property's default value
++  (which retiring it clears); the handler decides whether they may lose it."
 +  [db property title type choices e2ee?]
 +  (let [create? (nil? property)
 +        shape (choices-shape-refusal create? choices)]
@@ -572,8 +576,11 @@ index 5dc3e7d..d933fab 100644
 +                           (ldb/built-in? choice) (do (refuse! field (str (pr-str text) " is built in and can't be retired")) retired)
 +                           (contains? updated-ids id)
 +                           (do (refuse! field (str (pr-str text) " is also changed in " (get updated-ids id))) retired)
-+                           :else (conj retired {:index index :uuid (uuid-of id) :id id :text text
-+                                                :holders (choice-holders db (:db/ident property) id)}))))
++                           :else (conj retired (cond-> {:index index :uuid (uuid-of id) :id id :text text
++                                                        :holders (choice-holders db (:db/ident property) id)}
++                                                 ;; blocks that rely on the default show it
++                                                 (= id (:db/id (:logseq.property/default-value property)))
++                                                 (assoc :default true))))))
 +                     [] (map-indexed vector (:retire choices)))
 +            retired-uuids (set (map :uuid retired))
 +            ;; order: a full permutation of the surviving choices and the additions
@@ -785,15 +792,22 @@ index 5dc3e7d..d933fab 100644
 +(def ^:private property-update-flags ["acknowledge-holders" "dry-run"])
 +
 +(defn- retire-held-message
-+  "The 409 refusal for retired choices (validate-choices' :retire entries) that blocks hold."
++  "The 409 refusal for retired choices (validate-choices' :retire entries) that blocks hold or that
++  are the property's default value."
 +  [held]
-+  (str (string/join "; " (map (fn [{:keys [index text holders]}]
-+                                (str "choices.retire " index ": " (pr-str text)
-+                                     " is held by " holders (if (= 1 holders) " block" " blocks")))
-+                              held))
-+       "; set acknowledge-holders=true to "
-+       (if (= 1 (count held)) "remove it from them" "remove them from their holders")
-+       ", or dry-run=true to preview"))
++  (let [holding (filter (comp pos? :holders) held)]
++    (str (string/join "; " (map (fn [{:keys [index text holders default]}]
++                                  (str "choices.retire " index ": " (pr-str text) " is "
++                                       (string/join " and is "
++                                                    (cond-> []
++                                                      (pos? holders) (conj (str "held by " holders (if (= 1 holders) " block" " blocks")))
++                                                      default (conj "the property's default value")))))
++                                held))
++         "; set acknowledge-holders=true to "
++         (string/join " and " (cond-> []
++                                (seq holding) (conj (if (= 1 (count held)) "remove it from them" "remove them from their holders"))
++                                (some :default held) (conj "clear the default")))
++         ", or dry-run=true to preview")))
 +
 +;; Converting text values to choices: updateProperty's convert_values. One :avet scan of the property
 +;; finds each holder's values. A value block the property made (free text) is matched by its trimmed
@@ -946,14 +960,15 @@ index 5dc3e7d..d933fab 100644
 +    (cond-> (property-response updated)
 +      classes (assoc :out_of_class (out-of-class-count @conn updated))
 +      conversion (merge (conversion-response (:ok conversion) dry-run?))
-+      (seq retired) (assoc :retired (mapv (fn [{:keys [uuid text holders]}]
-+                                            {:uuid (uuid-string uuid) :title text :holders holders})
++      (seq retired) (assoc :retired (mapv (fn [{:keys [uuid text holders default]}]
++                                            (cond-> {:uuid (uuid-string uuid) :title text :holders holders}
++                                              default (assoc :default true)))
 +                                          retired)))))
 +
  (defn- handle-properties-and-search
    [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1931,14 +2742,37 @@
+@@ -1931,14 +2757,37 @@
  
      :semantic/properties-create
      (p/let [body (body-clj request)]
@@ -999,7 +1014,7 @@ index 5dc3e7d..d933fab 100644
  
      :semantic/properties-get
      (if-let [property (resolve-property db (:property-id path-params))]
-@@ -1948,16 +2782,37 @@
+@@ -1948,16 +2797,43 @@
      :semantic/properties-update
      (p/let [body (body-clj request)
              property (resolve-property db (:property-id path-params))]
@@ -1016,15 +1031,20 @@ index 5dc3e7d..d933fab 100644
 +      (let [type (if (:type body) (keyword (:type body)) (:logseq.property/type property))
 +            change (mode-change (:classes body))
 +            classes (when (contains? body :classes)
-+                      (if change
++                      (cond
++                        ;; The outliner allows only hide-empty-value and description on a built-in
++                        ;; property, and the app disables its tag picker.
++                        (ldb/built-in? property)
++                        {:error (str "classes: " (:block/title property) " is a built-in property and its classes can't be changed")}
++                        change
 +                        (validate-property-classes db (:block/title property) type (first change) (second change))
-+                        {:error "classes: give exactly one of set, add or remove"}))
++                        :else {:error "classes: give exactly one of set, add or remove"}))
 +            choices (when (and (property? property) (contains? body :choices))
 +                      (validate-choices db property (:block/title property) type (:choices body) e2ee?))
 +            conversion (when (property? property) (validate-conversion db property body choices e2ee?))
 +            flags (into {} (map (juxt identity #(flag-param url %))) property-update-flags)
 +            invalid (some #(when (= ::invalid (get flags %)) %) property-update-flags)
-+            held (filter (comp pos? :holders) (get-in choices [:ok :retire]))]
++            held (filter #(or (pos? (:holders %)) (:default %)) (get-in choices [:ok :retire]))]
 +        (cond
 +          invalid (http/bad-request (str invalid " must be true or false"))
 +          (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
@@ -1033,8 +1053,9 @@ index 5dc3e7d..d933fab 100644
 +          (http/bad-request (string/join "; " (keep :error [classes choices conversion])))
 +          (and (seq held) (not (get flags "acknowledge-holders")) (not (get flags "dry-run")))
 +          (http/json-response nil {:error (retire-held-message held)
-+                                   :retired (mapv (fn [{:keys [uuid text holders]}]
-+                                                    {:choice (uuid-string uuid) :title text :holders holders})
++                                   :retired (mapv (fn [{:keys [uuid text holders default]}]
++                                                    (cond-> {:choice (uuid-string uuid) :title text :holders holders}
++                                                      default (assoc :default true)))
 +                                                  held)}
 +                              409)
 +          :else
@@ -1048,7 +1069,7 @@ index 5dc3e7d..d933fab 100644
      :semantic/properties-delete
      (if-let [property (resolve-property db (:property-id path-params))]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c64cc9f..ee0bcf0 100644
+index c64cc9f..c20b05b 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -107,7 +107,7 @@
@@ -1078,7 +1099,7 @@ index c64cc9f..ee0bcf0 100644
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
 +   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
 +   "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
@@ -1088,7 +1109,7 @@ index c64cc9f..ee0bcf0 100644
     "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
 -                     dry-run-parameter]})
 +                     dry-run-parameter]
-+   "updateProperty" [(delete-flag-parameter "acknowledge-holders" "Set true to retire choices (choices.retire) that blocks hold; those blocks lose the value. Omitted or false, a retire with holders is refused with 409 and nothing is changed.")
++   "updateProperty" [(delete-flag-parameter "acknowledge-holders" "Set true to retire choices (choices.retire) that blocks hold or that are the property's default value; those blocks lose the value and the default is cleared. Omitted or false, such a retire is refused with 409 and nothing is changed.")
 +                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired, converted and the conversion mapping, and dry-run: true. A retire with holders is previewed without acknowledge-holders.")]})
  
  (def ^:private summary-prefix-parameter
@@ -1167,7 +1188,7 @@ index c64cc9f..ee0bcf0 100644
 +                                                                  :description "Every choice that survives the call, including any added in this call, exactly once, in the order the editor should list them. A title names the choice that ends the call with it (so a title a rename frees and an add takes names the new choice); a title the call frees and nothing takes still names its old choice."
 +                                                                  :items {:type "string"}}
 +                                                          :retire {:type "array"
-+                                                                   :description "Choices to remove, each by UUID, ident or title. A built-in choice (Status, Priority) is refused. Blocks holding one lose the value, so a retire with holders needs acknowledge-holders=true; preview with dry-run=true."
++                                                                   :description "Choices to remove, each by UUID, ident or title. A built-in choice (Status, Priority) is refused. Blocks holding one lose the value, and retiring the property's default value clears it, so either needs acknowledge-holders=true; preview with dry-run=true."
 +                                                                   :items {:type "string"}}}}
 +                                   :convert_values {:type "boolean"
 +                                                    :description "For a default (text) property: true turns its free-text values into the choices the call leaves, matched exactly, then ignoring case. Text that matches no choice refuses the call; add those choices under choices.add in the same call. Refused while the property has a default value, or when a text value has child blocks (deleting it would delete them); values cleared to the empty placeholder are left as they are. Preview the mapping with dry-run=true."}}}
@@ -1178,11 +1199,11 @@ index c64cc9f..ee0bcf0 100644
              "204" {:description "Deleted"}
              "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
             "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
-+           "updateProperty" {"409" (entity-response "RetireRefusal" "Choices to retire are held by blocks and acknowledge-holders is not true; nothing was changed")}
++           "updateProperty" {"409" (entity-response "RetireRefusal" "Choices to retire are held by blocks or are the property's default value, and acknowledge-holders is not true; nothing was changed")}
             "createTask"
             {"201" (entity-response "CreatedTaskResponse" "The created DB Task object and the page it is on")}
             "createAsset"
-@@ -517,7 +576,15 @@
+@@ -517,7 +576,16 @@
                                            :description "The acknowledge-* flags the delete still needs; empty when it would proceed."}}}
     :DeleteRefusal {:allOf [{:$ref "#/components/schemas/DeleteImpact"}
                             {:type "object" :required ["error"]
@@ -1191,15 +1212,16 @@ index c64cc9f..ee0bcf0 100644
 +   :RetireRefusal {:type "object" :required ["error" "retired"]
 +                   :properties {:error {:type "string"}
 +                                :retired {:type "array"
-+                                          :description "Each retired choice that blocks hold, with how many."
++                                          :description "Each retired choice that blocks hold, with how many, or that is the property's default value (default: true)."
 +                                          :items {:type "object" :required ["choice" "title" "holders"]
 +                                                  :properties {:choice {:type "string" :description "The choice's UUID."}
 +                                                               :title {:type "string"}
-+                                                               :holders {:type "integer"}}}}}}))
++                                                               :holders {:type "integer"}
++                                                               :default {:type "boolean"}}}}}}))
  
  (def ^:private bulk-schemas
    "Schemas of block tree properties and of the bulk and insert operations' responses."
-@@ -646,7 +713,18 @@
+@@ -646,7 +714,18 @@
                 :TagResponse {:type "object" :required ["uuid" "title"]
                               :properties {:uuid {:type "string"}
                                            :title {:type "string"}
@@ -1219,7 +1241,7 @@ index c64cc9f..ee0bcf0 100644
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
-@@ -679,11 +757,18 @@
+@@ -679,11 +758,18 @@
                 {:description "A built-in priority alias or one of the Priority property's own choices, selected by UUID, ident, or title (ignoring case). A choice limited to other tags than Task is refused."
                  :anyOf [{:type "string" :enum ["low" "medium" "high" "urgent"]}
                          {:$ref "#/components/schemas/EntitySelector"}]}
@@ -1239,7 +1261,7 @@ index c64cc9f..ee0bcf0 100644
                 :PropertyResponse {:type "object" :required ["uuid" "title" "type" "cardinality"]
                                    :properties {:uuid {:type "string"}
                                                 :ident {:type "string"}
-@@ -691,8 +776,36 @@
+@@ -691,8 +777,37 @@
                                                 :type {:type "string"}
                                                 :cardinality {:type "string"}
                                                 :choices {:type "array"
@@ -1254,13 +1276,14 @@ index c64cc9f..ee0bcf0 100644
 +                                                                              :title {:type "string"}
 +                                                                              :ident {:type "string"}}}}
 +                                               :out_of_class {:type "integer"
-+                                                              :description "On updateProperty with classes: how many holders have a value that is an object of none of the classes."}
++                                                              :description "On updateProperty with classes: how many holders have a value that is an object of none of the classes. A holder left empty (the empty placeholder) isn't counted."}
 +                                               :retired {:type "array"
-+                                                         :description "On updateProperty with choices.retire: each retired choice and how many blocks held it (they no longer do)."
++                                                         :description "On updateProperty with choices.retire: each retired choice and how many blocks held it (they no longer do), with default: true when it was the property's default value (now cleared)."
 +                                                         :items {:type "object" :required ["uuid" "title" "holders"]
 +                                                                 :properties {:uuid {:type "string"}
 +                                                                              :title {:type "string"}
-+                                                                              :holders {:type "integer"}}}}
++                                                                              :holders {:type "integer"}
++                                                                              :default {:type "boolean"}}}}
 +                                               :converted {:type "object" :required ["values" "holders"]
 +                                                           :description "On updateProperty with convert_values: how many text value blocks were converted (and deleted), and how many blocks held them."
 +                                                           :properties {:values {:type "integer"}
@@ -1280,10 +1303,10 @@ index c64cc9f..ee0bcf0 100644
                                       "map" "json" "string"]}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 new file mode 100644
-index 0000000..d9401ec
+index 0000000..9a231b6
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -0,0 +1,2045 @@
+@@ -0,0 +1,2136 @@
 +(ns logseq.db-sync.semantic-property-schema-test
 +  "A property's schema through createProperty, updateProperty and getProperty: its choices read
 +  back in editor order with icon and description, and a node property's classes. A value given by
@@ -1578,9 +1601,13 @@ index 0000000..d9401ec
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self blocks acme audit acme-ltd for-client clients]}]
-+        (let [[b0 b1 b2 b3 b4] blocks
++        (let [[b0 b1 b2 b3 b4 b5 b6] blocks
 +              id (fn [uuid] (:db/id (entity conn uuid)))]
-+          (p/let [_ (outliner-property/set-block-property! conn [:block/uuid b0] for-client (id acme))
++          (p/let [;; A holder the app left empty holds the empty placeholder, which isn't a value
++                  ;; the classes refuse, on either cardinality.
++                  _ (d/transact! conn [[:db/add (id b5) for-client :logseq.property/empty-placeholder]
++                                       [:db/add (id b6) clients :logseq.property/empty-placeholder]])
++                  _ (outliner-property/set-block-property! conn [:block/uuid b0] for-client (id acme))
 +                  _ (outliner-property/set-block-property! conn [:block/uuid b1] for-client (id audit))
 +                  ;; A recycled holder doesn't count.
 +                  _ (outliner-property/set-block-property! conn [:block/uuid b3] for-client (id audit))
@@ -1593,7 +1620,8 @@ index 0000000..d9401ec
 +                  service-too (restrict! self for-client :add ["Service"])
 +                  cleared (restrict! self for-client :set [])]
 +            (is (= 200 (:status restricted)) (str (:body restricted)))
-+            (is (= 1 (get-in restricted [:body :out_of_class])) "Audit is counted, Acme and a recycled holder are not")
++            (is (= 1 (get-in restricted [:body :out_of_class]))
++                "Audit is counted; Acme, a recycled holder and an empty placeholder are not")
 +            (is (= 2 (count (get (entity conn b4) clients))))
 +            (is (= 1 (get-in many [:body :out_of_class])) "a holder is counted once")
 +            (is (= acme (stored conn b0 for-client)) "existing values stay")
@@ -2767,7 +2795,9 @@ index 0000000..d9401ec
 +    (is (= "string" (get-in choices [:retire :items :type])))
 +    (is (= "#/components/schemas/RetireRefusal"
 +           (get-in operation [:responses "409" :content "application/json" :schema :$ref])))
-+    (is (string/includes? (:description operation) "acknowledge-holders=true"))))
++    (is (string/includes? (:description operation) "acknowledge-holders=true"))
++    (is (string/includes? (:description operation) "default value is refused the same way"))
++    (is (string/includes? (:description operation) "built-in property's classes"))))
 +
 +(deftest retire-does-not-rely-on-the-outliner-delete-test
 +  ;; Today delete-closed-value! retracts the whole choice entity, which also drops every ref to it.
@@ -3329,6 +3359,90 @@ index 0000000..d9401ec
 +            (is (= {:values 1 :holders 1} (get-in converted [:body :converted])))
 +            (is (= active (stored conn b0 phase)))
 +            (is (= :logseq.property/empty-placeholder (:db/ident (get (entity conn b1) phase))))))))))
++
++(deftest built-in-property-classes-refused-test
++  ;; The outliner allows only hide-empty-value and description on a built-in property, and the app
++  ;; disables its tag picker, so its classes can't be set, added to, removed or cleared, named by
++  ;; ident or by UUID, dry run included. A user property's classes still change.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self for-client]}]
++        (let [assignee-uuid (:block/uuid (d/entity @conn :logseq.property/assignee))
++              before (class-uuids conn :logseq.property/assignee)
++              by-uuid (str "/semantic/properties/" assignee-uuid)
++              message "classes: Assignee is a built-in property and its classes can't be changed"]
++          (p/let [set-one (restrict! self :logseq.property/assignee :set ["Client"])
++                  cleared (restrict! self :logseq.property/assignee :set [])
++                  added (restrict! self :logseq.property/assignee :add ["Client"])
++                  removed (restrict! self :logseq.property/assignee :remove ["Page"])
++                  uuid-path (request! self "PATCH" by-uuid {:classes {:set ["Client"]}})
++                  dry (request! self "PATCH" (str (property-path :logseq.property/assignee) "?dry-run=true")
++                                {:classes {:set ["Client"]}})
++                  user (restrict! self for-client :set ["Client"])]
++            (is (seq before) "Assignee is limited to Page")
++            (doseq [response [set-one cleared added removed uuid-path dry]]
++              (is (= 400 (:status response)) (str (:body response)))
++              (is (= message (get-in response [:body :error]))))
++            (is (= before (class-uuids conn :logseq.property/assignee)) "Assignee's classes are unchanged")
++            (is (= 200 (:status user)) (str (:body user)))))))))
++
++(deftest retire-default-value-choice-test
++  ;; A choice that is the property's default value is shown by every block that relies on the
++  ;; default (they hold the empty placeholder), so retiring it is refused like a held choice:
++  ;; 409 naming it unless acknowledge-holders=true, and dry-run and the response say so.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self status blocks]}]
++        (let [[b0 b1 b2] blocks
++              backlog (choice-uuid conn status "Backlog")
++              done-id (choice-uuid conn status "Done")
++              property-id (:db/id (d/entity @conn status))
++              default (fn [] (:block/uuid (:logseq.property/default-value (d/entity @conn status))))]
++          (p/let [_ (outliner-property/set-block-property! conn property-id :logseq.property/default-value
++                                                           (:db/id (entity conn backlog)))
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn b0)) status :logseq.property/empty-placeholder]])
++                  default-before (default)
++                  refused (retire! self status ["Backlog"])
++                  _ (hold! self b1 status "Done")
++                  with-held (retire! self status ["Done" "Backlog"])
++                  _ (hold! self b2 status "Backlog")
++                  held-and-default (retire! self status ["Backlog"])
++                  _ (request! self "DELETE" (value-path b1 status) nil)
++                  _ (request! self "DELETE" (value-path b2 status) nil)
++                  default-after (default)
++                  titles-after (choice-titles conn status)
++                  before (snapshot conn)
++                  dry (retire! self status ["Backlog"] "dry-run=true")
++                  after-dry (snapshot conn)
++                  real (retire! self status ["Backlog"] "acknowledge-holders=true")]
++            (is (= backlog default-before) "Backlog is the default")
++            (is (= 409 (:status refused)) (str (:body refused)))
++            (is (= (str "choices.retire 0: \"Backlog\" is the property's default value; set acknowledge-holders=true "
++                        "to clear the default, or dry-run=true to preview")
++                   (get-in refused [:body :error])))
++            (is (= [{:choice (str backlog) :title "Backlog" :holders 0 :default true}] (get-in refused [:body :retired])))
++            (is (= 409 (:status with-held)) (str (:body with-held)))
++            (is (= (str "choices.retire 0: \"Done\" is held by 1 block; choices.retire 1: \"Backlog\" is the property's "
++                        "default value; set acknowledge-holders=true to remove them from their holders and clear the "
++                        "default, or dry-run=true to preview")
++                   (get-in with-held [:body :error])))
++            (is (= [{:choice (str done-id) :title "Done" :holders 1}
++                    {:choice (str backlog) :title "Backlog" :holders 0 :default true}]
++                   (get-in with-held [:body :retired]))
++                "only the default is marked")
++            (is (= (str "choices.retire 0: \"Backlog\" is held by 1 block and is the property's default value; "
++                        "set acknowledge-holders=true to remove it from them and clear the default, or dry-run=true to preview")
++                   (get-in held-and-default [:body :error])))
++            (is (= backlog default-after) "no refused call cleared the default")
++            (is (= ["Active" "Done" "Backlog"] titles-after) "or retired a choice")
++            (is (= 200 (:status dry)) (str (:body dry)))
++            (is (= [{:uuid (str backlog) :title "Backlog" :holders 0 :default true}] (get-in dry [:body :retired]))
++                "the dry run says the default is cleared")
++            (is (= before after-dry) "and stores nothing")
++            (is (= 200 (:status real)) (str (:body real)))
++            (is (= [{:uuid (str backlog) :title "Backlog" :holders 0 :default true}] (get-in real [:body :retired])))
++            (is (nil? (entity conn backlog)) "the choice is gone")
++            (is (nil? (default)) "and the property has no default")))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 4d9e7d2..e1c9ab9 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

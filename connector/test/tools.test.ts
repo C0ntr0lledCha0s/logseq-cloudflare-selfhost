@@ -453,6 +453,8 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("exactly one of set, add or remove");
     expect(update.description).toContain("{set: []}");
     expect(update.description).toContain("out_of_class");
+    expect(update.description).toContain("holders left empty aren't counted");
+    expect(update.description).toContain("A built-in property's classes, such as Assignee's, can't be changed");
   });
 
   it("create_property and update_property take choices, and say how", async () => {
@@ -483,6 +485,7 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("choices.retire");
     expect(update.description).toContain("run it with dry-run first");
     expect(update.description).toContain("only acknowledge a loss the user agreed to");
+    expect(update.description).toContain("the choice that is the property's default value");
   });
 
   it("update_property converts text values with convert_values, and says how", async () => {
