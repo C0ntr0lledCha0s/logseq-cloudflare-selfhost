@@ -1,6 +1,6 @@
 # Guided setup: design
 
-**Status:** design, awaiting approval
+**Status:** approved by the owner, 2026-11-06
 **Repo:** `logseq-cloudflare-selfhost`
 
 Decisions marked *(owner)* are the owner's. Every other decision is the designer's call.
@@ -52,6 +52,7 @@ A no-terminal path is out of scope. It was considered, using Cloudflare's Deploy
 
 - A browser-only or no-terminal setup, or a Deploy-to-Cloudflare button *(owner)*.
 - Building the server somewhere other than GitHub Actions or the user's machine, or publishing prebuilt bundles.
+- A fork bumping `UPSTREAM_REF` on its own (D12).
 - Moving the allow-list into D1, granting access by sharing a graph, or connecting graphs to the connector without a PAT. Each is a separate design.
 - Automating the Logseq client: installing nightly builds, entering the server URL, signing in.
 - Changing how an existing install deploys. The owner's install keeps working with no action.
@@ -143,7 +144,7 @@ With the bucket and subdomain handled, the first OpenTofu run happens in Actions
    - the `protect-main` ruleset;
    - the workflow permission that lets the bump workflow open PRs;
    - whether Actions is enabled. If it isn't, setup prints the exact page to click and waits. GitHub's docs don't say whether the API can enable a new fork's workflows, so the builder checks that. If it can't, the "click to enable" prompt is the path.
-   - **the scheduled workflows** (`backup`, `bump-upstream`, `usage`), enabled with `gh workflow enable`. GitHub disables scheduled workflows on a new public fork, so without this a fork would never back up or bump upstream ([docs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows): "When a public repository is forked, scheduled workflows are disabled by default").
+   - **the scheduled workflows,** enabled with `gh workflow enable`: `backup` and `usage`, plus `sync-upstream` on a fork or `bump-upstream` on the original (D12). GitHub disables scheduled workflows on a new public fork, so without this a fork would never back up or bump upstream ([docs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows): "When a public repository is forked, scheduled workflows are disabled by default").
 6. **Secrets.**
    - **Missing secrets are pushed.** It compares secret *names* in `production` (`gh secret list --env production`, which never shows values) with the required names, and pushes the missing ones from `.env.local`, through `init-env`'s push code.
    - **Existing secrets aren't overwritten.** `--repush` pushes every value again, for after an edit to `.env.local`.
@@ -324,12 +325,42 @@ The tests must cover at least:
 - **The owner can run `doctor.sh`** any time. `setup.sh` on the owner's checkout finds every stage done.
 - **`allow-user.sh` (add mode)** becomes the documented way to add someone. It replaces "edit `.env.local`, run the 1.8 loop, redeploy" in README 9.1.
 
+### D12. How a fork gets updates: a weekly update PR *(owner)*
+
+The original repo moves `UPSTREAM_REF` and `patches/` together, through its own `bump-upstream` PRs. A fork must take both together, from the original's `main`, never bumping on its own. Otherwise its patches stop applying.
+
+**On a fork:**
+
+- **A new `sync-upstream.yml` replaces `bump-upstream`.** It runs weekly, and on demand.
+  1. It compares the fork's `main` with the parent repo's `main`. The parent is read from the GitHub API (`parent.full_name`), never hard-coded, so a fork of a fork follows its own parent.
+  2. If the parent is ahead, it opens a PR into the fork's `main` carrying the parent's changes, or updates the one already open. Its body lists the incoming commits and the CI result, in the style of `bump-pr-body.sh`.
+  3. The fork owner reviews and merges it. Merging deploys, as every merge to `main` does.
+- **`bump-upstream.yml` does nothing on a fork:** its jobs gain `if: ${{ !github.event.repository.fork }}`. `sync-upstream.yml` does nothing on the original, with the opposite condition.
+- **Conflicts** happen only if the fork changed tracked files. The PR shows them, and the README says to keep a fork unmodified and put local settings in GitHub variables and secrets.
+- **"Sync fork" stays usable by hand,** but the README recommends the PR. The ruleset blocks direct pushes to `main` (builder to confirm), and the PR runs CI before the deploy.
+
+**The constraint the builder must solve first.** The bump workflow's pattern doesn't carry over:
+
+- The default `GITHUB_TOKEN` can't push a branch containing changes to `.github/workflows/`, and updates often contain them.
+- A PR the default token opens doesn't trigger `pull_request` CI. `bump-upstream` works around that by dispatching `ci.yml` on its own branch. With no branch in the fork, there is nothing to dispatch on.
+
+So the update PR's head must be the parent's `main` itself, which needs no push, and the required `check` status has to come another way. The candidate: `sync-upstream.yml` runs the `ci.yml` checks as a reusable workflow against the parent's head commit, then reports a `check` status on that commit. The ruleset requires `check` from GitHub Actions (`integration_id` 15368), so the status must count as that.
+
+The builder runs a spike on a test fork before building. If no approach puts a passing `check` on the PR without a personal token:
+
+- **The PR body still shows the CI result** the workflow got.
+- **The owner merges with the admin bypass** the ruleset already allows through a pull request (`bypass_mode: pull_request`).
+- **The README says so** in one line. No personal access token is ever required for updates.
+
+**Upgrades for the owner's repo are unchanged.** `bump-upstream` there works as today.
+
 ## README
 
 - **A new top:** "Quick start" with D9, the D2 checklist and `setup.sh`.
 - **Sections 1 and 2** move under "Advanced: set up and deploy from your machine", trimmed where `ensure-account` and `setup.sh` replaced steps.
 - **Section 3:** the first sign-in is refused, and `setup.sh` is waiting for it; otherwise run `scripts/allow-user.sh --owner`.
 - **Section 9.1:** adding someone is `scripts/allow-user.sh`. The manual paths stay as the fallback.
+- **Section 6 (Upgrades):** a fork merges its weekly update PR (D12). The bump PR text applies to the original repo only.
 - **Section 11:** `enable-connector.sh` first. The manual steps stay as the fallback.
 - **Troubleshooting:** most rows gain "`doctor.sh` checks this".
 
@@ -345,4 +376,11 @@ The tests must cover at least:
 
 ## Open questions for the owner
 
-(Filled in after the builder check.)
+None. The builder check raised four questions:
+
+- **How forks get updates:** the owner chose the weekly update PR (D12).
+- **The other three were the designer's calls,** recorded above:
+  - a lost `.env.local` stops setup (D4 stage 3);
+  - `allow-user.sh` chooses its mode by checking D1 (D5);
+  - new token permissions only warn on existing installs (D6, D11);
+  - `enable-connector.sh` rewrites the `CONNECTOR_ENABLED` line (D7).
