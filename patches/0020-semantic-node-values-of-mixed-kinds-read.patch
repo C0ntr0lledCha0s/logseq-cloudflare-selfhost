@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 10558ac..b690780 100644
+index 10558ac..c03e19a 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -127,6 +127,12 @@
@@ -101,7 +101,7 @@ index 10558ac..b690780 100644
  (defn- prepare-property-value
    "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
    the value is for (an entity, or a map of the :block/tags a new block will have), which limits a
-@@ -791,7 +855,10 @@
+@@ -791,16 +855,28 @@
    [db property-ident value e2ee? scope]
    (let [property (d/entity db property-ident)]
      (cond
@@ -113,7 +113,10 @@ index 10558ac..b690780 100644
        (nil? value) {:error "missing property value"}
        :else
        (let [many-input? (or (sequential? value) (set? value))
-@@ -800,7 +867,9 @@
+             values (if many-input? value [value])
+-            resolved (mapv #(prepare-ref-property-value db property-ident % e2ee? scope) values)]
++            resolved (mapv #(prepare-ref-property-value db property-ident % e2ee? scope) values)
++            unresolved #(some (fn [[v r]] (when (nil? r) v)) (map vector values resolved))]
          (cond
            (some ::error resolved) {:error (some ::error resolved)}
            (every? some? resolved)
@@ -121,10 +124,16 @@ index 10558ac..b690780 100644
 +          (if-let [refused (refused-by-type db property values resolved)]
 +            (refusal property refused)
 +            {:value (if many-input? resolved (first resolved))})
++          ;; Text that isn't a finite number (NaN, Infinity) for a number property without choices,
++          ;; rather than an existing value named by its UUID.
++          (and (= :number (:logseq.property/type property))
++               (empty? (:block/_closed-value-property property))
++               (not (common-util/uuid-string? (unresolved))))
++          (refusal property (str (pr-str (str (unresolved))) " should be a finite number"))
            :else
            {:error (cond
                      (= property-ident :block/tags)
-@@ -866,7 +935,7 @@
+@@ -866,7 +942,7 @@
                    (cond
                      (not (property? property)) (reduced {:error (str "property not found: " selector)})
                      (nil? value) (reduced {:error (str selector ": missing property value")})
@@ -180,10 +189,10 @@ index 57b3b39..a206260 100644
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
 new file mode 100644
-index 0000000..21150b5
+index 0000000..2591008
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,453 @@
 +(ns logseq.db-sync.semantic-node-value-read-test
 +  "A node (many) property can hold entities of different kinds: plain and journal pages, which
 +  have no :block/order, and blocks, property entities and pages under the Library or a namespace
@@ -573,7 +582,7 @@ index 0000000..21150b5
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self blocks host-id points estimate]}]
-+        (let [[b0 b1 b2 b3 b4 b5] blocks
++        (let [[b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11] blocks
 +              put! (fn [block property value]
 +                     (request! self "PUT" (str "/semantic/blocks/" block "/properties/"
 +                                               (js/encodeURIComponent (ident-id property)))
@@ -596,7 +605,17 @@ index 0000000..21150b5
 +                                    :blocks [{:title "inserted" :properties {"points" 7}}]})
 +                  inserted (some-> (get-in insert [:body :blocks 0 :uuid]) uuid)
 +                  read (request! self "GET" (str "/semantic/blocks/" b0) nil)
-+                  not-a-number (batch-set! self (set-entry b2 (ident-id points) "three"))]
++                  not-a-number (batch-set! self (set-entry b2 (ident-id points) "three"))
++                  ;; Numeric text that parses to a value JSON can't carry: stored, it would read back as null.
++                  non-finite (reduce (fn [acc [label block write]]
++                                       (p/let [done acc r (write block)] (conj done [label block r])))
++                                     (p/resolved [])
++                                     (for [[text batch-block put-block] [["NaN" b6 b7] ["Infinity" b8 b9]
++                                                                             ["-Infinity" b10 b11]]
++                                               [how block write] [["batch" batch-block
++                                                                   #(batch-set! self (set-entry % (ident-id points) text))]
++                                                                  ["PUT" put-block #(put! % points text)]]]
++                                       [(str how " " text) block write]))]
 +            (doseq [[label r] [["batch" batch] ["single set" put] ["decimal" decimal] ["numeric text" text]
 +                               ["a db id of an own value" same-as-id] ["list" many]]]
 +              (is (= 200 (:status r)) (str label ": " (pr-str (:body r)))))
@@ -616,7 +635,17 @@ index 0000000..21150b5
 +                  (pr-str (:body read))))
 +            (testing "control: text that isn't a number is still refused"
 +              (is (= 400 (:status not-a-number)) (pr-str (:body not-a-number)))
-+              (is (= 2.5 (number b2 points))))))))))
++              (is (= 2.5 (number b2 points))))
++            (testing "text that isn't a finite number is refused, naming the entry and property, and nothing is stored"
++              (doseq [[label block r] non-finite]
++                (is (= 400 (:status r)) (str label ": " (pr-str (:body r))))
++                (is (re-find (if (string/starts-with? label "batch")
++                               #"^entry 0: points: .* should be a finite number"
++                               #"^points: .* should be a finite number")
++                             (str (get-in r [:body :error])))
++                    (str label ": " (pr-str (:body r))))
++                (is (nil? (get (d/entity @conn [:block/uuid block]) (:db/ident points)))
++                    (str label ": stored " (pr-str (number block points))))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index d69fbda..53363a1 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
