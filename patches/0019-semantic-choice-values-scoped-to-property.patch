@@ -70,19 +70,21 @@ index a019c3b..d99a20c 100644
 +                                       :value (d/entity db (:v datom))
 +                                       :reason reason})))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index b3bd63c..041b598 100644
+index b3bd63c..670f05d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -628,7 +628,31 @@
+@@ -628,7 +628,41 @@
    {:logseq.property/status task-status-idents
     :logseq.property/priority task-priority-idents})
  
 -(defn- resolve-ref-entity [db property-ident value]
 +(defn- title-candidates
-+  "The entities a ref property value given by title can mean. Another property's choice or value
-+  block is never one (the property's own value block is: a URL is reused), nor is a hidden entity. Pages win over blocks, objects with one of the
-+  property's classes over others, and user entities over built-ins. A title matches exactly, else
-+  a page name ignoring case."
++  "The entities a ref property value given by title can mean, or {::error reason}. Another
++  property's choice or value block is never one, nor is a hidden entity. A property limited to
++  classes takes only an object of one of them, and refuses a title only other entities have.
++  Then pages win over blocks, and user entities over built-ins. The property's own value blocks
++  with the title are one value (a URL that several blocks hold), so the oldest is reused. A title
++  matches exactly, else a page name ignoring case."
 +  [db property value]
 +  (let [candidates (fn [datoms]
 +                     (->> datoms
@@ -94,10 +96,18 @@ index b3bd63c..041b598 100644
 +        exact (candidates (d/datoms db :avet :block/title value))
 +        found (if (seq exact) exact (candidates (d/datoms db :avet :block/name (string/lower-case value))))
 +        prefer (fn [entities pred] (let [preferred (filter pred entities)] (if (seq preferred) preferred entities)))
-+        classes (set (map :db/id (:logseq.property/classes property)))]
-+    (cond-> (prefer found page?)
-+      (seq classes) (prefer #(some (comp classes :db/id) (:block/tags %)))
-+      true (prefer (complement entity-util/built-in?)))))
++        classes (:logseq.property/classes property)
++        of-class (if (seq classes)
++                   (filter (fn [entity] (some #(db-db/class-instance? % entity) classes)) found)
++                   found)
++        ranked (-> of-class (prefer page?) (prefer (complement entity-util/built-in?)))
++        own-value? #(= (:db/id property) (:db/id (:logseq.property/created-from-property %)))]
++    (cond
++      (and (seq found) (empty? of-class))
++      {::error (str "no " (string/join " or " (map #(str "#" (:block/title %)) (sort-by :db/id classes)))
++                    " object titled " (pr-str value))}
++      (every? own-value? ranked) (take 1 (sort-by :db/id ranked))
++      :else ranked)))
 +
 +(defn- resolve-ref-entity
 +  "The db id of the entity `value` names for a ref property, nil when none, or {::error reason}
@@ -106,7 +116,7 @@ index b3bd63c..041b598 100644
    (let [value (if (string? value)
                  (get-in property-choice-aliases
                          [property-ident (string/lower-case value)] value)
-@@ -638,19 +662,73 @@
+@@ -638,19 +672,75 @@
                   (qualified-keyword? value) (d/entity db value)
                   (and (string? value) (common-util/uuid-string? value))
                   (d/entity db [:block/uuid (uuid value)])
@@ -123,11 +133,13 @@ index b3bd63c..041b598 100644
 +                 (string? value)
 +                 (or (d/entity db (keyword value))
 +                     (let [candidates (title-candidates db (d/entity db property-ident) value)]
-+                       (if (next candidates)
++                       (cond
++                         (::error candidates) candidates
++                         (next candidates)
 +                         {::error (str (pr-str value) " matches " (count candidates) " entities ("
 +                                       (string/join ", " (map (comp str :block/uuid) (sort-by :db/id candidates)))
 +                                       "); give the one you mean by UUID")}
-+                         (first candidates))))
++                         :else (first candidates))))
                   :else nil)]
 -    (when (and entity
 -               (or (not= property-ident :block/tags) (entity-util/class? entity)))
@@ -186,7 +198,7 @@ index b3bd63c..041b598 100644
  (defn- free-text-value?
    "A plain string for a text (default-type) property without fixed choices. The outliner stores it
    in a new value block, as the editor does, so it is never looked up by title: text that happens to
-@@ -663,10 +741,12 @@
+@@ -663,10 +753,12 @@
         (non-blank-string? value)
         (not (common-util/uuid-string? value))))
  
@@ -202,7 +214,7 @@ index b3bd63c..041b598 100644
        (or (resolve-ref-entity db property-ident value)
            (when (and (not e2ee?)
                       (= :url (:logseq.property/type property))
-@@ -674,17 +754,32 @@
+@@ -674,17 +766,32 @@
                       (db-property-type/url? value))
              value)))))
  
@@ -241,22 +253,32 @@ index b3bd63c..041b598 100644
                      "property value must resolve to an existing entity by UUID, ident, or title")})))))
  
  (defn- set-prepared-property! [conn block-id property-ident value reset-existing-values?]
-@@ -703,24 +798,38 @@
+@@ -703,24 +810,48 @@
    [k]
    (subs (str k) 1))
  
++(defn- tag-ids
++  "The tag db ids a resolved :block/tags value holds (one id or several)."
++  [value]
++  (if (coll? value) value (keep identity [value])))
++
++(defn- scope-with-tags
++  "`scope` (see prepare-property-value) with the tags `tag-ids` that the same call adds to the
++  block, so a choice limited to one of those tags is offered."
++  [db scope tag-ids]
++  (if (seq tag-ids)
++    (cond-> {:block/tags (concat (:block/tags scope) (map #(d/entity db %) tag-ids))}
++      (:db/id scope) (assoc :db/id (:db/id scope)))
++    scope))
++
 +(defn- with-property-tags
-+  "`scope` with the tags that a `properties` object adds to the block, so a choice limited to
-+  one of those tags is offered."
++  "`scope` with the tags that a `properties` object adds to the block."
 +  [db scope properties e2ee?]
-+  (let [tag-ids (some (fn [[k value]]
-+                        (when (= :block/tags (resolve-property-ident db (property-selector k)))
-+                          (:value (prepare-property-value db :block/tags value e2ee? nil))))
-+                      properties)
-+        tag-ids (if (coll? tag-ids) tag-ids (keep identity [tag-ids]))]
-+    (if (seq tag-ids)
-+      {:block/tags (concat (:block/tags scope) (map #(d/entity db %) tag-ids))}
-+      scope)))
++  (scope-with-tags db scope
++                   (tag-ids (some (fn [[k value]]
++                                    (when (= :block/tags (resolve-property-ident db (property-selector k)))
++                                      (:value (prepare-property-value db :block/tags value e2ee? nil))))
++                                  properties))))
 +
  (defn- prepare-properties
 -  "Resolves a `properties` object to [[ident value] ...], or {:error reason} for the first key or
@@ -295,7 +317,7 @@ index b3bd63c..041b598 100644
  
  (defn- prepare-tree
    "Resolves the properties of every node of identity-checked `nodes`, keeping them under
-@@ -728,8 +837,11 @@
+@@ -728,8 +859,11 @@
    [db nodes e2ee? path]
    (reduce (fn [result [index node]]
              (let [node-path (str path "[" index "]")
@@ -308,7 +330,7 @@ index b3bd63c..041b598 100644
                    children (when (seq (:children node))
                               (prepare-tree db (:children node) e2ee? (str node-path ".children")))]
                (cond
-@@ -836,15 +948,11 @@
+@@ -836,15 +970,11 @@
      (:logseq.property/scheduled task) (assoc :scheduled (:logseq.property/scheduled task))
      (:logseq.property/deadline task) (assoc :deadline (:logseq.property/deadline task))))
  
@@ -329,7 +351,7 @@ index b3bd63c..041b598 100644
  
  (def ^:private search-types #{"pages" "blocks" "tags" "properties" "assets"})
  
-@@ -1334,7 +1442,8 @@
+@@ -1334,7 +1464,8 @@
      (p/let [body (body-clj request)
              block (find-entity db (:block-id path-params))
              property-ident (resolve-property-ident db (:property-id path-params))
@@ -339,24 +361,42 @@ index b3bd63c..041b598 100644
        (cond
          (nil? block) (http/bad-request "block not found")
          (nil? property-ident) (http/bad-request "property not found")
-@@ -1360,11 +1469,12 @@
+@@ -1358,13 +1489,28 @@
+     :semantic/blocks-batch-set-property
+     (p/let [body (body-clj request)
              entries (:entries body)
++            reset? (true? (:isResetExistingValues body))
++            ;; An entry's block is scoped with the tags earlier entries in the batch give it.
              resolved (when (sequential? entries)
-                        (mapv (fn [{:keys [block-id property-id value]}]
+-                       (mapv (fn [{:keys [block-id property-id value]}]
 -                               (let [property-ident (resolve-property-ident db property-id)]
 -                                 {:block (find-entity db block-id)
-+                               (let [property-ident (resolve-property-ident db property-id)
-+                                     block (find-entity db block-id)]
-+                                 {:block block
-                                   :property-ident property-ident
+-                                  :property-ident property-ident
 -                                  :prepared (when property-ident
 -                                              (prepare-property-value db property-ident value e2ee?))})) entries))]
-+                                  :prepared (when (and block property-ident)
-+                                              (prepare-property-value db property-ident value e2ee? block))})) entries))]
++                       (:entries
++                        (reduce (fn [{:keys [added] :as result} {:keys [block-id property-id value]}]
++                                  (let [property-ident (resolve-property-ident db property-id)
++                                        block (find-entity db block-id)
++                                        added-ids (get added (:db/id block))
++                                        scope (if (and reset? (seq added-ids))
++                                                (scope-with-tags db {:db/id (:db/id block)} added-ids)
++                                                (scope-with-tags db block added-ids))
++                                        prepared (when (and block property-ident)
++                                                   (prepare-property-value db property-ident value e2ee? scope))]
++                                    (cond-> (update result :entries conj {:block block
++                                                                          :property-ident property-ident
++                                                                          :prepared prepared})
++                                      (and (= :block/tags property-ident) (:value prepared))
++                                      (update-in [:added (:db/id block)]
++                                                 (if reset? (fn [_ ids] (vec ids)) (fnil into []))
++                                                 (tag-ids (:value prepared))))))
++                                {:entries [] :added {}}
++                                entries)))]
        (if-let [error (batch-entries-error entries resolved)]
          (http/bad-request error)
          (do (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
-@@ -1459,9 +1569,9 @@
+@@ -1459,9 +1605,9 @@
            priority (.get (.-searchParams url) "priority")
            content (some-> (.get (.-searchParams url) "content") string/lower-case)
            status-choice (when status (resolve-property-choice db :logseq.property/status
@@ -368,7 +408,7 @@ index b3bd63c..041b598 100644
        (cond
          (and status (nil? status-choice)) (http/bad-request "invalid task status")
          (and priority (nil? priority-choice)) (http/bad-request "invalid task priority")
-@@ -1482,10 +1592,11 @@
+@@ -1482,10 +1628,11 @@
      (p/let [body (body-clj request)]
        (let [status (or (:status body) "todo")
              priority (:priority body)
@@ -382,17 +422,83 @@ index b3bd63c..041b598 100644
              target (when-let [page-id (:page-id body)]
                       (find-entity db page-id))]
          (cond
-@@ -1769,7 +1880,8 @@
+@@ -1762,14 +1909,24 @@
+               (string? (:uuid node)) (cons (string/lower-case (:uuid node)))))
+           nodes))
+ 
++(defn- insert-entry-key
++  "What a batch insert entry writes to: the existing target or page, else the page title to create."
++  [target existing-page page]
++  (or (:db/id (or target existing-page))
++      (when (string? page) [:page (string/lower-case page)])))
++
+ (defn- insert-entry
+-  "One batch insert entry resolved against `db`: {:entry resolved} or {:error reason}."
+-  [db e2ee? index entry]
++  "One batch insert entry resolved against `db`: {:entry resolved} or {:error reason}. `added`
++  maps an insert-entry-key to the tags earlier entries give that target."
++  [db e2ee? added index entry]
+   (let [prefix (str "entries[" index "]")
          target (when (contains? entry :target-id) (find-entity db (:target-id entry)))
          page (:page entry)
          existing-page (when (and (non-blank-string? page) (not e2ee?)) (ldb/get-page db page))
 -        properties (when (contains? entry :properties) (prepare-properties db (:properties entry) e2ee?))
++        scope (scope-with-tags db (or target existing-page {})
++                               (get added (insert-entry-key target existing-page page)))
 +        properties (when (contains? entry :properties)
-+                     (prepare-properties db (:properties entry) e2ee? (or target existing-page {})))
++                     (prepare-properties db (:properties entry) e2ee? scope))
          error (cond
                  (and (contains? entry :target-id) (contains? entry :page)) "give target-id or page, not both"
                  (contains? entry :target-id) (when (nil? target) "target not found")
-@@ -1963,7 +2075,18 @@
+@@ -1794,6 +1951,7 @@
+       error {:error (str prefix ": " error)}
+       (:error tree) tree
+       :else {:entry {:target target
++                     :key (insert-entry-key target existing-page page)
+                      :page page
+                      :position (or (:position entry) "append")
+                      :properties (:properties properties)
+@@ -1805,20 +1963,25 @@
+   [db e2ee? entries]
+   (if-not (and (sequential? entries) (<= 1 (count entries) max-batch-size))
+     {:error (str "entries must be an array of 1 to " max-batch-size " entries")}
+-    (reduce (fn [{:keys [uuids] :as result} [index entry]]
+-              (let [{:keys [error] :as resolved} (if (map? entry)
+-                                                   (insert-entry db e2ee? index entry)
+-                                                   {:error (str "entries[" index "]: must be an object")})
+-                    entry-uuids (tree-uuids (:blocks entry))]
+-                (cond
+-                  error (reduced {:error error})
+-                  (some uuids entry-uuids)
+-                  (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
+-                  :else (-> result
+-                            (update :entries conj (:entry resolved))
+-                            (update :uuids into entry-uuids)))))
+-            {:entries [] :uuids #{}}
+-            (map-indexed vector entries))))
++    (-> (reduce (fn [{:keys [uuids added] :as result} [index entry]]
++                  (let [{:keys [error] :as resolved} (if (map? entry)
++                                                       (insert-entry db e2ee? added index entry)
++                                                       {:error (str "entries[" index "]: must be an object")})
++                        {:keys [key properties]} (:entry resolved)
++                        entry-uuids (tree-uuids (:blocks entry))]
++                    (cond
++                      error (reduced {:error error})
++                      (some uuids entry-uuids)
++                      (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
++                      :else (-> result
++                                (update :entries conj (dissoc (:entry resolved) :key))
++                                (update :uuids into entry-uuids)
++                                (update-in [:added key] (fnil into [])
++                                           (mapcat (fn [[ident value]] (when (= :block/tags ident) (tag-ids value)))
++                                                   properties))))))
++                {:entries [] :uuids #{} :added {}}
++                (map-indexed vector entries))
++        (dissoc :added))))
+ 
+ (defn- insert-entries!
+   "Applies resolved insert entries in order. A `page` entry uses the page with that name, or creates it."
+@@ -1963,7 +2126,18 @@
        (> (count selected) limit) (assoc :next-cursor (encode-cursor (first (last page)))))))
  
  (def ^:private health-checks
@@ -412,7 +518,7 @@ index b3bd63c..041b598 100644
  
  (defn- comma-list [^js url param]
    (let [raw (.get (.-searchParams url) param)]
-@@ -1984,7 +2107,13 @@
+@@ -1984,7 +2158,13 @@
                                                    :entities (mapv page-ref-response group)})
                                                 %))
        "pages-without-summary" (pages-check (graph-insights/pages-without-summary db prefix))
@@ -428,7 +534,7 @@ index b3bd63c..041b598 100644
  (defn- knowledge-index-entry [db {:keys [ref-properties lineage prefix]} page]
    (let [summary (graph-insights/page-summary db page prefix)]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 7f4a34e..ed5054c 100644
+index 7f4a34e..fecdbe3 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -111,7 +111,7 @@
@@ -445,7 +551,7 @@ index 7f4a34e..ed5054c 100644
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
 -   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
     "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
     "updateBlock" ["Update a block" "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
@@ -454,15 +560,15 @@ index 7f4a34e..ed5054c 100644
 -   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
 -   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
 -   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title."]
-+   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs."]
++   "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "setBlockProperty" ["Set a block property" "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs."]
     "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
 -   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax."]
-+   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs."]
++   "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Tags an earlier entry gives a block count for the later entries for that block."]
     "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
 -   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
-+   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
++   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed. A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags takes only an object with one of those tags, and refuses a title only other entities have; a title several pages share is refused with their UUIDs. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped."]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
@@ -500,10 +606,10 @@ index 7f4a34e..ed5054c 100644
                write-guard-schemas)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs
 new file mode 100644
-index 0000000..b35f53f
+index 0000000..30fd06f
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_choice_values_test.cljs
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,602 @@
 +(ns logseq.db-sync.semantic-choice-values-test
 +  "Values of a property with choices (closed values) resolve only among that property's own
 +  choices. Two properties here share the choice title \"active\"; Project status's choice is
@@ -749,23 +855,25 @@ index 0000000..b35f53f
 +(deftest health-flags-choice-values-owned-by-another-property-test
 +  (async done
 +    (with-choices done
-+      (fn [{:keys [conn self blocks project relationship project-active rel-active]}]
++      (fn [{:keys [conn self blocks plain-id project relationship project-active rel-active]}]
 +        (p/let [related (outliner-property/upsert-property!
 +                         conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
 +                         {:property-name "Related"})
 +                related (:db/ident related)
-+                [b0 b1 b2 b3] blocks
++                [b0 b1 b2 b3 b4] blocks
 +                _ (d/transact! conn [[:db/add [:block/uuid b0] relationship [:block/uuid project-active]]
 +                                     [:db/add [:block/uuid b1] relationship [:block/uuid rel-active]]
 +                                     ;; A node property holding a choice block, as a title once stored.
 +                                     [:db/add [:block/uuid b2] related [:block/uuid project-active]]
 +                                     ;; A hidden (recycled) holder is not reported.
 +                                     [:db/add [:block/uuid b3] relationship [:block/uuid project-active]]
-+                                     [:db/add [:block/uuid b3] :logseq.property/deleted-at 1]])
++                                     [:db/add [:block/uuid b3] :logseq.property/deleted-at 1]
++                                     ;; A plain block stored as a choice, as a matching title once was.
++                                     [:db/add [:block/uuid b4] relationship [:block/uuid plain-id]]])
 +                health (request! self "GET" "/semantic/health?checks=mismatched-choice-values" nil)]
 +          (is (= 200 (:status health)) (str (:body health)))
 +          (let [check (get-in health [:body :checks :mismatched-choice-values])]
-+            (is (= 2 (:count check)) (str check))
++            (is (= 3 (:count check)) (str check))
 +            (is (= #{{:uuid (str b0)
 +                      :property (subs (str relationship) 1)
 +                      :value "active"
@@ -777,7 +885,13 @@ index 0000000..b35f53f
 +                      :value "active"
 +                      :value-uuid (str project-active)
 +                      :value-property (subs (str project) 1)
-+                      :reason "another-propertys-choice"}}
++                      :reason "another-propertys-choice"}
++                     {:uuid (str b4)
++                      :property (subs (str relationship) 1)
++                      :value "one"
++                      :value-uuid (str plain-id)
++                      :value-property nil
++                      :reason "not-a-choice"}}
 +                   (set (map #(select-keys % [:uuid :property :value :value-uuid :value-property :reason])
 +                             (:items check))))
 +                "values whose choice belongs to Project status are flagged, on a choice or a node property")))))))
@@ -895,8 +1009,14 @@ index 0000000..b35f53f
 +                _ (outliner-property/upsert-closed-value! conn relationship
 +                                                          {:id triage :value "triage" :scoped-class-id bug-id})
 +                _ (d/transact! conn [[:db/add bug-id :logseq.property/choice-exclusions [:block/uuid rel-prospect]]])
-+                [b0 b1 b2 b3 b4] blocks
-+                _ (d/transact! conn [[:db/add [:block/uuid b1] :block/tags bug-id]
++                stale (random-uuid)
++                _ (outliner-property/upsert-closed-value! conn relationship
++                                                          {:id stale :value "stale" :scoped-class-id bug-id})
++                [b0 b1 b2 b3 b4 b5] blocks
++                _ (d/transact! conn [;; A recycled choice is not reported as out of scope.
++                                     [:db/add [:block/uuid stale] :logseq.property/deleted-at 1]
++                                     [:db/add [:block/uuid b5] relationship [:block/uuid stale]]
++                                     [:db/add [:block/uuid b1] :block/tags bug-id]
 +                                     [:db/add [:block/uuid b2] :block/tags bug-id]
 +                                     [:db/add [:block/uuid b3] relationship [:block/uuid triage]]
 +                                     [:db/add [:block/uuid b4] :block/tags bug-id]
@@ -931,6 +1051,167 @@ index 0000000..b35f53f
 +            (is (= #{[(str b3) "out-of-scope"] [(str b4) "out-of-scope"]}
 +                   (set (map (juxt :uuid :reason) (:items check))))
 +                (str "values outside the holder's choices are flagged: " check))))))))
++
++(defn- with-bug-scoped-triage
++  "with-choices plus a tag Bug and a Relationship status choice \"triage\" limited to Bug."
++  [done run]
++  (with-choices done
++    (fn [{:keys [conn self relationship] :as context}]
++      (p/let [bug (request! self "POST" "/semantic/tags" {:title "Bug"})
++              bug-id (:db/id (d/entity @conn [:block/uuid (uuid (get-in bug [:body :uuid]))]))
++              triage (random-uuid)
++              _ (outliner-property/upsert-closed-value! conn relationship
++                                                        {:id triage :value "triage" :scoped-class-id bug-id})]
++        (run (assoc context :bug-id bug-id :triage triage))))))
++
++(deftest tag-scope-comes-from-every-write-path-test
++  ;; Each write path builds the block's scope its own way; each is checked here.
++  (async done
++    (with-bug-scoped-triage done
++      (fn [{:keys [conn self page-id relationship bug-id triage]}]
++        (let [rel-ident (subs (str relationship) 1)
++              tagged-child (random-uuid)
++              status-bug (random-uuid)]
++          (p/let [;; A Tags property in the same properties object tags the new block.
++                  tree (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str page-id)
++                                  :blocks [{:uuid (str tagged-child) :title "Tagged by property"
++                                            :properties {"Tags" ["Bug"] "Relationship status" "triage"}}]})
++                  ;; A task is a Task: a Status choice limited to Bug is not one of its choices.
++                  _ (outliner-property/upsert-closed-value! conn :logseq.property/status
++                                                            {:id status-bug :value "Bug triage" :scoped-class-id bug-id})
++                  task (request! self "POST" "/semantic/tasks"
++                                 {:title "Scoped status task" :page-id (str page-id) :status "Bug triage"})
++                  ;; A batch insert entry's page properties are checked against the page's tags.
++                  entry (request! self "POST" "/semantic/block-trees/batch"
++                                  {:entries [{:page "Choices" :properties {rel-ident "triage"}}]})]
++            (is (= 201 (:status tree)) (str (:body tree)))
++            (is (= triage (stored-uuid conn tagged-child relationship))
++                "a block tagged Bug by its Tags property takes the Bug-scoped choice")
++            (is (= 400 (:status task)) (str (:body task)))
++            (is (not-any? #(= "Scoped status task" (:block/title %))
++                          (:block/_parent (d/entity @conn [:block/uuid page-id])))
++                "a refused task is not created")
++            (is (= 400 (:status entry)) (str (:body entry)))
++            (is (string/starts-with? (str (get-in entry [:body :error])) "entries[0]: ") (str (:body entry)))
++            (is (nil? (stored-uuid conn page-id relationship)) "a refused entry writes nothing")))))))
++
++(deftest batch-sees-tags-earlier-entries-add-test
++  ;; Tagging a block and setting a choice its new tag allows, in one call, works as two calls do.
++  (async done
++    (with-bug-scoped-triage done
++      (fn [{:keys [conn self blocks relationship bug-id triage]}]
++        (let [rel-ident (subs (str relationship) 1)
++              [b0 b1] blocks]
++          (p/let [batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                      {:entries [{:block-id (str b0) :property-id "block/tags" :value "Bug"}
++                                                 {:block-id (str b0) :property-id rel-ident :value "triage"}]})
++                  ;; The tag goes to b0 only: b1 is still refused.
++                  other-block (request! self "POST" "/semantic/block-properties/batch-set"
++                                        {:entries [{:block-id (str b0) :property-id "block/tags" :value "Bug"}
++                                                   {:block-id (str b1) :property-id rel-ident :value "triage"}]})
++                  batch-tree (request! self "POST" "/semantic/block-trees/batch"
++                                       {:entries [{:page "Fresh page" :properties {"Tags" ["Bug"]}}
++                                                  {:page "fresh page" :properties {rel-ident "triage"}}]})]
++            (is (= 200 (:status batch-set)) (str (:body batch-set)))
++            (is (= triage (stored-uuid conn b0 relationship)))
++            (is (contains? (set (map :db/id (:block/tags (d/entity @conn [:block/uuid b0])))) bug-id))
++            (is (= 400 (:status other-block)) (str (:body other-block)))
++            (is (string/starts-with? (str (get-in other-block [:body :error])) "entry 1: ") (str (:body other-block)))
++            (is (nil? (stored-uuid conn b1 relationship)))
++            (is (= 201 (:status batch-tree)) (str (:body batch-tree)))
++            (let [page (d/entity @conn [:block/uuid (uuid (get-in batch-tree [:body :entries 1 :target-id] "00000000-0000-0000-0000-000000000000"))])]
++              (is (= triage (:block/uuid (get page relationship)))
++                  "a later entry for the same page sees the tag an earlier entry adds"))))))))
++
++(deftest url-value-held-by-several-blocks-test
++  ;; The editor gives each holder of a URL its own value block, so a URL can have several.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id blocks]}]
++        (p/let [website (outliner-property/upsert-property!
++                         conn nil {:logseq.property/type :url :db/cardinality :db.cardinality/one}
++                         {:property-name "Website"})
++                website (:db/ident website)
++                website-ident (subs (str website) 1)
++                url "https://example.com/x"
++                [b0 b1 b2 b3] blocks
++                tree-child (random-uuid)
++                _ (outliner-property/set-block-property! conn [:block/uuid b0] website url)
++                _ (outliner-property/set-block-property! conn [:block/uuid b1] website url)
++                put (request! self "PUT" (property-path b2 website) {:value url})
++                batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                    {:entries [{:block-id (str b3) :property-id website-ident :value url}]})
++                tree (request! self "POST" "/semantic/block-trees"
++                               {:target-id (str page-id)
++                                :blocks [{:uuid (str tree-child) :title "Tree child"
++                                          :properties {"Website" url}}]})]
++          (is (not= (stored-uuid conn b0 website) (stored-uuid conn b1 website))
++              "two holders, two value blocks")
++          (is (= [200 200 201] (mapv :status [put batch-set tree])) (pr-str (mapv :body [put batch-set tree])))
++          (doseq [id [b2 b3 tree-child]]
++            (is (= url (:block/title (get (d/entity @conn [:block/uuid id]) website)))
++                "the URL is stored on the third block")))))))
++
++(deftest node-property-title-ranking-test
++  ;; A node property's title lookup: objects of the property's tags only, then pages over blocks,
++  ;; user entities over built-ins, and never a recycled entity.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self page-id blocks]}]
++        (p/let [company (request! self "POST" "/semantic/tags" {:title "Company"})
++                company-id (:db/id (d/entity @conn [:block/uuid (uuid (get-in company [:body :uuid]))]))
++                [zeta-page zeta-block globex-x globex-plain initech-built-in initech-user gone
++                 acme-notes acme-object] (repeatedly 9 random-uuid)
++                page (fn [id title & {:as more}]
++                       (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++                               :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++                              more))
++                block (fn [id title order & {:as more}]
++                        (merge {:block/uuid id :block/title title :block/page [:block/uuid page-id]
++                                :block/parent [:block/uuid page-id] :block/order order
++                                :block/created-at 1 :block/updated-at 1}
++                               more))
++                _ (d/transact! conn [(page zeta-page "Zeta")
++                                     (block zeta-block "Zeta" "b0")
++                                     (page globex-x "Globex" :block/tags #{:logseq.class/Page company-id})
++                                     (page globex-plain "Globex")
++                                     (page initech-built-in "Initech" :logseq.property/built-in? true)
++                                     (page initech-user "Initech")
++                                     (page gone "Gone page" :logseq.property/deleted-at 1)
++                                     (page acme-notes "Acme")
++                                     (block acme-object "Acme" "b1" :block/tags #{company-id})])
++                related (outliner-property/upsert-property!
++                         conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                         {:property-name "Related"})
++                company-ref (outliner-property/upsert-property!
++                             conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                             {:property-name "Company ref"})
++                _ (d/transact! conn [[:db/add (:db/id company-ref) :logseq.property/classes company-id]])
++                related (:db/ident related)
++                company-ref (:db/ident company-ref)
++                [b0 b1 b2 b3 b4 b5] blocks
++                page-over-block (request! self "PUT" (property-path b0 related) {:value "Zeta"})
++                class-match (request! self "PUT" (property-path b1 company-ref) {:value "Globex"})
++                class-before-page (request! self "PUT" (property-path b2 company-ref) {:value "Acme"})
++                no-class-match (request! self "PUT" (property-path b3 company-ref) {:value "Zeta"})
++                user-over-built-in (request! self "PUT" (property-path b4 related) {:value "Initech"})
++                recycled (request! self "PUT" (property-path b5 related) {:value "Gone page"})]
++          (is (= 200 (:status page-over-block)) (str (:body page-over-block)))
++          (is (= zeta-page (stored-uuid conn b0 related)) "a page wins over a block with its title")
++          (is (= 200 (:status class-match)) (str (:body class-match)))
++          (is (= globex-x (stored-uuid conn b1 company-ref)) "the page with the property's tag wins")
++          (is (= 200 (:status class-before-page)) (str (:body class-before-page)))
++          (is (= acme-object (stored-uuid conn b2 company-ref))
++              "a #Company block wins over an untagged page for a property limited to Company")
++          (is (= 400 (:status no-class-match)) (str (:body no-class-match)))
++          (is (string/includes? (str (get-in no-class-match [:body :error])) "#Company")
++              (str (:body no-class-match)))
++          (is (nil? (stored-uuid conn b3 company-ref)) "an object without the tag is never stored")
++          (is (= 200 (:status user-over-built-in)) (str (:body user-over-built-in)))
++          (is (= initech-user (stored-uuid conn b4 related)) "a user page wins over a built-in one")
++          (is (= 400 (:status recycled)) (str (:body recycled)))
++          (is (nil? (stored-uuid conn b5 related)) "a recycled page is never stored"))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
 index 7a23de6..e3a00c4 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
