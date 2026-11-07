@@ -1,0 +1,31 @@
+{
+  "blocks": [
+    {
+      "uuid": "aaaaaaaa-0000-4000-8000-000000000001",
+      "kind": "block",
+      "title": "Agenda",
+      "order": "a0",
+      "parent-id": "00000001-2026-1105-0000-000000000000",
+      "page-id": "00000001-2026-1105-0000-000000000000",
+      "tags": [],
+      "properties": [],
+      "markdown": "- Budget",
+      "block-count": 1200,
+      "truncated": false
+    },
+    {
+      "uuid": "aaaaaaaa-0000-4000-8000-000000000002",
+      "kind": "block",
+      "title": "Archive",
+      "order": "a1",
+      "parent-id": "00000001-2026-1105-0000-000000000000",
+      "page-id": "00000001-2026-1105-0000-000000000000",
+      "tags": [],
+      "properties": [],
+      "markdown": "- 2025",
+      "block-count": 800,
+      "truncated": true
+    }
+  ],
+  "missing": []
+}

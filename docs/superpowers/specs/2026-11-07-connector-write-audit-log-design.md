@@ -159,6 +159,16 @@ Rules:
 - **E2EE graphs.** `view=outline` and `getPageOutline` answer 409, so deletes store the summary view of the addressed blocks (ciphertext titles) with `e2ee: true`. The subtree can't be read back on E2EE graphs; this is a documented exception to acceptance 2 (section 11, question 3).
 - **The snapshot is best-effort.** It is a separate read before the write, so a Logseq client edit between the two is missed. The docs say so.
 
+**As built (stage 3).** Details the text above left open, settled in `connector/src/audit/snapshot.ts` and pinned by `connector/test/audit-snapshot.test.ts`:
+
+- **Which deletes refuse.** Every tool named `delete_*` with a pre-read (`delete_block`, `delete_blocks`, `delete_page`, `delete_tag`, `delete_property`) refuses when its read fails, as "any other pre-read failure on a delete" says. Only the block and page deletes can be `truncated`. A 404 on the read (a page that is hidden or already in the Recycle bin, which `getPageOutline` doesn't show but `deletePage` still finds) refuses too: that page's subtree can't be read.
+- **Only UUIDs go to `getBlocks`.** It takes UUIDs only and refuses a duplicate, so the read takes each UUID-shaped id once (ignoring case), in call order, and leaves titles, dates and `..` to the write, which refuses what doesn't exist. A call that names no UUID reads nothing. More than 100 blocks (a `batch_move_blocks` can name more) reads the first 100 and marks the snapshot `truncated`. Page, tag and property selectors are passed to their read as given, encoded once; `.`, `..` and empty ids read nothing, since the handler refuses them before any request.
+- **E2EE fallback.** On the outline's 409 a block delete reads `getBlocks` summary and `delete_page` reads `getPage`, each with `e2ee: true`: two GETs, the only case over one. A failing fallback refuses the delete.
+- **The oversized refusal** names the entry whose JSON takes the running total over 256 KB, counted in UTF-8 bytes: `entry 1: <uuid> takes the snapshot over 256 KB (262,145 bytes); delete it in parts`. Exactly 256 KB is kept.
+- **Cut-down snapshots** keep `uuid`, `kind`, `title`, `order`, `parent-id` and `page-id` of each block (or of the page, tag or property); if that is still over the cap, `data` is null.
+- **The read comes before `begin`** (step 3 before step 4), so when the INSERT fails the snapshot's GET has already reached the sync server; no write has.
+- **`refresh_refs`** stores `{source: "refresh_refs", data: [{uuid, page-id, before}]}` from its response through `finish` (`before = coalesce(?, before)`, still 1 row written), and nothing for a preview (`applied: false`).
+
 ### 3.5 `get_activity_log`
 
 A hand-written read tool in `connector/src/tools/activity-log.ts`, registered beside the other hand-written tools and checked against the graph alias like them.

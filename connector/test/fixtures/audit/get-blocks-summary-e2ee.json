@@ -1,0 +1,15 @@
+{
+  "blocks": [
+    {
+      "uuid": "aaaaaaaa-0000-4000-8000-000000000001",
+      "kind": "block",
+      "title": "~e2ee~AQIDBAUGBwgJ",
+      "order": "a0",
+      "parent-id": "00000001-2026-1105-0000-000000000000",
+      "page-id": "00000001-2026-1105-0000-000000000000",
+      "tags": [],
+      "properties": []
+    }
+  ],
+  "missing": []
+}

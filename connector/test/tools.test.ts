@@ -385,10 +385,30 @@ function observedConnector(onSuccess: (...args: unknown[]) => void): Handler {
 
 /** A sync stub answering every call with an empty JSON object, and uploads like createAsset. */
 function acceptEverything(): void {
-  syncHandler = (request) =>
+  syncHandler = preReadsEmpty((request) =>
     new URL(request.url).pathname.endsWith("/assets")
       ? Response.json({ uuid: "a1", "page-id": PAGE_UUID, "page-title": "Nov 5th, 2026" }, { status: 201 })
-      : Response.json({ ok: true });
+      : Response.json({ ok: true }),
+  );
+}
+
+/**
+ * `handler` for writes, with each before-snapshot GET (audit stage 3) answered by a valid, empty
+ * snapshot: getBlocks lists the ids as missing, and a page, tag or property read finds an empty
+ * entity. test/audit-snapshot.test.ts covers the snapshots themselves.
+ */
+function preReadsEmpty(handler: SyncHandler): SyncHandler {
+  return (request) => {
+    if (request.method !== "GET") return handler(request);
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/blocks")) return Response.json({ blocks: [], missing: (url.searchParams.get("ids") ?? "").split(",") });
+    return Response.json({ uuid: PAGE_UUID, kind: "page", title: "Notes", markdown: "", "block-count": 0, truncated: false });
+  };
+}
+
+/** The requests that weren't before-snapshot reads. */
+function writeRequests(): typeof syncRequests {
+  return syncRequests.filter((r) => r.method !== "GET");
 }
 
 describe("reason", () => {
@@ -423,13 +443,17 @@ describe("reason", () => {
       syncRequests = [];
       await callContent(name, args);
       const sentWithout = syncRequests.map(({ method, url, body }) => ({ method, url, body }));
-      // The request is exactly the one the call makes without a reason.
+      // The requests are exactly the ones the call makes without a reason: one write, after at most
+      // one before-snapshot read, and none of them carries the reason.
       expect(sentWith, name).toEqual(sentWithout);
-      expect(sentWith, name).toHaveLength(1);
-      expect(new URL(sentWith[0].url).searchParams.has("reason"), name).toBe(false);
-      expect(sentWith[0].url, name).not.toContain("tidy");
-      expect(sentWith[0].body, name).not.toContain("tidy");
-      expect(sentWith[0].body, name).not.toContain("reason");
+      expect(sentWith.filter((r) => r.method !== "GET"), name).toHaveLength(1);
+      expect(sentWith.length, name).toBeLessThanOrEqual(2);
+      for (const sent of sentWith) {
+        expect(new URL(sent.url).searchParams.has("reason"), name).toBe(false);
+        expect(sent.url, name).not.toContain("tidy");
+        expect(sent.body, name).not.toContain("tidy");
+        expect(sent.body, name).not.toContain("reason");
+      }
     }
   });
 
@@ -532,7 +556,7 @@ describe("reason", () => {
 
   it("onSuccess receives the targets the server names, and the summary leads the result", async () => {
     const deleted = deleteBlocksFixture.response;
-    syncHandler = () => Response.json(deleted);
+    syncHandler = preReadsEmpty(() => Response.json(deleted));
     const onSuccess = vi.fn();
     const handler = observedConnector(onSuccess);
     const result = await callContent(
@@ -1036,10 +1060,10 @@ describe("hand-written tools", () => {
       Response.json({ error: 'page-id: "Notes" (p1) is namespaced under Library' }, { status: 400 });
     const refused = await callTool("promote_page_to_tag", { graph: "work", "page-id": "p1" });
     expect(refused).toEqual({ isError: true, text: 'page-id: "Notes" (p1) is namespaced under Library' });
-    expect(syncRequests).toHaveLength(1);
-    expect(syncRequests[0].method).toBe("POST");
-    expect(new URL(syncRequests[0].url).pathname).toBe(`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`);
-    expect(syncRequests[0].body).toBe("");
+    expect(writeRequests()).toHaveLength(1);
+    expect(writeRequests()[0].method).toBe("POST");
+    expect(new URL(writeRequests()[0].url).pathname).toBe(`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`);
+    expect(writeRequests()[0].body).toBe("");
   });
 
   it("create_tag and connector_help point at promote_page_to_tag when a page holds the title", async () => {
@@ -1386,10 +1410,10 @@ describe("audit log", () => {
 
       // Success: the row is ok, with the reason, the addressed selectors and describeWrite's targets.
       syncRequests = [];
-      syncHandler = () => Response.json(CONTEXT_RESPONSE);
+      syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
       const ok = await callAudited(name, { ...args, reason: REASON });
       expect(ok.result.isError, name).toBe(false);
-      expect(syncRequests, name).toHaveLength(1);
+      expect(writeRequests(), name).toHaveLength(1);
       expect(ok.row, name).toMatchObject({
         graph_id: WORK_ID,
         alias: "work",
@@ -1399,7 +1423,6 @@ describe("audit log", () => {
         dry_run: 0,
         reason: REASON,
         error: null,
-        before: null,
         rows_written: 3,
         rows_read: 1,
       });
@@ -1409,7 +1432,7 @@ describe("audit log", () => {
 
       // Sync 409: an error row carrying the server's message, not ok and not two rows.
       syncRequests = [];
-      syncHandler = () => Response.json({ error: "entry 0: block not found" }, { status: 409 });
+      syncHandler = preReadsEmpty(() => Response.json({ error: "entry 0: block not found" }, { status: 409 }));
       const conflict = await callAudited(name, args);
       expect(conflict.result.isError, name).toBe(true);
       expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, targets: null, pages: null, graph_id: WORK_ID });
@@ -1505,7 +1528,10 @@ describe("audit log", () => {
         content: [{ type: "text", text: "audit log unavailable: D1_ERROR: database is locked; nothing was written" }],
       });
     }
-    expect(syncRequests).toHaveLength(0);
+    // Nothing is written. The before-snapshot (design §3.3 step 3) is read ahead of the INSERT that
+    // stores it, so update_block's and delete_blocks' reads went out; nothing else did.
+    expect(writeRequests()).toHaveLength(0);
+    expect(syncRequests.map((r) => r.method)).toEqual(["GET", "GET"]);
     expect(await auditRows(before)).toEqual([]);
   });
 
@@ -1517,7 +1543,7 @@ describe("audit log", () => {
     const rows = await auditRows(before);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ status: "pending", tool: "update_block", reason: REASON, targets: null });
-    expect(syncRequests.map((r) => r.method)).toEqual(["PATCH"]);
+    expect(syncRequests.map((r) => r.method)).toEqual(["GET", "PATCH"]);
     expect(result.isError).toBe(false);
     const lines = result.content[0].text.split("\n");
     expect(lines[0]).toBe(`Audit log entry ${rows[0].id} could not be completed: D1_ERROR: network connection lost`);
@@ -1573,7 +1599,7 @@ describe("audit log", () => {
       const ok = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
       expect(ok.isError).toBe(false);
     }
-    expect(syncRequests).toHaveLength(3);
+    expect(writeRequests()).toHaveLength(3);
     expect(probe).toHaveBeenCalledTimes(1);
     probe.mockRestore();
   });
@@ -1705,7 +1731,7 @@ describe("audit log", () => {
       ["create_page", { id: "p1", title: "Standup" }, null],
     ];
     for (const [name, response, pages] of cases) {
-      syncHandler = () => Response.json(response);
+      syncHandler = preReadsEmpty(() => Response.json(response));
       const { row } = await callAudited(name, { graph: "work", ...AUDIT_CALLS[name] });
       expect(row.status, name).toBe("ok");
       expect(JSON.parse(row.targets!), name).toEqual(toAffectedTargets(response));
@@ -1794,7 +1820,7 @@ describe("audit log", () => {
       syncRequests = [];
       const { result, row } = await callAudited(name, args);
       expect(result.isError, name).toBe(false);
-      expect(syncRequests, name).toHaveLength(1);
+      expect(writeRequests(), name).toHaveLength(1);
       expect(row.status, name).toBe("ok");
     }
   });

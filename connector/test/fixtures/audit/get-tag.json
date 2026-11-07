@@ -1,0 +1,7 @@
+{
+  "uuid": "cccccccc-0000-4000-8000-000000000001",
+  "title": "Meeting",
+  "ident": "user.class/Meeting-x1",
+  "extends": [{ "uuid": "cccccccc-0000-4000-8000-000000000004", "title": "Event" }],
+  "properties": [{ "uuid": "bbbbbbbb-0000-4000-8000-000000000001", "title": "Venue", "ident": "user.property/venue-x1" }]
+}

@@ -3,6 +3,7 @@ import { auditRetentionDays } from "../config";
 import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/common";
 import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
 import type { GraphAccess } from "../tools/semantic";
+import { refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 
 /**
  * The owner-only write log (design 2026-11-07-connector-write-audit-log §3.2, §3.6). A write call
@@ -74,6 +75,8 @@ export interface AuditFinish {
   targets: AffectedTarget[] | null;
   /** Page titles and UUIDs the call touched; stored lower-cased and '\n'-joined. */
   pages: string[];
+  /** A snapshot known only after the write (refresh_refs' own before-text); when absent, `before` is kept. */
+  before?: string | null;
 }
 
 export interface PurgeResult {
@@ -190,13 +193,14 @@ export class AuditLog {
     const pages = outcome.pages.length === 0 ? null : outcome.pages.map((p) => p.toLowerCase()).join("\n");
     const result = await this.db
       .prepare(
-        `UPDATE audit_log SET status = ?, error = ?, targets = ?, pages = ?, rows_written = ?, rows_read = ? WHERE id = ?`,
+        `UPDATE audit_log SET status = ?, error = ?, targets = ?, pages = ?, before = coalesce(?, before), rows_written = ?, rows_read = ? WHERE id = ?`,
       )
       .bind(
         outcome.status,
         outcome.error,
         outcome.targets === null ? null : JSON.stringify(outcome.targets),
         pages,
+        outcome.before ?? null,
         insert === undefined ? null : insert.written + AUDIT_UPDATE_ROWS,
         insert === undefined ? null : insert.read + AUDIT_UPDATE_ROWS,
         id,
@@ -331,8 +335,9 @@ function unfinished(id: number, error: unknown): string {
 
 /**
  * Runs one write call with its audit entry (design §3.3): the probe (once per isolate), the reason
- * and graph checks, a `pending` row, the write, then the outcome on that row. A refusal before the
- * write is logged too. A pending row that can't be stored refuses the write before anything reaches
+ * and graph checks, the before-snapshot (§3.4, not for dry runs), a `pending` row holding it, the
+ * write, then the outcome on that row. A refusal before the write is logged too, including a delete
+ * whose snapshot can't be taken in full. A pending row that can't be stored refuses the write before anything reaches
  * the sync server; an outcome that can't be stored leaves the write standing and leads the result
  * with a line saying so. `run` gets the arguments without `reason`. Throws what the call threw.
  */
@@ -343,6 +348,7 @@ export function audited(
   args: Record<string, unknown>,
   run: (rest: Record<string, unknown>) => Promise<CallToolResult>,
 ): Promise<AuditedWrite> {
+  const plan = snapshotClassFor(tool);
   return withCallGraphs(async () => {
     let probed: "ok" | "missing";
     try {
@@ -365,6 +371,16 @@ export function audited(
       refusal = error;
     }
 
+    const dryRun = isDryRun(args);
+    let before: string | null = null;
+    if (refusal === undefined && !dryRun) {
+      try {
+        before = await takeSnapshot(ctx.access, alias, tool, rest);
+      } catch (error) {
+        refusal = error;
+      }
+    }
+
     let id: number;
     try {
       id = await ctx.log.begin({
@@ -372,12 +388,12 @@ export function audited(
         graphId,
         alias,
         tool,
-        dryRun: isDryRun(args),
+        dryRun,
         reason: reason ?? null,
         client: ctx.client,
         session: ctx.session,
         addressed: addressedBy(args),
-        before: null,
+        before,
       });
     } catch (error) {
       throw new ToolError(`audit log unavailable: ${messageOf(error)}; nothing was written`, "audit-unavailable");
@@ -404,7 +420,8 @@ export function audited(
     const { targets, summary } = describeWrite(tool, result, reason);
     const lines: string[] = [];
     try {
-      await ctx.log.finish(id, { status: "ok", error: null, targets, pages: pagesOf(targets) });
+      const after = plan.source === "refresh_refs" ? refreshRefsBefore(result) : null;
+      await ctx.log.finish(id, { status: "ok", error: null, targets, pages: pagesOf(targets), before: after });
     } catch (error) {
       lines.push(unfinished(id, error));
     }

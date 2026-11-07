@@ -1,0 +1,6 @@
+{
+  "applied": true,
+  "changed": [
+    { "uuid": "aaaaaaaa-0000-4000-8000-000000000001", "page-id": "00000001-2026-1105-0000-000000000000", "before": "Call Sam #Followup", "after": "Call Sam #[[Followup]]", "tags": ["Followup"] }
+  ]
+}

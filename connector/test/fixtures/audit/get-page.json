@@ -1,0 +1,7 @@
+{
+  "uuid": "00000001-2026-1105-0000-000000000000",
+  "kind": "page",
+  "title": "Notes",
+  "tags": [{ "uuid": "cccccccc-0000-4000-8000-000000000003", "title": "Project" }],
+  "properties": [{ "ident": "user.property/venue-x1", "title": "Venue", "type": "default", "value": "Town Hall" }]
+}
