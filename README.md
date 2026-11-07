@@ -802,12 +802,12 @@ It does 11.3 to 11.5 for you:
 1. asks for the connector's hostname, such as `mcp.example.com`, which must be in the same domain as your sync hostname;
 2. prints the OAuth app's three values and the link to GitHub's new-app page (`https://github.com/settings/applications/new`; GitHub's own [guide](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) covers the form), so you can make the app now if you haven't, then asks for its client ID and client secret (typed silently). GitHub can't pre-fill that form;
 3. reads your numeric GitHub user ID from `gh` instead of asking, and shows the login so you can confirm it's yours;
-4. adds the connector's values to `.env.local` and the `production` environment, as 11.4 describes;
+4. adds the connector's values to `.env.local` and the `production` environment, as 11.4 describes, then pushes any connector secret that is still missing from `production` (after a push that failed part-way, for example);
 5. sets `CONNECTOR_ENABLED=true` in `.env.local` (rewriting that one line, after a backup) and in the `production` environment (11.5);
-6. runs `scripts/doctor.sh`, and stops before deploying if a check fails. It checks the token's KV permission and the connector hostname;
+6. runs `scripts/doctor.sh`. It checks the token's KV permission and the connector hostname. If a check fails, it switches the connector off again before anything deploys: `.env.local` goes back as it was (from the backup) and the `production` variable to `false`, so the next merge to `main` doesn't deploy the connector over a hostname that is in use;
 7. runs the deploy and follows it, then prints the claude.ai steps (11.6).
 
-It never asks for a value that is already in `.env.local`. If it stops, fix what it reported and run it again: it carries on from the checks, and deploys only if the latest deploy didn't succeed. It asks for secrets, so it refuses to run in GitHub Actions. Turning the connector off again stays manual (11.5).
+It never asks for a value that is already in `.env.local`. If it stops, fix what it reported and run it again. After a failed check it runs every step again; after a failed deploy the connector is already on, so it pushes any missing connector secret, runs the checks, and deploys only if the latest deploy didn't succeed. It asks for secrets, so it refuses to run in GitHub Actions. Turning the connector off again stays manual (11.5).
 
 The sections below are the same steps by hand, for when you want to see what the script does or it can't run.
 
@@ -841,7 +841,7 @@ The two GitHub names change on the way because GitHub forbids secret names that 
 - **Copy `GRAPH_TOKEN_KEY` and `COOKIE_ENCRYPTION_KEY` into your password manager.**
 - **A name that's present but empty** in `.env.local` stops the script. Fill it in by hand.
 - **A missing `TOFU_ENCRYPTION_PASSPHRASE`, `ASSET_LINK_SECRET` or `DB_SYNC_ADMIN_TOKEN`** stops the script before it writes or pushes anything. Restore the value from your password manager: `--add-missing` never generates these, because a new value wouldn't match the deployed one, and a new passphrase can't decrypt the OpenTofu state.
-- **If the push fails,** `.env.local` has already been written. Load it and push with the loop in 1.8, with the connector line uncommented.
+- **If the push fails,** `.env.local` has already been written. Run `scripts/enable-connector.sh` again, which pushes the connector secrets still missing from `production`, or load `.env.local` and push with the loop in 1.8, with the connector line uncommented.
 
 ### 11.5 Turn it on
 

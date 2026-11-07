@@ -21,14 +21,18 @@ const CONNECTOR_NAMES = ["CONNECTOR_HOSTNAME", "GITHUB_CLIENT_ID", "GITHUB_CLIEN
 const baseEnv = (connectorEnabled = "false") =>
   `CLOUDFLARE_API_TOKEN=tok\nCLOUDFLARE_ACCOUNT_ID=acct\nSYNC_HOSTNAME=sync.example.com\nCONNECTOR_ENABLED=${connectorEnabled}\n`;
 
-// Stub scripts record `<name> <args>` in $ENABLE_STUB_LOG and the connector inputs they were
-// called with in $ENABLE_STUB_LOG.env. A name in `fail` makes that script exit 1.
-const stub = (name, fail) => `#!/usr/bin/env bash
+// Stub scripts record `<name> <args>` in $ENABLE_STUB_LOG, the connector inputs init-env.sh was
+// called with in $ENABLE_STUB_LOG.env, and the CONNECTOR_ENABLED line doctor.sh saw in
+// $ENABLE_STUB_LOG.doctor. A call whose logged line starts with an entry of `failing` exits 1.
+const stub = (name, failing) => `#!/usr/bin/env bash
 echo "${name} $*" >> "$ENABLE_STUB_LOG"
 if [ "${name}" = "init-env.sh" ]; then
   for n in ${CONNECTOR_NAMES.join(" ")}; do echo "$n=\${!n:-}" >> "$ENABLE_STUB_LOG.env"; done
 fi
-${fail ? "exit 1" : ""}
+if [ "${name}" = "doctor.sh" ]; then
+  grep '^CONNECTOR_ENABLED=' "$(dirname "$0")/../.env.local" >> "$ENABLE_STUB_LOG.doctor"
+fi
+${failing.map((f) => `case "${name} $*" in ${JSON.stringify(f)}*) exit 1 ;; esac`).join("\n")}
 `;
 
 /** A temp git repo root: stub scripts, the real env-file.mjs and lib/gh.sh, a .env.local (or none), and an origin (plus an upstream when given). */
@@ -36,7 +40,7 @@ function makeRoot({ envLocal, failing = [], upstream = null }) {
   const dir = mkdtempSync(join(tmpdir(), "enable-connector-"));
   mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
   for (const name of ["init-env.sh", "doctor.sh", "run-deploy.sh"]) {
-    writeFileSync(join(dir, "scripts", name), stub(name, failing.includes(name)));
+    writeFileSync(join(dir, "scripts", name), stub(name, failing));
     chmodSync(join(dir, "scripts", name), 0o755);
   }
   for (const name of ["env-file.mjs", "lib/gh.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
@@ -57,6 +61,16 @@ const listed = (value) => `${JSON.stringify(value === undefined ? [] : [{ name: 
 const envVariable = (value) => ({ match: ENV_VARIABLES, stdout: listed(value) });
 const repoVariable = (value) => ({ match: REPO_VARIABLES, stdout: listed(value) });
 
+// The production secrets of a finished setup whose connector secrets are pushed too.
+const ALL_SECRETS = [
+  "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE", "ASSET_LINK_SECRET",
+  "DB_SYNC_ADMIN_TOKEN", "DB_SYNC_ALLOWED_USERS", "SYNC_HOSTNAME",
+  "CONNECTOR_HOSTNAME", "CONNECTOR_GITHUB_CLIENT_ID", "CONNECTOR_GITHUB_CLIENT_SECRET",
+  "OWNER_GITHUB_USER_ID", "COOKIE_ENCRYPTION_KEY", "GRAPH_TOKEN_KEY",
+];
+const SECRET_LIST = ["secret", "list", "--env", "production", "--json", "name", "-R", REPO];
+const secretList = (names) => ({ match: SECRET_LIST, stdout: `${JSON.stringify(names.map((name) => ({ name })))}\n` });
+
 /** `gh` rules for a connector that is off (the variable is unset at both levels). `over` rules come first, so they win. */
 const ghRules = (over = []) => [
   ...over,
@@ -65,6 +79,7 @@ const ghRules = (over = []) => [
   { match: ["repo", "view"], stdout: `${PARENT}\n` },
   envVariable(),
   repoVariable(),
+  secretList(ALL_SECRETS),
   // What gh 2.87.3 says for an unset variable, with or without --env: no "HTTP 404".
   { match: ["variable", "get"], stderr: "variable CONNECTOR_ENABLED was not found\n", exit: 1 },
   { match: ["api", "user", "-q", ".id"], stdout: "12345\n" },
@@ -95,6 +110,7 @@ async function enable({ input = "mcp.example.com\nclient-id\nclient-secret\n", r
       scripts: lines(log),
       inputs: Object.fromEntries(lines(`${log}.env`).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)])),
       ghCalls: gh.calls().map((c) => c.argv),
+      doctorSaw: lines(`${log}.doctor`),
       envLocal: existsSync(join(dir, ".env.local")) ? readFileSync(join(dir, ".env.local"), "utf8") : null,
     };
   } finally {
@@ -173,7 +189,7 @@ test("when the connector is already on in .env.local and on GitHub, it checks, d
   assert.ok(out.stdout.includes("the connector is already on"), out.stdout);
   assert.deepEqual(out.scripts, ["doctor.sh ", "run-deploy.sh --if-not-green"]);
   assert.deepEqual(variableSets(out.ghCalls), []);
-  assert.deepEqual(out.ghCalls.map((a) => a.slice(0, 2).join(" ")), ["repo view", "variable list", "variable list"]);
+  assert.deepEqual(out.ghCalls.map((a) => a.slice(0, 2).join(" ")), ["repo view", "variable list", "variable list", "secret list"]);
   assert.ok(out.stdout.includes("https://mcp.example.com/mcp"), out.stdout);
 });
 
@@ -210,7 +226,7 @@ test("the variable is read from the lists, never with gh variable get, whose 'wa
   const out = await enable();
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.ok(!out.ghCalls.some((a) => a[0] === "variable" && a[1] === "get"), JSON.stringify(out.ghCalls));
-  assert.deepEqual(out.ghCalls.filter((a) => a[1] === "list"), [ENV_VARIABLES, REPO_VARIABLES]);
+  assert.deepEqual(out.ghCalls.filter((a) => a[0] === "variable" && a[1] === "list"), [ENV_VARIABLES, REPO_VARIABLES]);
 });
 
 test("no production environment yet (a 404 listing its variables) counts as unset there", async () => {
@@ -239,11 +255,57 @@ test("on on GitHub but off in .env.local carries on and corrects the file", asyn
   assert.ok(out.envLocal.endsWith("CONNECTOR_ENABLED=true\n"), out.envLocal);
 });
 
-test("a failing doctor stops before the deploy and says a re-run continues", async () => {
+test("a failing doctor turns both switches back off, stops before the deploy, and says a re-run continues", async () => {
   const out = await enable({ failing: ["doctor.sh"] });
   assert.equal(out.status, 1);
   assert.deepEqual(out.scripts, ["init-env.sh --add-missing --push", "doctor.sh "]);
+  assert.deepEqual(out.doctorSaw, ["CONNECTOR_ENABLED=true"], "the checks ran with the switch on");
+  assert.deepEqual(variableSets(out.ghCalls), [
+    ["variable", "set", "CONNECTOR_ENABLED", "--env", "production", "--body", "true", "-R", REPO],
+    ["variable", "set", "CONNECTOR_ENABLED", "--env", "production", "--body", "false", "-R", REPO],
+  ]);
+  assert.equal(out.envLocal, baseEnv("false"), ".env.local is as it was");
   assert.ok(out.stderr.includes("fix the FAIL lines above, then re-run scripts/enable-connector.sh"), out.stderr);
+  assert.ok(out.stderr.includes("switched the connector off again"), out.stderr);
+});
+
+test("a failing doctor puts back the .env.local line's own old value, whatever it was", async () => {
+  // On locally but unset on GitHub: the full path runs, and the file goes back to true.
+  const envLocal = `${baseEnv("true")}# keep me\n`;
+  const out = await enable({ envLocal, failing: ["doctor.sh"] });
+  assert.equal(out.status, 1);
+  assert.equal(out.envLocal, envLocal);
+  assert.deepEqual(variableSets(out.ghCalls).map((a) => a[6]), ["true", "false"]);
+  assert.ok(!out.scripts.some((l) => l.startsWith("run-deploy.sh")), "no deploy");
+});
+
+test("connector secrets missing on GitHub are pushed from .env.local, on the already-on path too", async () => {
+  // An earlier run appended every value, then its push failed part-way: init-env --add-missing now finds nothing to add.
+  const present = ALL_SECRETS.filter((n) => n !== "CONNECTOR_GITHUB_CLIENT_SECRET" && n !== "GRAPH_TOKEN_KEY");
+  const values = `CONNECTOR_HOSTNAME=mcp.example.com\nGITHUB_CLIENT_ID=file-id\nGITHUB_CLIENT_SECRET=file-secret\nOWNER_GITHUB_USER_ID=777\n`;
+
+  const on = await enable({ input: "", envLocal: `${baseEnv("true")}${values}`, rules: ghRules([envVariable("true"), secretList(present)]) });
+  assert.equal(on.status, 0, on.stdout + on.stderr);
+  assert.deepEqual(on.scripts, ["init-env.sh --push-only GITHUB_CLIENT_SECRET GRAPH_TOKEN_KEY", "doctor.sh ", "run-deploy.sh --if-not-green"]);
+
+  const off = await enable({ input: "", envLocal: `${baseEnv()}${values}`, rules: ghRules([secretList(present)]) });
+  assert.equal(off.status, 0, off.stdout + off.stderr);
+  assert.deepEqual(off.scripts, [
+    "init-env.sh --add-missing --push",
+    "init-env.sh --push-only GITHUB_CLIENT_SECRET GRAPH_TOKEN_KEY",
+    "doctor.sh ",
+    "run-deploy.sh ",
+  ]);
+  assert.ok(!(on.stdout + on.stderr + off.stdout + off.stderr).includes("file-secret"));
+});
+
+test("a failed push of the missing connector secrets stops before the switches change", async () => {
+  const present = ALL_SECRETS.filter((n) => n !== "GRAPH_TOKEN_KEY");
+  const out = await enable({ rules: ghRules([secretList(present)]), failing: ["init-env.sh --push-only"] });
+  assert.equal(out.status, 1);
+  assert.deepEqual(out.scripts, ["init-env.sh --add-missing --push", "init-env.sh --push-only GRAPH_TOKEN_KEY"]);
+  assert.deepEqual(variableSets(out.ghCalls), []);
+  assert.ok(out.envLocal.includes("CONNECTOR_ENABLED=false"));
 });
 
 test("a failing deploy exits 1 and says a re-run continues", async () => {

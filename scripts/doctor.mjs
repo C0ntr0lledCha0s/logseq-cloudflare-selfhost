@@ -351,9 +351,16 @@ async function checkGithub({ env, gh, originUrl, add, connectorOn }) {
     add("FAIL", "secrets", "couldn't list the production environment's secrets (does the environment exist?)");
   } else {
     const present = new Set(secrets.value.map((s) => s.name));
-    const missing = required.filter((name) => !present.has(name));
-    if (missing.length > 0) add("FAIL", "secrets", `missing from the production environment: ${missing.join(", ")}. scripts/setup.sh pushes them (README 1.8)`);
-    else add("ok", "secrets", `all ${required.length} required names are present`);
+    // setup.sh pushes only the seven core names, and enable-connector.sh the connector's.
+    const groups = [
+      [REQUIRED_SECRETS.filter((name) => !present.has(name)), "scripts/setup.sh pushes these, README 1.8"],
+      [connectorOn ? CONNECTOR_SECRETS.filter((name) => !present.has(name)) : [], "scripts/enable-connector.sh pushes these"],
+    ].filter(([names]) => names.length > 0);
+    if (groups.length > 0) {
+      add("FAIL", "secrets", `missing from the production environment: ${groups.map(([names, fix]) => `${names.join(", ")} (${fix})`).join("; ")}`);
+    } else {
+      add("ok", "secrets", `all ${required.length} required names are present`);
+    }
   }
 
   // The deploy reads the environment variable, else the repository one, else treats it as off. The

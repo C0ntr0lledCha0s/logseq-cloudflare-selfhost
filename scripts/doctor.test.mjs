@@ -475,6 +475,25 @@ test("with the connector on, the six connector secret names are required too", a
   for (const name of CONNECTOR_SECRETS) assert.ok(result.detail.includes(name), name);
 });
 
+test("the secrets FAIL names the script that pushes each missing name", async () => {
+  const connectorOn = { CONNECTOR_ENABLED: "true", CONNECTOR_HOSTNAME: "mcp.example.com" };
+  // Only connector names missing: setup.sh pushes the core seven only, so it is not the fix.
+  const connector = await doctor({
+    env: connectorOn,
+    gh: greenGh({ secrets: [...SECRETS, ...CONNECTOR_SECRETS.slice(2)], envVariable: "true" }),
+  });
+  const onlyConnector = only(connector.results, "secrets").detail;
+  assert.equal(onlyConnector, "missing from the production environment: CONNECTOR_HOSTNAME, CONNECTOR_GITHUB_CLIENT_ID (scripts/enable-connector.sh pushes these)");
+
+  const core = await doctor({ gh: greenGh({ secrets: SECRETS.slice(1) }) });
+  assert.equal(only(core.results, "secrets").detail, "missing from the production environment: CLOUDFLARE_API_TOKEN (scripts/setup.sh pushes these, README 1.8)");
+
+  const both = await doctor({ env: connectorOn, gh: greenGh({ secrets: SECRETS.slice(1), envVariable: "true" }) });
+  const detail = only(both.results, "secrets").detail;
+  assert.ok(detail.includes("CLOUDFLARE_API_TOKEN (scripts/setup.sh pushes these, README 1.8)"), detail);
+  assert.ok(detail.includes("GRAPH_TOKEN_KEY (scripts/enable-connector.sh pushes these)"), detail);
+});
+
 test("secrets are listed by name from the production environment, never read", async () => {
   const gh = greenGh();
   await doctor({ gh });
