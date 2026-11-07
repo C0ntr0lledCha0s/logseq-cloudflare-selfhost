@@ -265,3 +265,28 @@ Each regression test is seen to fail first, and runs the real handler and outlin
 7. **Insert results.** Only the target and the top-level inserted blocks get context, not every node of a tree. Is that enough for acceptance 3?
 8. **`reason` length.** 200 characters, refused if longer. Is that the right limit, and should `reason` ever be required on deletes?
 9. **E2EE.** Title and date selectors are refused and results carry no titles there. Do you use an E2EE graph where you need this?
+
+## 12. As built
+
+The result follows the design. These are the places it differs or is more exact. The round 2 notes in sections 3.4 and 4 still apply.
+
+**Patch 0028.**
+
+- The helper section holds more than section 3.1 lists: `block-context`, `confirm-removed!`, `with-context-or-unavailable`, `resolve-page-selector` (with `iso-journal-day`, `visible-pages`, `titled-pages`, `selector-refusal` and `with-page-selector`) and the label helpers (`check-target-labels`, and `check-labels!`, which throws so a write that calls it first inside its transaction changes nothing). `feed-text` and `feed-ancestors` moved into it as planned.
+- A move's `from` and `to` are `{page, breadcrumb}` records, not bare breadcrumbs. `to` is read back after the transaction.
+- A context read that fails after a committed write answers `context: "unavailable"` with the server's message in `context-reason`.
+- A delete UUID that survives answers 500 with `{error, not-removed}`. A hidden or Recycle-bin page counts as removed.
+- Selectors never match tag entities, as well as hidden and Recycle-bin pages. On an E2EE graph a title, date or `target-label` is refused with 400, since titles can't be compared. A selector that names nothing answers 404 and lists what was tried; an ambiguous one answers 409 with `candidates` (UUID and title).
+- A `delete_page` dry run answers `references`, `blocks` (the blocks on the page, not counting property values) and `roots` (the first three root snippets in page order). A `delete_blocks` dry run adds `references` to each block's context. In a `batch_insert_block_trees` dry run, `would-create` is present only when it is true, not `false` otherwise. Dry runs of `delete_block`, single property writes and page or tag updates stay out of scope.
+- The `deletePage` 200 schema is now `anyOf`, because a dry-run body fits both branches.
+- Only addressed entities get a context, as designed. `descendants` is given for the blocks a delete names and for each top-level inserted block, and omitted elsewhere.
+
+**Connector.**
+
+- `reason` is trimmed and measured in code points. An empty or all-space reason counts as none, and `reasonGiven` agrees, so the log line says `reason=no`. A reason that isn't a string, or is over 200 code points, is a `ToolError` with status `refused`, raised before graph resolution or any fetch. `registerGraphTools` throws at build if an upstream operation already takes a `reason`.
+- The summary is one text item that leads the result, with `Reason: …` as its last line (section 3.7 item 5 gave the reason on the same item but not its position). The server's JSON follows it unchanged.
+- `capWriteResult` bounds a write's result. Over the cap, the JSON loses its indentation first, then the summary is cut with a notice that says the write was applied, and only then is the JSON truncated. A summary or cap failure can't fail a call after its write.
+- `CONTEXT_TOOLS` maps each tool to a past and present verb for its summary line (`Deleted` and `delete`). `NO_CONTEXT_TOOLS` gives the reason for each tool without context. A manifest test requires every write tool to be in exactly one.
+- `tools-manifest.json` records each tool's annotations and `checkManifest` compares them. It records no input schemas, so adding `reason` did not change it. `annotationsFor(name)` throws for a tool with no `ANNOTATIONS` entry, which fails both the manifest build and the Worker.
+
+**Decisions in section 11.** Answers 1, 2 and 5 stand as designed: `reason=yes|no` only in logs, moves additive, and a date that is also a page title refused as ambiguous. Unconfirmed by the owner, so still open for review.
