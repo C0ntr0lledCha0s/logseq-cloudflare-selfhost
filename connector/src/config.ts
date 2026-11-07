@@ -28,6 +28,24 @@ function isHostname(value: unknown): value is string {
   return typeof value === "string" && LOWERCASE_FQDN.test(value);
 }
 
+const DEFAULT_AUDIT_RETENTION_DAYS = 90;
+const MAX_AUDIT_RETENTION_DAYS = 365;
+
+/**
+ * Days the audit log keeps an entry: AUDIT_RETENTION_DAYS, rendered from
+ * `connector.auditRetentionDays` in config/settings.json, or 90 when unset. Throws unless it is a
+ * whole number from 1 to 365.
+ */
+export function auditRetentionDays(env: { AUDIT_RETENTION_DAYS?: string }): number {
+  const raw = env.AUDIT_RETENTION_DAYS;
+  if (raw === undefined) return DEFAULT_AUDIT_RETENTION_DAYS;
+  const days = Number(raw);
+  if (!POSITIVE_INTEGER.test(raw) || days > MAX_AUDIT_RETENTION_DAYS) {
+    throw new ConfigError(`AUDIT_RETENTION_DAYS must be a whole number of days from 1 to ${MAX_AUDIT_RETENTION_DAYS}`);
+  }
+  return days;
+}
+
 /** Checks every secret the connector needs, so a misconfigured deploy fails closed on every request. */
 export function checkConfig(env: Env): void {
   ownerGithubUserId(env);

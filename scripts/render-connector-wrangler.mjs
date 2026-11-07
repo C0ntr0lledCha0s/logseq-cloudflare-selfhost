@@ -73,7 +73,7 @@ function stripTrailingCommas(text) {
 }
 
 /**
- * The deploy config. With `semanticSearch` true it adds the Workers AI and Vectorize bindings, the
+ * The deploy config, with AUDIT_RETENTION_DAYS from `connector.auditRetentionDays`. With `semanticSearch` true it adds the Workers AI and Vectorize bindings, the
  * indexer's cron and the SEMANTIC_MAX_VECTORS cap; with false, none of them, so the connector has no
  * semantic tools and no cron.
  */
@@ -107,6 +107,15 @@ export function renderConnectorWrangler({ template, settings, hostname, tofuOutp
   ];
 
   cfg.triggers = { crons: [KB_INDEX_CRON] };
+
+  // Days the audit log keeps an entry; the hourly KB_INDEX_CRON purges older ones. Must match
+  // auditRetentionDays in connector/src/config.ts.
+  const days = connector.auditRetentionDays;
+  if (!Number.isSafeInteger(days) || days < 1 || days > 365) {
+    throw new Error("settings.connector.auditRetentionDays must be a whole number of days from 1 to 365");
+  }
+  if (cfg.vars && "AUDIT_RETENTION_DAYS" in cfg.vars) throw new Error("the template must not set AUDIT_RETENTION_DAYS");
+  cfg.vars = { ...cfg.vars, AUDIT_RETENTION_DAYS: String(days) };
 
   if (semanticSearch) {
     const semantic = must(connector.semanticSearch, "settings.connector.semanticSearch");

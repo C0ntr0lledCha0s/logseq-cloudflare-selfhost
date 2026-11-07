@@ -187,6 +187,12 @@ The hourly `KB_INDEX_CRON` case also calls `purgeAuditLog(env, cutoff)`, with th
 
 The probe matters: the measured alternative read the whole table every hour when nothing was old enough (section 2). A purge failure is logged and doesn't affect the KB index work in the same case.
 
+**As built (stage 1).** Measured from D1 meta in the connector's test pool, two statements differ from the text above, and the costs in section 5 are corrected here:
+
+- The DELETE is `DELETE FROM audit_log WHERE id < ? AND at < ?`, bound to the probed oldest id + 500. The `id IN (SELECT id … ORDER BY id LIMIT 500)` form read 2,000 rows to delete 500; the id range reads at most 501. A purge with old rows costs at most 502 rows read and writes 1 row per row deleted (D1 doesn't count index entries on DELETE), so at most 500, not 1,000. The probe also reads 1 row on an empty table. The probe selects `id, at` to bound the range.
+- The `status` CHECK is written `status = 'pending' OR status = 'ok' OR status = 'error' OR status = 'refused'` rather than `IN (...)`. An `IN` list of three or more values builds an ephemeral table that D1 bills as one more row read on every INSERT and UPDATE (INSERT 2 written and 1 read, UPDATE 1 written and 2 read); the OR chain keeps the section 5 figures of 3 written and 1 read per write call. It accepts and refuses the same values.
+- A purge failure is logged and rethrown after the KB index refresh ran, so the cron run shows as failed; a KB index failure is rethrown first.
+
 ### 3.7 Usage report
 
 `scripts/usage-report.mjs` gains an *Audit log* section, from one aggregate query through the D1 REST query API:

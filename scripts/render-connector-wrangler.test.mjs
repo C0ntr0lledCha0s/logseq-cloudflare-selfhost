@@ -142,7 +142,11 @@ test("semantic search on adds the AI and Vectorize bindings, the cron and the ca
 
 test("semantic search keeps template vars and refuses a template that sets the cap", () => {
   const withVars = `{ "main": "src/index.ts", "vars": { "OTHER": "x" } }`;
-  assert.deepEqual(render({ template: withVars, semanticSearch: true }).vars, { OTHER: "x", SEMANTIC_MAX_VECTORS: "13000" });
+  assert.deepEqual(render({ template: withVars, semanticSearch: true }).vars, {
+    OTHER: "x",
+    AUDIT_RETENTION_DAYS: "90",
+    SEMANTIC_MAX_VECTORS: "13000",
+  });
   assert.throws(
     () => render({ template: `{ "vars": { "SEMANTIC_MAX_VECTORS": "1" } }`, semanticSearch: true }),
     /must not set SEMANTIC_MAX_VECTORS/,
@@ -192,4 +196,35 @@ test("the rendered crons match the ones the connector dispatches on", () => {
   const source = readFileSync(new URL("../connector/src/crons.ts", import.meta.url), "utf8");
   const declared = Object.fromEntries([...source.matchAll(/export const (\w+) = "([^"]+)";/g)].map((m) => [m[1], m[2]]));
   assert.deepEqual(declared, { KB_INDEX_CRON, SEMANTIC_CRON });
+});
+
+test("renders AUDIT_RETENTION_DAYS from settings, with semantic search on or off", () => {
+  assert.equal(settings.connector.auditRetentionDays, 90);
+  assert.equal(render().vars.AUDIT_RETENTION_DAYS, "90");
+  assert.equal(render({ semanticSearch: true }).vars.AUDIT_RETENTION_DAYS, "90");
+  const connector = { ...settings.connector, auditRetentionDays: 30 };
+  assert.equal(render({ settings: { ...settings, connector } }).vars.AUDIT_RETENTION_DAYS, "30");
+  assert.deepEqual(render({ template: `{ "vars": { "OTHER": "x" } }` }).vars, { OTHER: "x", AUDIT_RETENTION_DAYS: "90" });
+});
+
+test("auditRetentionDays must be a whole number of days from 1 to 365", () => {
+  for (const auditRetentionDays of [1, 365]) {
+    const connector = { ...settings.connector, auditRetentionDays };
+    assert.equal(render({ settings: { ...settings, connector } }).vars.AUDIT_RETENTION_DAYS, String(auditRetentionDays));
+  }
+  for (const auditRetentionDays of [0, 366, -1, 1.5, "90", null, undefined, Number.NaN]) {
+    const connector = { ...settings.connector, auditRetentionDays };
+    assert.throws(
+      () => render({ settings: { ...settings, connector } }),
+      /settings.connector.auditRetentionDays must be a whole number of days from 1 to 365/,
+      String(auditRetentionDays),
+    );
+  }
+});
+
+test("refuses a template that sets AUDIT_RETENTION_DAYS", () => {
+  assert.throws(
+    () => render({ template: `{ "vars": { "AUDIT_RETENTION_DAYS": "7" } }` }),
+    /must not set AUDIT_RETENTION_DAYS/,
+  );
 });
