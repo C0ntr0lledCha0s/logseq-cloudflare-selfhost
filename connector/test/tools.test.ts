@@ -947,6 +947,40 @@ describe("hand-written tools", () => {
     expect(promote.description).toContain("Give extends to set the tags it extends in the same call");
   });
 
+  it("move_blocks takes a dry-run flag, sends it in the query and leads with the server's dry-run summary", async () => {
+    const tools = await listTools();
+    const move = tools.find((t) => t.name === "move_blocks");
+    expect(move.inputSchema.properties["dry-run"].type).toBe("boolean");
+    expect(move.description).toContain("dry-run: true previews from and to");
+    const page = { uuid: PAGE_UUID, title: "Nov 5th, 2026" };
+    syncHandler = () =>
+      Response.json({ uuids: ["b1"], moved: true, "dry-run": true,
+        affected: [{ uuid: "b1", kind: "block", snippet: "Notes", from: { page, breadcrumb: [] }, to: { page, breadcrumb: ["Meeting"] } }] });
+    const result = await callTool("move_blocks", {
+      graph: "work",
+      "dry-run": true,
+      reason: "check before moving",
+      body: { "block-ids": ["b1"], "target-id": "b2", position: "last-child" },
+    });
+    expect(result.isError).toBe(false);
+    expect(result.text.split("\n").slice(0, 3)).toEqual([
+      "Dry run, nothing changed: would move 1 block:",
+      '- "Notes" from Nov 5th, 2026 to Nov 5th, 2026 > Meeting',
+      "Reason: check before moving",
+    ]);
+    const url = new URL(syncRequests[0].url);
+    expect(url.pathname).toBe(`/api/v1/graphs/${WORK_ID}/block-moves`);
+    expect(url.searchParams.get("dry-run")).toBe("true");
+    expect(JSON.parse(syncRequests[0].body)).toEqual({ "block-ids": ["b1"], "target-id": "b2", position: "last-child" });
+  });
+
+  it("connector_help asks for a dry run of large deletes and moves, shown to the user before the real call", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "Pass dry-run: true to check a large delete, move or insert first (move_blocks takes it too): it names each block the write would touch by page, breadcrumb and snippet, with its descendant and reference counts, a page's block count and first blocks, and the pages an insert would create, and changes nothing. Show the user that summary before the real call.",
+    );
+  });
+
   it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
     syncHandler = () =>
       Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],

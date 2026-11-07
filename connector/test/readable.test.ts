@@ -16,14 +16,18 @@ import {
   toAffectedTargets,
 } from "../src/tools/readable";
 import batchInsertBlockTrees from "./fixtures/readable/batch-insert-block-trees.json";
+import batchInsertDryRun from "./fixtures/readable/batch-insert-dry-run.json";
+import batchMoveDryRun from "./fixtures/readable/batch-move-dry-run.json";
 import batchSetBlockProperty from "./fixtures/readable/batch-set-block-property.json";
 import deleteBlocks from "./fixtures/readable/delete-blocks.json";
 import deleteBlocksDryRun from "./fixtures/readable/delete-blocks-dry-run.json";
 import deleteBlocksE2ee from "./fixtures/readable/delete-blocks-e2ee.json";
 import deletePage from "./fixtures/readable/delete-page.json";
+import deletePageDryRun from "./fixtures/readable/delete-page-dry-run.json";
 import insertBlockTree from "./fixtures/readable/insert-block-tree.json";
 import insertUnavailable from "./fixtures/readable/insert-unavailable.json";
 import moveBlocks from "./fixtures/readable/move-blocks.json";
+import moveBlocksDryRun from "./fixtures/readable/move-blocks-dry-run.json";
 import setBlockProperty from "./fixtures/readable/set-block-property.json";
 
 describe("takeReason", () => {
@@ -93,14 +97,18 @@ describe("summarise", () => {
 type Fixture = { operationId: string; status: string; tool: string; response: Record<string, unknown> };
 const FIXTURES: Record<string, Fixture> = {
   "batch-insert-block-trees": batchInsertBlockTrees,
+  "batch-insert-dry-run": batchInsertDryRun,
+  "batch-move-dry-run": batchMoveDryRun,
   "batch-set-block-property": batchSetBlockProperty,
   "delete-blocks": deleteBlocks,
   "delete-blocks-dry-run": deleteBlocksDryRun,
   "delete-blocks-e2ee": deleteBlocksE2ee,
   "delete-page": deletePage,
+  "delete-page-dry-run": deletePageDryRun,
   "insert-block-tree": insertBlockTree,
   "insert-unavailable": insertUnavailable,
   "move-blocks": moveBlocks,
+  "move-blocks-dry-run": moveBlocksDryRun,
   "set-block-property": setBlockProperty,
 };
 
@@ -213,8 +221,62 @@ describe("summarise", () => {
 
   it("says a dry run changed nothing", () => {
     expect(summaryOf("delete-blocks-dry-run", "check first")).toBe(
-      'Dry run, nothing changed: would delete 1 block:\n- Nov 5th, 2026 > Notes > "Book flights" (+1 child)\nReason: check first',
+      'Dry run, nothing changed: would delete 1 block:\n- Nov 5th, 2026 > Notes > "Book flights" (+1 child, 2 references)\nReason: check first',
     );
+  });
+
+  // Stage 6: each of the five dry runs, with the counts the server adds to them.
+  it("a delete_page dry run gives the page's block count, references and first blocks", () => {
+    expect(summaryOf("delete-page-dry-run")).toBe(
+      'Dry run, nothing changed: would delete 1 page:\n- page "Scratch" (7 blocks, 1 reference; first blocks: "Zero", "A first", "B")',
+    );
+  });
+
+  it("move_blocks and batch_move_blocks dry runs say where each block would go", () => {
+    expect(summaryOf("move-blocks-dry-run", "tidy")).toBe(
+      'Dry run, nothing changed: would move 1 block:\n- "Notes" from Nov 5th, 2026 to Nov 5th, 2026 > [[Meeting]]\nReason: tidy',
+    );
+    expect(summaryOf("batch-move-dry-run")).toBe(
+      [
+        "Dry run, nothing changed: would move 2 blocks:",
+        '- "Sam\'s number" from Nov 5th, 2026 > Meeting > Agenda to Nov 5th, 2026 > Notes',
+        '- "Book flights" from Nov 5th, 2026 > Notes to Nov 5th, 2026 > Notes > Sam\'s number',
+      ].join("\n"),
+    );
+  });
+
+  it("a batch_insert_block_trees dry run names the pages it would create", () => {
+    expect(summaryOf("batch-insert-dry-run")).toBe(
+      [
+        "Dry run, nothing changed: would insert 2 blocks:",
+        '- Nov 5th, 2026 > Notes > "Pack" (+1 child)',
+        '- Trip ideas > "First" (+0 children)',
+        'Would create page "Trip ideas".',
+      ].join("\n"),
+    );
+  });
+
+  it("counts and would-create are read from the response, and singular counts read as such", () => {
+    const targets = toAffectedTargets(fixture("batch-insert-dry-run").response);
+    expect(targets.filter((t) => t.wouldCreate).map((t) => t.pageTitle)).toEqual(["Trip ideas"]);
+    expect(toAffectedTargets(fixture("delete-page-dry-run").response)[0]).toMatchObject({
+      references: 1,
+      blocks: 7,
+      roots: ["Zero", "A first", "B"],
+    });
+    const one: AffectedTarget = { uuid: "u", kind: "page", role: "affected", pageTitle: "P", breadcrumb: [], snippet: "P", blocks: 1, references: 0, roots: [] };
+    expect(summarise([one], { tool: "delete_page", dryRun: true })).toBe('Dry run, nothing changed: would delete 1 page:\n- page "P" (1 block, 0 references)');
+    expect(summarise([{ ...one, kind: "block", blocks: undefined, roots: undefined, descendants: 0, references: 1 }], { tool: "delete_blocks", dryRun: true })).toBe(
+      'Dry run, nothing changed: would delete 1 block:\n- P > "P" (+0 children, 1 reference)',
+    );
+  });
+
+  it("a real write is never described as a dry run, and created pages are not called would-create", () => {
+    const response: Record<string, unknown> = { ...fixture("batch-insert-dry-run").response, "dry-run": undefined };
+    response.entries = (response.entries as Record<string, unknown>[]).map(({ "would-create": _w, ...e }) => ({ ...e, created: true }));
+    const summary = describeWrite("batch_insert_block_trees", { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined).summary;
+    expect(summary.startsWith("Inserted 2 blocks:")).toBe(true);
+    expect(summary).not.toContain("Would create");
   });
 
   it("says titles are unavailable on an E2EE graph instead of showing UUID-only lines as complete", () => {

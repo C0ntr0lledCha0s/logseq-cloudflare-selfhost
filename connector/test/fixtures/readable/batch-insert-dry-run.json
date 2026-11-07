@@ -1,0 +1,83 @@
+{
+  "operationId": "batchInsertBlockTrees",
+  "status": "201",
+  "tool": "batch_insert_block_trees",
+  "response": {
+    "count": 3,
+    "dry-run": true,
+    "entries": [
+      {
+        "target-id": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d13",
+        "count": 2,
+        "target": {
+          "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d13",
+          "kind": "block",
+          "page": {
+            "uuid": "00000001-2026-1105-0000-000000000000",
+            "title": "Nov 5th, 2026"
+          },
+          "breadcrumb": [],
+          "snippet": "Notes"
+        },
+        "affected": [
+          {
+            "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d14",
+            "kind": "block",
+            "page": {
+              "uuid": "00000001-2026-1105-0000-000000000000",
+              "title": "Nov 5th, 2026"
+            },
+            "breadcrumb": [
+              "Notes"
+            ],
+            "snippet": "Pack",
+            "descendants": 1
+          }
+        ],
+        "blocks": [
+          {
+            "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d14",
+            "children": [
+              {
+                "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d15"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "target-id": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d16",
+        "count": 1,
+        "would-create": true,
+        "target": {
+          "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d16",
+          "kind": "page",
+          "page": {
+            "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d16",
+            "title": "Trip ideas"
+          },
+          "breadcrumb": [],
+          "snippet": "Trip ideas"
+        },
+        "affected": [
+          {
+            "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d17",
+            "kind": "block",
+            "page": {
+              "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d16",
+              "title": "Trip ideas"
+            },
+            "breadcrumb": [],
+            "snippet": "First",
+            "descendants": 0
+          }
+        ],
+        "blocks": [
+          {
+            "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d17"
+          }
+        ]
+      }
+    ]
+  }
+}

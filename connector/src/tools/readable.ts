@@ -40,6 +40,14 @@ export interface AffectedTarget {
   breadcrumb: string[];
   snippet?: string;
   descendants?: number;
+  /** Delete dry runs: how many blocks and pages the delete leaves refer to it (or a block under it). */
+  references?: number;
+  /** delete_page dry run: the blocks on the page. */
+  blocks?: number;
+  /** delete_page dry run: the first line of each of its first three top-level blocks. */
+  roots?: string[];
+  /** batch_insert_block_trees dry run, on an entry's target: the entry would create this page. */
+  wouldCreate?: boolean;
   from?: TargetLocation;
   to?: TargetLocation;
   e2ee?: boolean;
@@ -119,6 +127,9 @@ function target(value: unknown, role: AffectedTarget["role"]): AffectedTarget | 
   if (typeof page?.title === "string") out.pageTitle = page.title;
   if (typeof ctx.snippet === "string") out.snippet = ctx.snippet;
   if (typeof ctx.descendants === "number") out.descendants = ctx.descendants;
+  if (typeof ctx.references === "number") out.references = ctx.references;
+  if (typeof ctx.blocks === "number") out.blocks = ctx.blocks;
+  if (Array.isArray(ctx.roots)) out.roots = strings(ctx.roots);
   if (ctx.from !== undefined) out.from = location(ctx.from);
   if (ctx.to !== undefined) out.to = location(ctx.to);
   if (ctx.e2ee === true) out.e2ee = true;
@@ -135,6 +146,7 @@ export function toAffectedTargets(response: unknown): AffectedTarget[] {
   const collect = (holder: Record<string, unknown> | undefined) => {
     if (!holder) return;
     const t = target(holder.target, "target");
+    if (t && holder["would-create"] === true) t.wouldCreate = true;
     if (t) out.push(t);
     if (Array.isArray(holder.affected)) {
       for (const item of holder.affected) {
@@ -201,9 +213,18 @@ function path(segments: string[]): string {
   return shown.join(" > ");
 }
 
-function children(n: number | undefined): string {
-  if (n === undefined) return "";
-  return ` (+${n} ${n === 1 ? "child" : "children"})`;
+function count(n: number, singular: string, plural: string): string {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
+/** The counts a line ends with, e.g. " (+3 children, 2 references)"; empty when there are none. */
+function counts(t: AffectedTarget): string {
+  const parts: string[] = [];
+  if (t.descendants !== undefined) parts.push(`+${count(t.descendants, "child", "children")}`);
+  if (t.blocks !== undefined) parts.push(count(t.blocks, "block", "blocks"));
+  if (t.references !== undefined) parts.push(count(t.references, "reference", "references"));
+  const roots = t.roots && t.roots.length > 0 ? `; first blocks: ${t.roots.map((r) => `"${r}"`).join(", ")}` : "";
+  return parts.length > 0 || roots ? ` (${parts.join(", ")}${roots})` : "";
 }
 
 function where(loc: TargetLocation | undefined): string {
@@ -212,18 +233,20 @@ function where(loc: TargetLocation | undefined): string {
 }
 
 function line(t: AffectedTarget): string {
-  if (t.e2ee) return `${t.kind} ${t.uuid}${children(t.descendants)}`;
+  if (t.e2ee) return `${t.kind} ${t.uuid}${counts(t)}`;
   const quoted = `"${t.snippet ?? ""}"`;
   if (t.from !== undefined || t.to !== undefined) return `${quoted} from ${where(t.from)} to ${where(t.to)}`;
-  if (t.kind === "page" || t.kind === "journal") return `${t.kind} ${quoted}${children(t.descendants)}`;
-  return `${path([t.pageTitle ?? "?", ...t.breadcrumb, quoted])}${children(t.descendants)}`;
+  if (t.kind === "page" || t.kind === "journal") return `${t.kind} ${quoted}${counts(t)}`;
+  return `${path([t.pageTitle ?? "?", ...t.breadcrumb, quoted])}${counts(t)}`;
 }
 
 /**
  * The plain-text summary that leads a write's result: one line per block or page the write deleted,
  * moved or inserted (or, when it names none, per block it wrote to), each as page > breadcrumb >
- * "snippet" with the middle of a long path elided; then a line when the context could not be read;
- * then `Reason: …`. Empty when there is nothing to say. Nothing here fetches.
+ * "snippet" with the middle of a long path elided, and the counts the server gave (descendants, and
+ * on a dry run references, a page's blocks and its first blocks); on a dry run, a line per page an
+ * insert would create; then a line when the context could not be read; then `Reason: …`. Empty when
+ * there is nothing to say. Only what the server returned is shown, so nothing here fetches.
  */
 export function summarise(targets: AffectedTarget[], opts: SummaryOptions): string {
   const lines: string[] = [];
@@ -237,6 +260,8 @@ export function summarise(targets: AffectedTarget[], opts: SummaryOptions): stri
     lines.push(`${head}${shown.some((t) => t.e2ee) ? ` (${E2EE_NOTE})` : ""}:`);
     for (const t of shown) lines.push(`- ${line(t)}`);
   }
+  // Only a dry run's entries carry would-create; a real insert says created instead.
+  for (const t of targets.filter((t) => t.wouldCreate)) lines.push(`Would create page "${t.pageTitle ?? t.uuid}".`);
   if (opts.unavailable !== undefined) {
     lines.push(`Context unavailable (${opts.unavailable || "no reason given"}); the write was applied.`);
   }

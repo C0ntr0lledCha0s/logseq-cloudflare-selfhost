@@ -1,0 +1,59 @@
+{
+  "operationId": "batchMoveBlocks",
+  "status": "200",
+  "tool": "batch_move_blocks",
+  "response": {
+    "moved": 2,
+    "dry-run": true,
+    "affected": [
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d11",
+        "kind": "block",
+        "snippet": "Sam's number",
+        "from": {
+          "page": {
+            "uuid": "00000001-2026-1105-0000-000000000000",
+            "title": "Nov 5th, 2026"
+          },
+          "breadcrumb": [
+            "Meeting",
+            "Agenda"
+          ]
+        },
+        "to": {
+          "page": {
+            "uuid": "00000001-2026-1105-0000-000000000000",
+            "title": "Nov 5th, 2026"
+          },
+          "breadcrumb": [
+            "Notes"
+          ]
+        }
+      },
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d12",
+        "kind": "block",
+        "snippet": "Book flights",
+        "from": {
+          "page": {
+            "uuid": "00000001-2026-1105-0000-000000000000",
+            "title": "Nov 5th, 2026"
+          },
+          "breadcrumb": [
+            "Notes"
+          ]
+        },
+        "to": {
+          "page": {
+            "uuid": "00000001-2026-1105-0000-000000000000",
+            "title": "Nov 5th, 2026"
+          },
+          "breadcrumb": [
+            "Notes",
+            "Sam's number"
+          ]
+        }
+      }
+    ]
+  }
+}
