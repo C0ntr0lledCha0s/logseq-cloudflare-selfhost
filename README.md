@@ -686,6 +686,7 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 - **`--owner`** claims a fresh server, where the list is `none` and no one has signed in. It replaces `none` with the person you confirm.
 - **Without `--owner`** adds one more person to a server that already has a list. It appends their ID.
 - It writes the ID into `.env.local` (keeping a `.env.local.bak-<time>` copy), checks the new value with the same format check the deploy uses, pushes that one secret and runs and follows the deploy.
+- If the push fails, it puts `.env.local` back from that copy, so the file still matches `production`: fix what it reported and run it again. If the deploy fails after the push, the new list stays (production has it): run `scripts/run-deploy.sh`. After a failed deploy of a claim, `--owner` says the server is already claimed and points at `scripts/run-deploy.sh`.
 - It looks back 30 minutes and then polls every 10 seconds, for 10 minutes by default (`--wait <minutes>`). It asks about each distinct refused email once, and changes nothing unless you answer `y`.
 - It stops if `.env.local` looks out of date (the list says `none` but the server has users): restore the current file first.
 - It only reads logs, and it prints emails, so it refuses to run in GitHub Actions.

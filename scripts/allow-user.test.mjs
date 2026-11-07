@@ -114,10 +114,10 @@ test("chooseMode picks owner or add, and refuses each wrong combination with the
     () => chooseMode({ owner: false, localList: "none", knownUsers: 0 }),
     { message: "the list is none: run scripts/allow-user.sh --owner to claim the server first" },
   );
-  assert.throws(
-    () => chooseMode({ owner: true, localList: KNOWN_A, knownUsers: 1 }),
-    { message: "the server is already claimed; run scripts/allow-user.sh without --owner to add someone" },
-  );
+  // After a deploy that failed, the local list is already the owner's while the server still refuses them.
+  const claimed = "the server is already claimed; run scripts/allow-user.sh without --owner to add someone. If the last deploy failed, run scripts/run-deploy.sh";
+  assert.throws(() => chooseMode({ owner: true, localList: KNOWN_A, knownUsers: 1 }), { message: claimed });
+  assert.throws(() => chooseMode({ owner: true, localList: KNOWN_A, knownUsers: 0 }), { message: claimed });
 });
 
 test("nextList replaces none in owner mode, appends in add mode, and never lists a sub twice", () => {
@@ -346,7 +346,7 @@ test("add mode on a list of none, and --owner on a claimed server, stop before t
   await withCli({ list: KNOWN_A, cfRoutes: routes({ users: [{ id: KNOWN_A }] }) }, async (t) => {
     const r = await t.run(["--owner", "--wait", "0"]);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /the server is already claimed; run scripts\/allow-user\.sh without --owner to add someone/);
+    assert.match(r.stderr, /the server is already claimed; run scripts\/allow-user\.sh without --owner to add someone\. If the last deploy failed, run scripts\/run-deploy\.sh/);
     assert.equal(t.stub.requests.filter((req) => req.path.endsWith("/telemetry/query")).length, 0);
   });
 });
@@ -371,21 +371,27 @@ test("a 403 from the log query names the permission and the token link", async (
   });
 });
 
-test("a failed secret push leaves the file updated, says how to finish, and does not deploy", { timeout: 30000 }, async () => {
-  await withCli({ cfRoutes: routes({ polls: [[A]] }), gh: ghRules([{ match: ["secret", "set"], exit: 1 }]) }, async (t) => {
-    const r = await t.run(["--owner", "--wait", "0"], { input: "y\n" });
-    assert.equal(r.status, 1);
-    assert.equal(t.envLocal(), ENV_LOCAL(SUB));
-    assert.match(r.stderr, /scripts\/init-env\.sh --push-only DB_SYNC_ALLOWED_USERS/);
-    assert.ok(!t.gh.calls().some((c) => c.argv[0] === "workflow"), "no deploy");
-    assert.ok(!r.stdout.includes("Sign in again"));
-  });
+test("a failed secret push puts .env.local back as it was, so it matches production, and does not deploy", { timeout: 30000 }, async () => {
+  // Left with the new list, a setup.sh re-run would see the name present and the list not none, and say setup is complete.
+  for (const [list, users, args] of [["none", [], ["--owner"]], [KNOWN_A, [{ id: KNOWN_A }], []]]) {
+    await withCli({ list, cfRoutes: routes({ users, polls: [[A]] }), gh: ghRules([{ match: ["secret", "set"], exit: 1 }]) }, async (t) => {
+      const r = await t.run([...args, "--wait", "0"], { input: "y\n" });
+      assert.equal(r.status, 1);
+      assert.equal(t.envLocal(), ENV_LOCAL(list));
+      assert.equal(statSync(join(t.dir, ".env.local")).mode & 0o777, 0o600);
+      assert.match(r.stderr, /the secret was not pushed, so \.env\.local is back as it was/);
+      assert.match(r.stderr, /run scripts\/allow-user\.sh/);
+      assert.ok(!t.gh.calls().some((c) => c.argv[0] === "workflow"), "no deploy");
+      assert.ok(!r.stdout.includes("Sign in again"));
+    });
+  }
 });
 
-test("a failed deploy says the secret is pushed and how to re-run it", { timeout: 30000 }, async () => {
+test("a failed deploy keeps the new list, says the secret is pushed and how to re-run it", { timeout: 30000 }, async () => {
   await withCli({ cfRoutes: routes({ polls: [[A]] }), gh: ghRules([{ match: ["run", "watch"], exit: 1 }, { match: ["run", "view"], stdout: "{\"jobs\":[]}" }]) }, async (t) => {
     const r = await t.run(["--owner", "--wait", "0"], { input: "y\n" });
     assert.equal(r.status, 1);
+    assert.equal(t.envLocal(), ENV_LOCAL(SUB));
     assert.match(r.stderr, /scripts\/run-deploy\.sh/);
     assert.ok(!r.stdout.includes("Sign in again"));
   });

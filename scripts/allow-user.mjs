@@ -92,7 +92,10 @@ export function chooseMode({ owner, localList, knownUsers }) {
   }
   if (owner) {
     if (localList !== "none") {
-      throw new Error("the server is already claimed; run scripts/allow-user.sh without --owner to add someone");
+      // A claim whose deploy failed also lands here: the list is written and pushed, but not deployed.
+      throw new Error(
+        "the server is already claimed; run scripts/allow-user.sh without --owner to add someone. If the last deploy failed, run scripts/run-deploy.sh",
+      );
     }
     return "owner";
   }
@@ -285,7 +288,14 @@ export async function run(argv, env = process.env, stdin = process.stdin) {
   const backup = writeAllowedUsers(envFile, nextList(mode, localList, accepted.sub));
   console.log(`${NAME} updated in .env.local (backup: ${basename(backup)}). Pushing it and deploying…`);
   if (!runRepoScript(repoRoot, "init-env.sh", ["--push-only", NAME], env)) {
-    console.error(`error: the secret was not pushed. .env.local is updated; run scripts/init-env.sh --push-only ${NAME}, then scripts/run-deploy.sh`);
+    // Put the file back, so it matches production again: left with the new list, a setup.sh re-run
+    // would see the secret present and the list not none, and call setup complete. A deploy that fails
+    // after a good push keeps the new file (production has the list), and the message below says so.
+    copyFileSync(backup, envFile);
+    chmodSync(envFile, 0o600);
+    console.error(
+      `error: the secret was not pushed, so .env.local is back as it was and nothing changed. Fix what init-env.sh reported, then run scripts/allow-user.sh${mode === "owner" ? " --owner" : ""} again`,
+    );
     return 1;
   }
   if (!runRepoScript(repoRoot, "run-deploy.sh", [], env)) {
