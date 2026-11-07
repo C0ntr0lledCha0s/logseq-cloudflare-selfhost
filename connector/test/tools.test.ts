@@ -2028,7 +2028,21 @@ const STAMPING_TOOLS = [
   "save_file_from_url",
 ];
 
+const HOLDER_STAMP_SENTENCE =
+  "When edit stamps are on for the graph, each other block whose property value this call removes or converts (a value pointing at a deleted block, a retired choice, a text value converted to a choice) is stamped editedBy=claude and claudeEditedAt (hidden properties, listed on the Claude Activity page).";
+/** The tools whose write stamps the blocks holding a value it removes or converts, not its own targets. */
+const HOLDER_STAMPING_TOOLS = ["delete_block", "delete_blocks", "update_property"];
+
 describe("edit stamps contract", () => {
+  it("each tool that stamps the holders of a value it removes says so once; no other tool does", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const holding = tools
+      .filter((t: { description: string }) => t.description.includes(HOLDER_STAMP_SENTENCE))
+      .map((t: { name: string }) => t.name);
+    expect(holding.sort()).toEqual([...HOLDER_STAMPING_TOOLS].sort());
+    for (const tool of tools) expect(tool.description.split(HOLDER_STAMP_SENTENCE).length, tool.name).toBeLessThanOrEqual(2);
+  });
+
   it("each stamping tool's description holds the stamp sentence once; no other tool's does", async () => {
     const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
     const holding = tools.filter((t: { description: string }) => t.description.includes(STAMP_SENTENCE)).map((t: { name: string }) => t.name);
@@ -2045,13 +2059,15 @@ describe("edit stamps contract", () => {
     for (const phrase of [
       "When edit stamps are on for a graph (the default), the connector marks its writes",
       "each block a write creates or changes is stamped with two hidden properties, editedBy=claude and claudeEditedAt",
-      "Pages, tags and properties are not stamped, nor are deletes",
+      "Pages, tags and properties are not stamped, nor are the blocks a delete removes",
+      "delete_block, delete_blocks and update_property do stamp each other block whose property value they remove or convert",
       "The stamp stays when the owner later edits the block in the app",
       "E2EE graphs are not stamped",
       "The owner turns stamps off per graph on the connector's graph settings page; no tool can",
       "Claude Activity page",
       "Recycle bin",
-      "answers 409 naming it",
+      "answers 409 naming it until the owner renames it in the Logseq app (update_property can't: the rename is refused too)",
+      "the properties of an insert (a BlockTree node's, or a batch_insert_block_trees entry's) refuse them too, naming the entry or node (entries[0]: editedBy is set by the server and can't be written)",
       "editedBy and claudeEditedAt are set by the server; set_block_property, batch_set_block_property, delete_block_property and batch_delete_block_property refuse them, naming the entry",
     ]) {
       expect(help, phrase).toContain(phrase);

@@ -75,6 +75,11 @@ const STAMPING_TOOLS = new Set([
   "refresh_refs",
 ]);
 
+/** The sentence on each tool whose write stamps the blocks holding a value it removes or converts (spec §12). */
+export const HOLDER_STAMP_HINT =
+  "When edit stamps are on for the graph, each other block whose property value this call removes or converts (a value pointing at a deleted block, a retired choice, a text value converted to a choice) is stamped editedBy=claude and claudeEditedAt (hidden properties, listed on the Claude Activity page).";
+const HOLDER_STAMPING_TOOLS = new Set(["delete_block", "delete_blocks", "update_property"]);
+
 /** Usage conventions added to the generated descriptions of the tools they concern. */
 const HINTS: Record<string, string> = {
   insert_block_tree:
@@ -101,6 +106,7 @@ function description(op: GraphOperation): string {
   if (op.operation.description) parts.push(op.operation.description);
   if (HINTS[op.name]) parts.push(HINTS[op.name]);
   if (STAMPING_TOOLS.has(op.name)) parts.push(STAMP_HINT);
+  if (HOLDER_STAMPING_TOOLS.has(op.name)) parts.push(HOLDER_STAMP_HINT);
   return parts.join("\n\n");
 }
 

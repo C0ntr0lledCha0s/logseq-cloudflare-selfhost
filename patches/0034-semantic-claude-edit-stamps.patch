@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index f65a3a1..8937921 100644
+index f65a3a1..4b4cc11 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -152,15 +152,19 @@
@@ -28,7 +28,30 @@ index f65a3a1..8937921 100644
  
  ;; A many value's entities are listed by :block/order, then by db id. Blocks, property entities and
  ;; pages under the Library or a namespace parent have an order key (a string); plain and journal
-@@ -1322,12 +1326,211 @@
+@@ -1134,9 +1138,12 @@
+          (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
+          (into {}))))
+ 
++(declare stamp-property-refusal)
++
+ (defn- prepare-properties
+   "Resolves a `properties` object for the block `scope` (see prepare-property-value) to
+-  [[ident value] ...], or {:error reason} for the first key or value that doesn't resolve."
++  [[ident value] ...], or {:error reason} for the first key or value that doesn't resolve, or that
++  names an edit-stamp property (patch 0034), which only the server writes."
+   [db properties e2ee? scope]
+   (if-not (and (map? properties) (seq properties))
+     {:error "properties must be a non-empty object"}
+@@ -1148,6 +1155,8 @@
+                                  (prepare-property-value db (:db/ident property) value e2ee? scope))]
+                   (cond
+                     (not (property? property)) (reduced {:error (str "property not found: " selector)})
++                    (stamp-property-refusal (:db/ident property))
++                    (reduced {:error (stamp-property-refusal (:db/ident property))})
+                     (nil? value) (reduced {:error (str selector ": missing property value")})
+                     (:error prepared) (reduced {:error (str selector ": " (or (::refusal prepared) (:error prepared)))})
+                     :else (update result :properties conj [(:db/ident property) (:value prepared)]))))
+@@ -1322,12 +1331,211 @@
                     (and (contains? enabled (search-type entity))
                          (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))))
  
@@ -61,7 +84,7 @@ index f65a3a1..8937921 100644
 +
 +(defn- stamp-property-conflict [entity]
 +  (str "edit stamps: property " (:block/title entity) " (" (entity-ident entity) ") is not the stamp"
-+       " property; rename it or turn off \"Mark Claude's edits\" for this graph"))
++       " property; rename it in the app or turn off \"Mark Claude's edits\" for this graph"))
 +
 +(defn- stamp-choice-conflict [db]
 +  (let [choice (d/entity db [:block/uuid editedby-choice-uuid])
@@ -79,7 +102,7 @@ index f65a3a1..8937921 100644
 +           (some #(= stamp-header-value (str (db-property/closed-value-content (d/entity db (:e %)))))
 +                 (d/datoms db :avet :block/closed-value-property (:db/id property))))
 +      (str "edit stamps: editedBy has a claude choice that isn't the stamp's (" editedby-choice-uuid
-+           "); delete it or turn off \"Mark Claude's edits\" for this graph"))))
++           "); delete it in the app or turn off \"Mark Claude's edits\" for this graph"))))
 +
 +(defn- check-stamp-schema
 +  "nil when the stamp properties can be used or created in `db`, else the 409 that refuses the write:
@@ -243,7 +266,7 @@ index f65a3a1..8937921 100644
  
  (defn- created-by-tx [before after datoms creator]
    (let [targets (into #{}
-@@ -1361,7 +1564,12 @@
+@@ -1361,7 +1569,12 @@
      (apply mutate conn args)
      (let [result (volatile! nil)
            metadata (volatile! nil)
@@ -256,7 +279,7 @@ index f65a3a1..8937921 100644
        ;; Keep identity scoped to synchronous work on an isolated connection.
        ;; The author and operation reach storage in the same transaction.
        (ldb/batch-transact-with-temp-conn!
-@@ -1369,9 +1577,21 @@
+@@ -1369,9 +1582,21 @@
         (fn [tx-conn tx-data]
           (vreset! result (apply mutate tx-conn args))
           (when-let [authorship (seq (created-by-tx before @tx-conn @tx-data creator))]
@@ -280,7 +303,7 @@ index f65a3a1..8937921 100644
                        (vreset! metadata (:tx-meta report))))
         :transform-tx-meta (fn [_] @metadata))
        @result)))
-@@ -2221,7 +2441,7 @@
+@@ -2221,7 +2446,7 @@
              (when-let [reason (cond
                                  (nil? block) "block not found"
                                  (nil? property-ident) "property not found"
@@ -289,7 +312,7 @@ index f65a3a1..8937921 100644
                (str "entry " index ": " reason)))
            (map-indexed vector resolved))))
  
-@@ -2244,6 +2464,8 @@
+@@ -2244,6 +2469,8 @@
        (cond
          (nil? block) (http/bad-request "block not found")
          (nil? property-ident) (http/bad-request "property not found")
@@ -298,7 +321,7 @@ index f65a3a1..8937921 100644
          (not (contains? body :value)) (http/bad-request "missing property value")
          (:error prepared) (http/bad-request (:error prepared))
          :else
-@@ -2258,8 +2480,12 @@
+@@ -2258,8 +2485,12 @@
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
            property-ident (resolve-property-ident db (:property-id path-params))]
@@ -312,7 +335,7 @@ index f65a3a1..8937921 100644
          (refusing-labels
           #(do
              (atomic-write! conn creator false :remove-block-property
-@@ -2733,7 +2959,8 @@
+@@ -2733,7 +2964,8 @@
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
                (p/catch (fn [error]
@@ -322,7 +345,7 @@ index f65a3a1..8937921 100644
  
      :semantic/assets-get
      (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
-@@ -4437,6 +4664,17 @@
+@@ -4437,6 +4669,17 @@
      (= :semantic/block-changes handler) (handle-block-changes context)
      :else (http/not-found)))
  
@@ -340,7 +363,7 @@ index f65a3a1..8937921 100644
  (defn handle [{:keys [^js self route ^js url] :as context}]
    (let [conn (ensure-conn! self)
          handler (:handler route)
-@@ -4454,9 +4692,10 @@
+@@ -4454,9 +4697,10 @@
          context (assoc context :conn conn :db db :handler handler :e2ee? e2ee?
                         :path-params (:path-params route)
                         :creator (request-creator (:request context) e2ee?))]
@@ -359,10 +382,10 @@ index f65a3a1..8937921 100644
 +        (dispatch-handle context handler)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 new file mode 100644
-index 0000000..5a890fa
+index 0000000..122055e
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
-@@ -0,0 +1,1620 @@
+@@ -0,0 +1,1720 @@
 +(ns logseq.db-sync.semantic-edit-stamps-test
 +  "Claude edit stamps (patch 0034), stage 1: the flag and the schema. A write whose request carries
 +  x-logseq-edit-stamp: claude, from a real actor on a graph that isn't E2EE, creates two hidden
@@ -720,7 +743,7 @@ index 0000000..5a890fa
 +       (p/finally done))))
 +
 +(defn- conflict-message [property-title ident]
-+  (str "edit stamps: property " property-title " (" ident ") is not the stamp property; rename it or"
++  (str "edit stamps: property " property-title " (" ident ") is not the stamp property; rename it in the app or"
 +       " turn off \"Mark Claude's edits\" for this graph"))
 +
 +(defn- user-property! [conn ident schema property-title]
@@ -776,7 +799,7 @@ index 0000000..5a890fa
 +                  (user-property! conn by-ident {} "editedBy")
 +                  (outliner-property/upsert-closed-value! conn by-ident {:value "claude"}))
 +                (constantly (str "edit stamps: editedBy has a claude choice that isn't the stamp's ("
-+                                 choice-uuid "); delete it or turn off \"Mark Claude's edits\" for this graph"))]]]
++                                 choice-uuid "); delete it in the app or turn off \"Mark Claude's edits\" for this graph"))]]]
 +      (p/let [{:keys [conn self a]} (seed-graph)
 +              _ (setup conn)
 +              before (snapshot conn)
@@ -1403,6 +1426,41 @@ index 0000000..5a890fa
 +      (fn [{:keys [self a b]}]
 +        (request! self "DELETE" "/semantic/blocks" {:block-ids [(str a) (str b)]} :headers stamped))
 +      (constantly #{})]
++     ;; A delete or update_property changes the blocks whose values it removes or converts, so those
++     ;; holders are stamped; the deleted blocks and the property are not.
++     ["deleteBlock, which removes a node value another block holds"
++      (fn [{:keys [self a b]}]
++        (p/do (request! self "POST" "/semantic/properties" {:title "related" :type "node"} :headers signed)
++              (request! self "PUT" (str "/semantic/blocks/" b "/properties/related") {:value (str a)}
++                        :headers signed)))
++      (fn [{:keys [self a]}]
++        (request! self "DELETE" (str "/semantic/blocks/" a "?acknowledge-references=true") nil :headers stamped))
++      (fn [{:keys [b]} _] #{b})]
++     ["deleteBlocks, which removes a node value another block holds"
++      (fn [{:keys [self a c]}]
++        (p/do (request! self "POST" "/semantic/properties" {:title "related" :type "node"} :headers signed)
++              (request! self "PUT" (str "/semantic/blocks/" c "/properties/related") {:value (str a)}
++                        :headers signed)))
++      (fn [{:keys [self a]}]
++        (request! self "DELETE" "/semantic/blocks?acknowledge-references=true" {:block-ids [(str a)]}
++                  :headers stamped))
++      (fn [{:keys [c]} _] #{c})]
++     ["updateProperty, retiring a choice two blocks hold"
++      (fn [{:keys [self a b]}]
++        (p/do (request! self "POST" "/semantic/properties" {:title "feeling" :choices [{:title "ok"} {:title "bad"}]}
++                        :headers signed)
++              (request! self "PUT" (str "/semantic/blocks/" a "/properties/feeling") {:value "ok"} :headers signed)
++              (request! self "PUT" (str "/semantic/blocks/" b "/properties/feeling") {:value "ok"} :headers signed)))
++      (fn [{:keys [self]}]
++        (request! self "PATCH" "/semantic/properties/feeling?acknowledge-holders=true" {:choices {:retire ["ok"]}}
++                  :headers stamped))
++      (fn [{:keys [a b]} _] #{a b})]
++     ["updateProperty, converting two blocks' text values to a choice"
++      (fn [{:keys [self a b]}] (p/do (set-mood! self a "ok") (set-mood! self b "ok")))
++      (fn [{:keys [self]}]
++        (request! self "PATCH" (str "/semantic/properties/" mood-param)
++                  {:convert_values true :choices {:add [{:title "ok"}]}} :headers stamped))
++      (fn [{:keys [a b]} _] #{a b})]
 +     ["createPage (pages are not stamped)"
 +      nil
 +      (fn [{:keys [self]}] (request! self "POST" "/semantic/pages" {:title "Fresh page"} :headers stamped))
@@ -1690,6 +1748,71 @@ index 0000000..5a890fa
 +              (is (= (server-message 0 "claudeEditedAt") (get-in both [:body :error])))
 +              (is (= (server-message 0 "editedBy") (get-in reversed [:body :error])))
 +              (is (= before (snapshot conn))))))))))
++
++;; The insert inputs that take a properties object (a batch entry's own properties, on an existing
++;; block, an existing page or a page the call creates, and a BlockTree node's properties at any depth,
++;; through insertBlockTree, insertBlockChildren, captureToToday and a batch entry's blocks) refuse
++;; the stamp properties too, named by title, ident or UUID, with or without the header, also when
++;; another property comes first in the object. The refusal names the entry or node; nothing is written.
++;; Before the fix these answered 201 and stored the caller's values, e.g.:
++;;   expected: (= [400 "entries[0]: editedBy is set by the server and can't be written"] ...)
++;;   actual: (not (= [400 ...] [201 nil]))
++(deftest insert-properties-cannot-name-the-stamp-properties-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self notes a b]} (seed-stamp-graph)
++                _ (update-block! self a "A edited" stamped)
++                {:keys [by at]} (schema-entities @conn)
++                names {"editedBy" ["editedBy" "user.property/claude-editedBy" (str (:block/uuid by))]
++                       "claudeEditedAt" ["claudeEditedAt" "user.property/claude-editedAt" (str (:block/uuid at))]}
++                values {"editedBy" "claude" "claudeEditedAt" 1}
++                ;; Capture makes today's journal before it checks its blocks, so make it first.
++                _ (request! self "POST" "/semantic/capture" {:blocks [{:title "today"}]} :headers signed)
++                before (snapshot conn)
++                stamps-before (stamps @conn)
++                calls (fn [id value]
++                        ;; Another property first, so the refusal isn't only for a lone key.
++                        (let [props (array-map "user.property/mood" "ok" id value)
++                              node [{:title "N" :properties props}]]
++                          [["batch entry on an existing block" "entries[0]"
++                            "POST" "/semantic/block-trees/batch"
++                            {:entries [{:target-id (str b) :properties props}]}]
++                           ["batch entry on an existing block, with blocks" "entries[0]"
++                            "POST" "/semantic/block-trees/batch"
++                            {:entries [{:target-id (str b) :properties props :blocks [{:title "x"}]}]}]
++                           ["batch entry on a page" "entries[1]"
++                            "POST" "/semantic/block-trees/batch"
++                            {:entries [{:target-id (str notes) :blocks [{:title "y"}]}
++                                       {:target-id (str notes) :properties props :blocks [{:title "x"}]}]}]
++                           ["batch entry on a page it creates" "entries[0]"
++                            "POST" "/semantic/block-trees/batch"
++                            {:entries [{:page "Fresh" :properties props :blocks [{:title "x"}]}]}]
++                           ["batch entry's node" "entries[0].blocks[0]"
++                            "POST" "/semantic/block-trees/batch"
++                            {:entries [{:target-id (str notes) :blocks node}]}]
++                           ["insertBlockTree node" "blocks[0]"
++                            "POST" "/semantic/block-trees" {:target-id (str notes) :blocks node}]
++                           ["insertBlockTree child node" "blocks[0].children[0]"
++                            "POST" "/semantic/block-trees"
++                            {:target-id (str notes) :blocks [{:title "P" :children node}]}]
++                           ["insertBlockChildren node" "blocks[0]"
++                            "POST" (str "/semantic/blocks/" b "/children") {:position "append" :blocks node}]
++                           ["captureToToday node" "blocks[0]"
++                            "POST" "/semantic/capture" {:blocks node}]]))
++                results (p/all
++                         (for [headers [signed stamped]
++                               [property-title ids] names
++                               id ids
++                               [call-label path method url body] (calls id (get values property-title))]
++                           (p/let [response (request! self method url body :headers headers)]
++                             [(str call-label ", " property-title " as " id (when (= headers stamped) ", flagged"))
++                              (str path ": " property-title " is set by the server and can't be written")
++                              response])))]
++          (doseq [[label expected response] results]
++            (is (= [400 expected] [(:status response) (get-in response [:body :error])]) label))
++          (is (= before (snapshot conn)) "nothing is written")
++          (is (= stamps-before (stamps @conn)) "no stamp is set or changed"))))))
 +
 +;; What the refusal must not catch: other property writes on a stamped block, a re-send, a reset
 +;; and a property whose title only starts like a stamp property, with and without the header. The
