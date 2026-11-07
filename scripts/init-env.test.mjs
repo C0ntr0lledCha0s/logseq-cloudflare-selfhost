@@ -538,7 +538,7 @@ test("fresh run writes DB_SYNC_ALLOWED_USERS=none, whatever the environment hold
     const r = await run(dir, [], { DB_SYNC_ALLOWED_USERS: USER_A });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.equal(parseEnv(dir).DB_SYNC_ALLOWED_USERS, "none");
-    assert.match(r.stdout, /db-sync\/user-not-allowed/);
+    assert.match(r.stdout, /scripts\/allow-user\.sh --owner/);
     assert.match(r.stdout, /README section 9\.1/);
   });
 });
@@ -587,7 +587,7 @@ test("--add-missing does not ask for the connector values when only DB_SYNC_ALLO
     const r = await run(dir, ["--add-missing"], { DB_SYNC_ALLOWED_USERS: "none" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.match(readFileSync(join(dir, ".env.local"), "utf8"), /\nDB_SYNC_ALLOWED_USERS=none\n$/);
-    assert.match(r.stdout, /db-sync\/user-not-allowed/);
+    assert.match(r.stdout, /scripts\/allow-user\.sh --owner/);
   });
 });
 

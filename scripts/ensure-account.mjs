@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Usage: ensure-account.mjs
-// Env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN (R2 Write and Workers Scripts Write).
+// Env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN (Workers R2 Storage Edit and Workers Scripts Edit).
 // Creates the account prerequisites the first deploy needs and OpenTofu can't: the R2 bucket that
 // holds OpenTofu's state, and the account's workers.dev subdomain. Each is created only when it is
 // missing, so a re-run changes nothing.

@@ -11,9 +11,17 @@ This repo self-hosts Logseq's DB sync server on Cloudflare, plus `logseq-connect
 | `connector/src/semantic/` | The semantic index: Workers AI embeddings, Vectorize, D1 state, cron indexer. |
 | `connector/migrations/` | D1 migrations (sign-ins, graph tokens and semantic state share one database). |
 | `scripts/` | Bash and Node build, deploy, backup and usage scripts. Every script has a `*.test.mjs` next to it. |
+| `scripts/setup.sh` | The guided setup, one command from a fork to a deployed server (eight resumable stages). Orchestrates `doctor.sh`, `init-env.sh`, `run-deploy.sh` and `allow-user.sh`; it doesn't re-implement them. |
+| `scripts/doctor.sh`, `doctor.mjs` | Read-only checks of the Cloudflare account, token, domain, GitHub repo and `.env.local`. One `ok`, `warn`, `skip` or `FAIL` line each. |
+| `scripts/allow-user.sh`, `allow-user.mjs` | Claims the server (`--owner`) or adds a person, from the sync Worker's `user-not-allowed` log. Edits `DB_SYNC_ALLOWED_USERS` in `.env.local` after a backup. |
+| `scripts/enable-connector.sh` | Turns the connector on after its GitHub OAuth app exists (secrets, `CONNECTOR_ENABLED` in both places, doctor, deploy). |
+| `scripts/run-deploy.sh` | Starts the `deploy` workflow on `main` and follows it from the terminal. |
+| `scripts/ensure-account.mjs` | Creates OpenTofu's state bucket and the `workers.dev` subdomain when missing. `deploy.yml` runs it before `tofu init`. |
+| `scripts/lib/gh.sh` | `gh_try` and `gh_must`, sourced by `setup.sh` and `enable-connector.sh`. |
+| `config/token-permissions.json`, `scripts/token-link.mjs` | The Cloudflare token's permissions, and the dashboard link that pre-fills them. README 1.1 lists the same names. |
 | `infra/` | OpenTofu (Cloudflare provider v5). |
 | `config/settings.json` | Non-secret settings: plan, connector and semantic switches. |
-| `.github/workflows/` | `ci`, `deploy` (merging to main deploys), `backup`, `usage`, `bump-upstream`. |
+| `.github/workflows/` | `ci`, `deploy` (merging to main deploys), `backup`, `usage`, `bump-upstream` (the original repo only) and `sync-upstream` (forks only: a weekly PR from the parent's `main`). |
 | `docs/superpowers/specs`, `docs/superpowers/plans` | Design specs and implementation plans, named `YYYY-MM-DD-slug(-design).md`. |
 | `docs/solutions/` | Learnings from past bugs and features (the compound loop). Read the relevant ones before you investigate or design. |
 | `docs/lanes/` | How staged work runs: lanes, stages, gates, reviews. |
@@ -24,6 +32,7 @@ This repo self-hosts Logseq's DB sync server on Cloudflare, plus `logseq-connect
 
 - `scripts/check.sh` is the gate every lane uses. It runs the scripts' unit tests, the connector tests, typecheck and tools-manifest check (when `connector/vendor/` exists), and `tofu fmt`. It names each check it skipped and why. Add `--upstream` when `patches/` changed.
 - `npm test` runs the scripts' unit tests only (fast, needs nothing built).
+- `scripts/doctor.sh` checks the account, domain, GitHub repo and `.env.local` without changing anything. Run it when setup or a deploy fails. `scripts/setup.sh` is the guided setup, safe to re-run.
 - Connector checks need the vendored upstream API: `scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream`. The build needs mise's toolchain (Java, Clojure, pnpm) and takes a while; CI runs it on every PR.
 - `npm --prefix connector run update:manifest` rewrites `tools-manifest.json` after a tool is added, removed or renamed.
 

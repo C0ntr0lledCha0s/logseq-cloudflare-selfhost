@@ -406,7 +406,7 @@ case "$add_names " in
 esac
 # Only when the value written is `none`: a real list needs no next step.
 if [[ "$add_names " == *" $allowed_users_name "* && "${DB_SYNC_ALLOWED_USERS:-}" = "none" ]]; then
-  echo "  - Your first sign-in will be refused. Get your ID from the db-sync/user-not-allowed log line (wrangler tail or Workers Logs), then set DB_SYNC_ALLOWED_USERS: README section 9.1."
+  echo "  - Your first sign-in will be refused. Sign in once, then run scripts/allow-user.sh --owner to add your ID to DB_SYNC_ALLOWED_USERS: README section 9.1."
 fi
 if [ "$push" != 1 ]; then
   echo "  - Copy the values to the GitHub production environment (README 1.8)."

@@ -4,14 +4,22 @@ Run Logseq's DB sync server (the upstream `deps/db-sync` Cloudflare Worker) on y
 
 The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), applies twenty small patches at build time (`patches/`), and deploys with OpenTofu, wrangler and GitHub Actions.
 
+**New here?** Go to the [Quick start](#quick-start). It is a short checklist of browser steps, then one command, and it assumes you have never used GitHub or Cloudflare before.
+
 ## Contents
 
 - [What you get](#what-you-get)
 - [Costs](#costs)
-- [Prerequisites](#prerequisites)
+- [Quick start](#quick-start)
+  - [Before you start](#before-you-start)
+  - [Browser checklist](#browser-checklist)
+  - [Run setup](#run-setup)
+  - [If something fails](#if-something-fails)
 - [0. Install nightly Logseq on every device](#0-install-nightly-logseq-on-every-device)
-- [1. Bootstrap](#1-bootstrap)
-- [2. First deploy](#2-first-deploy)
+- [Advanced: set up and deploy from your machine](#advanced-set-up-and-deploy-from-your-machine)
+  - [Prerequisites](#prerequisites)
+  - [1. Bootstrap](#1-bootstrap)
+  - [2. First deploy](#2-first-deploy)
 - [3. Point your clients at the server](#3-point-your-clients-at-the-server)
 - [4. Create a personal access token](#4-create-a-personal-access-token)
 - [5. Use it from remote Claude Code](#5-use-it-from-remote-claude-code)
@@ -47,7 +55,7 @@ The repo does not fork Logseq. It pins an upstream commit (`UPSTREAM_REF`), appl
 - **Batched writes that sync as they were written.** A batched write (such as `batchSetBlockProperty` or a block tree insert with properties) runs on a temporary copy of the graph, then replays its changes into the graph in one transaction, but each change kept the copy's transaction id. The log clients replay keeps one change per entity, attribute, value and transaction id and sorts by transaction id, so a value removed, added back and removed again within a batch could log as "remove, then add", and clients kept a value the server had removed: resetting two tags' parent to Organization left the second tag under Root as well in the app, while the server was right. `patches/0018-batch-commits-as-one-transaction.patch` replays the changes without their transaction ids, so a batch is one transaction with one id. The desktop app runs its own batched edits through the same upstream code, which this patch can't reach.
 - **A list of who may use the server.** Upstream lets any Logseq account sign in, create graphs and create PATs on your server. `patches/0019-allowed-users.patch` refuses every user who isn't in the secret `DB_SYNC_ALLOWED_USERS`, with a 401. A missing, empty or malformed list refuses everyone. Section 9 explains how to set it.
 - **No unauthenticated MCP endpoint.** Upstream's `/mcp` answers anyone, with no token. `patches/0020-remove-upstream-mcp.patch` removes it, so the path now answers 404 (section 8). The connector (section 11) does its job.
-- **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream bump PR, and takes daily backups.
+- **Repeatable deploys.** OpenTofu manages the D1 database and R2 buckets. wrangler deploys the code, bindings, secrets and custom domain. GitHub Actions runs CI, deploys on merge to `main`, opens a weekly upstream PR (a bump on the original repo, an update on a fork), and takes daily backups.
 
 **What still depends on Logseq the company:**
 
@@ -99,22 +107,111 @@ To turn it on:
 
 To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`.
 
-## Prerequisites
+## Quick start
 
-- **A Cloudflare account** with a zone (`example.com`) already active on it. The sync hostname (`sync.example.com`) must be in that zone and should not already have a DNS record: wrangler creates the record and the certificate.
-- **A payment method** on the Cloudflare account, so R2 can be enabled.
-- **A GitHub fork or copy of this repo** (for example `C0ntr0lledCha0s/logseq-cloudflare-selfhost`), with Actions enabled and `main` as the default branch.
-- **Locally:** `git`, `curl`, `openssl`, the GitHub CLI `gh`, and [mise](https://mise.jdx.dev). mise installs the pinned toolchain from `mise.toml`: Node 22, pnpm 10.33.0, Java (Temurin 21), the Clojure CLI, OpenTofu 1.10 and rclone.
+This is the recommended way in. You do a few steps in a browser, then run one command in a terminal. You don't need to know GitHub, Cloudflare or DNS in advance, and you don't install OpenTofu, Java or Clojure: the deploy runs on GitHub Actions. If you'd rather build and deploy from your own machine, see [Advanced](#advanced-set-up-and-deploy-from-your-machine).
+
+### Before you start
+
+You need three things: a GitHub account, a Cloudflare account and a domain name. Each provider's own guide is better than a description of its screens here, so this section links to them.
+
+**GitHub**
+
+- **An account.** [Create one](https://docs.github.com/en/get-started/start-your-journey/creating-an-account-on-github) if you don't have one. Then install the GitHub command-line tool, [`gh`](https://cli.github.com), and sign in with [`gh auth login`](https://cli.github.com/manual/gh_auth_login). If setup later needs another permission, it prints the `gh auth refresh` command to run.
+- **A public fork of this repo.** [Fork it](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo) with the Fork button. This is the only supported route on GitHub Free:
+  - **It is public, and that's fine.** A fork of a public repo stays public ([about forks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/about-forks)). The deploy keeps its secrets in a GitHub "environment", and GitHub Free offers environments only on public repos ([environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)). Nothing secret or identifying is ever committed: your hostname and IDs live in secrets.
+  - **It keeps getting this project's fixes.** A fork receives a weekly pull request with them (section 6).
+  - **It costs nothing to run.** Actions on a public repo uses GitHub's standard runners for free ([Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)).
+- **A private copy** needs GitHub Pro or above, because environments on a private repo do. A "Use this template" copy can be private, but it starts with unrelated history, so it can't pull this project's fixes. It isn't a supported path.
+- **Actions enabled on your fork.** Open the fork's **Actions** tab and click the green button. `scripts/setup.sh` checks this, and enables the scheduled workflows itself.
+
+**Cloudflare**
+
+- **An account** on the Free plan. [Create one](https://developers.cloudflare.com/fundamentals/account/create-account/).
+- **A payment method.** It is needed only to enable R2, the storage service this server uses. Normal use stays inside the free allowances ([R2 pricing](https://developers.cloudflare.com/r2/pricing/); see also Costs above).
+
+**A domain.** The server needs its own hostname, such as `sync.example.com`. The domain's DNS must be on Cloudflare (a "full setup"), and its zone must be `active`. Pick the route that fits:
+
+- **You already have a domain on Cloudflare.** Use a new subdomain of it, such as `sync.example.com`. Don't reuse a name that already serves something: `scripts/doctor.sh` refuses a hostname that has a DNS record.
+- **You have no domain.** Buy one through [Cloudflare Registrar](https://developers.cloudflare.com/registrar/). It sells at the registry's price with no markup, and the domain is on Cloudflare from the start. Not every ending is sold there ([supported endings](https://www.cloudflare.com/tld-policies/)).
+- **Your domain is at another registrar.** [Add it to Cloudflare](https://developers.cloudflare.com/fundamentals/manage-domains/add-site/), then [change its nameservers](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/) at your registrar. Check that the records Cloudflare imported include everything you use, especially email (MX), before you switch. The zone shows `pending` until the change takes effect, sometimes for hours, and `scripts/doctor.sh` reports it. Buying a cheap second domain just for this is often simpler.
+  - A partial (CNAME) setup doesn't work here. It needs a Business plan or above, and Cloudflare Registrar domains can't use it ([partial setup](https://developers.cloudflare.com/dns/zone-setups/partial-setup/)).
+
+**On your computer:** `git`, `gh` (above), `openssl` and [Node.js](https://nodejs.org/en/download) 22 or newer.
+
+**Logseq.** Every device needs a nightly build (section 0).
+
+### Browser checklist
+
+Do these once. `scripts/doctor.sh` checks what it can of each of them.
+
+1. **GitHub:** have an account, and [fork this repo](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo). Open your fork's Actions tab and enable Actions.
+2. **Cloudflare:** have an account, and a domain whose zone is `active` on it (see Before you start).
+3. **Cloudflare:** add a payment method and enable R2. Open **R2** in the dashboard and complete the checkout. Until you do, R2 calls fail with `10042: Please enable R2 through the Cloudflare Dashboard`. For a few minutes afterwards, connections to R2 may fail with a TLS error: wait, then retry.
+4. **Cloudflare:** create the API token. In your clone (item 5), run `node scripts/token-link.mjs` and open the link it prints. The dashboard opens "create API token" with the permissions below already ticked. Choose your account and your domain's zone when it asks, then create the token and copy it. `scripts/setup.sh` prints the same link when it asks for the token. If the link doesn't pre-fill the form, make the token by hand under **Manage Account → Account API Tokens → Create Token → Custom token**, with these permissions:
+
+   | Permission | Scope | Used for |
+   |---|---|---|
+   | Workers Scripts Edit | Account | Deploying the Workers, and creating the `workers.dev` subdomain |
+   | D1 Edit | Account | The sync index database |
+   | Workers R2 Storage Edit | Account | The asset and backup buckets, and OpenTofu's state bucket |
+   | Workers Observability Write | Account | `scripts/allow-user.sh` reads the sync Worker's logs with it |
+   | Workers KV Storage Edit | Account | Optional: the connector's OAuth store (section 11) |
+   | Vectorize Write | Account | Optional: the connector's semantic search (11.11) |
+   | Workers Routes Edit | Zone: your domain | Attaching the custom domain |
+   | DNS Edit | Zone: your domain | Creating the hostname's DNS record |
+   | Zone Read | Zone: your domain | `scripts/doctor.sh` checks that the zone is active and the hostname is free |
+
+   The link asks for every row, so one token covers turning on the connector and semantic search later. A token without the optional rows works until you need them; `scripts/doctor.sh` then names the missing one. Account policy and zone policy are separate: a token with only the zone permissions fails with `10000: Authentication error`.
+5. **On your computer:** install `gh` and run `gh auth login` (see Before you start). Then clone your fork, using your own GitHub name:
+
+   ```bash
+   git clone https://github.com/<you>/logseq-cloudflare-selfhost.git
+   cd logseq-cloudflare-selfhost
+   npm ci
+   ```
+
+### Run setup
+
+From inside the clone:
 
 ```bash
-git clone https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost.git
-cd logseq-cloudflare-selfhost
-mise trust && mise install
-eval "$(mise activate bash)"   # or zsh; puts node, pnpm, tofu, rclone on PATH
-npm ci
+scripts/setup.sh
 ```
 
-The commands below assume mise is activated in your shell. `mise activate` only works in interactive shells. In scripts or other non-interactive shells, prefix commands with `mise exec --` instead, as several examples below do. Where a command runs through `scripts/with-r2-credentials.sh`, the wrapper itself needs `node` and `curl` on `PATH`.
+It runs eight stages in order. Each stage checks whether its work is already done and prints `done` if so, so you can run it again after any failure and it carries on from the stage that stopped. On a finished install it changes nothing.
+
+1. **Checks your computer.** `gh` is signed in with the `repo` permission, Node is 22 or newer, `openssl` is installed, and the checkout's `origin` is on GitHub.
+2. **Confirms the repo.** It prints which GitHub repo it will set up and asks `Set up <you>/<repo>? [y/N]`. The default is no. It warns if the repo isn't a fork, because you probably meant your own copy.
+3. **Collects your values.** It prints the token link, then asks for the Cloudflare API token (typed silently), your Cloudflare account ID (**Account home** in the dashboard) and your hostname. It generates the other secrets and writes `.env.local`, which stays on your machine with mode 600. **Save `TOFU_ENCRYPTION_PASSPHRASE` from `.env.local` in a password manager** when it asks: without it the OpenTofu state can't be decrypted. If the repo already holds secrets but this machine has no `.env.local`, it stops and asks you to restore the file rather than generate values that don't match the deployed ones.
+4. **Runs `scripts/doctor.sh`.** It checks the token, its permissions, that R2 is enabled, that your domain's zone is active, and that the hostname has no DNS record yet. It stops on any failure and says what to fix.
+5. **Configures GitHub.** It creates the `production` environment, restricted to the `main` branch, the "Protect main" ruleset, and the setting that lets Actions open pull requests. It checks that Actions is on (if not, it prints the page to open and waits for you). It enables the scheduled workflows: backups, the usage report and the upstream update. GitHub switches scheduled workflows off on a new fork, so this matters.
+6. **Pushes the secrets** that GitHub doesn't hold yet, by name, from `.env.local`. It never overwrites a secret that exists. After you edit `.env.local`, `scripts/setup.sh --repush` pushes them all again.
+7. **Deploys.** It starts the `deploy` workflow and follows it until it ends. The first run creates OpenTofu's state bucket and your account's `workers.dev` subdomain, then the databases and buckets, then the Worker and your hostname. It prints the run's address, and if a step fails, that step's name. It skips this stage if the latest deploy succeeded; `--deploy` forces a deploy.
+8. **Claims the server for you.** It prints your server's address and starts `scripts/allow-user.sh --owner`.
+
+`scripts/setup.sh --yes` skips the repo question and the wait for you to save the passphrase.
+
+**What to expect at the end.** A new server refuses everyone, because its list of allowed users starts as `none`. That is deliberate: if the first person to sign in became the owner, a stranger could claim a fresh server before you. So:
+
+1. The terminal says `In Logseq, set the sync server to https://sync.example.com and sign in. You'll be refused; that's expected. Waiting for the sign-in…`.
+2. In Logseq (a nightly build), set **Settings → Advanced → Sync Server URL** to your hostname and sign in with your Logseq account. Logseq shows an error. That's the refusal.
+3. The terminal asks `Allow you@example.com? [y/N]`. Answer `y` if it's your email. If it isn't an address you recognise, answer `n`: someone else signed in first.
+4. It writes your user ID into `.env.local` (keeping a `.env.local.bak-<time>` copy), pushes that one secret, deploys again and then prints `Sign in again.` Re-enter the server URL first if Logseq signed you out, then sign in. You're in.
+
+It waits 10 minutes for the sign-in (`--wait <minutes>` changes that). If you miss the window, run `scripts/allow-user.sh --owner` yourself. Section 3 covers the rest of the Logseq side.
+
+**Later.** To add someone else, ask them to sign in (they'll be refused), then run `scripts/allow-user.sh` (9.1). To turn on the connector for claude.ai, create its OAuth app and run `scripts/enable-connector.sh` (section 11).
+
+### If something fails
+
+Run:
+
+```bash
+scripts/doctor.sh
+```
+
+It changes nothing. It prints one line per check, `ok`, `warn`, `skip` or `FAIL`, and every `FAIL` says what to fix. Fix it, then run `scripts/setup.sh` again: it continues from where it stopped. A deploy that failed prints the failing step and the run's address; the Troubleshooting table (section 10) lists the common messages.
 
 ## 0. Install nightly Logseq on every device
 
@@ -129,40 +226,58 @@ PATs, their settings tab and the matching D1 migration arrived upstream on 2026-
 
 If you rely on iOS, you can't use this server from it until a release ships with PAT support.
 
-## 1. Bootstrap
+## Advanced: set up and deploy from your machine
 
-You do this once. Steps 1.1 to 1.3 happen in the Cloudflare dashboard.
+The [Quick start](#quick-start) replaces sections 1 and 2 for most people. Use this path when you want to build and deploy from your own computer, to debug a deploy, or to see what the scripts do. `scripts/setup.sh` already does 1.4 (writing `.env.local`), 1.8 (the GitHub settings and secrets) and the first deploy, and the deploy workflow creates the state bucket (1.6) and the `workers.dev` subdomain for you.
 
-### 1.1 Create the Cloudflare API token
+### Prerequisites
 
-This one account-owned token is the only Cloudflare credential. Create it under **Manage Account → Account API Tokens → Create Token → Custom token**. It needs **two policies**:
+- **Everything in the Quick start's [Before you start](#before-you-start):** a Cloudflare account with a domain active on it (the sync hostname `sync.example.com` must be in that zone and should not already have a DNS record: wrangler creates the record and the certificate), a payment method for R2, and your own fork of this repo with Actions enabled and `main` as the default branch.
+- **Locally:** `git`, `curl`, `openssl`, the GitHub CLI `gh`, and [mise](https://mise.jdx.dev). mise installs the pinned toolchain from `mise.toml`: Node 22, pnpm 10.33.0, Java (Temurin 21), the Clojure CLI, OpenTofu 1.10 and rclone. The Quick start needs only `git`, `gh`, `openssl` and Node 22.
+
+```bash
+git clone https://github.com/<you>/logseq-cloudflare-selfhost.git
+cd logseq-cloudflare-selfhost
+mise trust && mise install
+eval "$(mise activate bash)"   # or zsh; puts node, pnpm, tofu, rclone on PATH
+npm ci
+```
+
+The commands below assume mise is activated in your shell. `mise activate` only works in interactive shells. In scripts or other non-interactive shells, prefix commands with `mise exec --` instead, as several examples below do. Where a command runs through `scripts/with-r2-credentials.sh`, the wrapper itself needs `node` and `curl` on `PATH`.
+
+### 1. Bootstrap
+
+You do this once. Steps 1.1 and 1.2 happen in the Cloudflare dashboard.
+
+#### 1.1 Create the Cloudflare API token
+
+This one account-owned token is the only Cloudflare credential. The quickest way to make it is the pre-filled link: run `node scripts/token-link.mjs` and open what it prints (the Quick start's [browser checklist](#browser-checklist) has the steps). To make it by hand, go to **Manage Account → Account API Tokens → Create Token → Custom token**. It needs **two policies**:
 
 | Policy | Resources | Permissions |
 |---|---|---|
-| Account | Your account | **Workers Admin**; **D1** Write + Read; **Workers R2 Storage** Write + Read; **Workers KV Storage** Write + Read |
-| Zone | The zone `example.com` | **Workers Routes** Write + Read; **DNS** Write + Read |
+| Account | Your account | **Workers Scripts Edit**; **D1 Edit**; **Workers R2 Storage Edit**; **Workers Observability Write**; **Workers KV Storage Edit** (connector); **Vectorize Write** (semantic search) |
+| Zone | The zone `example.com` | **Workers Routes Edit**; **DNS Edit**; **Zone Read** |
 
-- **Why Workers Admin.** It replaces the legacy "Workers Scripts Edit" permission. You need Admin rather than Editor because the first deploy creates the Worker. Scope it to all Workers, because custom domains don't support per-Worker roles.
+- **Why Workers Scripts Edit.** The first deploy creates the Worker, and Edit covers that.
 - **Why two policies.** A token with only the zone policy gives D1 and R2 nothing, and every call fails with `10000: Authentication error`.
-- **Workers KV Storage** is only used by the optional connector (section 11), for its OAuth store. Add it before you enable the connector; a token without it can't create the KV namespace.
-- **Vectorize** Write + Read is only used by the connector's optional semantic search (11.11), to create its index and deploy the binding.
-- **DNS Write** was granted in the verified setup. It may not be needed, but that hasn't been proven either way.
+- **Workers Observability Write** is used by `scripts/allow-user.sh` to read the sync Worker's logs. Cloudflare lists Write as the only permission for that call, although it only reads.
+- **Zone Read** is used by `scripts/doctor.sh` to find your zone and check that it is active and that the hostname is free.
+- **Workers KV Storage Edit** is only used by the optional connector (section 11), for its OAuth store. Add it before you enable the connector; a token without it can't create the KV namespace.
+- **Vectorize Write** is only used by the connector's optional semantic search (11.11), to create its index and deploy the binding.
+- **DNS Edit** was granted in the verified setup. It may not be needed, but that hasn't been proven either way.
+- **An older token keeps working.** `scripts/doctor.sh` warns about Zone Read and Workers Observability Write when they're missing on a server that is already deployed; it doesn't fail. Add them when you want `allow-user.sh`, or make a new token with the link.
 
 You don't create separate R2 S3 keys. `scripts/with-r2-credentials.sh` derives them from this token: the access key ID is the token's ID, and the secret is the SHA-256 of the token value. It exports them only to the command it wraps. There are no `R2_*` or `AWS_*` secrets anywhere.
 
-### 1.2 Enable R2
+#### 1.2 Enable R2
 
-In the dashboard, open **R2** and enable it. This needs a payment method on file. Until you do, R2 API calls fail with `10042: Please enable R2 through the Cloudflare Dashboard`.
+In the dashboard, open **R2** and enable it. This needs a payment method on file. Until you do, R2 API calls fail with `10042: Please enable R2 through the Cloudflare Dashboard`, and the deploy's account step and `scripts/doctor.sh` both say so.
 
 For a few minutes after you enable it, connections to `<account-id>.r2.cloudflarestorage.com` fail with a TLS handshake error, because the endpoint isn't provisioned yet. Wait, then retry.
 
-### 1.3 Create the workers.dev subdomain
+#### 1.4 Fill in `.env.local`
 
-Open **Workers & Pages** in the dashboard once. That creates your account's `workers.dev` subdomain. Without it, the first deploy fails with `10063: You need a workers.dev subdomain`. The Worker itself doesn't use `workers.dev`.
-
-### 1.4 Fill in `.env.local`
-
-`.env.local` holds the same values the GitHub `production` environment holds, so you can run everything from your machine. It is git-ignored.
+`.env.local` holds the same values the GitHub `production` environment holds, so you can run everything from your machine. It is git-ignored. `scripts/setup.sh` runs `init-env.sh` for you when the file is missing, so skip this step if you used the Quick start.
 
 **You supply only three things: the Cloudflare API token, the Cloudflare account ID, and your hostname. Three more values are generated, and the allow-list starts as `none`.**
 
@@ -184,7 +299,7 @@ The optional connector's values aren't asked for here. You add them later with `
 | `ASSET_LINK_SECRET` | The HMAC key for signed asset links. | Generated |
 | `DB_SYNC_ADMIN_TOKEN` | Admin header token. It bypasses graph access checks, and backups use it. | Generated |
 | `TOFU_ENCRYPTION_PASSPHRASE` | Encrypts the OpenTofu state and plans. | Generated |
-| `DB_SYNC_ALLOWED_USERS` | Logseq user IDs allowed to use the server, or `none`. Written as `none`; set your ID after your first sign-in (section 9). | Template |
+| `DB_SYNC_ALLOWED_USERS` | Logseq user IDs allowed to use the server, or `none`. Written as `none`; `scripts/allow-user.sh --owner` sets your ID after your first sign-in (section 9). | Template |
 | `SMOKE_PAT` | Optional. Leave it empty until you have a PAT (section 4). | Later |
 | `CONNECTOR_ENABLED` | `false` until you turn the connector on (section 11). | Template |
 
@@ -199,7 +314,7 @@ export TF_VAR_cloudflare_account_id="$CLOUDFLARE_ACCOUNT_ID" \
        TF_VAR_connector_enabled="${CONNECTOR_ENABLED:-false}"
 ```
 
-### 1.5 Fetch and build upstream
+#### 1.5 Fetch and build upstream
 
 This clones `logseq/logseq` at `UPSTREAM_REF` into `.upstream/`, applies the patch, checks that upstream's Worker bindings match `config/expected-bindings.json`, and builds the Worker. It also installs the wrangler version upstream pins, which the next steps use. The first build takes a while.
 
@@ -209,16 +324,17 @@ node scripts/check-upstream-bindings.mjs .upstream/deps/db-sync/worker/wrangler.
 scripts/build.sh .upstream
 ```
 
-### 1.6 Create the OpenTofu state bucket
+#### 1.6 The OpenTofu state bucket
 
-OpenTofu keeps its state in an R2 bucket. The bucket can't manage itself, so you create it once by hand. The name `logseq-selfhost-tofu-state` is fixed in `infra/backend.hcl.example` and `deploy.yml`.
+OpenTofu keeps its state in an R2 bucket that can't manage itself. The bucket's name, `logseq-selfhost-tofu-state`, is fixed in `infra/backend.hcl.example` and `deploy.yml`. **You don't create it by hand:** the deploy workflow creates it, and your account's `workers.dev` subdomain, before it runs `tofu init`. To do the same from your machine before 1.7, with `.env.local` loaded as in 1.4:
 
 ```bash
-.upstream/deps/db-sync/node_modules/.bin/wrangler r2 bucket create logseq-selfhost-tofu-state
-# optional: --location weur|eeur|apac|wnam|enam|oc
+node scripts/ensure-account.mjs
 ```
 
-### 1.7 Initialise and apply OpenTofu
+It creates the bucket and the subdomain only when they're missing, so a re-run changes nothing. It needs R2 enabled (1.2), and stops with a message saying so if it isn't.
+
+#### 1.7 Initialise and apply OpenTofu
 
 ```bash
 sed "s/<ACCOUNT_ID>/$CLOUDFLARE_ACCOUNT_ID/" infra/backend.hcl.example > infra/backend.hcl
@@ -238,7 +354,9 @@ All three resources have `prevent_destroy`. Names and retention come from `confi
 
 `tofu apply` without a plan file asks you to type `yes` interactively. Planning to a file and applying that file, as above, avoids the prompt. Plan files are encrypted too, and `*.tfplan` is git-ignored.
 
-### 1.8 Set up the GitHub `production` environment
+#### 1.8 Set up the GitHub `production` environment
+
+`scripts/setup.sh` does this whole step (its stages 5 and 6), each part only when it's missing. Do it by hand if you want to see what it does, or if setup can't.
 
 `deploy.yml` and `backup.yml` read their secrets from a GitHub environment called `production`. Restrict it to `main`, so no other branch or pull request can use them. Run these from inside your clone; `gh` fills in `{owner}/{repo}`:
 
@@ -250,13 +368,13 @@ gh api -X POST 'repos/{owner}/{repo}/environments/production/deployment-branch-p
   -f name=main -f type=branch
 ```
 
-Because every push to `main` deploys, also protect `main` with the ruleset in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It blocks deletion and force pushes, requires a pull request, and requires the `check` CI job to pass. Repository admins can still bypass it through a pull request. The weekly bump PRs are opened with the default token, so their `pull_request` CI run waits for approval (it shows as "action required" and can be ignored). The bump workflow starts `ci` on the PR branch with `workflow_dispatch` instead, and that run supplies the required `check` status. Import it via **Settings → Rules → Rulesets → New ruleset → Import a ruleset**, or:
+Because every push to `main` deploys, also protect `main` with the ruleset in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It blocks deletion and force pushes, requires a pull request, and requires the `check` CI job to pass. Repository admins can still bypass it through a pull request. On the original repo, the weekly bump PRs are opened with the default token, so their `pull_request` CI run waits for approval (it shows as "action required" and can be ignored). The bump workflow starts `ci` on the PR branch with `workflow_dispatch` instead, and that run supplies the required `check` status. A fork's update PR gets its `check` status another way (section 6). Import it via **Settings → Rules → Rulesets → New ruleset → Import a ruleset**, or:
 
 ```bash
 gh api -X POST 'repos/{owner}/{repo}/rulesets' --input .github/rulesets/protect-main.json
 ```
 
-Allow the weekly bump workflow to open its pull request: **Settings → Actions → General → Workflow permissions → tick "Allow GitHub Actions to create and approve pull requests"**. Or:
+Allow the weekly update workflow to open its pull request: **Settings → Actions → General → Workflow permissions → tick "Allow GitHub Actions to create and approve pull requests"**. Or:
 
 ```bash
 gh api -X PUT 'repos/{owner}/{repo}/actions/permissions/workflow' \
@@ -289,7 +407,7 @@ Then add the secrets:
 
 The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the seven required secrets above in the `production` environment of the repo that owns your checkout (it prints the repo name first and passes it to `gh` with `-R`), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in. The connector's secrets are pushed later, by `scripts/init-env.sh --add-missing --push` (section 11).
 
-If `.env.local` already exists, or a push failed part-way, load `.env.local` as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments. Uncomment the second `names` line once the connector's values are in `.env.local`:
+If `.env.local` already exists, or a push failed part-way, `scripts/init-env.sh --push-only NAME...` pushes just the named values from it (the connector's names too). Or load `.env.local` as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments. Uncomment the second `names` line once the connector's values are in `.env.local`:
 
 ```bash
 repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # run inside this checkout
@@ -304,7 +422,7 @@ for name in $names; do
 done
 ```
 
-## 2. First deploy
+### 2. First deploy
 
 You can deploy either from your machine or from GitHub Actions; both have been verified. Both run the same script, `scripts/deploy.sh`, which:
 
@@ -316,15 +434,15 @@ You can deploy either from your machine or from GitHub Actions; both have been v
 6. runs `wrangler deploy --secrets-file`, which ships the code and the three secrets (`ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `DB_SYNC_ALLOWED_USERS`) together, and attaches the custom domain;
 7. runs `scripts/smoke-test.sh https://$SYNC_HOSTNAME`.
 
-**From your machine**, with `.env.local` loaded and steps 1.5 and 1.7 done:
+**From your machine**, with `.env.local` loaded and steps 1.5 and 1.7 done (1.6 creates the state bucket 1.7 needs):
 
 ```bash
 scripts/with-r2-credentials.sh mise exec -- scripts/deploy.sh
 ```
 
-**A local deploy ships whatever is in your `.upstream` checkout.** After merging a bump PR, run `rm -rf .upstream` and redo 1.5 before deploying locally, or you'll roll the server back to the older upstream commit.
+**A local deploy ships whatever is in your `.upstream` checkout.** After merging an upstream bump or update PR, run `rm -rf .upstream` and redo 1.5 before deploying locally, or you'll roll the server back to the older upstream commit.
 
-**From GitHub Actions:** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow). The workflow runs `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`. It then runs `scripts/deploy-connector.sh`, which prints `connector disabled` and does nothing until you enable the connector (section 11).
+**From GitHub Actions:** merge to `main`, or run the `deploy` workflow manually (Actions → deploy → Run workflow, or `scripts/run-deploy.sh`, which starts it and follows it from your terminal, printing the failed step's name and the run's address if it fails). The workflow runs `scripts/ensure-account.mjs` (the state bucket and `workers.dev` subdomain, created only if missing), then `tofu init`, `tofu apply -auto-approve`, fetches, checks and builds upstream, then runs `deploy.sh`. It then runs `scripts/deploy-connector.sh`, which prints `connector disabled` and does nothing until you enable the connector (section 11).
 
 A passing smoke test prints:
 
@@ -348,7 +466,7 @@ On each device, running a nightly build (section 0):
 
 Then sign in with your Logseq account and create or upload a graph.
 
-**On a new install, the first sign-in is refused.** The allow-list starts as `none`, which refuses everyone. Get your user ID as [9.1](#91-who-can-use-your-server) describes for a fresh install, set `DB_SYNC_ALLOWED_USERS`, push it and redeploy. Then sign in again. Re-enter the server URL first if the client signed you out.
+**On a new install, the first sign-in is refused.** The allow-list starts as `none`, which refuses everyone. If you ran `scripts/setup.sh`, it is waiting for that sign-in: when you're refused, it asks `Allow <your email>? [y/N]`, and on `y` it adds your ID, pushes it and redeploys. Otherwise, sign in once (you'll be refused), then run `scripts/allow-user.sh --owner`, which looks back over the last 30 minutes; [9.1](#91-who-can-use-your-server) has the details and the manual route. Then sign in again. Re-enter the server URL first if the client signed you out.
 
 **Logging out clears the custom URL.** The client goes back to Logseq's hosted sync. Re-enter the URL after every logout, before you sign in again.
 
@@ -432,7 +550,20 @@ A write round trip has been verified on an unencrypted graph: `createPage` and `
 
 ## 6. Upgrades
 
-`UPSTREAM_REF` pins the upstream `logseq/logseq` commit the server is built from. Every Monday, `bump-upstream.yml`:
+**On a fork (the Quick start path), updates arrive as a weekly pull request.** The original repo moves `UPSTREAM_REF` and `patches/` together, so your fork must take both together, from the original's `main`. Every Monday (04:00 UTC), and when you run it from Actions → sync-upstream → Run workflow, the `sync-upstream` workflow:
+
+1. reads your fork's parent repo from GitHub and compares the parent's `main` with yours;
+2. if the parent is ahead, runs the CI checks against the parent's latest commit;
+3. opens a pull request into your `main` titled `chore: update from <parent>`, or updates the one already open. Its body says how many commits are coming and how CI went.
+
+**Review it and merge it.** Merging deploys, as every merge to `main` does. Then run `rm -rf .upstream` before any local deploy (section 2).
+
+- **Keep your fork unmodified.** Conflicts happen only if you changed tracked files. Put local settings in GitHub variables and secrets, never in the code.
+- **The required `check` normally appears on the PR.** The workflow reports it from the CI run it did on the parent's commit. If the PR shows no `check`, read the body's "CI on the update" line. If it says `success`, you can merge as a repository admin, using the admin bypass that the ruleset allows through a pull request. If it says `failure`, don't merge: the "What to look at" list below applies. You never need a personal access token for updates.
+- **"Sync fork" still works by hand**, but the pull request is better: it runs CI before the deploy.
+- **The original repo's own `bump-upstream` workflow does nothing on a fork**, and `sync-upstream` does nothing on the original. The rest of this section describes the bump on the original repo, and the checklist, rollbacks and migrations apply to both.
+
+**On the original repo,** `UPSTREAM_REF` pins the upstream `logseq/logseq` commit the server is built from. Every Monday, `bump-upstream.yml`:
 
 1. compares it with upstream `master`;
 2. if they differ, runs the full CI build against the new commit (`ci.yml`);
@@ -505,7 +636,7 @@ WRANGLER="$PWD/.upstream/deps/db-sync/node_modules/.bin/wrangler" \
   - Re-pointing means `tofu state rm` of the old database and `tofu import` of the new one. Only do this if you know OpenTofu well.
 - **Assets.** Copy them back from `logseq-sync-backups/assets/` to `logseq-sync-assets`, for example with rclone using the derived R2 credentials. An asset deleted by accident or by an attacker is no longer in the mirror after the next backup, but it is kept in `daily/<date>/assets-deleted/` for the retention window; restore it from there.
 
-**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop the daily backup, the weekly bump and the usage report. Re-enable them in the Actions tab, or run `gh workflow enable backup.yml`, `gh workflow enable bump-upstream.yml` and `gh workflow enable usage.yml`. Check occasionally that the latest runs are recent.
+**Scheduled workflows can stop silently.** GitHub disables `schedule` triggers in public repos after 60 days without repository activity. That would quietly stop the daily backup, the weekly bump or update PR and the usage report. GitHub also switches scheduled workflows off on a new fork; `scripts/setup.sh` turns them back on, and `scripts/doctor.sh` warns if one is off. To re-enable them yourself, use the Actions tab, or run `gh workflow enable backup.yml`, `gh workflow enable usage.yml` and `gh workflow enable sync-upstream.yml` (`bump-upstream.yml` on the original repo). Check occasionally that the latest runs are recent.
 
 **If rclone gets a 403 on its bucket check,** set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` for the asset sync. That's the usual fix for R2 tokens that can't list buckets. The verified setup didn't need it, because the token from 1.1 can list buckets.
 
@@ -541,15 +672,27 @@ The Worker refuses every Logseq user who isn't in the secret `DB_SYNC_ALLOWED_US
 
 The value is `none`, or one or more Logseq user IDs separated by commas. Each ID is a lowercase UUID, and spaces around it are ignored. **It fails closed.** A missing, empty or malformed value refuses everyone, and so does `none`. `deploy.sh` stops before deploying anything if the value is malformed, so a typo can't ship. It also stops on `none` once anyone has signed in to the server, so `none` can't switch everyone off on an existing install.
 
-**Finding your user ID.** Use any one of these:
+**Finding your user ID.** On a fresh install, no one has signed in yet, and a refused user is never recorded, so the server has no list of users to show you. Use the tool that reads the refusal instead:
 
-- **`scripts/list-users.sh`** prints each user's ID, email, username, how many graphs they own and whether they're on your list. It needs `.env.local` (1.4), runs only on your machine, and refuses to run in GitHub Actions because it prints IDs and emails.
+- **`scripts/allow-user.sh`.** Sign in once from Logseq. You are refused, and the Worker logs a `db-sync/user-not-allowed` warning with your user ID and email. `scripts/allow-user.sh --owner` finds that warning in the Worker's stored logs, shows you the email (not the ID, unless you pass `--show-ids`) and asks `Allow <email>? [y/N]`. `scripts/setup.sh` starts it for you at the end. It needs the token's **Workers Observability Write** permission (1.1); if the token lacks it, the script says so and prints the token link.
+- **`scripts/list-users.sh`**, once someone has signed in, prints each user's ID, email, username, how many graphs they own and whether they're on your list. It needs `.env.local` (1.4), runs only on your machine, and refuses to run in GitHub Actions because it prints IDs and emails.
 - **The Cloudflare dashboard.** Go to Storage & Databases → D1 → the sync database (`logseq-sync-index` by default) → Console, and run `SELECT id, email FROM users`.
-- **On a fresh install,** no one has signed in yet, and a refused user is never recorded, so neither of the above shows you. Sign in once from Logseq. You are refused, and the Worker logs a `db-sync/user-not-allowed` warning with your user ID and email. Read it with `wrangler tail logseq-sync` (the default worker name; `config/settings.json` has `workerName`) or in Workers Logs in the dashboard. Then set the list and redeploy. You can also decode the `sub` claim of the `id-token` in the client's Local Storage (section 4 shows where it is): that is your user ID.
+- **By hand, on a fresh install.** Read the `db-sync/user-not-allowed` warning with `wrangler tail logseq-sync` (the default worker name; `config/settings.json` has `workerName`) or in Workers Logs in the dashboard, then set the list as below and redeploy. You can also decode the `sub` claim of the `id-token` in the client's Local Storage (section 4 shows where it is): that is your user ID.
 
 A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy passes and the server refuses everyone until you set your ID. The deploy prints a warning about that. It is expected.
 
-**Adding someone.** Append their ID to the comma-separated list in `.env.local`, with no spaces, and in the `production` secret (reload `.env.local`, then push it with [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy. If they haven't signed in yet, the deploy warns that a listed ID hasn't signed in. That is expected.
+**How `scripts/allow-user.sh` works.** Its two modes are chosen from the local list and from the users the server already has:
+
+- **`--owner`** claims a fresh server, where the list is `none` and no one has signed in. It replaces `none` with the person you confirm.
+- **Without `--owner`** adds one more person to a server that already has a list. It appends their ID.
+- It writes the ID into `.env.local` (keeping a `.env.local.bak-<time>` copy), checks the new value with the same format check the deploy uses, pushes that one secret and runs and follows the deploy.
+- It looks back 30 minutes and then polls every 10 seconds, for 10 minutes by default (`--wait <minutes>`). It asks about each distinct refused email once, and changes nothing unless you answer `y`.
+- It stops if `.env.local` looks out of date (the list says `none` but the server has users): restore the current file first.
+- It only reads logs, and it prints emails, so it refuses to run in GitHub Actions.
+
+**Adding someone.** Ask them to sign in to your server from Logseq. They are refused, which is expected. Then run `scripts/allow-user.sh` and answer `y` for their email. If they haven't signed in yet when the deploy runs, the deploy warns that a listed ID hasn't signed in; that is expected.
+
+**Adding someone by hand.** Append their ID to the comma-separated list in `.env.local`, with no spaces, and in the `production` secret (reload `.env.local`, then run `scripts/init-env.sh --push-only DB_SYNC_ALLOWED_USERS`, or use [the loop in 1.8](#18-set-up-the-github-production-environment)), then redeploy (`scripts/run-deploy.sh`).
 
 **Removing someone.** Take their ID out of both places and redeploy. It takes effect on the next deploy. Their graphs stay on the server (see the cleanup below).
 
@@ -580,10 +723,10 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 
 | Symptom | Cause and fix |
 |---|---|
-| `10000: Authentication error` from D1 or R2 calls | The token's policy doesn't cover account resources. Add the account policy from 1.1. |
-| `10042: Please enable R2 through the Cloudflare Dashboard` | Enable R2 (1.2). |
+| `10000: Authentication error` from D1 or R2 calls | The token's policy doesn't cover account resources. Add the account policy from 1.1, or make a new token with `node scripts/token-link.mjs`. `scripts/doctor.sh` checks this and names the missing permission. |
+| `10042: Please enable R2 through the Cloudflare Dashboard` | Enable R2 (1.2). `scripts/doctor.sh` checks this. |
 | TLS handshake failure on `<account-id>.r2.cloudflarestorage.com` | You enabled R2 in the last few minutes. Wait and retry. |
-| `10063: You need a workers.dev subdomain` | Open Workers & Pages in the dashboard once (1.3). |
+| `10063: You need a workers.dev subdomain` | The deploy creates the subdomain itself (`scripts/ensure-account.mjs`, 1.6), so this means that step didn't run or its token lacks Workers Scripts Edit. `scripts/doctor.sh` checks this. Run `node scripts/ensure-account.mjs` locally, or open Workers & Pages in the dashboard once. |
 | A secret value is wrong or truncated after `. ./.env.local` | It contains `$`. Single-quote it. |
 | `with-r2-credentials: CLOUDFLARE_API_TOKEN has unexpected characters` | Stray whitespace, a newline or quotes around the token in `.env.local` or the GitHub secret. |
 | `Error acquiring the state lock` | Another `tofu` run, or a cancelled one, holds the lock. Wait for it to finish. If you're sure none is running, use `tofu force-unlock <id>`. |
@@ -594,14 +737,19 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 | `503 {"error":"rate limiter unavailable"}` from `/api/v1/*` | The rate-limit bindings are missing from the deployed config. Check that `rateLimitNamespaces` in `config/settings.json` names both limiters and that `check-upstream-bindings` passes, then redeploy. |
 | `429 rate limit exceeded` | The limit is 120 reads or 20 writes per minute. Slow down. |
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
-| Backups, the weekly bump or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` / `gh workflow enable usage.yml` (section 7). |
+| Backups, the weekly bump or update PR, or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity, or because your fork is new. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable sync-upstream.yml` (`bump-upstream.yml` on the original repo) / `gh workflow enable usage.yml` (section 7). `scripts/doctor.sh` checks this. |
 | The usage report fails with `not authorized` | `CLOUDFLARE_ANALYTICS_TOKEN` lacks **Account Analytics** Read, or belongs to another account ([Watching your usage](#watching-your-usage)). |
-| Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
-| The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
+| Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permission from 1.1. |
+| The bump or update workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
-| Everything returns 401 after a deploy | The Worker refuses users who aren't in `DB_SYNC_ALLOWED_USERS`. Check the secret, and look for a `db-sync/user-not-allowed` warning in `wrangler tail logseq-sync` or Workers Logs: it names the refused user's ID. Fix the list and redeploy (9.1). |
+| Everything returns 401 after a deploy | The Worker refuses users who aren't in `DB_SYNC_ALLOWED_USERS`. Check the secret. To add yourself or someone else, sign in so you're refused, then run `scripts/allow-user.sh` (9.1). By hand, look for a `db-sync/user-not-allowed` warning in `wrangler tail logseq-sync` or Workers Logs: it names the refused user's ID. |
 | Deploy fails: `none of the N listed user IDs is a known user of this server` | A typo, the wrong account, or `none` on a server that already has users (`none of the 0 listed user IDs ...`). Run `scripts/list-users.sh`, correct `DB_SYNC_ALLOWED_USERS` in `.env.local` and the `production` secret, and deploy again. Nothing was deployed. |
 | Deploy fails: `DB_SYNC_ALLOWED_USERS is empty or missing` | The secret isn't set in the `production` environment. Push it with [the loop in 1.8](#18-set-up-the-github-production-environment), then deploy again. Nothing was deployed. |
+| `doctor`: `zone example.com is pending` | The domain's nameservers haven't switched to Cloudflare yet. Change them at your registrar (Quick start, Before you start), wait for the zone to turn `active` (sometimes hours), then re-run `scripts/doctor.sh`. |
+| `doctor`: `<hostname> already has a DNS record`, so it is probably in use | The hostname is taken. A deploy from Actions would replace the record, and whatever is served from that name would go down. Choose another hostname (fix `SYNC_HOSTNAME` in `.env.local`, and in the `production` secret if it's already pushed), or delete the record in the dashboard if nothing uses it. |
+| `setup.sh`: `This repo is already set up` and no `.env.local` | The `production` environment already holds secrets, but this machine has no `.env.local`. Restore it from your password manager or copy it from your other machine, then re-run. Setup won't generate new values, because a new `TOFU_ENCRYPTION_PASSPHRASE` can't decrypt the existing state. |
+| `allow-user`: `No refused sign-in was accepted within N minutes` | No refusal reached the log, or you answered `n`. Check that Logseq's sync server is `https://sync.example.com` (your hostname), that you're on a nightly client, and that the sign-in showed an error. Then run `scripts/allow-user.sh --owner` again; `--wait <minutes>` waits longer. |
+| `allow-user`: `the token can't read Workers Logs` | The token lacks Workers Observability Write. Add it (1.1), or make a new token with `node scripts/token-link.mjs`. |
 | Smoke test `FAIL health: 000` right after the first deploy | The custom domain's certificate is still being issued. Wait a few minutes and re-run `scripts/smoke-test.sh https://sync.example.com`. |
 
 Connector problems are covered in section 11.
@@ -643,13 +791,35 @@ The connector allows exactly one GitHub account, by its numeric user ID rather t
 gh api user -q .id
 ```
 
+**Then run one command.** From inside your clone, with a finished setup (the Quick start):
+
+```bash
+scripts/enable-connector.sh
+```
+
+It does 11.3 to 11.5 for you:
+
+1. asks for the connector's hostname, such as `mcp.example.com`, which must be in the same domain as your sync hostname;
+2. prints the OAuth app's three values and the link to GitHub's new-app page (`https://github.com/settings/applications/new`; GitHub's own [guide](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) covers the form), so you can make the app now if you haven't, then asks for its client ID and client secret (typed silently). GitHub can't pre-fill that form;
+3. reads your numeric GitHub user ID from `gh` instead of asking, and shows the login so you can confirm it's yours;
+4. adds the connector's values to `.env.local` and the `production` environment, as 11.4 describes;
+5. sets `CONNECTOR_ENABLED=true` in `.env.local` (rewriting that one line, after a backup) and in the `production` environment (11.5);
+6. runs `scripts/doctor.sh`, and stops before deploying if a check fails. It checks the token's KV permission and the connector hostname;
+7. runs the deploy and follows it, then prints the claude.ai steps (11.6).
+
+It never asks for a value that is already in `.env.local`. If it stops, fix what it reported and run it again: it carries on from the checks, and deploys only if the latest deploy didn't succeed. It asks for secrets, so it refuses to run in GitHub Actions. Turning the connector off again stays manual (11.5).
+
+The sections below are the same steps by hand, for when you want to see what the script does or it can't run.
+
 ### 11.3 Add the KV permission to the Cloudflare token
 
-Edit the token from 1.1 and add **Workers KV Storage** Write + Read to its account policy. The connector's OAuth grants and its `kb_index` cache live in KV, and OpenTofu creates both namespaces with this token. Editing the policies doesn't change the token's value.
+`scripts/enable-connector.sh` doesn't change the token: a token made with `node scripts/token-link.mjs` already has the permission, and `scripts/doctor.sh` fails with the missing name if yours doesn't.
+
+**By hand:** edit the token from 1.1 and add **Workers KV Storage Edit** to its account policy. The connector's OAuth grants and its `kb_index` cache live in KV, and OpenTofu creates both namespaces with this token. Editing the policies doesn't change the token's value.
 
 ### 11.4 Add the connector's secrets
 
-With `.env.local` from 1.4 in place and `gh` logged in, run:
+`scripts/enable-connector.sh` runs this step. **By hand:** with `.env.local` from 1.4 in place and `gh` logged in, run:
 
 ```bash
 scripts/init-env.sh --add-missing --push
@@ -674,6 +844,8 @@ The two GitHub names change on the way because GitHub forbids secret names that 
 - **If the push fails,** `.env.local` has already been written. Load it and push with the loop in 1.8, with the connector line uncommented.
 
 ### 11.5 Turn it on
+
+`scripts/enable-connector.sh` sets the switch in both places and deploys. **By hand**, read on.
 
 The connector is switched by `CONNECTOR_ENABLED`, a GitHub Actions **variable** (not a secret), so a fork turns it on without changing a committed file. `true` turns it on; unset, empty or `false` means off; any other value fails the deploy. While it's off, CI still builds and tests the connector, but OpenTofu and the deploy skip it.
 
@@ -813,8 +985,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | Smoke test `FAIL oauth-metadata: 000` | The custom domain's certificate is still being issued after the first deploy. Wait a few minutes and re-run `scripts/smoke-connector.sh https://mcp.example.com`. |
 | Smoke test `FAIL oauth-metadata` with `421`, `500` or `resource` | `421` or `resource`: the URL you tested isn't `CONNECTOR_HOSTNAME`. `500`: see "Server misconfigured" above. |
 | Deploy fails with `GITHUB_CLIENT_ID: parameter null or not set` (or another connector name) | The connector is enabled but a secret is missing from the `production` environment. If the name is missing from `.env.local` too, `scripts/init-env.sh --add-missing --push` adds and pushes it. Otherwise push it with the 1.8 loop: `--add-missing` only pushes names it adds. Remember the `CONNECTOR_GITHUB_*` names. |
-| Creating `cloudflare_workers_kv_namespace.connector_oauth` fails with an authentication or permission error | The Cloudflare token lacks **Workers KV Storage** Write + Read (11.3). |
-| `tofu apply` fails with `Instance cannot be destroyed` for the connector's KV namespace or D1 database | OpenTofu ran with the connector off while its resources exist. If you meant it to be on, set the `CONNECTOR_ENABLED` variable (Actions) or `CONNECTOR_ENABLED=true` in `.env.local` and `TF_VAR_connector_enabled` (local, 1.4), and re-run. To turn it off, follow "Turning it off" in 11.5. |
+| Creating `cloudflare_workers_kv_namespace.connector_oauth` fails with an authentication or permission error | The Cloudflare token lacks **Workers KV Storage Edit** (11.3). `scripts/doctor.sh` checks this once `CONNECTOR_ENABLED` is `true`. |
+| `tofu apply` fails with `Instance cannot be destroyed` for the connector's KV namespace or D1 database | OpenTofu ran with the connector off while its resources exist. If you meant it to be on, set the `CONNECTOR_ENABLED` variable (Actions) or `CONNECTOR_ENABLED=true` in `.env.local` and `TF_VAR_connector_enabled` (local, 1.4), and re-run. To turn it off, follow "Turning it off" in 11.5. `scripts/doctor.sh` checks that `CONNECTOR_ENABLED` agrees between `.env.local` and GitHub. |
 | The cron run fails with `kb index refresh failed for N of M graphs` | The `kb-index graph=… status=…` lines before it name the graph: `http-401` or `http-403` means its token expired (replace it at `/graphs`). The other graphs were still rebuilt. |
 | `kb_index` answers `the knowledge index of 'x' has more than 20000 pages` | The connector refuses to cache a graph that large. Use `search_graph` and `list_pages` instead. |
 | Deploy fails at **Read connector setting** with `The CONNECTOR_ENABLED variable must be true or false` | The variable holds something else, such as `True` or `yes`. Set it to exactly `true` or `false`, or delete it for off. |
@@ -830,7 +1002,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 
 To turn it on, with the connector already on (11.5):
 
-1. Add **Vectorize** Write + Read to the Cloudflare token's account policy (1.1).
+1. Add **Vectorize Write** to the Cloudflare token's account policy (1.1). A token made with `node scripts/token-link.mjs` already has it.
 2. Set the variable and deploy:
 
    ```bash
@@ -849,7 +1021,7 @@ To turn it on, with the connector already on (11.5):
 | Status `error` with `Workers AI embedding failed` | Usually the free 10,000 neurons a day are used up. It resumes after midnight UTC. |
 | Status `error` with `token for graph ... expired` | Replace the graph's token (11.7). |
 | Deploy fails with `Vectorize index ... has N dimensions` | An index with that name was created with another shape. Delete it (`npx wrangler vectorize delete logseq-connector-blocks`), delete the `semantic_*` rows, and deploy again. |
-| Deploy fails with `reading Vectorize index ... Authentication error` | The token lacks Vectorize Write + Read (step 1). |
+| Deploy fails with `reading Vectorize index ... Authentication error` | The token lacks Vectorize Write (step 1). `scripts/doctor.sh` checks this once `SEMANTIC_SEARCH_ENABLED` is `true`. |
 
 ## Backlog
 
@@ -858,7 +1030,7 @@ To turn it on, with the connector already on (11.5):
 3. **An upstream PR** making the PAT groups configurable, so the patch can be dropped.
 4. **An off-account backup copy.**
 5. **A client-side decryption MCP** for E2EE graphs, so agents can work with encrypted graphs.
-6. **Confirm the minimal token permissions**, in particular whether DNS Write is needed.
+6. **Confirm the minimal token permissions**, in particular whether DNS Edit is needed.
 7. **Measure a large real graph against the Free CPU limits:** first upload, asset sync and snapshot download.
 
 ## Licence and credits
