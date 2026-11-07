@@ -11,7 +11,8 @@ import {
 } from "../src/auth/service-tokens";
 import { timingSafeEqual } from "../src/crypto";
 import { GraphStore } from "../src/graphs";
-import { isolateTools, mcpHandler } from "../src/mcp";
+import { createConnector } from "../src/index";
+import { type ServiceProps, isolateTools, mcpApiHandler, mcpHandler } from "../src/mcp";
 import { type RequestScope, lookupGraph, requestScope, withCallGraphs } from "../src/tools/common";
 
 interface Measured {
@@ -681,3 +682,449 @@ function meteredFirst(): { db: D1Database; measured: Measured[] } {
   };
   return { db: { prepare: (sql: string) => statement(env.DB.prepare(sql), sql) } as unknown as D1Database, measured };
 }
+
+// ---------------------------------------------------------------------------------------------
+// HTTP: a service token through the real provider (createConnector().fetch) to /mcp.
+// ---------------------------------------------------------------------------------------------
+
+/** OWNER_GITHUB_USER_ID in wrangler.test.jsonc. */
+const HTTP_OWNER = 1001;
+const GENERIC = { error: "invalid_token", error_description: "Invalid access token" };
+
+interface HttpSyncCall {
+  method: string;
+  url: string;
+  stamp: string | null;
+}
+
+let httpSync: HttpSyncCall[];
+let httpConsole: MockInstance[];
+
+/** Every statement whose SQL matches `filter` is run through `meta`; others go to the real binding untouched. */
+function meter(
+  filter: RegExp,
+  base: D1Database = env.DB,
+  alter: (sql: string, result: D1Result) => D1Result = (_sql, r) => r,
+): { db: D1Database; measured: Measured[] } {
+  const measured: Measured[] = [];
+  const record = <T extends D1Result>(sql: string, result: T): T => {
+    measured.push({ sql: sql.replace(/\s+/g, " ").trim(), rowsRead: result.meta.rows_read, rowsWritten: result.meta.rows_written });
+    return alter(sql, result) as T;
+  };
+  const statement = (stmt: D1PreparedStatement, sql: string): D1PreparedStatement =>
+    ({
+      bind: (...values: unknown[]) => statement(stmt.bind(...values), sql),
+      run: async () => record(sql, await stmt.run()),
+      all: async () => record(sql, await stmt.all()),
+      first: async (column?: string) => {
+        const row = (record(sql, await stmt.all()).results[0] ?? null) as Record<string, unknown> | null;
+        return column === undefined ? row : (row?.[column] ?? null);
+      },
+      raw: () => {
+        throw new Error("raw() has no meta");
+      },
+    }) as unknown as D1PreparedStatement;
+  const db = new Proxy(base, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => (filter.test(sql) ? statement(target.prepare(sql), sql) : target.prepare(sql));
+      const value = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { db, measured };
+}
+
+function httpEnv(overrides: Partial<Env> = {}): Env {
+  const sync = {
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      httpSync.push({ method: request.method, url: request.url, stamp: request.headers.get("x-logseq-edit-stamp") });
+      return Response.json({ uuid: PAGE, kind: "page", title: "Notes", markdown: "", "block-count": 0, truncated: false, blocks: [], missing: [] });
+    },
+  } as unknown as Fetcher;
+  // AI and VECTORIZE only need to exist for the semantic tools to be registered.
+  return { ...env, SYNC: sync, AI: {} as Ai, VECTORIZE: {} as Vectorize, SEMANTIC_MAX_VECTORS: "10000", ...overrides } as Env;
+}
+
+interface HttpResult {
+  status: number;
+  headers: [string, string][];
+  body: string;
+  json: any;
+}
+
+/** One JSON-RPC request to https://mcp.example.com/mcp through the real Worker, with `bearer`. */
+async function post(
+  bearer: string,
+  method: string,
+  params: unknown = {},
+  { e = httpEnv(), session }: { e?: Env; session?: string } = {},
+): Promise<HttpResult> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${bearer}`,
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18",
+  };
+  if (session) headers["mcp-session-id"] = session;
+  const request = new Request("https://mcp.example.com/mcp", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
+  const ctx = createExecutionContext();
+  const res = await connector.fetch!(request as Request<unknown, IncomingRequestCfProperties>, e, ctx);
+  await waitOnExecutionContext(ctx);
+  const body = await res.text();
+  let json: any = null;
+  if (res.headers.get("Content-Type")?.includes("text/event-stream")) {
+    json = body
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)))
+      .find((msg) => msg.id === 1);
+  } else if (body) {
+    json = JSON.parse(body);
+  }
+  return { status: res.status, headers: [...res.headers], body, json };
+}
+
+async function httpCall(bearer: string, name: string, args: Record<string, unknown>, opts: { e?: Env; session?: string } = {}) {
+  const res = await post(bearer, "tools/call", { name, arguments: args }, opts);
+  expect(res.status, res.body).toBe(200);
+  const result = res.json.result;
+  return { isError: result.isError === true, text: result.content.map((c: { text: string }) => c.text).join("\n") };
+}
+
+function consoleText(): string {
+  return httpConsole.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" ")).join("\n");
+}
+
+/** The token is nowhere in a response or the console: not whole, and not its secret part. */
+function expectNoToken(res: HttpResult, token: string) {
+  const secret = token.startsWith("lsct_") && token.length > 20 ? token.slice(5) : token;
+  for (const text of [res.body, JSON.stringify(res.headers), consoleText()]) {
+    expect(text).not.toContain(token);
+    expect(text).not.toContain(secret);
+  }
+}
+
+async function makeToken(name: string, overrides: Partial<Parameters<ServiceTokenStore["create"]>[0]> = {}) {
+  const now = Date.now();
+  return new ServiceTokenStore(env.DB).create({
+    name,
+    ownerId: HTTP_OWNER,
+    graphIds: [WORK],
+    access: "write",
+    createdAt: now - DAY,
+    expiresAt: now + 90 * DAY,
+    ...overrides,
+  });
+}
+
+async function lastUsed(id: string): Promise<number | null> {
+  return (await new ServiceTokenStore(env.DB).get(id))!.lastUsedAt;
+}
+
+describe("HTTP", () => {
+  beforeEach(async () => {
+    await env.DB.exec("DELETE FROM graphs");
+    await env.DB.exec("DELETE FROM audit_log");
+    const base = { permission: "both" as const, expiresAt: null };
+    await graphStore().add({ ...base, alias: "work", graphId: WORK, graphName: "Work", mode: "write", token: "logseq_pat_Work1" });
+    await graphStore().add({ ...base, alias: "notes", graphId: NOTES, graphName: "Notes", mode: "write", token: "logseq_pat_Notes2" });
+    httpSync = [];
+    httpConsole = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m));
+  });
+
+  afterEach(() => {
+    for (const spy of httpConsole) spy.mockRestore();
+    vi.restoreAllMocks();
+  });
+
+  it("a valid read-write token reaches initialize and tools/list at /mcp", async () => {
+    const { token } = await makeToken("ci");
+    const init = await post(token, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "test", version: "0" },
+    });
+    expect(init.status, init.body).toBe(200);
+    expect(init.json.result.serverInfo.name).toBe("logseq-connector");
+    const listed = await post(token, "tools/list");
+    expect(listed.status, listed.body).toBe(200);
+    expect(listed.json.result.tools.map((t: { name: string }) => t.name).sort()).toEqual(committedManifest.map((t) => t.name).sort());
+    expectNoToken(init, token);
+    expectNoToken(listed, token);
+  });
+
+  it("an unknown token of the right shape, a malformed bearer and a:b:c get the generic 401; none reads a D1 row", async () => {
+    await makeToken("ci");
+    for (const bearer of [generateServiceToken(), `lsct_${"A".repeat(42)}`, "lsct_short", "not-a-token", "a:b:c", `lsct_${"A".repeat(43)}:x:y`]) {
+      const m = meter(/./);
+      const res = await post(bearer, "tools/list", {}, { e: httpEnv({ DB: m.db }) });
+      expect(res.status, bearer).toBe(401);
+      expect(res.json, bearer).toEqual(GENERIC);
+      // A right-shaped token is looked up by hash (a miss reads 0 rows); anything else never reaches D1.
+      const expected = TOKEN_PATTERN.test(bearer) ? [[expect.stringMatching(/FROM service_tokens WHERE token_hash = \?$/), 0, 0]] : [];
+      expect(m.measured.map((x) => [x.sql, x.rowsRead, x.rowsWritten]), bearer).toEqual(expected);
+      expectNoToken(res, bearer);
+    }
+    expect(httpSync).toEqual([]);
+  });
+
+  it("revoked, expired and previous-owner tokens get 401 naming the reason and the token; the token is in no output", async () => {
+    const now = Date.now();
+    const revoked = await makeToken("ci");
+    await new ServiceTokenStore(env.DB).revoke(revoked.id, now - 1000);
+    const expiresAt = Date.UTC(2026, 0, 2, 3, 4, 5);
+    const expired = await makeToken("nightly", { createdAt: expiresAt - DAY, expiresAt });
+    const previous = await makeToken("backup", { ownerId: 2002 });
+    const cases: [string, string][] = [
+      [revoked.token, "service token 'ci' was revoked"],
+      [expired.token, "service token 'nightly' expired on 2026-01-02"],
+      [previous.token, "service token 'backup' belongs to a previous owner"],
+    ];
+    for (const [token, description] of cases) {
+      const res = await post(token, "tools/list");
+      expect(res.status).toBe(401);
+      expect(res.json).toEqual({ error: "invalid_token", error_description: description });
+      expect(new Headers(res.headers).get("WWW-Authenticate")).toContain('error="invalid_token"');
+      expectNoToken(res, token);
+    }
+    expect(httpSync).toEqual([]);
+    // Nothing refused is recorded as used.
+    for (const { id } of [revoked, expired, previous]) expect(await lastUsed(id)).toBeNull();
+  });
+
+  it("reasons come in order: revoked before expired before previous owner", async () => {
+    const now = Date.now();
+    const all = await makeToken("ci", { ownerId: 2002, createdAt: now - 2 * DAY, expiresAt: now - DAY });
+    await new ServiceTokenStore(env.DB).revoke(all.id, now - 1000);
+    expect((await post(all.token, "tools/list")).json.error_description).toBe("service token 'ci' was revoked");
+    const expiredOther = await makeToken("nightly", { ownerId: 2002, createdAt: Date.UTC(2026, 0, 1), expiresAt: Date.UTC(2026, 0, 3) });
+    expect((await post(expiredOther.token, "tools/list")).json.error_description).toBe("service token 'nightly' expired on 2026-01-03");
+  });
+
+  it("expiry boundary: expires_at = now is refused, now + 1 accepted (review focus 3)", async () => {
+    const now = Date.UTC(2026, 10, 7, 12, 0, 0);
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const atNow = await makeToken("ci", { createdAt: now - DAY, expiresAt: now });
+    const later = await makeToken("nightly", { createdAt: now - DAY, expiresAt: now + 1 });
+    const refused = await post(atNow.token, "tools/list");
+    expect(refused.status).toBe(401);
+    expect(refused.json.error_description).toBe("service token 'ci' expired on 2026-11-07");
+    expect((await post(later.token, "tools/list")).status).toBe(200);
+  });
+
+  it("a token touched a minute ago that has since expired is refused: the throttle never skips verification (review focus 2)", async () => {
+    const t = Date.UTC(2026, 10, 7, 12, 0, 0);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t);
+    const { id, token } = await makeToken("ci", { createdAt: t - DAY, expiresAt: t + 30_000 });
+    expect((await post(token, "tools/list")).status).toBe(200);
+    expect(await lastUsed(id)).toBe(t);
+    clock.mockReturnValue(t + 60_000);
+    const res = await post(token, "tools/list");
+    expect(res.status).toBe(401);
+    expect(res.json.error_description).toBe("service token 'ci' expired on 2026-11-07");
+  });
+
+  it("order pin: a different right-shaped token gets the generic 401 while a revoked token is stored", async () => {
+    const revoked = await makeToken("ci");
+    await new ServiceTokenStore(env.DB).revoke(revoked.id, Date.now());
+    // Only the holder of the real token learns a reason; nothing else is revealed, not even with one row stored.
+    for (const bearer of [generateServiceToken(), `${revoked.token.slice(0, -1)}${revoked.token.endsWith("A") ? "B" : "A"}`]) {
+      const res = await post(bearer, "tools/list");
+      expect(res.status).toBe(401);
+      expect(res.json).toEqual(GENERIC);
+      expect(res.body).not.toContain("ci");
+    }
+  });
+
+  it("hash compare: a row found whose token_hash differs (test DB wrapper) gets the generic 401", async () => {
+    const { token } = await makeToken("ci");
+    const revoked = await makeToken("nightly");
+    await new ServiceTokenStore(env.DB).revoke(revoked.id, Date.now());
+    const tamper = (sql: string, result: D1Result) =>
+      /WHERE token_hash = \?/.test(sql)
+        ? ({ ...result, results: result.results.map((r) => ({ ...(r as object), token_hash: "f".repeat(64) })) } as D1Result)
+        : result;
+    for (const bearer of [token, revoked.token]) {
+      const m = meter(/service_tokens/, env.DB, tamper);
+      const res = await post(bearer, "tools/list", {}, { e: httpEnv({ DB: m.db }) });
+      expect(res.status).toBe(401);
+      expect(res.json).toEqual(GENERIC);
+    }
+  });
+
+  it("owner backstop: service props for another owner reaching mcpApiHandler get 403", async () => {
+    const props: ServiceProps = {
+      kind: "service",
+      tokenId: "t1",
+      name: "ci",
+      githubUserId: 2002,
+      graphIds: [WORK],
+      access: "write",
+      lastUsedAt: Date.now(),
+    };
+    const ctx = createExecutionContext();
+    (ctx as unknown as { props: unknown }).props = props;
+    const res = await mcpApiHandler.fetch(
+      new Request("https://mcp.example.com/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      }),
+      httpEnv(),
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(403);
+    // The same props for the owner pass.
+    const ownCtx = createExecutionContext();
+    (ownCtx as unknown as { props: unknown }).props = { ...props, githubUserId: HTTP_OWNER };
+    const own = await mcpApiHandler.fetch(
+      new Request("https://mcp.example.com/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      }),
+      httpEnv(),
+      ownCtx,
+    );
+    await waitOnExecutionContext(ownCtx);
+    expect(own.status).toBe(200);
+  });
+
+  it("a write is audited with client service:ci and the session id sent, and carries x-logseq-edit-stamp: claude", async () => {
+    const { token } = await makeToken("ci");
+    const written = await httpCall(token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, { session: "session-42" });
+    expect(written.isError, written.text).toBe(false);
+    const writes = httpSync.filter((c) => c.method !== "GET");
+    expect(writes.map((c) => [c.method, c.stamp])).toEqual([["PATCH", "claude"]]);
+    const rows = (await env.DB.prepare("SELECT tool, alias, status, client, session FROM audit_log ORDER BY id").all()).results;
+    expect(rows).toEqual([{ tool: "update_block", alias: "work", status: "ok", client: "service:ci", session: "session-42" }]);
+    // The same write sent again is written again.
+    const again = await httpCall(token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, { session: "session-42" });
+    expect(again.isError, again.text).toBe(false);
+    expect(httpSync.filter((c) => c.method !== "GET")).toHaveLength(2);
+  });
+
+  it("read-only token through HTTP: a write is refused naming the token with 0 sync calls; a read reaches the sync server", async () => {
+    const { token } = await makeToken("ci", { access: "read" });
+    expect(await httpCall(token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } })).toEqual({
+      isError: true,
+      text: "graph 'work' is read-only (service token 'ci' is read-only)",
+    });
+    expect(httpSync).toEqual([]);
+    const listed = await httpCall(token, "list_graphs", {});
+    expect(JSON.parse(listed.text).map((g: { alias: string; mode: string }) => [g.alias, g.mode])).toEqual([["work", "read"]]);
+    const read = await httpCall(token, "get_page", { graph: "work", "page-id": PAGE });
+    expect(read.isError, read.text).toBe(false);
+    expect(httpSync.map((c) => c.method)).toEqual(["GET"]);
+    const rows = (await env.DB.prepare("SELECT tool, status, client FROM audit_log WHERE kind = 'write'").all()).results;
+    expect(rows).toEqual([{ tool: "update_block", status: "refused", client: "service:ci" }]);
+  });
+
+  it("out of scope through HTTP: the scope reaches the tool callback (risk 2)", async () => {
+    const { token } = await makeToken("ci");
+    const message = "graph 'notes' is outside service token 'ci''s scope (it covers: work)";
+    expect(await httpCall(token, "get_page", { graph: "notes", "page-id": PAGE })).toEqual({ isError: true, text: message });
+    expect(await httpCall(token, "update_block", { graph: "notes", "block-id": B1, body: { title: "x" } })).toEqual({ isError: true, text: message });
+    expect(httpSync).toEqual([]);
+  });
+
+  it("last_used_at: the first request writes it, a second within the hour issues no touch, one after the hour writes again", async () => {
+    const t = Date.UTC(2026, 10, 7, 12, 0, 0);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t);
+    const { id, token } = await makeToken("ci", { createdAt: t - DAY, expiresAt: t + 90 * DAY });
+    const run = async (at: number) => {
+      clock.mockReturnValue(at);
+      const m = meter(/service_tokens/);
+      const res = await post(token, "tools/list", {}, { e: httpEnv({ DB: m.db }) });
+      expect(res.status).toBe(200);
+      return m.measured.map((x) => [x.sql.split(" ")[0], x.rowsRead, x.rowsWritten]);
+    };
+    expect(await run(t)).toEqual([
+      ["SELECT", 1, 0],
+      ["UPDATE", 1, 1],
+    ]);
+    expect(await lastUsed(id)).toBe(t);
+    // Within the hour: the verify read only, and no UPDATE is even sent.
+    expect(await run(t + 60_000)).toEqual([["SELECT", 1, 0]]);
+    expect(await run(t + TOUCH_INTERVAL_MS)).toEqual([["SELECT", 1, 0]]);
+    expect(await lastUsed(id)).toBe(t);
+    expect(await run(t + TOUCH_INTERVAL_MS + 1)).toEqual([
+      ["SELECT", 1, 0],
+      ["UPDATE", 1, 1],
+    ]);
+    expect(await lastUsed(id)).toBe(t + TOUCH_INTERVAL_MS + 1);
+  });
+
+  it("a failed touch is logged by id and never reaches the response", async () => {
+    const { id, token } = await makeToken("ci");
+    const failing = meter(/service_tokens/, env.DB, (sql, result) => {
+      if (sql.startsWith("UPDATE")) throw new Error("D1_ERROR: touch failed");
+      return result;
+    });
+    const res = await post(token, "tools/list", {}, { e: httpEnv({ DB: failing.db }) });
+    expect(res.status).toBe(200);
+    expect(consoleText()).toContain(`service-token-touch-failed id=${id}`);
+    expectNoToken(res, token);
+  });
+
+  it("a D1 failure in verify answers non-200 and leaks no token", async () => {
+    const { token } = await makeToken("ci");
+    const failing = meter(/service_tokens/, env.DB, () => {
+      throw new Error("D1_ERROR: network connection lost");
+    });
+    // The provider rethrows anything that is not an ExternalTokenError, so the runtime answers 500;
+    // what it would print is this error, which carries D1's message and no token.
+    const thrown = await post(token, "tools/list", {}, { e: httpEnv({ DB: failing.db }) }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    const text = `${(thrown as Error).message}\n${(thrown as Error).stack}`;
+    expect((thrown as Error).message).toBe("D1_ERROR: network connection lost");
+    expect(text).not.toContain(token);
+    expect(text).not.toContain(token.slice(5));
+    expect(consoleText()).not.toContain(token);
+    expect(consoleText()).not.toContain(token.slice(5));
+    expect(httpSync).toEqual([]);
+  });
+
+  it("no column of service_tokens or audit_log contains any token, after writes, refusals and reasons", async () => {
+    const write = await makeToken("ci");
+    const read = await makeToken("nightly", { access: "read" });
+    const revoked = await makeToken("backup");
+    await new ServiceTokenStore(env.DB).revoke(revoked.id, Date.now());
+    await httpCall(write.token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, { session: "s1" });
+    await httpCall(read.token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } });
+    await httpCall(write.token, "update_block", { graph: "notes", "block-id": B1, body: { title: "x" } });
+    expect((await post(revoked.token, "tools/list")).status).toBe(401);
+    const tokens = [write.token, read.token, revoked.token];
+    const audit = (await env.DB.prepare("SELECT * FROM audit_log").all<Record<string, unknown>>()).results;
+    expect(audit.length).toBe(3);
+    for (const row of [...(await allColumns()), ...audit]) {
+      for (const value of Object.values(row)) {
+        for (const token of tokens) {
+          expect(String(value)).not.toContain(token);
+          expect(String(value)).not.toContain(token.slice(5));
+        }
+      }
+    }
+  });
+
+  it("cost: a known token's verify reads 1 row and writes 0, and scope adds no D1 read", async () => {
+    const { id, token } = await makeToken("ci");
+    await new ServiceTokenStore(env.DB).touch(id, Date.now());
+    const m = meter(/service_tokens/);
+    const res = await post(token, "tools/call", { name: "get_page", arguments: { graph: "work", "page-id": PAGE } }, { e: httpEnv({ DB: m.db }) });
+    expect(res.status).toBe(200);
+    expect(m.measured.map((x) => [x.sql, x.rowsRead, x.rowsWritten])).toEqual([
+      [expect.stringMatching(/^SELECT .* FROM service_tokens WHERE token_hash = \?$/), 1, 0],
+    ]);
+  });
+});

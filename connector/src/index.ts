@@ -1,6 +1,7 @@
 import { OAuthProvider, type OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import type { GitHubFetch } from "./auth/github";
 import { isAllowedRedirectUri } from "./auth/redirect-uris";
+import { verifyServiceToken } from "./auth/service-tokens";
 import { type DefaultEnv, authRoute } from "./auth/routes";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
 import { GraphStore } from "./graphs";
@@ -28,6 +29,7 @@ function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
  * `https://<host>/mcp` URL the client reaches, and the provider takes it as a fixed string.
  */
 export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthProviderOptions<Env> {
+  const resource = `https://${host}/mcp`;
   return {
     apiRoute: "/mcp",
     apiHandler: mcpApiHandler,
@@ -36,7 +38,12 @@ export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthPr
     tokenEndpoint: "/token",
     clientRegistrationEndpoint: "/register",
     clientIdMetadataDocumentEnabled: true,
-    resourceMetadata: { resource: `https://${host}/mcp`, resource_name: "Logseq graphs" },
+    resourceMetadata: { resource, resource_name: "Logseq graphs" },
+    // A bearer that is not an issued OAuth token: a service token, or the generic 401 (design §3.2).
+    async resolveExternalToken({ token, env }) {
+      const props = await verifyServiceToken(env, token, Date.now());
+      return props ? { audience: resource, props } : null;
+    },
     clientRegistrationCallback({ clientMetadata }) {
       const uris = clientMetadata.redirect_uris;
       const allowed =

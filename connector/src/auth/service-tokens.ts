@@ -1,4 +1,6 @@
-import { base64url } from "../crypto";
+import { ExternalTokenError } from "@cloudflare/workers-oauth-provider";
+import { base64url, timingSafeEqual } from "../crypto";
+import { isOwner } from "./github";
 
 /**
  * Service tokens: `lsct_` bearers for unattended Claude Code cloud sessions (design
@@ -173,4 +175,47 @@ export class ServiceTokenStore {
       .run();
     return result.meta.changes > 0;
   }
+}
+
+/** What a verified token carries to `mcpApiHandler` as `ctx.props` (design §3.2 step 5). */
+export interface ServiceProps {
+  kind: "service";
+  tokenId: string;
+  name: string;
+  /** The token's owner; `mcpApiHandler` checks it against OWNER_GITHUB_USER_ID again. */
+  githubUserId: number;
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  /** From the verify read, so the handler can throttle the touch without another read. */
+  lastUsedAt: number | null;
+}
+
+function refuse(description: string): never {
+  throw new ExternalTokenError("invalid_token", { description, statusCode: 401 });
+}
+
+/**
+ * The provider's `resolveExternalToken` check for a bearer (design §3.2). In order: the shape (a
+ * bearer that is not a service token never reaches D1), the lookup by the full hash, a constant-time
+ * compare, and only then the reasons, revoked, expired and previous owner, each thrown as a 401 that
+ * names the token. `null` is the provider's generic `Invalid access token`, so a wrong token never
+ * learns a reason. Logs nothing; the token and its hash never leave this function.
+ */
+export async function verifyServiceToken(env: Env, token: string, now: number): Promise<ServiceProps | null> {
+  if (!TOKEN_PATTERN.test(token)) return null;
+  const hash = await hashServiceToken(token);
+  const row = await new ServiceTokenStore(env.DB).findByHash(hash);
+  if (!row || !timingSafeEqual(row.tokenHash, hash)) return null;
+  if (row.revokedAt !== null) refuse(`service token '${row.name}' was revoked`);
+  if (row.expiresAt <= now) refuse(`service token '${row.name}' expired on ${new Date(row.expiresAt).toISOString().slice(0, 10)}`);
+  if (!isOwner(row.ownerId, env)) refuse(`service token '${row.name}' belongs to a previous owner`);
+  return {
+    kind: "service",
+    tokenId: row.id,
+    name: row.name,
+    githubUserId: row.ownerId,
+    graphIds: row.graphIds,
+    access: row.access,
+    lastUsedAt: row.lastUsedAt,
+  };
 }

@@ -352,6 +352,26 @@ describe("GitHub sign-in for MCP authorization", () => {
     expect(text).toContain("insert_block_tree");
   });
 
+  it("an OAuth request at /mcp reads no service_tokens row (service tokens are checked only for other bearers)", async () => {
+    const accessToken = await issueAccessToken(harness());
+    const seen: string[] = [];
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            seen.push(sql);
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const mcp = await callConnectorHelp(harness(undefined, { DB: db }), accessToken);
+    expect(mcp.status).toBe(200);
+    expect(seen.filter((sql) => /service_tokens/.test(sql))).toEqual([]);
+  });
+
   it("changing OWNER_GITHUB_USER_ID revokes existing grants at /mcp with 403", async () => {
     const accessToken = await issueAccessToken(harness());
     // Same KV (the grant is still valid), but the owner is now someone else.

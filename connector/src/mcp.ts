@@ -5,6 +5,7 @@ import openapi from "../vendor/openapi.json";
 import { type AuditContext, AuditLog, userAgentFamily } from "./audit/log";
 import { isOwner } from "./auth/github";
 import type { GrantProps } from "./auth/routes";
+import { type ServiceProps, ServiceTokenStore, TOUCH_INTERVAL_MS } from "./auth/service-tokens";
 import { GraphStore } from "./graphs";
 import { registerActivityLogTool } from "./tools/activity-log";
 import { registerAssetTools } from "./tools/assets";
@@ -79,6 +80,17 @@ async function markDirty(env: Env, tool: string, alias: string): Promise<void> {
   }
 }
 
+/** Records a service token's use after the response; a failure is logged by id and never reaches the result. */
+async function touchServiceToken(env: Env, id: string, now: number): Promise<void> {
+  try {
+    await new ServiceTokenStore(env.DB).touch(id, now);
+  } catch {
+    console.error(`service-token-touch-failed id=${id}`);
+  }
+}
+
+export type { ServiceProps };
+
 /** Who sent a request, as the audit log stores it (design §3.8). Neither is a token. */
 export interface Caller {
   client: string | null;
@@ -133,14 +145,26 @@ export function mcpHandler(
 }
 
 /**
- * The provider's `apiHandler`: only reached with a valid access token for this host's `/mcp`. The
- * owner is checked again on every request, so changing OWNER_GITHUB_USER_ID revokes existing grants.
+ * The provider's `apiHandler`: only reached with a valid access token for this host's `/mcp`, either
+ * an OAuth grant or a service token (src/auth/service-tokens.ts). The owner is checked again on every
+ * request, for both, so changing OWNER_GITHUB_USER_ID revokes existing grants.
  */
 export const mcpApiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // The provider sets props to the decrypted GrantProps stored with the grant (src/auth/routes.ts).
-    const props = ctx.props as GrantProps;
+    // OAuth props are the decrypted GrantProps stored with the grant (src/auth/routes.ts); service
+    // props come from verifyServiceToken.
+    const props = ctx.props as GrantProps | ServiceProps;
     if (!isOwner(props.githubUserId, env)) return new Response("Forbidden", { status: 403 });
+    if ("kind" in props && props.kind === "service") {
+      const now = Date.now();
+      // At most one write an hour per token; the UPDATE's own condition settles a race between isolates.
+      if (props.lastUsedAt === null || props.lastUsedAt < now - TOUCH_INTERVAL_MS) {
+        ctx.waitUntil(touchServiceToken(env, props.tokenId, now));
+      }
+      const caller: Caller = { client: `service:${props.name}`, session: request.headers.get("mcp-session-id") };
+      const scope: RequestScope = { kind: "service", name: props.name, graphIds: new Set(props.graphIds), access: props.access };
+      return mcpHandler(env, ctx, caller, scope)(request, env, ctx);
+    }
     return mcpHandler(env, ctx, callerOf(request))(request, env, ctx);
   },
 };

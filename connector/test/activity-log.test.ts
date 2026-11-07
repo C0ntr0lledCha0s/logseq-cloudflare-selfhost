@@ -6,6 +6,8 @@ import { AuditLog, QUERY_SCAN_CAP, READ_ROW_WRITES } from "../src/audit/log";
 import { SNAPSHOT_MAX_BYTES, snapshotClassFor } from "../src/audit/snapshot";
 import { RESULT_CHAR_LIMIT } from "../src/tools/common";
 import { GraphStore } from "../src/graphs";
+import { ServiceTokenStore } from "../src/auth/service-tokens";
+import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS } from "../src/tools/readable";
@@ -911,5 +913,57 @@ describe("contract", () => {
     expect(CONTEXT_TOOLS).not.toHaveProperty("get_activity_log");
     expect(NO_CONTEXT_TOOLS).not.toHaveProperty("get_activity_log");
     expect(CONNECTOR_HELP).toContain("get_activity_log answers what changed and shows what an update, move or delete overwrote");
+  });
+});
+
+describe("service tokens", () => {
+  /** One tools/call through the real Worker at /mcp with a service token. */
+  async function viaToken(token: string, name: string, args: Record<string, unknown>, session: string) {
+    const e = testEnv();
+    const request = new Request("https://mcp.example.com/mcp", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+        "mcp-session-id": session,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: { graph: "work", ...args } } }),
+    });
+    const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
+    const ctx = createExecutionContext();
+    const res = await connector.fetch!(request as Request<unknown, IncomingRequestCfProperties>, e, ctx);
+    await waitOnExecutionContext(ctx);
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    const json = res.headers.get("Content-Type")?.includes("text/event-stream")
+      ? text
+          .split("\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)))
+          .find((msg) => msg.id === 1)
+      : JSON.parse(text);
+    return json.result.content.map((c: { text: string }) => c.text) as string[];
+  }
+
+  it("a write through a service token is listed with client service:<name> and its session, as stored", async () => {
+    await env.DB.exec("DELETE FROM service_tokens");
+    const now = Date.now();
+    const { token } = await new ServiceTokenStore(env.DB).create({
+      name: "ci",
+      ownerId: 1001,
+      graphIds: [WORK_ID],
+      access: "write",
+      createdAt: now - DAY,
+      expiresAt: now + DAY,
+    });
+    writeResponse = () => Response.json({ updated: true, target: affected("Meeting", MEETING, ["Agenda"], "Book the room", B1) });
+    await viaToken(token, "set_block_property", { reason: REASON, "block-id": B1, "property-id": "Venue", body: { value: "Library" } }, "session-ci");
+    const content = await viaToken(token, "get_activity_log", {}, "session-ci");
+    const json = JSON.parse(content[1]);
+    expect(json.entries).toHaveLength(1);
+    expect(json.entries[0]).toMatchObject({ tool: "set_block_property", status: "ok", client: "service:ci", session: "session-ci" });
+    expect(content.join("\n")).not.toContain(token);
   });
 });
