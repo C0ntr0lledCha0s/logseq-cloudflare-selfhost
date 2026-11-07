@@ -1024,6 +1024,7 @@ describe("hand-written tools", () => {
     );
     expect(help).toContain("Setting a page's tags to Tag is refused");
     expect(help).toContain("The other built-in type tags (Journal, Whiteboard, PDF Annotation, Property, Asset) are set by Logseq itself");
+    expect(help).toContain("as is Journal on a journal that a batch insert creates by its date or journal title");
     expect(help).toContain(
       "A tags list replaces only user tags: Page, Tag, Journal and the other built-in type tags an entity holds are kept",
     );
