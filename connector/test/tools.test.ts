@@ -1023,6 +1023,7 @@ describe("hand-written tools", () => {
       "when create_tag is refused because a page has the title, promote_page_to_tag converts that page, keeping its blocks and references",
     );
     expect(help).toContain("Setting a page's tags to Tag is refused");
+    expect(help).toContain("The other built-in type tags (Journal, Whiteboard, PDF Annotation, Property, Asset) are set by Logseq itself");
     expect(help).toContain(
       "A tags list replaces only user tags: Page, Tag, Journal and the other built-in type tags an entity holds are kept",
     );
