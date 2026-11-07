@@ -2,12 +2,7 @@
 // sync server that serves listBlockChanges and searchGraph over an in-memory graph with the same
 // contract as patches/0014 (full listing by UUID, changes since t, epochs, 410, 409).
 import { DIMENSIONS, type Embedder, type VectorIndex } from "../src/semantic/config";
-
-const STOPWORDS = new Set(
-  "a an and are as at be by did do does for from has have how i in is it its me my of on or our the to was we were what when where which who why will with you your about after before should".split(
-    " ",
-  ),
-);
+import { STOPWORDS } from "../src/semantic/ranking";
 
 /** Words that mean the same thing to the fake model, mapped to one stem. */
 const SYNONYMS: Record<string, string> = {

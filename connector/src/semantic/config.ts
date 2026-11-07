@@ -15,6 +15,10 @@ export const ORPHAN_BATCH = 500;
 export const SEMANTIC_TOP_K = 50;
 /** Keyword results fetched per query. */
 export const KEYWORD_LIMIT = 50;
+/** Content words a query needs before the ranking rules for multi-word questions apply. */
+export const RANKED_QUERY_WORDS = 3;
+/** Distinctive terms the keyword leg searches for a multi-word question. */
+export const KEYWORD_TERMS = 3;
 
 /** Turns texts into vectors of `DIMENSIONS` numbers, one per text, in order. */
 export interface Embedder {

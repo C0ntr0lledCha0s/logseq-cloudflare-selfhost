@@ -9,13 +9,16 @@ import { ConfigError } from "../src/config";
 import {
   DIMENSIONS,
   PAGES_PER_RUN,
+  KEYWORD_TERMS,
   PAGE_SIZE,
+  RANKED_QUERY_WORDS,
   type SemanticBindings,
   semanticBindings,
   workersAiEmbedder,
 } from "../src/semantic/config";
 import { documentText, parseFeedPage, toDocument, vectorId } from "../src/semantic/document";
 import { runIndexer } from "../src/semantic/indexer";
+import { STOPWORDS, contentWords, distinctiveTerms, wordCount } from "../src/semantic/ranking";
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
@@ -170,6 +173,55 @@ describe("reciprocal rank fusion", () => {
       ["y", { semantic: 3, keyword: 1 }],
     ]);
     expect(reciprocalRankFusion({ a: ["p"], b: ["q"] }).map((f) => f.id)).toEqual(["p", "q"]);
+  });
+});
+
+describe("ranking terms", () => {
+  it("contentWords drops stopwords, short words and duplicates", () => {
+    expect(contentWords("When is the car's warrant of fitness due?")).toEqual(["car", "warrant", "fitness", "due"]);
+    // Two content words left after stopwords and short words: below RANKED_QUERY_WORDS.
+    expect(contentWords("is it the WOF due")).toEqual(["wof", "due"]);
+    expect(contentWords("is it the WOF due").length).toBeLessThan(RANKED_QUERY_WORDS);
+    // Exact duplicates only: a plural is its own word.
+    expect(contentWords("dashboard dashboards Dashboard")).toEqual(["dashboard", "dashboards"]);
+    // Three characters is the minimum; two is dropped.
+    expect(contentWords("gp vet tax")).toEqual(["vet", "tax"]);
+    // Runs of any non-alphanumerics split words; digits are word characters.
+    expect(contentWords("Q3-budget/2026 (draft)")).toEqual(["budget", "2026", "draft"]);
+    // Letters outside ASCII are word characters, so a macron does not split a word.
+    expect(contentWords("whānau hui at the marae")).toEqual(["whānau", "hui", "marae"]);
+    expect(contentWords("")).toEqual([]);
+    expect(contentWords("is it the")).toEqual([]);
+  });
+
+  it("distinctiveTerms keeps the three longest, ties by first appearance", () => {
+    expect(KEYWORD_TERMS).toBe(3);
+    // stock and level tie on 5 characters; stock appears first.
+    expect(distinctiveTerms("stock level reporting dashboard")).toEqual(["reporting", "dashboard", "stock"]);
+    // Reversed order: level now appears first, so it wins the tie.
+    expect(distinctiveTerms("dashboard reporting level stock")).toEqual(["dashboard", "reporting", "level"]);
+    expect(distinctiveTerms("When will the new hire start on the warehouse project?")).toEqual(["warehouse", "project", "start"]);
+    expect(distinctiveTerms("kids dentist")).toEqual(["dentist", "kids"]);
+    expect(distinctiveTerms("rego")).toEqual(["rego"]);
+    expect(distinctiveTerms("is it the")).toEqual([]);
+  });
+
+  it("wordCount counts the stored text on whitespace", () => {
+    expect(wordCount("Dashboards")).toBe(1);
+    expect(wordCount("Stock on hand")).toBe(3);
+    expect(wordCount("  two   words ")).toBe(2);
+    expect(wordCount("line one\nline\ttwo")).toBe(4);
+    expect(wordCount("")).toBe(0);
+    expect(wordCount("   ")).toBe(0);
+  });
+
+  it("the fake embedder uses the shared stopwords", () => {
+    expect(STOPWORDS.size).toBeGreaterThan(0);
+    for (const word of STOPWORDS) {
+      expect(fakeEmbed(`dashboard ${word}`), word).toEqual(fakeEmbed("dashboard"));
+    }
+    // And a word outside the list does change the vector.
+    expect(fakeEmbed("dashboard warehouse")).not.toEqual(fakeEmbed("dashboard"));
   });
 });
 
