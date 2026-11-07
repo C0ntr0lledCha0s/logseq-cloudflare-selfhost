@@ -31,6 +31,11 @@
 # Never prints secret values and never overwrites an existing .env.local (--add-missing only appends).
 set -euo pipefail
 
+original_names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME"
+connector_names="CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
+# Not a credential and never generated: who may use the server.
+allowed_users_name="DB_SYNC_ALLOWED_USERS"
+
 usage="usage: init-env.sh [--add-missing] [--push] | init-env.sh --push-only NAME..."
 push=0
 add_missing=0
@@ -64,6 +69,17 @@ if [ "$push_only" = 1 ]; then
     echo "$usage" >&2
     exit 2
   }
+  # Unknown names are a usage error, so they are refused before any file or tool is looked at.
+  for name in $only_names; do
+    known=0
+    for allowed in $original_names $connector_names $allowed_users_name SMOKE_PAT; do
+      [ "$name" != "$allowed" ] || known=1
+    done
+    [ "$known" = 1 ] || {
+      echo "init-env: --push-only: unknown name $name" >&2
+      exit 2
+    }
+  done
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -114,10 +130,6 @@ if [ "$push_only" != 1 ]; then
   }
 fi
 
-original_names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME"
-connector_names="CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
-# Not a credential and never generated: who may use the server.
-allowed_users_name="DB_SYNC_ALLOWED_USERS"
 generated_names="ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN TOFU_ENCRYPTION_PASSPHRASE COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
 # Pushes the values of $add_names to the production environment. $recovery says what to do on failure.
 push_secrets() {
@@ -159,20 +171,15 @@ push_secrets() {
 # --add-missing the absent ones.
 add_names=""
 if [ "$push_only" = 1 ]; then
-  # Check every name before pushing any. The file is parsed, never sourced.
+  # Check every name before pushing any. The file is parsed, never sourced: the last `NAME=value`
+  # line wins, and one pair of surrounding quotes (README 1.4 single-quotes values with `$`) is removed.
   problems=0
   for name in $only_names; do
-    known=0
-    for allowed in $original_names $connector_names $allowed_users_name SMOKE_PAT; do
-      [ "$name" != "$allowed" ] || known=1
-    done
-    [ "$known" = 1 ] || {
-      echo "init-env: --push-only: unknown name $name" >&2
-      exit 2
-    }
-  done
-  for name in $only_names; do
     value="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$name=//p" "$env_file" | tail -n 1)"
+    value="${value%$'\r'}"
+    case "$value" in
+      \'*\' | \"*\") value="${value:1:${#value}-2}" ;;
+    esac
     if [ -z "$value" ]; then
       echo "init-env: --push-only: $name is missing or empty in $env_file" >&2
       problems=1

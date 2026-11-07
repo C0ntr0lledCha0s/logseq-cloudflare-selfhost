@@ -747,3 +747,39 @@ test("--push-only without a name exits 2 with the usage", { timeout: 60000 }, as
     assert.match(r.stderr, /usage: init-env.sh/);
   });
 });
+
+test("--push-only removes one pair of surrounding quotes and a trailing CR, as sourcing .env.local would", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(
+      dir,
+      `${SIX_ONLY}CONNECTOR_HOSTNAME='va$lue'\nOWNER_GITHUB_USER_ID="1234567"\nSMOKE_PAT=tok\r\nGRAPH_TOKEN_KEY='it"s'\n`,
+      0o600,
+    );
+    const { bin, log } = stubGh(dir);
+    const names = ["CONNECTOR_HOSTNAME", "OWNER_GITHUB_USER_ID", "SMOKE_PAT", "GRAPH_TOKEN_KEY"];
+    const r = await run(dir, ["--push-only", ...names], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.deepEqual(secretCalls(log).map((c) => c.stdin), ["va$lue", "1234567", "tok", `it"s`]);
+  });
+});
+
+test("--push-only treats a quoted-empty value as empty and pushes nothing", { timeout: 60000 }, async () => {
+  for (const empty of [`''`, `""`]) {
+    await withDir(async (dir) => {
+      writeExisting(dir, `${SIX_ONLY}${ALLOWED}=${USER_A}\nSMOKE_PAT=${empty}\n`, 0o600);
+      const { bin, log } = stubGh(dir);
+      const r = await run(dir, ["--push-only", ALLOWED, "SMOKE_PAT"], { PATH: `${bin}:${process.env.PATH}` });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /SMOKE_PAT is missing or empty/);
+      assert.equal(secretCalls(log).length, 0);
+    });
+  }
+});
+
+test("--push-only with an unknown name exits 2 even when .env.local is absent", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const r = await run(dir, ["--push-only", "NOT_A_SECRET"], {});
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /init-env: --push-only: unknown name NOT_A_SECRET/);
+  });
+});
