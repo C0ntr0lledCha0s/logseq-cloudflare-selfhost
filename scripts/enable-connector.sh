@@ -90,10 +90,18 @@ rc=0
 env_get CONNECTOR_ENABLED || rc=$?
 [ "$rc" -eq 0 ] || fail "CONNECTOR_ENABLED isn't in .env.local: add the line CONNECTOR_ENABLED=false (see .env.local.example), then re-run"
 local_enabled="$env_val"
+# CONNECTOR_ENABLED as the deploy reads it: the production environment variable, else the repository
+# variable, else false. The lists are read rather than `gh variable get`, whose "not found" for an
+# unset variable is not a 404. A missing production environment (a 404) holds no variables.
 rc=0
-gh_try gh variable get CONNECTOR_ENABLED --env production -R "$repo" || rc=$?
-github_enabled=""
-[ "$rc" -ne 0 ] || github_enabled="$gh_out"
+gh_try gh variable list --env production --json name,value -R "$repo" || rc=$?
+env_variables="[]"
+[ "$rc" -ne 0 ] || env_variables="$gh_out"
+gh_must gh variable list --json name,value -R "$repo"
+github_enabled="$(ENV_VARIABLES="$env_variables" REPO_VARIABLES="$gh_out" node -e '
+  const find = (list) => JSON.parse(list).find((v) => v.name === "CONNECTOR_ENABLED");
+  console.log((find(process.env.ENV_VARIABLES) ?? find(process.env.REPO_VARIABLES))?.value || "false");
+')"
 if [ "$local_enabled" = "true" ] && [ "$github_enabled" = "true" ]; then
   # Both switches are set before the checks run, so a failed check or deploy lands here on the
   # re-run: carry on from the checks, and deploy only if the latest deploy isn't green.

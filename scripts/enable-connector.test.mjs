@@ -50,13 +50,23 @@ function makeRoot({ envLocal, failing = [], upstream = null }) {
   return dir;
 }
 
-/** `gh` rules for a connector that is off. `over` rules come first, so they win. */
+// The `CONNECTOR_ENABLED` variable lists, environment and repository level, as `gh variable list --json name,value`.
+const ENV_VARIABLES = ["variable", "list", "--env", "production", "--json", "name,value", "-R", REPO];
+const REPO_VARIABLES = ["variable", "list", "--json", "name,value", "-R", REPO];
+const listed = (value) => `${JSON.stringify(value === undefined ? [] : [{ name: "CONNECTOR_ENABLED", value }])}\n`;
+const envVariable = (value) => ({ match: ENV_VARIABLES, stdout: listed(value) });
+const repoVariable = (value) => ({ match: REPO_VARIABLES, stdout: listed(value) });
+
+/** `gh` rules for a connector that is off (the variable is unset at both levels). `over` rules come first, so they win. */
 const ghRules = (over = []) => [
   ...over,
   { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
   // gh's own choice in a clone with an `upstream` remote.
   { match: ["repo", "view"], stdout: `${PARENT}\n` },
-  { match: ["variable", "get", "CONNECTOR_ENABLED"], stderr: NOT_FOUND, exit: 1 },
+  envVariable(),
+  repoVariable(),
+  // What gh 2.87.3 says for an unset variable, with or without --env: no "HTTP 404".
+  { match: ["variable", "get"], stderr: "variable CONNECTOR_ENABLED was not found\n", exit: 1 },
   { match: ["api", "user", "-q", ".id"], stdout: "12345\n" },
   { match: ["api", "user", "-q", ".login"], stdout: "octocat\n" },
   { match: ["variable", "set"] },
@@ -153,7 +163,7 @@ test("a hostname that only ends with the domain's text, not a dot and the domain
 
 const alreadyOn = (extra = {}) => ({
   envLocal: `${baseEnv("true")}CONNECTOR_HOSTNAME=mcp.example.com\n`,
-  rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stdout: "true\n" }]),
+  rules: ghRules([envVariable("true")]),
   ...extra,
 });
 
@@ -163,7 +173,7 @@ test("when the connector is already on in .env.local and on GitHub, it checks, d
   assert.ok(out.stdout.includes("the connector is already on"), out.stdout);
   assert.deepEqual(out.scripts, ["doctor.sh ", "run-deploy.sh --if-not-green"]);
   assert.deepEqual(variableSets(out.ghCalls), []);
-  assert.deepEqual(out.ghCalls.map((a) => a[0]), ["repo", "variable"]);
+  assert.deepEqual(out.ghCalls.map((a) => a.slice(0, 2).join(" ")), ["repo view", "variable list", "variable list"]);
   assert.ok(out.stdout.includes("https://mcp.example.com/mcp"), out.stdout);
 });
 
@@ -189,15 +199,42 @@ test("already on but no CONNECTOR_HOSTNAME in .env.local stops before any check"
   assert.deepEqual(out.scripts, []);
 });
 
-test("on in .env.local but unset on GitHub (a 404) carries on and sets the variable", async () => {
+test("on in .env.local but unset on GitHub carries on and sets the variable", async () => {
   const out = await enable({ envLocal: baseEnv("true") });
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.equal(variableSets(out.ghCalls).length, 1);
   assert.deepEqual(out.scripts, ["init-env.sh --add-missing --push", "doctor.sh ", "run-deploy.sh "]);
 });
 
+test("the variable is read from the lists, never with gh variable get, whose 'was not found' isn't a 404", async () => {
+  const out = await enable();
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.ok(!out.ghCalls.some((a) => a[0] === "variable" && a[1] === "get"), JSON.stringify(out.ghCalls));
+  assert.deepEqual(out.ghCalls.filter((a) => a[1] === "list"), [ENV_VARIABLES, REPO_VARIABLES]);
+});
+
+test("no production environment yet (a 404 listing its variables) counts as unset there", async () => {
+  const out = await enable({ rules: ghRules([{ match: ENV_VARIABLES, stderr: NOT_FOUND, exit: 1 }]) });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.equal(variableSets(out.ghCalls).length, 1);
+});
+
+test("the repository variable counts when the environment has none, as the deploy reads it", async () => {
+  const out = await enable(alreadyOn({ rules: ghRules([repoVariable("true")]) }));
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.ok(out.stdout.includes("the connector is already on"), out.stdout);
+  assert.deepEqual(out.scripts, ["doctor.sh ", "run-deploy.sh --if-not-green"]);
+});
+
+test("the environment variable wins over the repository one, so false there means off", async () => {
+  const out = await enable(alreadyOn({ rules: ghRules([envVariable("false"), repoVariable("true")]) }));
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.ok(!out.stdout.includes("the connector is already on"), out.stdout);
+  assert.deepEqual(variableSets(out.ghCalls).length, 1);
+});
+
 test("on on GitHub but off in .env.local carries on and corrects the file", async () => {
-  const out = await enable({ rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stdout: "true\n" }]) });
+  const out = await enable({ rules: ghRules([envVariable("true")]) });
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.ok(out.envLocal.endsWith("CONNECTOR_ENABLED=true\n"), out.envLocal);
 });
@@ -267,16 +304,23 @@ test("no .env.local points at setup.sh", async () => {
 });
 
 test("a 403 from GitHub names the login and the admin requirement", async () => {
-  const out = await enable({ rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stderr: FORBIDDEN, exit: 1 }]) });
+  const out = await enable({ rules: ghRules([{ match: ENV_VARIABLES, stderr: FORBIDDEN, exit: 1 }]) });
   assert.equal(out.status, 1);
   assert.ok(out.stderr.includes("octocat") && out.stderr.includes("admin"), out.stderr);
   assert.deepEqual(out.scripts, []);
 });
 
 test("another gh failure stops with gh's own message", async () => {
-  const out = await enable({ rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stderr: "gh: server error (HTTP 500)\n", exit: 1 }]) });
+  for (const match of [ENV_VARIABLES, REPO_VARIABLES]) {
+    const out = await enable({ rules: ghRules([{ match, stderr: "gh: server error (HTTP 500)\n", exit: 1 }]) });
+    assert.equal(out.status, 1);
+    assert.ok(out.stderr.includes("HTTP 500"), out.stderr);
+    assert.deepEqual(out.scripts, []);
+  }
+  // A 404 for the repository itself is not "unset".
+  const out = await enable({ rules: ghRules([{ match: REPO_VARIABLES, stderr: NOT_FOUND, exit: 1 }]) });
   assert.equal(out.status, 1);
-  assert.ok(out.stderr.includes("HTTP 500"), out.stderr);
+  assert.ok(out.stderr.includes("HTTP 404"), out.stderr);
   assert.deepEqual(out.scripts, []);
 });
 

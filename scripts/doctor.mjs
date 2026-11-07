@@ -348,22 +348,33 @@ async function checkGithub({ env, gh, originUrl, add, connectorOn }) {
     else add("ok", "secrets", `all ${required.length} required names are present`);
   }
 
-  // The deploy reads the environment variable, else the repository one, else treats it as off.
-  const effective = (() => {
-    for (const args of [
-      ["variable", "get", "CONNECTOR_ENABLED", "-R", repo, "--env", "production"],
-      ["variable", "get", "CONNECTOR_ENABLED", "-R", repo],
-    ]) {
-      const out = gh(args);
-      if (out.status === 0) return out.stdout.trim() || "false";
+  // The deploy reads the environment variable, else the repository one, else treats it as off. The
+  // lists are read rather than `gh variable get`, whose "not found" for an unset variable can't be told
+  // apart from a failure. A missing production environment (a 404) holds no variables; any other
+  // failure is a FAIL, not an unset variable.
+  const variables = (scope) => {
+    const out = gh(["variable", "list", ...scope, "--json", "name,value", "-R", repo]);
+    if (out.status !== 0) return { ok: false, notFound: (out.stderr ?? "").includes("HTTP 404") };
+    try {
+      return { ok: true, list: JSON.parse(out.stdout) };
+    } catch {
+      return { ok: false, notFound: false };
     }
-    return "false";
-  })();
-  const local = env.CONNECTOR_ENABLED || "false";
-  if (effective === local) {
-    add("ok", "connector-setting", `CONNECTOR_ENABLED is ${local} on GitHub and in .env.local`);
+  };
+  const envVariables = variables(["--env", "production"]);
+  const repoVariables = variables([]);
+  if (!(envVariables.ok || envVariables.notFound) || !repoVariables.ok) {
+    add("FAIL", "connector-setting", "couldn't read the CONNECTOR_ENABLED variable (gh variable list): run gh auth status, and check you can administer the repo");
   } else {
-    add("FAIL", "connector-setting", `CONNECTOR_ENABLED is ${effective} on GitHub but ${local} in .env.local. A local OpenTofu run would plan to destroy the connector's resources (README 11.5)`);
+    const find = (list) => list.find((v) => v?.name === "CONNECTOR_ENABLED");
+    const found = (envVariables.ok ? find(envVariables.list) : undefined) ?? find(repoVariables.list);
+    const effective = found?.value?.trim() || "false";
+    const local = env.CONNECTOR_ENABLED || "false";
+    if (effective === local) {
+      add("ok", "connector-setting", `CONNECTOR_ENABLED is ${local} on GitHub and in .env.local`);
+    } else {
+      add("FAIL", "connector-setting", `CONNECTOR_ENABLED is ${effective} on GitHub but ${local} in .env.local. A local OpenTofu run would plan to destroy the connector's resources (README 11.5)`);
+    }
   }
 
   const workflows = json(["workflow", "list", "-R", repo, "--all", "--json", "name,state"]);

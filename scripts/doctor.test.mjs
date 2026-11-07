@@ -48,6 +48,9 @@ function greenRoutes(overrides = {}) {
   };
 }
 
+/** `gh variable list --json name,value` output holding CONNECTOR_ENABLED, or nothing when `value` is undefined. */
+const variableList = (value) => JSON.stringify(value === undefined ? [] : [{ name: "CONNECTOR_ENABLED", value }]);
+
 /** A fake `gh` for a repo where every check passes. `rules` are [argv prefix, { status, stdout }]. */
 function greenGh({ secrets = SECRETS, fork = false, envVariable, repoVariable, workflows, extra = [] } = {}) {
   const all = workflows ?? [
@@ -65,14 +68,8 @@ function greenGh({ secrets = SECRETS, fork = false, envVariable, repoVariable, w
       { status: 0, stdout: JSON.stringify({ deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }) },
     ],
     [`secret list -R ${REPO} --env production`, { status: 0, stdout: JSON.stringify(secrets.map((name) => ({ name }))) }],
-    [
-      `variable get CONNECTOR_ENABLED -R ${REPO} --env production`,
-      envVariable === undefined ? { status: 1, stdout: "" } : { status: 0, stdout: `${envVariable}\n` },
-    ],
-    [
-      `variable get CONNECTOR_ENABLED -R ${REPO}`,
-      repoVariable === undefined ? { status: 1, stdout: "" } : { status: 0, stdout: `${repoVariable}\n` },
-    ],
+    [`variable list --env production --json name,value -R ${REPO}`, { status: 0, stdout: variableList(envVariable) }],
+    [`variable list --json name,value -R ${REPO}`, { status: 0, stdout: variableList(repoVariable) }],
     [`workflow list -R ${REPO} --all`, { status: 0, stdout: JSON.stringify(all) }],
   ];
   const calls = [];
@@ -508,6 +505,33 @@ test("connector-setting: the environment variable wins over the repository one, 
   assert.equal(levelOf(emptyVariable.results, "connector-setting"), "ok");
 });
 
+test("connector-setting: a failure reading the variables is a FAIL, not an unset variable", async () => {
+  const failures = [
+    ["variable", { status: 1, stdout: "", stderr: "error connecting to api.github.com\n" }],
+    [`variable list --env production`, { status: 1, stdout: "", stderr: "gh: Resource not accessible by personal access token (HTTP 403)\n" }],
+    [`variable list --json`, { status: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)\n" }],
+    ["variable", { status: 0, stdout: "not json" }],
+  ];
+  for (const failure of failures) {
+    const { results, exitCode } = await doctor({ gh: greenGh({ extra: [failure] }) });
+    const setting = only(results, "connector-setting");
+    assert.equal(setting.level, "FAIL", JSON.stringify(failure));
+    assert.ok(setting.detail.includes("gh variable list"), setting.detail);
+    assert.equal(exitCode, 1);
+  }
+});
+
+test("connector-setting: no production environment (a 404 listing its variables) falls back to the repository variable", async () => {
+  const missingEnv = [`variable list --env production`, { status: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)\n" }];
+  const { results } = await doctor({
+    gh: greenGh({ repoVariable: "true", extra: [missingEnv] }),
+    env: { CONNECTOR_ENABLED: "false" },
+  });
+  const setting = only(results, "connector-setting");
+  assert.equal(setting.level, "FAIL");
+  assert.ok(setting.detail.startsWith("CONNECTOR_ENABLED is true on GitHub but false in .env.local"), setting.detail);
+});
+
 test("a workflow that isn't active is a warn, and a missing one too", async () => {
   const workflows = [{ name: "backup", state: "disabled_fork" }, { name: "usage", state: "active" }];
   const { results, exitCode } = await doctor({ gh: greenGh({ workflows }) });
@@ -677,7 +701,7 @@ async function runCli({ envLocal, env = {}, routes = greenRoutes(), mode = 0o600
       stdout: JSON.stringify({ deployment_branch_policy: { custom_branch_policies: true } }),
     },
     { match: ["secret", "list"], stdout: JSON.stringify(SECRETS.map((name) => ({ name }))) },
-    { match: ["variable", "get"], exit: 1 },
+    { match: ["variable", "list"], stdout: "[]" },
     {
       match: ["workflow", "list"],
       stdout: JSON.stringify(["backup", "usage", "bump-upstream"].map((name) => ({ name, state: "active" }))),
