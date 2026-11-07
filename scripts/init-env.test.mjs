@@ -783,3 +783,16 @@ test("--push-only with an unknown name exits 2 even when .env.local is absent", 
     assert.match(r.stderr, /init-env: --push-only: unknown name NOT_A_SECRET/);
   });
 });
+
+for (const [label, arg] of [["an empty-string", ""], ["a glob", "*"]]) {
+  test(`--push-only with ${label} name exits 2 with no gh call`, { timeout: 60000 }, async () => {
+    await withDir(async (dir) => {
+      writeExisting(dir, `${SIX_ONLY}${ALLOWED}=none\n`, 0o600);
+      const { bin, log } = stubGh(dir);
+      const r = await run(dir, ["--push-only", arg], { PATH: `${bin}:${process.env.PATH}` });
+      assert.equal(r.status, 2, r.stdout + r.stderr);
+      assert.ok(r.stderr.includes(`init-env: --push-only: unknown name ${arg}\n`), r.stderr);
+      assert.ok(!existsSync(log), "gh was not called");
+    });
+  });
+}

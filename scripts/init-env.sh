@@ -40,7 +40,7 @@ usage="usage: init-env.sh [--add-missing] [--push] | init-env.sh --push-only NAM
 push=0
 add_missing=0
 push_only=0
-only_names=""
+only_names=()
 for arg in "$@"; do
   case "$arg" in
     --push) push=1 ;;
@@ -56,7 +56,7 @@ for arg in "$@"; do
         echo "$usage" >&2
         exit 2
       }
-      only_names="$only_names $arg"
+      only_names+=("$arg")
       ;;
   esac
 done
@@ -65,12 +65,12 @@ if [ "$push_only" = 1 ]; then
     echo "init-env: --push-only can't be combined with --add-missing or --push" >&2
     exit 2
   fi
-  [ -n "$only_names" ] || {
+  [ "${#only_names[@]}" -gt 0 ] || {
     echo "$usage" >&2
     exit 2
   }
   # Unknown names are a usage error, so they are refused before any file or tool is looked at.
-  for name in $only_names; do
+  for name in "${only_names[@]}"; do
     known=0
     for allowed in $original_names $connector_names $allowed_users_name SMOKE_PAT; do
       [ "$name" != "$allowed" ] || known=1
@@ -174,7 +174,7 @@ if [ "$push_only" = 1 ]; then
   # Check every name before pushing any. The file is parsed, never sourced: the last `NAME=value`
   # line wins, and one pair of surrounding quotes (README 1.4 single-quotes values with `$`) is removed.
   problems=0
-  for name in $only_names; do
+  for name in "${only_names[@]}"; do
     value="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$name=//p" "$env_file" | tail -n 1)"
     value="${value%$'\r'}"
     case "$value" in
@@ -190,7 +190,8 @@ if [ "$push_only" = 1 ]; then
     echo "init-env: nothing was pushed" >&2
     exit 1
   }
-  add_names="$only_names"
+  # Every name is validated, so the unquoted expansion in push_secrets is safe.
+  add_names="${only_names[*]}"
   recovery="init-env: nothing was written; fix the problem and re-run the same command"
   push_secrets
   exit 0
