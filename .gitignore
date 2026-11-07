@@ -5,6 +5,7 @@ infra/.terraform/
 wrangler.rendered.toml
 backup-out/
 .env.local
+.env.local.bak-*
 infra/backend.hcl
 tofu-output.json
 *.tfstate
