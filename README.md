@@ -736,7 +736,7 @@ The `kb_index` cache namespace `logseq-connector-kb-index` has no `prevent_destr
 3. Click **Connect**. The connector asks you to allow Claude access to your Logseq graphs, then sends you to GitHub. Sign in with the GitHub account whose ID is in `OWNER_GITHUB_USER_ID`. Any other account gets "This GitHub account is not allowed to use this connector."
 4. Enable the connector in a conversation from its tools menu, then ask "list my Logseq graphs".
 
-Every tool carries MCP annotations: read tools are marked read-only and delete tools destructive. Whether claude.ai uses them to skip or force the approval prompt for a custom connector hasn't been checked. Either way you can set each tool to Always allow, Needs approval or Blocked in the connector's settings.
+Every tool carries MCP annotations from one table (`ANNOTATIONS` in `connector/src/tools/spec.mjs`, recorded in `tools-manifest.json`): reads are read-only; deletes, updates, property sets, `refresh_refs` and `promote_page_to_tag` are destructive, since they can overwrite or remove data; deletes and sets are idempotent; and only `save_file_from_url`, which fetches an outside URL, is open-world. Whether claude.ai uses them to skip or force the approval prompt for a custom connector hasn't been checked. Either way you can set each tool to Always allow, Needs approval or Blocked in the connector's settings.
 
 **Claude Code cloud sessions** inherit your claude.ai connectors. Enable the connector for the session. The traffic goes through Anthropic, so the environment needs no network allow-list, environment variables or skill for it. Section 5 stays available for raw REST access.
 

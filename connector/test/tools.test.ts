@@ -5,7 +5,15 @@ import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
-import { type OpenApiSpec, SEMANTIC_TOOLS, buildManifest, checkManifest } from "../src/tools/spec.mjs";
+import { buildGraphTools } from "../src/tools/semantic";
+import {
+  ANNOTATIONS,
+  type OpenApiSpec,
+  SEMANTIC_TOOLS,
+  annotationsFor,
+  buildManifest,
+  checkManifest,
+} from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_TOKEN = "logseq_pat_WorkToken123";
@@ -182,34 +190,134 @@ describe("tool list", () => {
     const names = (await listTools()).map((t) => t.name).sort();
     expect(names).toEqual(committedManifest.map((e) => e.name).filter((n) => !SEMANTIC_TOOLS.includes(n)));
   });
+});
 
-  it("every GET tool readOnlyHint true, every DELETE destructiveHint true", async () => {
-    // Hand-written tools have no method; these two write to the graph, like a POST.
-    const handwrittenWrites = new Set(["save_document", "save_file_from_url"]);
-    const methods = new Map(
-      committedManifest.map((e) => [e.name, e.method ?? (handwrittenWrites.has(e.name) ? "POST" : null)]),
-    );
-    const tools = await listTools();
-    let gets = 0;
-    let deletes = 0;
-    for (const tool of tools) {
-      const method = methods.get(tool.name);
-      const { readOnlyHint, destructiveHint } = tool.annotations;
-      if (method === "GET" || method === null) {
-        gets += method === "GET" ? 1 : 0;
-        expect(readOnlyHint, tool.name).toBe(true);
-        expect(destructiveHint ?? false, tool.name).toBe(false);
-      } else if (method === "DELETE") {
-        deletes += 1;
-        expect(destructiveHint, tool.name).toBe(true);
-        expect(readOnlyHint, tool.name).toBe(false);
-      } else {
-        expect(readOnlyHint, tool.name).toBe(false);
-        expect(destructiveHint, tool.name).toBe(false);
-      }
+const HINT_KEYS = ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const;
+
+/** A server built as mcpHandler builds it with semantic search on (tools/list never calls AI or Vectorize). */
+function semanticOnEnv(): Env {
+  return testEnv({ AI: {} as Ai, VECTORIZE: {} as Vectorize, SEMANTIC_MAX_VECTORS: "10000" });
+}
+
+/** A copy of the spec with one more graph operation, which no annotations entry covers. */
+function specWithFakeOperation(): OpenApiSpec {
+  const changed = structuredClone(spec);
+  changed.paths["/api/v1/graphs/{graph-id}/fake"] = {
+    get: {
+      operationId: "fakeOperation",
+      summary: "Fake",
+      parameters: [{ name: "graph-id", in: "path", required: true, schema: { type: "string" } }],
+    },
+  };
+  return changed;
+}
+
+/** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
+const READ_HANDWRITTEN = ["connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file"];
+const DESTRUCTIVE_NAMED = [
+  "batch_delete_block_property",
+  "update_page",
+  "update_block",
+  "update_tag",
+  "update_property",
+  "set_block_property",
+  "batch_set_block_property",
+  "refresh_refs",
+  "promote_page_to_tag",
+];
+const ADDITIVE_NAMED = [
+  "batch_insert_block_trees",
+  "capture_to_today",
+  "move_blocks",
+  "batch_move_blocks",
+  "save_document",
+  "save_file_from_url",
+];
+
+function expectedHints(name: string, method: string | null) {
+  const classes: string[] = [];
+  if (method === "GET" || READ_HANDWRITTEN.includes(name)) classes.push("read");
+  if (name.startsWith("delete_") || DESTRUCTIVE_NAMED.includes(name)) classes.push("destructive");
+  if (/^(create|insert)_/.test(name) || ADDITIVE_NAMED.includes(name)) classes.push("additive");
+  // A new tool must be classified on purpose, and no tool may sit in two classes.
+  expect(classes, `${name} is in exactly one class`).toHaveLength(1);
+  const openWorldHint = name === "save_file_from_url";
+  if (classes[0] === "read") return { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint };
+  if (classes[0] === "additive") return { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint };
+  const idempotentHint = /^(batch_)?(delete|set)_/.test(name);
+  return { readOnlyHint: false, destructiveHint: true, idempotentHint, openWorldHint };
+}
+
+describe("annotations", () => {
+  it("every tool has annotations (and annotationsFor of an unknown tool throws)", () => {
+    const names = committedManifest.map((e) => e.name);
+    for (const name of names) {
+      expect(Object.keys(ANNOTATIONS[name] ?? {}).sort(), name).toEqual([...HINT_KEYS].sort());
+      for (const key of HINT_KEYS) expect(typeof ANNOTATIONS[name][key], `${name}.${key}`).toBe("boolean");
+      expect(annotationsFor(name)).toEqual(ANNOTATIONS[name]);
     }
-    expect(gets).toBeGreaterThan(5);
-    expect(deletes).toBeGreaterThan(3);
+    // No stale entries for tools that no longer exist.
+    expect(Object.keys(ANNOTATIONS).sort()).toEqual([...names].sort());
+    expect(() => annotationsFor("not_a_tool")).toThrow("no annotations for tool not_a_tool");
+    // Inherited keys are not entries.
+    expect(() => annotationsFor("toString")).toThrow("no annotations for tool toString");
+    // A generated tool with no entry fails the build: the manifest and the isolate's tools both refuse it.
+    const changed = specWithFakeOperation();
+    expect(() => buildManifest(changed)).toThrow("no annotations for tool fake_operation");
+    expect(() => buildGraphTools(changed, { env: testEnv(), resolve: async () => null })).toThrow(
+      "no annotations for tool fake_operation",
+    );
+  });
+
+  it("registered tools use the table (semantic on)", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    expect(tools.map((t: { name: string }) => t.name).sort()).toEqual(committedManifest.map((e) => e.name));
+    const differing = tools
+      .filter((t: { name: string; annotations: unknown }) => JSON.stringify(t.annotations) !== JSON.stringify(ANNOTATIONS[t.name]))
+      .map((t: { name: string }) => t.name);
+    expect(differing).toEqual([]);
+    for (const tool of tools) expect(tool.annotations, tool.name).toEqual(ANNOTATIONS[tool.name]);
+  });
+
+  it("expected hints: destructive writes, idempotent deletes and sets, read-only reads, open world for URL fetches only", async () => {
+    const methods = new Map(committedManifest.map((e) => [e.name, e.method]));
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const counts = { read: 0, destructive: 0, additive: 0 };
+    const wrong: Record<string, string> = {};
+    for (const tool of tools) {
+      const want = expectedHints(tool.name, methods.get(tool.name) ?? null);
+      const got = tool.annotations ?? {};
+      const off = HINT_KEYS.filter((k) => got[k] !== want[k]).map((k) => `${k}=${got[k]}`);
+      if (off.length > 0) wrong[tool.name] = off.join(" ");
+    }
+    expect(wrong).toEqual({});
+    for (const tool of tools) {
+      const want = expectedHints(tool.name, methods.get(tool.name) ?? null);
+      expect(tool.annotations, tool.name).toEqual(want);
+      expect(ANNOTATIONS[tool.name], tool.name).toEqual(want);
+      counts[want.readOnlyHint ? "read" : want.destructiveHint ? "destructive" : "additive"] += 1;
+    }
+    expect(counts.read).toBeGreaterThan(15);
+    expect(counts.destructive).toBeGreaterThan(10);
+    expect(counts.additive).toBeGreaterThan(8);
+    // The data-losing calls the HTTP method hid, named one by one.
+    for (const name of [
+      "batch_delete_block_property",
+      "update_property",
+      "update_block",
+      "set_block_property",
+      "refresh_refs",
+      "promote_page_to_tag",
+    ]) {
+      expect(ANNOTATIONS[name], name).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    }
+    for (const name of ["delete_blocks", "delete_page", "set_block_property", "batch_set_block_property"]) {
+      expect(ANNOTATIONS[name].idempotentHint, name).toBe(true);
+    }
+    for (const name of ["update_block", "move_blocks", "save_document"]) {
+      expect(ANNOTATIONS[name].idempotentHint, name).toBe(false);
+    }
+    expect(Object.keys(ANNOTATIONS).filter((name) => ANNOTATIONS[name].openWorldHint)).toEqual(["save_file_from_url"]);
   });
 });
 
@@ -519,14 +627,13 @@ describe("hand-written tools", () => {
     expect(promote.inputSchema.required.sort()).toEqual(["graph", "page-id"]);
     expect(promote.inputSchema.properties["page-id"].type).toBe("string");
     expect(promote.inputSchema.properties.body.type).toBe("object");
-    expect(promote.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(promote.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
     expect(promote.description).toContain(
       "Turns an existing page into a tag in place: its UUID, blocks, properties and references are kept, and links to it stay links (they aren't tagged).",
     );
     expect(promote.description).toContain("Refuses journals, built-ins, properties, namespaced pages and existing tags.");
     expect(promote.description).toContain("Setting a page's tags to Tag is refused; use this instead.");
-    expect(committedManifest).toContainEqual({
-      name: "promote_page_to_tag",
+    expect(committedManifest.find((e) => e.name === "promote_page_to_tag")).toMatchObject({
       method: "POST",
       path: "/api/v1/graphs/{graph-id}/pages/{page-id}/promote-to-tag",
     });
@@ -619,6 +726,7 @@ describe("hand-written tools", () => {
       "choices.retire",
       "convert_values",
       "choices and convert_values are refused on E2EE graphs",
+      "are marked destructive, so claude.ai asks before running them",
     ]) {
       expect(result.text).toContain(phrase);
     }
@@ -631,17 +739,29 @@ describe("tools manifest", () => {
   it("manifest check passes on committed manifest and fails after adding a fake operation", () => {
     expect(checkManifest(committedManifest, spec)).toEqual([]);
 
-    const changed = structuredClone(spec);
-    changed.paths["/api/v1/graphs/{graph-id}/fake"] = {
-      get: {
-        operationId: "fakeOperation",
-        summary: "Fake",
-        parameters: [{ name: "graph-id", in: "path", required: true, schema: { type: "string" } }],
-      },
-    };
-    const diff = checkManifest(committedManifest, changed);
-    expect(diff).toEqual(["+ fake_operation GET /api/v1/graphs/{graph-id}/fake"]);
-    expect(buildManifest(changed)).toHaveLength(committedManifest.length + 1);
+    const [first, ...rest] = committedManifest;
+    expect(checkManifest(rest, spec)).toEqual([
+      "+ batch_delete_block_property POST /api/v1/graphs/{graph-id}/block-properties/batch-delete [destructive idempotent]",
+    ]);
+    expect(first.name).toBe("batch_delete_block_property");
+    // An operation with no annotations entry stops the manifest from being built at all.
+    expect(() => buildManifest(specWithFakeOperation())).toThrow("no annotations for tool fake_operation");
+  });
+
+  it("manifest records annotations (checkManifest flags a differing destructiveHint)", () => {
+    for (const entry of committedManifest as { name: string; annotations?: unknown }[]) {
+      expect(entry.annotations, `${entry.name} records annotations`).toBeDefined();
+      expect(entry.annotations, entry.name).toEqual(ANNOTATIONS[entry.name]);
+    }
+    const flipped = structuredClone(committedManifest) as { name: string; annotations: Record<string, boolean> }[];
+    flipped.find((e) => e.name === "update_block")!.annotations.destructiveHint = false;
+    expect(checkManifest(flipped, spec)).toEqual([
+      "+ update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [destructive]",
+      "- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [no hints]",
+    ]);
+    // A committed manifest from before annotations were recorded is stale.
+    const bare = committedManifest.map(({ name, method, path }) => ({ name, method, path }));
+    expect(checkManifest(bare, spec)).toContain("- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [annotations missing]");
   });
 
   it("refuses operations it does not understand", () => {

@@ -5,7 +5,7 @@ import type { ResolvedGraph } from "../graphs";
 import { SafeFetchError, readUpTo, safeFetch } from "../net/safe-fetch";
 import { RESULT_CHAR_LIMIT, ToolError, aliasArg, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
-import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION } from "./spec.mjs";
+import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 // The file tools replace the generated createAsset/getAsset (design §7). createAsset takes the raw
 // bytes as `application/octet-stream` with their exact `size` and SHA-256 `checksum` as query
@@ -261,8 +261,6 @@ export function registerAssetTools(
   access: GraphAccess,
   onSuccess: (tool: string, alias: string) => void,
 ): void {
-  const write = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
-
   function handle<A>(name: string, call: (alias: string, args: A) => Promise<CallToolResult>) {
     return (args: A) => {
       const alias = aliasArg(args);
@@ -288,7 +286,7 @@ export function registerAssetTools(
         base64: z.string().optional().describe("The document's bytes, base64-encoded. Pass this or text."),
         page: pageArg,
       }),
-      annotations: write,
+      annotations: annotationsFor("save_document"),
     },
     handle("save_document", async (alias, args) => {
       const graph = await resolveGraph(access, alias, true);
@@ -323,7 +321,7 @@ export function registerAssetTools(
           .describe("File name with an extension; defaults to the URL's last path segment"),
         page: pageArg,
       }),
-      annotations: write,
+      annotations: annotationsFor("save_file_from_url"),
     },
     handle("save_file_from_url", async (alias, args) => {
       const graph = await resolveGraph(access, alias, true);
@@ -355,7 +353,7 @@ export function registerAssetTools(
           .regex(UUID)
           .describe("The asset block's UUID, e.g. from save_document, list_assets or search_graph"),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+      annotations: annotationsFor("read_file"),
     },
     handle("read_file", (alias, args) => readFile(access, alias, args.assetUuid)),
   );

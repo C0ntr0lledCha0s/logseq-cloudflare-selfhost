@@ -7,7 +7,7 @@ description: Add or change an MCP tool the connector exposes to Claude, either g
 
 There are two kinds of tool:
 
-- **Generated tools** come from the vendored upstream `openapi.json` (`connector/src/tools/semantic.ts`, filtered and named in `spec.mjs`). To add one, add the operation upstream with a patch (`add-upstream-patch`), re-vendor, and it appears. `EXCLUDED_OPERATIONS` in `spec.mjs` hides operations Claude shouldn't call.
+- **Generated tools** come from the vendored upstream `openapi.json` (`connector/src/tools/semantic.ts`, filtered and named in `spec.mjs`). To add one, add the operation upstream with a patch (`add-upstream-patch`), re-vendor, and give it an entry in `ANNOTATIONS` in `spec.mjs` (upstream's method-derived hints are ignored; a tool with no entry fails the manifest and the Worker). `EXCLUDED_OPERATIONS` in `spec.mjs` hides operations Claude shouldn't call.
 - **Hand-written tools** are registered with `server.registerTool` in `connector/src/tools/` (`handwritten.ts`, `kb-index.ts`, `semantic-search.ts` and `assets.ts`, wired up in `src/mcp.ts`). Use one when the tool combines calls, reads the connector's own storage (D1, KV, Vectorize) or must not reach the sync server.
 
 ## Steps for a hand-written tool
@@ -16,7 +16,7 @@ There are two kinds of tool:
 2. **Register it** with:
    - a description that says what it returns and when to use it,
    - a zod `inputSchema` (the graph argument uses `ALIAS_PATTERN` and `GRAPH_PARAM_DESCRIPTION` from `spec.mjs`),
-   - `annotations` (`readOnlyHint`, `destructiveHint`, `openWorldHint`) that are true for this tool, and
+   - `annotations: annotationsFor("<name>")`, with the tool's entry added to `ANNOTATIONS` in `spec.mjs` (one of `READ`, `DESTRUCTIVE`, `DESTRUCTIVE_IDEMPOTENT` or `ADDITIVE`; `openWorldHint` only when it fetches outside the graph), and
    - its body wrapped in `runTool`.
 3. **List it** in `HANDWRITTEN_TOOLS` in `spec.mjs` (and `SEMANTIC_TOOLS` if it depends on semantic search), then run `npm --prefix connector run update:manifest`.
 4. **Teach Claude.** Update `connector_help` (`CONNECTOR_HELP` in `handwritten.ts`) if the tool changes how Claude should work, and README §11.8.
