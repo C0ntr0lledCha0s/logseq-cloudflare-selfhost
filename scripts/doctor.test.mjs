@@ -568,6 +568,29 @@ test("gh not installed or not logged in is one FAIL, and no other GitHub check r
   assert.equal(exitCode, 1);
 });
 
+test("DOCTOR_SKIP_GITHUB=1 skips the five GitHub checks, makes no gh call, and says so", async () => {
+  const gh = greenGh();
+  const { results, exitCode, ghCalls } = await doctor({ env: { DOCTOR_SKIP_GITHUB: "1" }, gh });
+  assert.deepEqual(ghCalls, []);
+  for (const name of ["actions", "environment", "secrets", "connector-setting", "schedules"]) {
+    assert.equal(named(results, name).length, 0, name);
+  }
+  const skipped = only(results, "github");
+  assert.deepEqual([skipped.level, skipped.detail], ["skip", "setup.sh configures it next"]);
+  // The Cloudflare and local checks still ran, and a skip isn't a failure.
+  assert.equal(levelOf(results, "token"), "ok");
+  assert.equal(levelOf(results, "env-mode"), "ok");
+  assert.equal(exitCode, 0);
+});
+
+test("DOCTOR_SKIP_GITHUB=1 prints `skip github: setup.sh configures it next` from the CLI", async () => {
+  const envLocal = `CLOUDFLARE_ACCOUNT_ID=acct\nCLOUDFLARE_API_TOKEN=tok\nSYNC_HOSTNAME=sync.example.com\nDB_SYNC_ALLOWED_USERS=${USER}\n`;
+  const out = await runCli({ envLocal, env: { DOCTOR_SKIP_GITHUB: "1" } });
+  assert.equal(out.status, 0, out.stdout);
+  assert.ok(out.stdout.split("\n").includes("skip github: setup.sh configures it next"), out.stdout);
+  assert.ok(out.stdout.includes("doctor: 0 failed, 0 warnings"), out.stdout);
+});
+
 test("env-mode: .env.local must be mode 600", async () => {
   const loose = await doctor({ repo: repoDir({ mode: 0o644 }) });
   const result = only(loose.results, "env-mode");

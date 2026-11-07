@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 /**
  * Writes a Node `gh` stub into `dir/bin` (put `bin` on PATH). Each call is logged as a JSON line.
- * `rules` are `{ match: string[], stdout?: string, exit?: number }`: the first rule whose `match`
+ * `rules` are `{ match: string[], stdout?: string, stderr?: string, exit?: number }`: the first rule whose `match`
  * is a prefix of argv applies. A call no rule matches exits 1 with `unstubbed gh call: <argv>`.
  */
 export function stubGh(dir, rules) {
@@ -28,6 +28,7 @@ if (!rule) {
   process.exit(1);
 }
 if (rule.stdout) process.stdout.write(rule.stdout);
+if (rule.stderr) process.stderr.write(rule.stderr);
 process.exit(rule.exit ?? 0);
 `,
   );

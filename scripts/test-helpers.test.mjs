@@ -28,6 +28,17 @@ test("stubGh: the first matching prefix rule answers, and every call is logged w
   }
 });
 
+test("stubGh: a rule's stderr is written with its exit code", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "test-helpers-"));
+  try {
+    const gh = stubGh(dir, [{ match: ["api"], stderr: "gh: Not Found (HTTP 404)\n", exit: 1 }]);
+    const r = await runScript("gh", ["api", "x"], { env: { PATH: `${gh.bin}:${process.env.PATH}` } });
+    assert.deepEqual([r.status, r.stdout, r.stderr], [1, "", "gh: Not Found (HTTP 404)\n"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("stubGh: an unmatched call exits 1 and names the call on stderr", async () => {
   const dir = mkdtempSync(join(tmpdir(), "test-helpers-"));
   try {

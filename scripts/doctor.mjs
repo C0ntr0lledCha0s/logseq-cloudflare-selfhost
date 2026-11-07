@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Usage: doctor.mjs [--repo-root <dir>]   (normally run through doctor.sh, which loads .env.local)
 // Env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, SYNC_HOSTNAME, CONNECTOR_ENABLED, CONNECTOR_HOSTNAME,
-// SEMANTIC_SEARCH_ENABLED, DB_SYNC_ALLOWED_USERS. CF_API_BASE and CF_API_TEST are for tests (cloudflare-api.mjs).
+// SEMANTIC_SEARCH_ENABLED, DB_SYNC_ALLOWED_USERS. DOCTOR_SKIP_GITHUB=1 skips the GitHub checks (setup.sh sets it
+// for its own run, before it has configured GitHub). CF_API_BASE and CF_API_TEST are for tests (cloudflare-api.mjs).
 //
 // A read-only check of the Cloudflare account, the token, the domain, the GitHub repo and the local
-// files. It prints one line per check (ok, warn or FAIL) and exits 1 if any check failed. It never
+// files. It prints one line per check (ok, warn, skip or FAIL) and exits 1 if any check failed. It never
 // prints a secret, an ID or a DNS record's content: only names, counts and the API's own messages.
 // The check that matters most is `dns`: a deploy from Actions replaces an existing DNS record on the
 // hostname without asking, so a hostname that is already in use must stop setup.
@@ -276,7 +277,10 @@ export async function runDoctor({ env, cfCall, gh, now, repoRoot = defaultRepoRo
   }
 
   // ---- GitHub ----
-  await checkGithub({ env, gh, add, connectorOn });
+  // setup.sh runs the doctor before it creates the environment, the secrets and the schedules, so
+  // those checks can't pass yet. It sets DOCTOR_SKIP_GITHUB=1 for that run only.
+  if (env.DOCTOR_SKIP_GITHUB === "1") add("skip", "github", "setup.sh configures it next");
+  else await checkGithub({ env, gh, add, connectorOn });
 
   // ---- Local files ----
   try {
