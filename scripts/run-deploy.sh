@@ -33,9 +33,11 @@ max_polls=20
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(dirname "$script_dir")"
-repo="$(cd "$repo_root" && gh repo view --json nameWithOwner -q .nameWithOwner)"
-[ -n "$repo" ] || {
-  echo "run-deploy: could not determine the GitHub repo for $repo_root" >&2
+# shellcheck source=lib/gh.sh
+. "$script_dir/lib/gh.sh"
+# The repo the origin remote points at, never gh's own pick (the parent, in a fork clone with an upstream remote).
+repo="$(origin_repo "$repo_root")" || {
+  echo "run-deploy: could not determine the GitHub repo of the origin remote of $repo_root" >&2
   exit 1
 }
 

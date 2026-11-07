@@ -39,7 +39,7 @@ fail() {
   exit 1
 }
 
-# gh_try and gh_must (stdin closed on every gh call, 404 and 403 told apart) live in lib/gh.sh.
+# origin_repo, gh_try and gh_must (stdin closed on every gh call, 404 and 403 told apart) live in lib/gh.sh.
 # shellcheck source=lib/gh.sh
 . "$scripts/lib/gh.sh"
 
@@ -83,7 +83,7 @@ TEXT
 # ---- Prerequisites ----
 [ -f "$env_file" ] || fail "there is no .env.local here: run scripts/setup.sh first"
 command -v gh >/dev/null 2>&1 || fail "install gh (https://cli.github.com) and run gh auth login"
-repo="$(gh repo view --json nameWithOwner -q .nameWithOwner </dev/null)" || fail "couldn't read this repo from gh: run gh auth status"
+repo="$(origin_repo "$repo_root")" || fail "couldn't read the origin remote's repo from gh: run gh auth status"
 
 # ---- 1. Already on? ----
 rc=0

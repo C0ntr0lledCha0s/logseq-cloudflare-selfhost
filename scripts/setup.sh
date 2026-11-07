@@ -48,7 +48,7 @@ fail() {
   exit 1
 }
 
-# gh_try and gh_must (stdin closed on every gh call, 404 and 403 told apart) live in lib/gh.sh.
+# origin_repo, gh_try and gh_must (stdin closed on every gh call, 404 and 403 told apart) live in lib/gh.sh.
 # shellcheck source=lib/gh.sh
 . "$scripts/lib/gh.sh"
 
@@ -81,8 +81,9 @@ echo "done"
 
 # ---- 2. Which repo ----
 stage 2 "Which repo"
-repo="$(gh repo view --json nameWithOwner -q .nameWithOwner </dev/null)" || fail "couldn't read this repo from gh: run gh auth status"
-is_fork="$(gh repo view --json isFork -q .isFork </dev/null)" || fail "couldn't read this repo from gh: run gh auth status"
+# The repo the origin remote points at (lib/gh.sh), never gh's own pick, which is the parent in a fork clone with an upstream remote.
+repo="$(origin_repo "$repo_root")" || fail "couldn't read the origin remote's repo from gh: run gh auth status"
+is_fork="$(gh repo view "$repo" --json isFork -q .isFork </dev/null)" || fail "couldn't read $repo from gh: run gh auth status"
 echo "This will set up $repo (GitHub) and deploy to your Cloudflare account."
 if [ "$is_fork" = "false" ]; then
   echo "Note: $repo is not a fork. If you meant to set up your own copy, fork it first (README \"Before you start\")."

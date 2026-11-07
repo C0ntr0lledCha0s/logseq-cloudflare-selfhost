@@ -76,9 +76,10 @@ const defaultRepoRoot = () => join(dirname(fileURLToPath(import.meta.url)), ".."
 
 /**
  * Runs every check. `cfCall` is `(opts) => cf({ apiBase, apiToken, ...opts })`, `gh(args)` returns
- * `{ status, stdout }`, and `now` is the time in milliseconds. Never throws for a failed check.
+ * `{ status, stdout, stderr }`, `originUrl` is the checkout's `origin` remote URL ("" when there is none),
+ * and `now` is the time in milliseconds. Never throws for a failed check.
  */
-export async function runDoctor({ env, cfCall, gh, now, repoRoot = defaultRepoRoot() }) {
+export async function runDoctor({ env, cfCall, gh, originUrl, now, repoRoot = defaultRepoRoot() }) {
   const { syncWorker, connectorWorker } = readSettings(repoRoot);
   const results = [];
   const add = (level, name, detail) => results.push({ level, name, detail });
@@ -280,7 +281,7 @@ export async function runDoctor({ env, cfCall, gh, now, repoRoot = defaultRepoRo
   // setup.sh runs the doctor before it creates the environment, the secrets and the schedules, so
   // those checks can't pass yet. It sets DOCTOR_SKIP_GITHUB=1 for that run only.
   if (env.DOCTOR_SKIP_GITHUB === "1") add("skip", "github", "setup.sh configures it next");
-  else await checkGithub({ env, gh, add, connectorOn });
+  else await checkGithub({ env, gh, originUrl, add, connectorOn });
 
   // ---- Local files ----
   try {
@@ -298,7 +299,7 @@ export async function runDoctor({ env, cfCall, gh, now, repoRoot = defaultRepoRo
 }
 
 /** The GitHub checks. They compare names and states only: `gh` never shows a secret's value. */
-async function checkGithub({ env, gh, add, connectorOn }) {
+async function checkGithub({ env, gh, originUrl, add, connectorOn }) {
   const json = (args) => {
     const out = gh(args);
     if (out.status !== 0) return { ok: false };
@@ -309,7 +310,13 @@ async function checkGithub({ env, gh, add, connectorOn }) {
     }
   };
 
-  const repoInfo = json(["repo", "view", "--json", "nameWithOwner,isFork"]);
+  // The repo the origin remote points at. `gh repo view` with no repo argument would pick the parent
+  // in a fork clone with an `upstream` remote.
+  if (originUrl === "") {
+    add("FAIL", "github", "this checkout has no origin remote (git remote get-url origin): run doctor from your clone of the repo");
+    return;
+  }
+  const repoInfo = json(["repo", "view", originUrl, "--json", "nameWithOwner,isFork"]);
   if (!repoInfo.ok || typeof repoInfo.value?.nameWithOwner !== "string") {
     add("FAIL", "github", "gh isn't installed or logged in (gh auth login)");
     return;
@@ -381,8 +388,14 @@ const formatResult = (r) => `${r.level.padEnd(4)} ${r.name}: ${r.detail}`;
 function ghRunner(repoRoot) {
   return (args) => {
     const out = spawnSync("gh", args, { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-    return { status: out.error ? 127 : (out.status ?? 1), stdout: out.stdout ?? "" };
+    return { status: out.error ? 127 : (out.status ?? 1), stdout: out.stdout ?? "", stderr: out.stderr ?? "" };
   };
+}
+
+/** The URL of the checkout's `origin` remote, or "" when there is none. */
+function originRemoteUrl(repoRoot) {
+  const out = spawnSync("git", ["-C", repoRoot, "remote", "get-url", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return out.status === 0 ? out.stdout.trim() : "";
 }
 
 /** Returns the exit code. */
@@ -392,7 +405,9 @@ export async function run(argv, env = process.env) {
   const apiBase = apiBaseFromEnv(env);
   const apiToken = env.CLOUDFLARE_API_TOKEN;
   const cfCall = (opts) => cf({ apiBase, apiToken, ...opts });
-  const { results, exitCode } = await runDoctor({ env, cfCall, gh: ghRunner(repoRoot), now: Date.now(), repoRoot });
+  const { results, exitCode } = await runDoctor({
+    env, cfCall, gh: ghRunner(repoRoot), originUrl: originRemoteUrl(repoRoot), now: Date.now(), repoRoot,
+  });
   for (const r of results) console.log(formatResult(r));
   const failed = results.filter((r) => r.level === "FAIL").length;
   const warnings = results.filter((r) => r.level === "warn").length;

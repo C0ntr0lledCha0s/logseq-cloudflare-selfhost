@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -12,6 +13,9 @@ import { permissionLabels, readConfig } from "./token-link.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TOKEN_PAGE = "dash.cloudflare.com/?to=/:account/api-tokens";
 const REPO = "example/logseq-selfhost";
+const ORIGIN = `https://github.com/${REPO}.git`;
+// The repo a fork was made from: `gh repo view` with no repo argument names it in a clone with an `upstream` remote.
+const PARENT = "upstream-owner/logseq-selfhost";
 const SECRETS = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE", "ASSET_LINK_SECRET",
   "DB_SYNC_ADMIN_TOKEN", "DB_SYNC_ALLOWED_USERS", "SYNC_HOSTNAME",
@@ -53,7 +57,8 @@ function greenGh({ secrets = SECRETS, fork = false, envVariable, repoVariable, w
   ];
   const rules = [
     ...extra,
-    ["repo view", { status: 0, stdout: JSON.stringify({ nameWithOwner: REPO, isFork: fork }) }],
+    [`repo view ${ORIGIN} --json nameWithOwner,isFork`, { status: 0, stdout: JSON.stringify({ nameWithOwner: REPO, isFork: fork }) }],
+    ["repo view", { status: 0, stdout: JSON.stringify({ nameWithOwner: PARENT, isFork: false }) }],
     [`api repos/${REPO}/actions/permissions`, { status: 0, stdout: JSON.stringify({ enabled: true }) }],
     [
       `api repos/${REPO}/environments/production`,
@@ -100,11 +105,11 @@ const baseEnv = {
 };
 
 /** Runs the doctor against a Cloudflare stub. Returns the results, the exit code and what was called. */
-async function doctor({ env = {}, routes = greenRoutes(), gh = greenGh(), repo = repoDir() } = {}) {
+async function doctor({ env = {}, routes = greenRoutes(), gh = greenGh(), repo = repoDir(), originUrl = ORIGIN } = {}) {
   const stub = await cfStub(routes);
   try {
     const cfCall = (opts) => cf({ apiBase: stub.base, apiToken: "tok", ...opts });
-    const outcome = await runDoctor({ env: { ...baseEnv, ...env }, cfCall, gh: gh.gh, now: NOW, repoRoot: repo });
+    const outcome = await runDoctor({ env: { ...baseEnv, ...env }, cfCall, gh: gh.gh, originUrl, now: NOW, repoRoot: repo });
     return { ...outcome, requests: stub.requests, ghCalls: gh.calls };
   } finally {
     await stub.close();
@@ -653,12 +658,19 @@ test("DOCTOR_REPO_ROOT is refused without DOCTOR_TEST=1", async () => {
   assert.ok(out.stderr.includes("DOCTOR_REPO_ROOT is test-only and requires DOCTOR_TEST=1"), out.stderr);
 });
 
-/** Runs doctor.sh against a Cloudflare stub and a stubbed `gh`, in a temp repo that holds .env.local. */
+/**
+ * Runs doctor.sh against a Cloudflare stub and a stubbed `gh`, in a temp clone that holds .env.local.
+ * The clone's `origin` is REPO and its `upstream` the parent, which gh picks when given no repo.
+ */
 async function runCli({ envLocal, env = {}, routes = greenRoutes(), mode = 0o600 } = {}) {
   const dir = repoDir({ envLocal, mode });
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync("git", ["remote", "add", "origin", ORIGIN], { cwd: dir });
+  execFileSync("git", ["remote", "add", "upstream", `https://github.com/${PARENT}.git`], { cwd: dir });
   const ghDir = mkdtempSync(join(tmpdir(), "doctor-gh-"));
-  const { bin } = stubGh(ghDir, [
-    { match: ["repo", "view"], stdout: JSON.stringify({ nameWithOwner: REPO, isFork: false }) },
+  const { bin, calls } = stubGh(ghDir, [
+    { match: ["repo", "view", ORIGIN], stdout: JSON.stringify({ nameWithOwner: REPO, isFork: false }) },
+    { match: ["repo", "view"], stdout: JSON.stringify({ nameWithOwner: PARENT, isFork: false }) },
     { match: ["api", `repos/${REPO}/actions/permissions`], stdout: JSON.stringify({ enabled: true }) },
     {
       match: ["api", `repos/${REPO}/environments/production`],
@@ -682,7 +694,7 @@ async function runCli({ envLocal, env = {}, routes = greenRoutes(), mode = 0o600
         ...env,
       },
     });
-    return { ...out, requests: stub.requests };
+    return { ...out, requests: stub.requests, ghCalls: calls().map((c) => c.argv) };
   } finally {
     await stub.close();
   }
@@ -698,6 +710,23 @@ test("doctor.sh reads .env.local, prints one line per check and a summary, and e
   assert.ok(lines.includes("ok   token: the token is active"), out.stdout);
   assert.ok(lines.every((line) => /^(ok  |warn|FAIL) \S+: .+$/.test(line) || line.startsWith("doctor: ")), out.stdout);
   assert.ok(!/\btok\b/.test(out.stdout) && !/\bacct\b/.test(out.stdout), out.stdout);
+});
+
+test("doctor.sh checks the repo the origin remote points at, never the parent gh would pick", async () => {
+  const envLocal = `CLOUDFLARE_ACCOUNT_ID=acct\nCLOUDFLARE_API_TOKEN=tok\nSYNC_HOSTNAME=sync.example.com\nDB_SYNC_ALLOWED_USERS=${USER}\n`;
+  const out = await runCli({ envLocal });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.deepEqual(out.ghCalls[0], ["repo", "view", ORIGIN, "--json", "nameWithOwner,isFork"]);
+  assert.ok(!out.ghCalls.flat().some((arg) => arg.includes(PARENT)), JSON.stringify(out.ghCalls));
+});
+
+test("a checkout with no origin remote is one github FAIL, and no gh call is made", async () => {
+  const gh = greenGh();
+  const { results, ghCalls } = await doctor({ gh, originUrl: "" });
+  const github = only(results, "github");
+  assert.equal(github.level, "FAIL");
+  assert.ok(github.detail.includes("git remote get-url origin"), github.detail);
+  assert.deepEqual(ghCalls, []);
 });
 
 test("doctor.sh: a value the caller already set wins over .env.local, and exit 1 follows a FAIL", async () => {

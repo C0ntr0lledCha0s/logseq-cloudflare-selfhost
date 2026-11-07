@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync,
-  readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
+  readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -41,9 +41,17 @@ const inputs = {
   SYNC_HOSTNAME: HOST,
 };
 
+// The fixture is a fork clone: `origin` is the user's repo and `upstream` the parent. `gh repo view`
+// with no repo argument names the parent in such a clone, so the stub answers parent/repo unless the
+// origin URL is passed.
+const ORIGIN = "https://github.com/expected/repo.git";
+
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "init-env-"));
   copyFileSync(join(root, ".env.local.example"), join(dir, ".env.local.example"));
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync("git", ["remote", "add", "origin", ORIGIN], { cwd: dir });
+  execFileSync("git", ["remote", "add", "upstream", "https://github.com/parent/repo.git"], { cwd: dir });
   return dir;
 }
 
@@ -59,7 +67,7 @@ const fs = require("fs");
 const stdin = fs.readFileSync(0, "utf8");
 const argv = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, stdin, cwd: process.cwd() }) + "\\n");
-if (argv[0] === "repo") process.stdout.write("expected/repo\\n");
+if (argv[0] === "repo") process.stdout.write(argv[2] === ${JSON.stringify(ORIGIN)} ? "expected/repo\\n" : "parent/repo\\n");
 process.exit(argv[0] === "secret" && argv[2] === ${JSON.stringify(failOn ?? "")} ? 1 : 0);
 `,
   );
@@ -173,8 +181,8 @@ test("--push sets each secret via gh with the value on stdin only", { timeout: 6
     assert.match(r.stdout, /expected\/repo/);
     const env = parseEnv(dir);
     const all = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    assert.deepEqual(all[0].argv.slice(0, 2), ["repo", "view"]);
-    assert.equal(realpathSync(all[0].cwd), realpathSync(dir), "repo derived from the checkout, not cwd");
+    // The repo comes from the checkout's origin remote, whatever the current directory is.
+    assert.deepEqual(all[0].argv, ["repo", "view", ORIGIN, "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
     assert.deepEqual(all[1].argv, ["api", "repos/expected/repo/environments/production"]);
     const calls = all.slice(2);
     const names = [
@@ -363,7 +371,7 @@ test("--add-missing --push pushes only added names with -R", { timeout: 60000 },
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const env = parseEnv(dir);
     const all = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    assert.deepEqual(all[0].argv.slice(0, 2), ["repo", "view"]);
+    assert.deepEqual(all[0].argv, ["repo", "view", ORIGIN, "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
     assert.deepEqual(all[1].argv, ["api", "repos/expected/repo/environments/production"]);
     const calls = all.slice(2);
     assert.equal(calls.length, CONNECTOR_NAMES.length);

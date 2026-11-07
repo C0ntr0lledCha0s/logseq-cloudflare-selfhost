@@ -405,12 +405,12 @@ Then add the secrets:
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
-The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the seven required secrets above in the `production` environment of the repo that owns your checkout (it prints the repo name first and passes it to `gh` with `-R`), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in. The connector's secrets are pushed later, by `scripts/init-env.sh --add-missing --push` (section 11).
+The easiest way is `scripts/init-env.sh --push`. It does 1.4 and then sets the seven required secrets above in the `production` environment of the repo your checkout's `origin` remote points at (it prints the repo name first and passes it to `gh` with `-R`; a fork clone with an `upstream` remote still pushes to your fork, not the parent), passing each value on stdin only. Run it after the `production` environment exists (the commands above) and `gh` is logged in. The connector's secrets are pushed later, by `scripts/init-env.sh --add-missing --push` (section 11).
 
 If `.env.local` already exists, or a push failed part-way, `scripts/init-env.sh --push-only NAME...` pushes just the named values from it (the connector's names too). Or load `.env.local` as in 1.4 and copy the values with this loop (bash). The values never land in your shell history or in `gh`'s arguments. Uncomment the second `names` line once the connector's values are in `.env.local`:
 
 ```bash
-repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"   # run inside this checkout
+repo="$(gh repo view "$(git remote get-url origin)" --json nameWithOwner -q .nameWithOwner)"   # run inside this checkout
 echo "Pushing to $repo"
 names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN DB_SYNC_ALLOWED_USERS SYNC_HOSTNAME"
 # names="$names CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"

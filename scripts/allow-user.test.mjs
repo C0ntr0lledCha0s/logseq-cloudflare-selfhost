@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -17,6 +18,7 @@ const SUB_C = "88888888-2222-4333-8444-555555555555";
 const KNOWN_A = "aaaaaaaa-0000-4000-8000-000000000001";
 const KNOWN_B = "bbbbbbbb-0000-4000-8000-000000000002";
 const REPO = "example/repo";
+const ORIGIN = `https://github.com/${REPO}.git`;
 const RUN_URL = "https://github.com/example/repo/actions/runs/4242";
 const TELEMETRY = "POST /accounts/acct/workers/observability/telemetry/query";
 
@@ -150,7 +152,9 @@ const ENV_LOCAL = (list) =>
 
 const ghRules = (extra = []) => [
   ...extra,
-  { match: ["repo", "view"], stdout: `${REPO}\n` },
+  { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
+  // gh's own choice in a fork clone with an `upstream` remote: the parent repo.
+  { match: ["repo", "view"], stdout: "upstream-owner/repo\n" },
   { match: ["api", `repos/${REPO}/environments/production`] },
   { match: ["secret", "set"] },
   { match: ["workflow", "run"] },
@@ -176,9 +180,12 @@ async function withCli({ list = "none", cfRoutes = routes(), gh = ghRules() }, f
   const stub = await cfStub(cfRoutes);
   try {
     mkdirSync(join(dir, "config"));
-    mkdirSync(join(dir, "scripts"));
+    mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
     copyFileSync(join(root, "config", "settings.json"), join(dir, "config", "settings.json"));
-    for (const name of ["init-env.sh", "run-deploy.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
+    for (const name of ["init-env.sh", "run-deploy.sh", "lib/gh.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["remote", "add", "origin", ORIGIN], { cwd: dir });
+    execFileSync("git", ["remote", "add", "upstream", "https://github.com/upstream-owner/repo.git"], { cwd: dir });
     writeFileSync(join(dir, ".env.local"), ENV_LOCAL(list), { mode: 0o600 });
     chmodSync(join(dir, ".env.local"), 0o600);
     const ghStub = stubGh(dir, gh);

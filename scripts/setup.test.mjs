@@ -15,6 +15,11 @@ const SECRETS = [
   "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "TOFU_ENCRYPTION_PASSPHRASE", "ASSET_LINK_SECRET",
   "DB_SYNC_ADMIN_TOKEN", "DB_SYNC_ALLOWED_USERS", "SYNC_HOSTNAME",
 ];
+const ORIGIN = `https://github.com/${REPO}.git`;
+// The repo a fork was made from. `gh repo view` with no repo argument names it when the clone has an
+// `upstream` remote, so the stub answers with it unless the origin URL is passed.
+const PARENT = "upstream-owner/logseq-selfhost";
+const PARENT_URL = `https://github.com/${PARENT}.git`;
 const NOT_FOUND = "gh: Not Found (HTTP 404)\n";
 const FORBIDDEN = "gh: Resource not accessible by personal access token (HTTP 403)\n";
 
@@ -36,7 +41,7 @@ fi
 `;
 
 /** A temp repo root: stub scripts, the real helpers setup.sh calls, the ruleset, and a GitHub origin. */
-function makeRoot({ envLocal = null, origin = `https://github.com/${REPO}.git` } = {}) {
+function makeRoot({ envLocal = null, origin = ORIGIN, upstream = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "setup-"));
   mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
   mkdirSync(join(dir, "config"));
@@ -54,6 +59,7 @@ function makeRoot({ envLocal = null, origin = `https://github.com/${REPO}.git` }
   }
   execFileSync("git", ["init", "-q"], { cwd: dir });
   if (origin !== null) execFileSync("git", ["remote", "add", "origin", origin], { cwd: dir });
+  if (upstream !== null) execFileSync("git", ["remote", "add", "upstream", upstream], { cwd: dir });
   return dir;
 }
 
@@ -69,8 +75,10 @@ function ghRules({ fork = true, over = [] } = {}) {
   return [
     ...over,
     { match: ["auth", "status"], stdout: "Logged in to github.com\n  - Token scopes: 'gist', 'read:org', 'repo'\n" },
-    { match: ["repo", "view", "--json", "nameWithOwner"], stdout: `${REPO}\n` },
-    { match: ["repo", "view", "--json", "isFork"], stdout: `${fork}\n` },
+    { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
+    { match: ["repo", "view", REPO, "--json", "isFork"], stdout: `${fork}\n` },
+    // gh's own choice in a clone with an `upstream` remote.
+    { match: ["repo", "view"], stdout: `${PARENT}\n` },
     { match: ["api", "user"], stdout: "octocat\n" },
     { match: ["secret", "list"], stdout: JSON.stringify(SECRETS.map((name) => ({ name }))) },
     {
@@ -101,8 +109,8 @@ const freshRules = (opts = {}) =>
   });
 
 /** Runs setup.sh in a temp root. Returns the result, the stub-script log and the `gh` calls. */
-async function setup({ args = ["--yes"], input = "", rules = ghRules(), envLocal = null, origin, env = {} } = {}) {
-  const dir = makeRoot({ envLocal, origin });
+async function setup({ args = ["--yes"], input = "", rules = ghRules(), envLocal = null, origin, upstream, env = {} } = {}) {
+  const dir = makeRoot({ envLocal, origin, upstream });
   const gh = stubGh(dir, rules);
   const log = join(dir, "stub.log");
   try {
@@ -175,6 +183,18 @@ test("the repo is named, and a repo that isn't a fork gets bump-upstream and a w
   assert.equal(original.status, 0, original.stdout + original.stderr);
   assert.ok(original.stdout.includes(`Note: ${REPO} is not a fork. If you meant to set up your own copy, fork it first (README "Before you start").`), original.stdout);
   assert.deepEqual(enables(original.ghCalls), ["backup.yml", "usage.yml", "bump-upstream.yml"]);
+});
+
+test("a fork clone with an upstream remote sets up the origin repo, never the parent", async () => {
+  const out = await setup({ envLocal: finishedEnv, upstream: PARENT_URL });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.ok(out.stdout.includes(`This will set up ${REPO} (GitHub)`), out.stdout);
+  const views = out.ghCalls.filter((a) => a[0] === "repo" && a[1] === "view");
+  assert.deepEqual(views.map((a) => a[2]), [ORIGIN, REPO]);
+  assert.ok(!out.ghCalls.flat().some((arg) => arg.includes(PARENT)), JSON.stringify(out.ghCalls));
+  for (const call of out.ghCalls.filter((a) => ["secret", "workflow"].includes(a[0]))) {
+    assert.equal(call[call.indexOf("-R") + 1], REPO, call.join(" "));
+  }
 });
 
 test("a second run on a finished install changes nothing and deploys only if not green", async () => {

@@ -131,16 +131,14 @@ if [ "$push_only" != 1 ]; then
 fi
 
 generated_names="ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN TOFU_ENCRYPTION_PASSPHRASE COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
+# shellcheck source=lib/gh.sh
+. "$script_dir/lib/gh.sh"
 # Pushes the values of $add_names to the production environment. $recovery says what to do on failure.
 push_secrets() {
-  # Target the repo that owns this checkout, whatever the current directory is.
-  target_repo="$(cd "$repo_root" && gh repo view --json nameWithOwner -q .nameWithOwner)" || {
-    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
-    echo "$recovery" >&2
-    exit 1
-  }
-  [ -n "$target_repo" ] || {
-    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
+  # Target the repo the checkout's origin remote points at, whatever the current directory is, and
+  # never gh's own pick (the parent, in a fork clone with an upstream remote).
+  target_repo="$(origin_repo "$repo_root")" || {
+    echo "init-env: could not determine the GitHub repo of the origin remote of $repo_root" >&2
     echo "$recovery" >&2
     exit 1
   }

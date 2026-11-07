@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -9,6 +10,10 @@ import { runScript, stubGh } from "./test-helpers.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const enableSh = join(root, "scripts", "enable-connector.sh");
 const REPO = "example/logseq-selfhost";
+const ORIGIN = `https://github.com/${REPO}.git`;
+// The repo a fork was made from: `gh repo view` with no repo argument names it in a clone with an `upstream` remote.
+const PARENT = "upstream-owner/logseq-selfhost";
+const PARENT_URL = `https://github.com/${PARENT}.git`;
 const NOT_FOUND = "gh: Not Found (HTTP 404)\n";
 const FORBIDDEN = "gh: Resource not accessible by personal access token (HTTP 403)\n";
 const CONNECTOR_NAMES = ["CONNECTOR_HOSTNAME", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "OWNER_GITHUB_USER_ID"];
@@ -26,8 +31,8 @@ fi
 ${fail ? "exit 1" : ""}
 `;
 
-/** A temp repo root: stub scripts, the real env-file.mjs and lib/gh.sh, and a .env.local (or none). */
-function makeRoot({ envLocal, failing = [] }) {
+/** A temp git repo root: stub scripts, the real env-file.mjs and lib/gh.sh, a .env.local (or none), and an origin (plus an upstream when given). */
+function makeRoot({ envLocal, failing = [], upstream = null }) {
   const dir = mkdtempSync(join(tmpdir(), "enable-connector-"));
   mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
   for (const name of ["init-env.sh", "doctor.sh", "run-deploy.sh"]) {
@@ -39,13 +44,18 @@ function makeRoot({ envLocal, failing = [] }) {
     writeFileSync(join(dir, ".env.local"), envLocal);
     chmodSync(join(dir, ".env.local"), 0o600);
   }
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync("git", ["remote", "add", "origin", ORIGIN], { cwd: dir });
+  if (upstream !== null) execFileSync("git", ["remote", "add", "upstream", upstream], { cwd: dir });
   return dir;
 }
 
 /** `gh` rules for a connector that is off. `over` rules come first, so they win. */
 const ghRules = (over = []) => [
   ...over,
-  { match: ["repo", "view", "--json", "nameWithOwner"], stdout: `${REPO}\n` },
+  { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
+  // gh's own choice in a clone with an `upstream` remote.
+  { match: ["repo", "view"], stdout: `${PARENT}\n` },
   { match: ["variable", "get", "CONNECTOR_ENABLED"], stderr: NOT_FOUND, exit: 1 },
   { match: ["api", "user", "-q", ".id"], stdout: "12345\n" },
   { match: ["api", "user", "-q", ".login"], stdout: "octocat\n" },
@@ -53,8 +63,8 @@ const ghRules = (over = []) => [
 ];
 
 /** Runs enable-connector.sh in a temp root. Returns the result, the stub-script log, the inputs init-env.sh saw and the `gh` calls. */
-async function enable({ input = "mcp.example.com\nclient-id\nclient-secret\n", rules = ghRules(), envLocal = baseEnv(), failing = [], env = {} } = {}) {
-  const dir = makeRoot({ envLocal, failing });
+async function enable({ input = "mcp.example.com\nclient-id\nclient-secret\n", rules = ghRules(), envLocal = baseEnv(), failing = [], upstream = null, env = {} } = {}) {
+  const dir = makeRoot({ envLocal, failing, upstream });
   const gh = stubGh(dir, rules);
   const log = join(dir, "stub.log");
   const lines = (file) => (existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean) : []);
@@ -102,6 +112,15 @@ test("a first run takes the hostname and OAuth details, pushes secrets, turns th
   assert.ok(out.stdout.includes("https://mcp.example.com/mcp"), out.stdout);
   assert.ok(!(out.stdout + out.stderr).includes("client-secret"), "the client secret is never printed");
   assert.ok(!out.ghCalls.flat().includes("client-secret"), "the client secret is never a gh argument");
+});
+
+test("a fork clone with an upstream remote turns the connector on in the origin repo, never the parent", async () => {
+  const out = await enable({ upstream: PARENT_URL });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  const views = out.ghCalls.filter((a) => a[0] === "repo" && a[1] === "view");
+  assert.deepEqual(views.map((a) => a[2]), [ORIGIN]);
+  assert.ok(!out.ghCalls.flat().some((arg) => arg.includes(PARENT)), JSON.stringify(out.ghCalls));
+  for (const call of out.ghCalls.filter((a) => a[0] === "variable")) assert.equal(call[call.indexOf("-R") + 1], REPO, call.join(" "));
 });
 
 test("the hostname is lower-cased and the OAuth details can come from the environment, without prompts", async () => {

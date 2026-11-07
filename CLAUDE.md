@@ -17,7 +17,7 @@ This repo self-hosts Logseq's DB sync server on Cloudflare, plus `logseq-connect
 | `scripts/enable-connector.sh` | Turns the connector on after its GitHub OAuth app exists (secrets, `CONNECTOR_ENABLED` in both places, doctor, deploy). |
 | `scripts/run-deploy.sh` | Starts the `deploy` workflow on `main` and follows it from the terminal. |
 | `scripts/ensure-account.mjs` | Creates OpenTofu's state bucket and the `workers.dev` subdomain when missing. `deploy.yml` runs it before `tofu init`. |
-| `scripts/lib/gh.sh` | `gh_try` and `gh_must`, sourced by `setup.sh` and `enable-connector.sh`. |
+| `scripts/lib/gh.sh` | `origin_repo` (the repo the `origin` remote points at, never the parent `gh` would pick in a fork clone), sourced by `setup.sh`, `enable-connector.sh`, `init-env.sh` and `run-deploy.sh`; `gh_try` and `gh_must`, used by the first two. |
 | `config/token-permissions.json`, `scripts/token-link.mjs` | The Cloudflare token's permissions, and the dashboard link that pre-fills them. README 1.1 lists the same names. |
 | `infra/` | OpenTofu (Cloudflare provider v5). |
 | `config/settings.json` | Non-secret settings: plan, connector and semantic switches. |

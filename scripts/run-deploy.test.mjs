@@ -1,15 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runScript, stubGh } from "./test-helpers.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const script = join(root, "scripts", "run-deploy.sh");
 
 const REPO = "owner/repo";
+const ORIGIN = `https://github.com/${REPO}.git`;
+// The repo a fork was made from: `gh repo view` with no repo argument names it in a clone with an `upstream` remote.
+const PARENT = "upstream-owner/repo";
 const RUN_URL = "https://github.com/owner/repo/actions/runs/4242";
 const LIST = ["run", "list", "-R", REPO, "--workflow", "deploy.yml"];
 const json = (value) => `${JSON.stringify(value)}\n`;
@@ -17,16 +20,32 @@ const json = (value) => `${JSON.stringify(value)}\n`;
 const NEW_RUN = [{ databaseId: 4242, createdAt: "2099-01-01T00:00:00Z", url: RUN_URL }];
 const OLD_RUN = [{ databaseId: 1, createdAt: "2000-01-01T00:00:00Z", url: "https://github.com/owner/repo/actions/runs/1" }];
 
-const rules = (...extra) => [{ match: ["repo", "view"], stdout: `${REPO}\n` }, ...extra];
+const rules = (...extra) => [
+  { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
+  { match: ["repo", "view"], stdout: `${PARENT}\n` },
+  ...extra,
+];
 const dispatched = (runs) => ({ match: [...LIST, "--event", "workflow_dispatch"], stdout: json(runs) });
 const latestOnMain = (runs) => ({ match: [...LIST, "--branch", "main"], stdout: json(runs) });
 
+/**
+ * Runs the real run-deploy.sh from a temp clone whose `origin` is REPO and whose `upstream` is the
+ * parent repo, so the repo it targets comes from origin and nowhere else.
+ */
 async function withGh(ghRules, fn) {
   const dir = mkdtempSync(join(tmpdir(), "run-deploy-"));
   try {
+    mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
+    for (const name of ["run-deploy.sh", "lib/gh.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
+    chmodSync(join(dir, "scripts", "run-deploy.sh"), 0o755);
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["remote", "add", "origin", ORIGIN], { cwd: dir });
+    execFileSync("git", ["remote", "add", "upstream", `https://github.com/${PARENT}.git`], { cwd: dir });
     const gh = stubGh(dir, ghRules);
     const run = (args = [], env = {}) =>
-      runScript(script, args, { env: { PATH: `${gh.bin}:${process.env.PATH}`, RUN_DEPLOY_TEST: "1", RUN_DEPLOY_POLL_SECONDS: "0", ...env } });
+      runScript(join(dir, "scripts", "run-deploy.sh"), args, {
+        env: { PATH: `${gh.bin}:${process.env.PATH}`, RUN_DEPLOY_TEST: "1", RUN_DEPLOY_POLL_SECONDS: "0", ...env },
+      });
     return await fn(run, gh);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -46,6 +65,18 @@ test("a successful run prints the URL and exits 0", { timeout: 30000 }, async ()
     assert.ok(calls.includes(`workflow run deploy.yml -R ${REPO} --ref main`), calls.join("\n"));
     assert.ok(calls.includes(`run watch 4242 -R ${REPO} --exit-status`), calls.join("\n"));
     assert.ok(calls.includes(`run list -R ${REPO} --workflow deploy.yml --event workflow_dispatch --limit 5 --json databaseId,createdAt,url`), calls.join("\n"));
+  });
+});
+
+test("the repo comes from the origin remote, never the parent repo gh would pick", { timeout: 30000 }, async () => {
+  const ghRules = rules({ match: ["workflow", "run"] }, dispatched(NEW_RUN), { match: ["run", "watch"] });
+  await withGh(ghRules, async (run, gh) => {
+    const r = await run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const calls = gh.calls().map((c) => c.argv);
+    assert.deepEqual(calls[0], ["repo", "view", ORIGIN, "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+    assert.ok(!calls.flat().some((arg) => arg.includes(PARENT)), JSON.stringify(calls));
+    for (const call of calls.slice(1)) assert.equal(call[call.indexOf("-R") + 1], REPO, call.join(" "));
   });
 });
 
