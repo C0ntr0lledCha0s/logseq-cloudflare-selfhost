@@ -22,6 +22,7 @@ interface SyncCall {
   url: URL;
   auth: string | null;
   contentType: string | null;
+  stamp: string | null;
   bytes: Uint8Array;
 }
 
@@ -44,6 +45,7 @@ function testEnv(): Env {
         url: new URL(request.url),
         auth: request.headers.get("Authorization"),
         contentType: request.headers.get("Content-Type"),
+        stamp: request.headers.get("x-logseq-edit-stamp"),
         bytes: new Uint8Array(await request.clone().arrayBuffer()),
       });
       return syncHandler(request);
@@ -867,5 +869,77 @@ describe("audit log", () => {
     const bad = await rowsFor(() => callTool("save_file_from_url", { graph: "work", url: "http://files.example.com/a.pdf" }));
     expect(bad.row.status).toBe("refused");
     expect(bad.row.error).toMatch(/^cannot fetch that URL: /);
+  });
+});
+
+describe("edit stamps", () => {
+  /** Uploads as acceptUploads does, and a page search that finds the page titled Standup. */
+  function acceptUploadsAndSearch(): void {
+    acceptUploads();
+    const uploads = syncHandler;
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === `/api/v1/graphs/${WORK_ID}/search`) {
+        return Response.json({ results: [{ uuid: PAGE_ID, title: "Standup" }] });
+      }
+      return uploads(request);
+    };
+  }
+
+  it("save_document and save_file_from_url send x-logseq-edit-stamp: claude on the upload exactly when the graph's setting is on; the page search never does", async () => {
+    const pdf = new TextEncoder().encode("%PDF-1.7 report");
+    const calls: [string, Record<string, unknown>][] = [
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup" }],
+      ["save_document", { graph: "work", fileName: "blob.bin", base64: base64(new Uint8Array([1, 2, 3])), page: PAGE_ID }],
+      // A page named by title is found with a GET search before the upload.
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup", page: "Standup" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf", page: "Standup" }],
+    ];
+    for (const [name, args] of calls) {
+      fetchSpy.mockImplementation(async () => new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+      acceptUploadsAndSearch();
+      const sent: Record<string, SyncCall[]> = {};
+      for (const editStamps of [1, 0]) {
+        await env.DB.prepare("UPDATE graphs SET edit_stamps = ? WHERE alias = 'work'").bind(editStamps).run();
+        syncCalls = [];
+        const result = await callTool(name, args);
+        expect(result.isError, name).toBe(false);
+        sent[editStamps] = syncCalls;
+      }
+      const on = sent[1];
+      const off = sent[0];
+      expect(on.filter((c) => c.method === "POST").map((c) => c.stamp), name).toEqual(["claude"]);
+      for (const c of on.filter((c) => c.method !== "POST")) expect([c.method, c.stamp], name).toEqual(["GET", null]);
+      expect(off.map((c) => c.stamp), name).toEqual(off.map(() => null));
+      // The same requests either way: no extra Worker request or rate-limited write.
+      const strip = (cs: SyncCall[]) => cs.map(({ stamp: _stamp, ...rest }) => ({ ...rest, url: rest.url.href }));
+      expect(strip(on), name).toEqual(strip(off));
+      if (args.page === "Standup") expect(on.map((c) => c.method), name).toEqual(["GET", "POST"]);
+    }
+  });
+
+  it("read_file's GETs never carry the header", async () => {
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === `/api/v1/graphs/${WORK_ID}/assets/${ASSET_ID}`) {
+        return Response.json({
+          uuid: ASSET_ID,
+          title: "standup",
+          type: "md",
+          size: 9,
+          checksum: "0".repeat(64),
+          url: `https://sync.internal/assets/${WORK_ID}/${ASSET_ID}.md?expires=1999999999&signature=abcd`,
+          "expires-at": 1999999999,
+        });
+      }
+      return new Response("# Standup");
+    };
+    const result = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+    expect(result.isError).toBe(false);
+    expect(syncCalls.map((c) => [c.method, c.stamp])).toEqual([
+      ["GET", null],
+      ["GET", null],
+    ]);
   });
 });

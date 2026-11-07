@@ -44,6 +44,37 @@ const ALIAS = new RegExp(ALIAS_PATTERN);
 const GRAPH_PATH = /^\/api\/v1\/graphs\/([^/]+)(\/.*)$/;
 const DEFAULT_RETRY_AFTER_S = 60;
 
+/** The request header that asks the sync server to stamp a write's blocks as Claude's (patch 0034). */
+const EDIT_STAMP_HEADER = "x-logseq-edit-stamp";
+
+/**
+ * Headers for a sync request on `graph`: `x-logseq-edit-stamp: claude` on every non-GET when the
+ * graph's edit stamps are on (design 2026-11-07-claude-edit-stamps-editedby §3.4). GETs, including
+ * the audit log's before-snapshot reads, never carry it.
+ */
+export function editStampHeaders(graph: ResolvedGraph, method: string): Record<string, string> {
+  return method !== "GET" && graph.editStamps ? { [EDIT_STAMP_HEADER]: "claude" } : {};
+}
+
+/** Spec §4's sentence on each tool whose write the server stamps (save_document and save_file_from_url add it themselves). */
+export const STAMP_HINT =
+  "When edit stamps are on for the graph, each block this call creates or changes is stamped editedBy=claude and claudeEditedAt (hidden properties, listed on the Claude Activity page).";
+const STAMPING_TOOLS = new Set([
+  "insert_block_tree",
+  "insert_block_children",
+  "batch_insert_block_trees",
+  "capture_to_today",
+  "create_task",
+  "update_block",
+  "set_block_property",
+  "batch_set_block_property",
+  "delete_block_property",
+  "batch_delete_block_property",
+  "move_blocks",
+  "batch_move_blocks",
+  "refresh_refs",
+]);
+
 /** Usage conventions added to the generated descriptions of the tools they concern. */
 const HINTS: Record<string, string> = {
   insert_block_tree:
@@ -69,6 +100,7 @@ function description(op: GraphOperation): string {
   const parts = [op.operation.summary ?? `${op.method} ${op.path}`];
   if (op.operation.description) parts.push(op.operation.description);
   if (HINTS[op.name]) parts.push(HINTS[op.name]);
+  if (STAMPING_TOOLS.has(op.name)) parts.push(STAMP_HINT);
   return parts.join("\n\n");
 }
 
@@ -124,6 +156,7 @@ async function request(access: GraphAccess, req: UpstreamRequest): Promise<unkno
     path: `/api/v1/graphs/${encodeURIComponent(graph.graphId)}${rest}`,
     query: queryParams(req.query),
     json: req.body,
+    headers: editStampHeaders(graph, req.method),
   });
   const text = await response.text();
   return text === "" ? null : JSON.parse(text);

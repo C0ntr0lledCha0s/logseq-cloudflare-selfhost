@@ -29,7 +29,7 @@ const NOTES_ID = "22222222-2222-2222-2222-222222222222";
 
 type SyncHandler = (request: Request) => Response | Promise<Response>;
 let syncHandler: SyncHandler;
-let syncRequests: { method: string; url: string; auth: string | null; body: string }[];
+let syncRequests: { method: string; url: string; auth: string | null; body: string; stamp: string | null }[];
 let consoleSpies: MockInstance[];
 
 function store(): GraphStore {
@@ -49,6 +49,7 @@ function testEnv(overrides: Partial<Env> = {}): Env {
         url: request.url,
         auth: request.headers.get("Authorization"),
         body: await request.clone().text(),
+        stamp: request.headers.get("x-logseq-edit-stamp"),
       });
       return syncHandler(request);
     },
@@ -669,6 +670,7 @@ describe("routing", () => {
       url: `https://sync.internal/api/v1/graphs/${WORK_ID}/pages`,
       auth: `Bearer ${WORK_TOKEN}`,
       body: JSON.stringify({ title: "Standup [[Ann]]" }),
+      stamp: "claude",
     });
     expect((await store().get("work"))?.lastUsedAt).not.toBeNull();
     expect((await store().get("notes"))?.lastUsedAt).toBeNull();
@@ -1345,6 +1347,7 @@ const CONTEXT_RESPONSE = {
 
 interface AuditDbRow {
   id: number;
+  at: number;
   graph_id: string | null;
   alias: string;
   tool: string;
@@ -1861,5 +1864,198 @@ describe("audit log", () => {
     expect(userAgentFamily("Mozilla/5.0")).toBe("other");
     expect(userAgentFamily("curl/8.5.0")).toBe("other");
     expect(userAgentFamily(null)).toBe("other");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Edit stamps (design 2026-11-07-claude-edit-stamps-editedby §3.4; plan stage 4)
+// ---------------------------------------------------------------------------------------------
+
+/** env.DB, recording each statement's own D1 `meta` (`first` is answered from `all`, the same query). */
+function meteredDb(): { db: D1Database; measured: { sql: string; rowsRead: number; rowsWritten: number }[] } {
+  const measured: { sql: string; rowsRead: number; rowsWritten: number }[] = [];
+  const record = <T extends D1Result>(sql: string, result: T): T => {
+    measured.push({ sql, rowsRead: result.meta.rows_read, rowsWritten: result.meta.rows_written });
+    return result;
+  };
+  const statement = (stmt: D1PreparedStatement, sql: string): D1PreparedStatement =>
+    ({
+      bind: (...values: unknown[]) => statement(stmt.bind(...values), sql),
+      run: async () => record(sql, await stmt.run()),
+      all: async () => record(sql, await stmt.all()),
+      first: async (column?: string) => {
+        const row = (record(sql, await stmt.all()).results[0] ?? null) as Record<string, unknown> | null;
+        return column === undefined || row === null ? row : row[column];
+      },
+    }) as unknown as D1PreparedStatement;
+  return { db: { prepare: (sql: string) => statement(env.DB.prepare(sql), sql) } as unknown as D1Database, measured };
+}
+
+/** Placeholder arguments for a tool's required inputs, from its input schema. */
+function placeholderArgs(tool: { inputSchema: { properties?: Record<string, any>; required?: string[] } }): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  for (const key of tool.inputSchema.required ?? []) {
+    const schema = tool.inputSchema.properties?.[key] ?? {};
+    if (key === "graph") args[key] = "work";
+    else if (schema.type === "integer" || schema.type === "number") args[key] = 1;
+    else if (schema.type === "boolean") args[key] = true;
+    else if (schema.type === "array") args[key] = [B1];
+    else if (schema.type === "object") args[key] = {};
+    else args[key] = B1;
+  }
+  return args;
+}
+
+/** Each sync request of one call, with or without the graph's edit stamps, and the D1 cost of the call. */
+async function stampedRun(name: string, args: Record<string, unknown>, editStamps: boolean) {
+  await env.DB.prepare("UPDATE graphs SET edit_stamps = ? WHERE alias = 'work'").bind(editStamps ? 1 : 0).run();
+  syncRequests = [];
+  const { db, measured } = meteredDb();
+  const before = await lastAuditId();
+  const result = await callContent(name, args, connector(testEnv({ DB: db })));
+  const rows = await auditRows(before);
+  return { result, requests: syncRequests, measured, rows };
+}
+
+describe("edit stamps header", () => {
+  it("every generated write sends x-logseq-edit-stamp: claude on each non-GET exactly when the graph's setting is on, with the same requests, D1 cost and audit row", async () => {
+    let gets = 0;
+    for (const name of GENERATED_WRITES) {
+      const args = { graph: "work", ...AUDIT_CALLS[name], reason: REASON };
+      syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
+      const on = await stampedRun(name, args, true);
+      const off = await stampedRun(name, args, false);
+      expect(on.result.isError, name).toBe(false);
+      expect(off.result.isError, name).toBe(false);
+
+      // On: every non-GET carries the header with exactly "claude"; no GET (the audit pre-reads) does.
+      const writes = on.requests.filter((r) => r.method !== "GET");
+      expect(writes, name).toHaveLength(1);
+      for (const r of on.requests) expect([r.method, r.stamp], name).toEqual([r.method, r.method === "GET" ? null : "claude"]);
+      gets += on.requests.length - writes.length;
+      // Off: nothing carries it.
+      expect(off.requests.map((r) => r.stamp), name).toEqual(off.requests.map(() => null));
+
+      // Otherwise identical: the same requests in the same order (so the same Worker requests and
+      // rate-limited writes), the same D1 statements and rows, and the same audit row.
+      const strip = (rs: typeof syncRequests) => rs.map(({ stamp: _stamp, ...rest }) => rest);
+      expect(strip(on.requests), name).toEqual(strip(off.requests));
+      expect(on.measured.map(({ sql, rowsRead, rowsWritten }) => [sql, rowsRead, rowsWritten]), name).toEqual(
+        off.measured.map(({ sql, rowsRead, rowsWritten }) => [sql, rowsRead, rowsWritten]),
+      );
+      expect(on.rows, name).toHaveLength(1);
+      expect(off.rows, name).toHaveLength(1);
+      const { id: _a, at: _b, ...onRow } = on.rows[0];
+      const { id: _c, at: _d, ...offRow } = off.rows[0];
+      expect(onRow, name).toEqual(offRow);
+    }
+    // The GET assertion above is not vacuous: the deletes, updates, moves and property writes pre-read.
+    expect(gets).toBeGreaterThan(10);
+  });
+
+  it("dry runs and refused writes: a dry run's request carries the header, a refusal before the request sends nothing", async () => {
+    syncHandler = preReadsEmpty(() => Response.json({ ...CONTEXT_RESPONSE, "dry-run": true }));
+    for (const [name, where] of Object.entries(DRY_RUN_IN)) {
+      const base: Record<string, unknown> = { graph: "work", ...AUDIT_CALLS[name] };
+      const args = where === "query" ? { ...base, "dry-run": true } : { ...base, body: { ...(base.body as object), "dry-run": true } };
+      const on = await stampedRun(name, args, true);
+      expect(on.result.isError, name).toBe(false);
+      expect(on.requests.filter((r) => r.method !== "GET").map((r) => r.stamp), name).toEqual(["claude"]);
+      expect(on.requests.filter((r) => r.method === "GET").map((r) => r.stamp), name).toEqual(
+        on.requests.filter((r) => r.method === "GET").map(() => null),
+      );
+    }
+    // A read-only graph and an over-long reason are refused before any request, stamps on or off.
+    for (const args of [
+      { graph: "notes", "block-id": B1, body: { title: "x" } },
+      { graph: "work", "block-id": B1, body: { title: "x" }, reason: "x".repeat(201) },
+    ]) {
+      const on = await stampedRun("update_block", args, true);
+      expect(on.result.isError).toBe(true);
+      expect(on.requests).toEqual([]);
+    }
+  });
+
+  it("a DELETE with no body carries the header; no read tool's GET ever does, whatever its query", async () => {
+    acceptEverything();
+    const del = await stampedRun("delete_block", { graph: "work", "block-id": B1 }, true);
+    const deletes = del.requests.filter((r) => r.method === "DELETE");
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]).toMatchObject({ body: "", stamp: "claude" });
+
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const generatedReads = committedManifest.filter((e) => e.method === "GET").map((e) => e.name);
+    expect(generatedReads.length).toBeGreaterThan(15);
+    let reads = 0;
+    for (const name of generatedReads) {
+      const tool = tools.find((t: { name: string }) => t.name === name);
+      // Every optional query input too, so a body-like query (ids, filters, cursors) is sent.
+      const args = { ...placeholderArgs(tool) };
+      for (const [key, schema] of Object.entries<any>(tool.inputSchema.properties ?? {})) {
+        if (key in args) continue;
+        if (Array.isArray(schema.enum)) args[key] = schema.enum[0];
+        else if (schema.type === "string") args[key] = "Meeting";
+        else if (schema.type === "integer" || schema.type === "number") args[key] = 5;
+        else if (schema.type === "boolean") args[key] = true;
+      }
+      const run = await stampedRun(name, args, true);
+      expect(run.requests.length, `${name}: ${JSON.stringify(run.result)} ${JSON.stringify(args)}`).toBeGreaterThan(0);
+      for (const r of run.requests) expect([r.method, r.stamp], name).toEqual(["GET", null]);
+      reads += run.requests.length;
+    }
+    expect(reads).toBeGreaterThanOrEqual(generatedReads.length);
+  });
+});
+
+const STAMP_SENTENCE =
+  "When edit stamps are on for the graph, each block this call creates or changes is stamped editedBy=claude and claudeEditedAt (hidden properties, listed on the Claude Activity page).";
+/** Spec §4's stamping tools, named independently of the source's list. */
+const STAMPING_TOOLS = [
+  "insert_block_tree",
+  "insert_block_children",
+  "batch_insert_block_trees",
+  "capture_to_today",
+  "create_task",
+  "update_block",
+  "set_block_property",
+  "batch_set_block_property",
+  "delete_block_property",
+  "batch_delete_block_property",
+  "move_blocks",
+  "batch_move_blocks",
+  "refresh_refs",
+  "save_document",
+  "save_file_from_url",
+];
+
+describe("edit stamps contract", () => {
+  it("each stamping tool's description holds the stamp sentence once; no other tool's does", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const holding = tools.filter((t: { description: string }) => t.description.includes(STAMP_SENTENCE)).map((t: { name: string }) => t.name);
+    expect(holding.sort()).toEqual([...STAMPING_TOOLS].sort());
+    for (const tool of tools) expect(tool.description.split(STAMP_SENTENCE).length, tool.name).toBeLessThanOrEqual(2);
+    // No read tool carries it.
+    for (const tool of tools.filter((t: { annotations: { readOnlyHint: boolean } }) => t.annotations.readOnlyHint)) {
+      expect(tool.description, tool.name).not.toContain("editedBy");
+    }
+  });
+
+  it("connector_help holds the edit stamps section, once", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    for (const phrase of [
+      "When edit stamps are on for a graph (the default), the connector marks its writes",
+      "each block a write creates or changes is stamped with two hidden properties, editedBy=claude and claudeEditedAt",
+      "Pages, tags and properties are not stamped, nor are deletes",
+      "The stamp stays when the owner later edits the block in the app",
+      "E2EE graphs are not stamped",
+      "The owner turns stamps off per graph on the connector's graph settings page; no tool can",
+      "Claude Activity page",
+      "Recycle bin",
+      "answers 409 naming it",
+      "editedBy and claudeEditedAt are set by the server; set_block_property, batch_set_block_property, delete_block_property and batch_delete_block_property refuse them, naming the entry",
+    ]) {
+      expect(help, phrase).toContain(phrase);
+    }
+    expect(help.split("editedBy and claudeEditedAt are set by the server").length).toBe(2);
   });
 });

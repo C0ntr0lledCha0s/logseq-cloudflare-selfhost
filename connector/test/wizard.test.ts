@@ -223,6 +223,8 @@ describe("connect a graph", () => {
       permission: "both",
       expiresAt: expires,
       lastUsedAt: null,
+      // A newly connected graph starts with edit stamps on (migration 0005's default).
+      editStamps: true,
     });
     expect(await store().token("my-work-graph")).toBe(TOKEN);
 

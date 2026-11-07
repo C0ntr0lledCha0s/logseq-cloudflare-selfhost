@@ -6,7 +6,7 @@ import { SafeFetchError, readUpTo, safeFetch } from "../net/safe-fetch";
 import { RESULT_CHAR_LIMIT, ToolError, aliasArg, runTool, textResult } from "./common";
 import { type AuditContext, audited } from "../audit/log";
 import { type OnSuccess, reasonGiven, reasonSchema } from "./readable";
-import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
+import { type GraphAccess, STAMP_HINT, editStampHeaders, graphFetch, resolveGraph } from "./semantic";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 // The file tools replace the generated createAsset/getAsset (design §7). createAsset takes the raw
@@ -165,7 +165,7 @@ async function upload(
     path: graphPath(graph, "/assets"),
     query,
     body: file.bytes,
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: { "Content-Type": "application/octet-stream", ...editStampHeaders(graph, "POST") },
   });
   const asset = (await response.json()) as { uuid?: unknown; "page-id"?: unknown; "page-title"?: unknown };
   if (typeof asset.uuid !== "string") throw new Error("createAsset answered without an asset uuid");
@@ -295,7 +295,7 @@ export function registerAssetTools(server: McpServer, access: GraphAccess, onSuc
     "save_document",
     {
       description:
-        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
+        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID and the page it was attached to (pageId, pageTitle). " + STAMP_HINT,
       inputSchema: z.object({
         graph: graphArg,
         fileName: z.string().min(1).describe("File name with an extension, e.g. meeting-notes.md"),
@@ -328,7 +328,7 @@ export function registerAssetTools(server: McpServer, access: GraphAccess, onSuc
     "save_file_from_url",
     {
       description:
-        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
+        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID and the page it was attached to (pageId, pageTitle). " + STAMP_HINT,
       inputSchema: z.object({
         graph: graphArg,
         url: z.string().describe("Public https URL of the file"),

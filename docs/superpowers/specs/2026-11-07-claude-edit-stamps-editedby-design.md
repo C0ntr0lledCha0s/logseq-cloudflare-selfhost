@@ -284,3 +284,13 @@ The choice is matched by its fixed UUID, never its title. `:remove-block-childre
 **Mutation check** (one line each, in a scratch copy): no title check, comparing `:block/title` instead of `:block/name`, no kept order, ascending sort, creating the page before the stamps, no Query tag, no code display, the week query using `:-1d-ms`, dropping the choice clause or the window clause, and creating the page on unflagged writes each fail a test.
 
 **Cost.** About 40 datoms once per graph (the page, two blocks and their two query value blocks with their properties); per flagged write, one `:block/name` index read. No Worker request, D1 row or neuron.
+
+### Stage 4: the connector sends the header
+
+**What is sent.** `editStampHeaders(graph, method)` in `tools/semantic.ts` returns `x-logseq-edit-stamp: claude` for a non-GET request when `ResolvedGraph.editStamps` is true, and nothing otherwise. `request()` (every generated tool) and the asset upload in `tools/assets.ts` (`save_document`, `save_file_from_url`) pass it as `SyncRequest.headers`; those are the only non-GET `graphFetch` calls. Every other request is a GET (the audit before-snapshots, page lookups by title, `read_file`, `kb_index`, `semantic_search` and the indexer's feed), and none carries the header. The header goes on every non-GET of a generated tool, including ones the server doesn't stamp (`create_page`, `delete_page` and the other page, tag and property writes) and dry runs; the server decides what to stamp.
+
+**Setting.** Migration 0005 adds `graphs.edit_stamps INTEGER NOT NULL DEFAULT 1` with a `0 or 1` check (an OR, as 0004 does, not an IN list). `resolve()` reads it in the statement it already ran, and `RECORD_COLUMNS` carries it for `list` and `get`; `GraphPatch.editStamps` lets `update` set it (Stage 5's wizard uses it). A new graph starts with stamps on.
+
+**Measured, per write tool, stamps on against off** (`edit stamps header` in `test/tools.test.ts`): the same sync requests in the same order (so the same Worker requests and rate-limited writes), the same D1 statements with the same `rows_read` and `rows_written`, and the same audit row apart from `id` and `at`. `resolve()` is one statement reading one row. No neurons: nothing here calls Workers AI.
+
+**Contract.** Spec §4's sentence is on the 13 generated stamping tools (through `STAMPING_TOOLS` in `semantic.ts`) and on `save_document` and `save_file_from_url`, and on no other tool. `CONNECTOR_HELP` holds the section, with Stage 2's refusal sentence folded into its end. Question 4 (section 11) is still open; if the owner answers "help only", `STAMPING_TOOLS` and `STAMP_HINT` go.
