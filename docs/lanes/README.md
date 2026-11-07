@@ -84,6 +84,7 @@ The rule: Opus where a wrong call ships a bad fix or lets a defect through, and 
   - Fixers report every id they were given.
   - After `max_fix_rounds` (default 2), if non-security blockers or majors are still open, the lane runs one targeted round: one implementer on just those ids, then one re-check of just those ids (no fresh lenses).
   - What is still open after that goes into `followup`, and the closeout lists it, with the backlog, as proposed backlog items with the probe or test path attached. Open non-security findings go to the owner as "for your call", and an open security finding blocks.
+  - **Mutation step, scoped and capped.** Round 1 mutates the rules the diff adds; later rounds mutate only rules added or changed since the previous round's HEAD (`mutation_base`, passed by the bug and feature lanes). Each round makes at most 12 mutations (`mutation_cap`), choosing untested rules first, then rules guarding writes, deletes and refusals, and lists every rule it skipped. Before this, item 26's tests lens re-ran 30–40 mutations every round and took 45–54 minutes a round.
   - **Class sweep.** A fix that narrows a type or a resolver lists every property type or input kind that reaches the same resolver, tests a representative input for each, and runs the mutation step on its own new rules before the stage ends.
 - **Approval.** A feature always stops after its spec unless an approved `spec` is passed in.
 - **Claims.** The closeout runs the gate once on HEAD and reports the SHA. The PR body only claims checks run there.

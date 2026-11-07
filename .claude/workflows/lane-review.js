@@ -1,7 +1,7 @@
 export const meta = {
   name: 'lane-review',
   description: 'Review the branch diff through tests, correctness, data-integrity and light (efficiency, security and contract) lenses; skeptics verify each serious finding and mark pre-existing ones for the backlog; open findings from earlier rounds are re-checked by id',
-  whenToUse: 'Before a PR, or called each round by lane-bug / lane-feature. args: {base?: "origin/main", brief?: object|string, context?: string, open?: finding[] (from the previous round), round?: number, models?: {role: "opus"|"sonnet"|"inherit"}}',
+  whenToUse: 'Before a PR, or called each round by lane-bug / lane-feature. args: {base?: "origin/main", brief?: object|string, context?: string, open?: finding[] (from the previous round), round?: number, mutation_base?: sha (later rounds: mutate only rules changed since), mutation_cap?: 12, models?: {role: "opus"|"sonnet"|"inherit"}}',
   phases: [
     { title: 'Scope', detail: 'what changed, which lenses apply' },
     { title: 'Review', detail: 'one reviewer per lens (tests first), plus a re-check of every open finding id' },
@@ -44,6 +44,11 @@ const MODELS = Object.assign({
 const M = role => (MODELS[role] && MODELS[role] !== 'inherit' ? { model: MODELS[role] } : {})
 const BASE = A.base || 'origin/main'
 const ROUND = A.round || 1
+// Mutation step scope: round 1 mutates every rule the diff adds; later rounds only rules added or
+// changed since the previous round's HEAD (mutation_base), since earlier rules were mutated then.
+// At most MUTATION_CAP mutations per round; the rest are listed, never silently dropped.
+const MUTATION_BASE = A.mutation_base || null
+const MUTATION_CAP = A.mutation_cap ?? 12
 const CARRIED = (A.open || []).filter(f => f && f.id)
 const BRIEF = typeof A.brief === 'string' ? A.brief : JSON.stringify(A.brief || {}, null, 2)
 const CONTEXT = A.context || ''
@@ -83,6 +88,11 @@ const FINDINGS_SCHEMA = {
         },
         required: ['title', 'severity', 'file', 'failure_scenario', 'evidence', 'fix'],
       },
+    },
+    mutations: {
+      type: 'object',
+      description: 'tests lens only: the mutation step this round',
+      properties: { run: { type: 'integer' }, survived: { type: 'integer' }, skipped: { type: 'array', items: { type: 'string' } } },
     },
   },
   required: ['findings'],
@@ -132,8 +142,9 @@ if (!scope || scope.empty) {
   return { empty: true, round: ROUND, open: CARRIED, backlog: [], should_fix: [], nits: [], refuted: [], rechecks: [], security_open: CARRIED.some(f => f.severity === 'security') }
 }
 
+const MUTATION_TEXT = `Mutation step: ${MUTATION_BASE ? `mutate only the rules or branches added or changed in ${MUTATION_BASE}..HEAD (\`git diff ${MUTATION_BASE}..HEAD\`); rules from earlier rounds were mutated then` : `mutate the new rules or branches in the diff`} that docs, a description or a docstring promise. Make at most ${MUTATION_CAP} mutations this round, choosing first the rules with no test that clearly targets them, then the rules guarding data (writes, deletes, refusals). For each: a one-line mutation in a scratch copy that removes it, run only the change's own test namespace(s) against it in one warm watch (\`scripts/upstream-test.sh <copy> <namespace-regex>\` for patches; the connector or scripts suite for those), restore it. Report every rule that survives (the tests stay green) as a finding, citing the promise. Fill mutations with the count run, the count that survived, and every rule you chose not to mutate (skipped), so nothing is dropped silently.`
 const LENSES = [
-  { key: 'tests', agentType: 'adversarial-reviewer', prompt: "Lens: tests. Use REVIEW.md \"Gates and tests\". For each behaviour the change claims, is there a test that was seen to fail without it? Revert the fix in a scratch copy and run the test to check. Does each test run the real handler, outliner or SQL? Mutation step: for each new rule or branch in the diff that docs, a description or a docstring promises, make a one-line mutation in a scratch copy that removes it, run only the change's own test namespace(s) against it (`scripts/upstream-test.sh <copy> <namespace-regex>` for patches; the connector or scripts suite for those), restore it, and report every rule that survives (the tests stay green) as a finding, citing the promise. Do the PR or commit claims cover only checks run on HEAD?" },
+  { key: 'tests', agentType: 'adversarial-reviewer', prompt: "Lens: tests. Use REVIEW.md \"Gates and tests\". For each behaviour the change claims, is there a test that was seen to fail without it? Revert the fix in a scratch copy and run the test to check. Does each test run the real handler, outliner or SQL? " + MUTATION_TEXT + " Do the PR or commit claims cover only checks run on HEAD?" },
   { key: 'correctness', agentType: 'adversarial-reviewer', prompt: 'Lens: correctness. Use REVIEW.md "Gates and tests" (fix the class) and "API and patches". Break it with realistic identifiers, empty and huge inputs, partial failure and retries.' },
   { key: 'integrity', agentType: 'adversarial-reviewer', prompt: "Lens: data integrity on the owner's live graph. Use REVIEW.md \"API and patches\" and \"Sync\": silent success, read-back through every read tool, order keys, one transaction per batch, destructive guards, and migrations that can't be re-run." },
   {
@@ -168,8 +179,12 @@ const reviewThunk = () =>
   pipeline(
     LENSES,
     lens => agent(`${common}\n\n${lens.prompt}`, { ...M('lens_' + lens.key), label: `review:${lens.key}:r${ROUND}`, phase: 'Review', agentType: lens.agentType, schema: FINDINGS_SCHEMA }),
-    (res, lens) =>
-      parallel(
+    (res, lens) => {
+      if (lens.key === 'tests' && res && res.mutations) {
+        const m = res.mutations
+        log(`Round ${ROUND} mutations${MUTATION_BASE ? ` (since ${String(MUTATION_BASE).slice(0, 7)})` : ''}: ${m.run ?? '?'} run, ${m.survived ?? '?'} survived, ${(m.skipped || []).length} not mutated${(m.skipped || []).length ? `: ${m.skipped.join('; ')}` : ''}`)
+      }
+      return (parallel(
         ((res && res.findings) || []).map((f, i) => async () => {
           const tagged = { ...f, id: `r${ROUND}-${lens.key}-${i + 1}`, lens: lens.key, severity: SEVERITIES.includes(f.severity) ? f.severity : 'blocker' }
           if (!serious(tagged)) return tagged
@@ -192,7 +207,8 @@ const reviewThunk = () =>
             votes,
           }
         }),
-      ),
+      ))
+    },
   )
 
 // The re-check is started first, so it and the tests lens take the first two agent slots.
