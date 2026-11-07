@@ -1,8 +1,34 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index f65a3a1..b062530 100644
+index f65a3a1..4c8427c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -1322,12 +1322,110 @@
+@@ -152,15 +152,19 @@
+                    :title (db-property/property-value-content value)}
+             (:db/ident value) (assoc :ident (entity-ident value)))))
+ 
++(declare stamp-property-idents)
++
+ (defn- shown-property?
+   "Whether a property value is shown in a response: a user or library property, or a built-in
+-  one Logseq marks public, as the editor shows it."
++  one Logseq marks public, as the editor shows it. The edit stamps (patch 0034) are left out: the
++  server sets them, and the app hides them."
+   [k]
+-  (or (not (db-property/internal-property? k))
+-      ;; Hidden in the editor's property list, but shown as the block's heading level.
+-      (= :logseq.property/heading k)
+-      (and (db-property/logseq-property? k)
+-           (contains? db-property/public-built-in-properties k))))
++  (and (not (contains? stamp-property-idents k))
++       (or (not (db-property/internal-property? k))
++           ;; Hidden in the editor's property list, but shown as the block's heading level.
++           (= :logseq.property/heading k)
++           (and (db-property/logseq-property? k)
++                (contains? db-property/public-built-in-properties k)))))
+ 
+ ;; A many value's entities are listed by :block/order, then by db id. Blocks, property entities and
+ ;; pages under the Library or a namespace parent have an order key (a string); plain and journal
+@@ -1322,12 +1326,161 @@
                     (and (contains? enabled (search-type entity))
                          (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))))
  
@@ -103,6 +129,57 @@ index f65a3a1..b062530 100644
 +  (mapv #(:db/id (d/entity @conn %))
 +        [editedby-ident :user.property/claude-editedAt [:block/uuid editedby-choice-uuid]]))
 +
++(def ^:private stamp-qualifying-attributes
++  "Block attributes whose added datom makes a block a stamp target. Besides these, a property
++  attribute (stamp-property-attribute?) or :block/tags (the Tags property) qualifies added or
++  retracted, so removing a value or a tag stamps the block that held it. :block/page (children a
++  cross-page move carries along), :block/refs, :block/path-refs, the timestamps and :block/tx-id
++  don't: the outliner writes them for blocks the caller didn't change."
++  #{:block/title :block/parent :block/order})
++
++(defn- stamp-property-attribute?
++  "Whether `attribute` holds a property value: user, library, plugin or built-in, as upstream's
++  db-property/property? tells them apart (a namespace containing .property)."
++  [attribute]
++  (when-let [space (and (keyword? attribute) (namespace attribute))]
++    (db-property/user-property-namespace? space)))
++
++(defn- stamp-qualifying-datom? [{:keys [a added]}]
++  (or (= :block/tags a)
++      (stamp-property-attribute? a)
++      (and added (contains? stamp-qualifying-attributes a))))
++
++(defn- stamp-target?
++  "Whether `entity` (in the db after the write) is a block a stamp may go on: a block on a page that
++  doesn't hold a property's value. Pages, tags and properties have no :block/page; closed values
++  (choices) and property value blocks carry :logseq.property/created-from-property. A deleted block
++  has no entity there and is never a target."
++  [entity]
++  (and (:block/page entity)
++       (nil? (:logseq.property/created-from-property entity))))
++
++(defn- stamp-tx
++  "The stamp datoms for a flagged write: editedBy = the claude choice and claudeEditedAt = `now` on
++  each block a datom of the write's `tx-data` qualifies (stamp-qualifying-datom?) and that is a
++  stamp-target? in `after`, two datoms per block however many of its datoms qualify."
++  [after tx-data now]
++  (when-let [choice-id (:db/id (d/entity after [:block/uuid editedby-choice-uuid]))]
++    (into []
++          (comp (filter stamp-qualifying-datom?)
++                (map :e)
++                (distinct)
++                (filter #(stamp-target? (d/entity after %)))
++                (mapcat (fn [e] [[:db/add e editedby-ident choice-id]
++                                 [:db/add e :user.property/claude-editedAt now]])))
++          tx-data)))
++
++(defn- stamp-property-refusal
++  "Why a property write naming `property-ident` is refused: the stamp properties are set by the
++  server only, with or without the edit-stamp header. nil for any other property."
++  [property-ident]
++  (when-let [{:keys [title]} (get stamp-property-idents property-ident)]
++    (str title " is set by the server and can't be written")))
++
  (defn- request-creator [request e2ee?]
    (when-let [encoded (.get (.-headers request) "x-logseq-sync-actor")]
      (let [claims (js/JSON.parse (js/decodeURIComponent encoded))]
@@ -116,7 +193,7 @@ index f65a3a1..b062530 100644
  
  (defn- created-by-tx [before after datoms creator]
    (let [targets (into #{}
-@@ -1361,7 +1459,12 @@
+@@ -1361,7 +1514,12 @@
      (apply mutate conn args)
      (let [result (volatile! nil)
            metadata (volatile! nil)
@@ -129,7 +206,7 @@ index f65a3a1..b062530 100644
        ;; Keep identity scoped to synchronous work on an isolated connection.
        ;; The author and operation reach storage in the same transaction.
        (ldb/batch-transact-with-temp-conn!
-@@ -1369,9 +1472,15 @@
+@@ -1369,9 +1527,19 @@
         (fn [tx-conn tx-data]
           (vreset! result (apply mutate tx-conn args))
           (when-let [authorship (seq (created-by-tx before @tx-conn @tx-data creator))]
@@ -140,14 +217,50 @@ index f65a3a1..b062530 100644
 +           ;; discards the temp conn, so nothing reaches `conn`.
 +           (refuse-stamp-conflict! @tx-conn)
 +           (vreset! capture? false)
-+           (ensure-stamp-schema! tx-conn)))
++           (ensure-stamp-schema! tx-conn)
++           ;; Every block the write created or changed, in the same tx; the schema's own
++           ;; entities are properties and a choice, so they never qualify.
++           (when-let [stamps (seq (stamp-tx @tx-conn @tx-data (.now js/Date)))]
++             (ldb/transact! tx-conn stamps))))
         :listen-db (fn [report]
 -                    (when (:outliner-op (:tx-meta report))
 +                    (when (and @capture? (:outliner-op (:tx-meta report)))
                        (vreset! metadata (:tx-meta report))))
         :transform-tx-meta (fn [_] @metadata))
        @result)))
-@@ -2733,7 +2842,8 @@
+@@ -2221,7 +2389,7 @@
+             (when-let [reason (cond
+                                 (nil? block) "block not found"
+                                 (nil? property-ident) "property not found"
+-                                :else (:error prepared))]
++                                :else (or (stamp-property-refusal property-ident) (:error prepared)))]
+               (str "entry " index ": " reason)))
+           (map-indexed vector resolved))))
+ 
+@@ -2244,6 +2412,8 @@
+       (cond
+         (nil? block) (http/bad-request "block not found")
+         (nil? property-ident) (http/bad-request "property not found")
++        (stamp-property-refusal property-ident)
++        (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
+         (not (contains? body :value)) (http/bad-request "missing property value")
+         (:error prepared) (http/bad-request (:error prepared))
+         :else
+@@ -2258,8 +2428,12 @@
+     :semantic/blocks-delete-property
+     (let [block (find-entity db (:block-id path-params))
+           property-ident (resolve-property-ident db (:property-id path-params))]
+-      (if (or (nil? block) (nil? property-ident))
++      (cond
++        (or (nil? block) (nil? property-ident))
+         (http/bad-request "invalid block or property")
++        (stamp-property-refusal property-ident)
++        (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
++        :else
+         (refusing-labels
+          #(do
+             (atomic-write! conn creator false :remove-block-property
+@@ -2733,7 +2907,8 @@
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
                (p/catch (fn [error]
@@ -157,7 +270,7 @@ index f65a3a1..b062530 100644
  
      :semantic/assets-get
      (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
-@@ -4437,6 +4547,17 @@
+@@ -4437,6 +4612,17 @@
      (= :semantic/block-changes handler) (handle-block-changes context)
      :else (http/not-found)))
  
@@ -175,7 +288,7 @@ index f65a3a1..b062530 100644
  (defn handle [{:keys [^js self route ^js url] :as context}]
    (let [conn (ensure-conn! self)
          handler (:handler route)
-@@ -4454,9 +4575,10 @@
+@@ -4454,9 +4640,10 @@
          context (assoc context :conn conn :db db :handler handler :e2ee? e2ee?
                         :path-params (:path-params route)
                         :creator (request-creator (:request context) e2ee?))]
@@ -194,10 +307,10 @@ index f65a3a1..b062530 100644
 +        (dispatch-handle context handler)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 new file mode 100644
-index 0000000..5e470f5
+index 0000000..746164b
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
-@@ -0,0 +1,663 @@
+@@ -0,0 +1,1394 @@
 +(ns logseq.db-sync.semantic-edit-stamps-test
 +  "Claude edit stamps (patch 0034), stage 1: the flag and the schema. A write whose request carries
 +  x-logseq-edit-stamp: claude, from a real actor on a graph that isn't E2EE, creates two hidden
@@ -205,8 +318,10 @@ index 0000000..5e470f5
 +  property whose one choice, claude, has a fixed UUID) and claudeEditedAt
 +  (:user.property/claude-editedAt, :datetime). A property that is in their way (a decoy titled
 +  editedBy, an ident of the wrong type, the choice's UUID held elsewhere) refuses the write with a
-+  409 before anything is stored. No block is stamped yet. The probes at the top settle the spec's
-+  section 9 facts against UPSTREAM_REF. The graph has a page Notes with blocks A, B and C."
++  409 before anything is stored. The probes at the top settle the spec's section 9 facts against
++  UPSTREAM_REF. Stage 2 (at the end): a flagged write stamps each block it creates or changes with
++  editedBy and claudeEditedAt in its own transaction, and the property tools refuse the two stamp
++  properties. The graph has a page Notes with blocks A, B and C."
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
@@ -217,11 +332,13 @@ index 0000000..5e470f5
 +            [logseq.db-sync.worker.dispatch :as dispatch]
 +            [logseq.db-sync.worker.handler.index :as index-handler]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.common.normalize :as db-normalize]
 +            [logseq.db.frontend.inputs :as db-inputs]
 +            [logseq.db.frontend.property :as db-property]
 +            [logseq.db.frontend.rules :as rules]
 +            [logseq.db.frontend.validate :as db-validate]
 +            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
 +            [logseq.outliner.page :as outliner-page]
 +            [logseq.outliner.property :as outliner-property]
 +            [promesa.core :as p]))
@@ -299,14 +416,17 @@ index 0000000..5e470f5
 +          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
 +         more))
 +
-+(defn- seed-graph []
++(defn- seed-graph
++  "A graph with page Notes holding blocks A, B and C. `ids` fixes their UUIDs ([notes a b c]), so
++  two graphs can be compared."
++  [& [ids]]
 +  (let [conn (sqlite-export/create-conn)
 +        deleted (atom [])
 +        bucket #js {:put (fn [_ _ _] (p/resolved #js {}))
 +                    :delete (fn [key] (swap! deleted conj key) (p/resolved nil))}
 +        self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true
 +                  :env #js {"TIMEZONE" "UTC" "LOGSEQ_SYNC_ASSETS" bucket}}
-+        [notes a b c] (repeatedly 4 random-uuid)]
++        [notes a b c] (or ids (repeatedly 4 random-uuid))]
 +    (d/transact! conn [(raw-page notes "Notes")])
 +    (d/transact! conn (map-indexed (fn [i [id t]]
 +                                     {:block/uuid id :block/title t :block/order (str "a" i)
@@ -487,9 +607,9 @@ index 0000000..5e470f5
 +          (testing "in the write's own transaction"
 +            (is (= #{write-tx} (set (map :tx (mapcat #(d/datoms db :eavt %) schema-ids))))))
 +          (is (empty? (validation-errors db schema-ids)))
-+          (testing "no block is stamped yet"
-+            (is (empty? (holders-of db by-ident)))
-+            (is (empty? (holders-of db at-ident)))))))))
++          (testing "only the written block is stamped (stage 2)"
++            (is (= #{(:db/id (d/entity db [:block/uuid a]))} (set (map :e (holders-of db by-ident)))))
++            (is (= #{(:db/id (d/entity db [:block/uuid a]))} (set (map :e (holders-of db at-ident)))))))))))
 +
 +;; Before the fix both writes transacted the same number of datoms, but the first assertion of the
 +;; test above already failed; this one pins that only the first flagged write adds schema.
@@ -507,7 +627,8 @@ index 0000000..5e470f5
 +            (d/unlisten! conn ::sizes)
 +            (is (= [200 200] [(:status second-write) (:status unflagged)]))
 +            (is (= 2 (count @sizes)))
-+            (is (= (first @sizes) (second @sizes)) "a flagged write adds no datoms once the schema exists")
++            (is (= (+ 2 (second @sizes)) (first @sizes))
++                "once the schema exists a flagged write adds only its block's two stamp datoms")
 +            (is (= #{schema-tx} (set (map :tx (mapcat #(d/datoms @conn :eavt (:db/id %)) [by at choice])))))))))))
 +
 +;; Before the fix: no case created schema, so these passed; the repeated-header case failed:
@@ -861,6 +982,729 @@ index 0000000..5e470f5
 +          (p/then #(is (= (set (keys write-kinds)) (set @seen)) "every write kind ran"))
 +          (p/catch #(is false (str % (some-> % .-stack))))
 +          (p/finally done)))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Stage 2: the stamp. A flagged write stamps each block it creates or changes with editedBy (the
++;; claude choice) and claudeEditedAt, in its own transaction. Pages, tags, properties, closed values,
++;; property value blocks, siblings and children a move carries along are never stamped. The property
++;; tools refuse to write the two stamp properties, with or without the header.
++
++(def ^:private mood-ident :user.property/mood)
++(def ^:private mood-param (js/encodeURIComponent "user.property/mood"))
++
++(defn- seed-stamp-graph
++  "seed-graph plus a page Other holding D, whose children are E and F, with G under E; and a text
++  property mood (:user.property/mood)."
++  [& [ids]]
++  (let [{:keys [conn] :as graph} (seed-graph (seq (take 4 ids)))
++        [other d e f g] (or (seq (drop 4 ids)) (repeatedly 5 random-uuid))
++        block (fn [id t order parent]
++                {:block/uuid id :block/title t :block/order order :block/page [:block/uuid other]
++                 :block/parent [:block/uuid parent] :block/created-at 1 :block/updated-at 1})]
++    (d/transact! conn [(raw-page other "Other")])
++    (d/transact! conn [(block d "D" "a0" other)])
++    (d/transact! conn [(block e "E" "a0" d) (block f "F" "a1" d)])
++    (d/transact! conn [(block g "G" "a0" e)])
++    (user-property! conn mood-ident {} "mood")
++    (assoc graph :other other :d d :e e :f f :g g)))
++
++(defn- stamps
++  "Each block holding claudeEditedAt, by UUID: its editedBy value's db id, its claudeEditedAt, and
++  the tx of each stamp datom."
++  [db]
++  (into {}
++        (map (fn [datom]
++               (let [by (first (d/datoms db :eavt (:e datom) by-ident))]
++                 [(:block/uuid (d/entity db (:e datom)))
++                  {:by (:v by) :by-tx (:tx by) :at (:v datom) :at-tx (:tx datom)}])))
++        (holders-of db at-ident)))
++
++(defn- traced!
++  "Runs (write) and returns its response, the transactions it committed and the call's time window."
++  [conn write]
++  (let [reports (atom [])
++        t0 (.now js/Date)]
++    (d/listen! conn ::traced #(swap! reports conj %))
++    (-> (p/let [response (write)]
++          {:response response :reports @reports :t0 t0 :t1 (.now js/Date)})
++        (p/finally #(d/unlisten! conn ::traced)))))
++
++(defn- stamp-datoms [reports]
++  (filter #(and (:added %) (contains? #{by-ident at-ident} (:a %))) (mapcat :tx-data reports)))
++
++(defn- check-stamps!
++  "That the traced write stamped exactly the blocks `expected` (UUIDs), each with the claude choice and
++  a claudeEditedAt inside the call's window, two datoms per block, in the transaction that changed the
++  block. The write commits `transactions` transactions (capture makes today's journal first)."
++  [conn {:keys [response reports t0 t1]} expected & {:keys [transactions] :or {transactions 1}}]
++  (let [db @conn
++        choice-id (:db/id (d/entity db [:block/uuid choice-uuid]))
++        added (stamp-datoms reports)
++        ;; The tx of the block's own change: any datom on it in the write that isn't a stamp.
++        change-tx (fn [id]
++                    (let [e (:db/id (d/entity db [:block/uuid id]))]
++                      (some #(when (and (= e (:e %)) (not (contains? #{by-ident at-ident} (:a %)))) (:tx %))
++                            (mapcat :tx-data reports))))
++        all (stamps db)]
++    (is (<= 200 (:status response) 299) (pr-str response))
++    (is (= transactions (count reports)) "the write's transactions")
++    (is (some? choice-id) "the schema exists")
++    (is (= (set expected) (set (keys all))) "exactly these blocks are stamped")
++    (is (= (set expected) (set (map #(:block/uuid (d/entity db (:e %))) added))))
++    (is (= (* 2 (count expected)) (count added)) "two stamp datoms per block")
++    (is (= (set (map :e (holders-of db by-ident))) (set (map :e (holders-of db at-ident))))
++        "editedBy and claudeEditedAt are on the same blocks")
++    (doseq [id expected
++            :let [{:keys [by at by-tx at-tx]} (get all id)]]
++      (testing (str (title conn id))
++        (is (= choice-id by) "editedBy is the claude choice")
++        (is (and (number? at) (<= t0 at t1)) (str "claudeEditedAt " at " is in [" t0 ", " t1 "]"))
++        (is (some? (change-tx id)))
++        (is (= (change-tx id) by-tx at-tx) "the stamp shares the write's tx id")))))
++
++(defn- set-mood! [self id value]
++  (request! self "PUT" (str "/semantic/blocks/" id "/properties/" mood-param) {:value value} :headers signed))
++
++(defn- asset-upload! [self page headers]
++  (request! self "POST"
++            (str "/semantic/assets?file-name=photo.png&title=Photo&size=4&page-id=" page
++                 "&checksum=" (apply str (repeat 64 "b")))
++            nil :headers headers :content-type "application/octet-stream"
++            :raw-body (js/Blob. #js [(js/Uint8Array. #js [1 2 3 4])])))
++
++(defn- response-uuid [response]
++  (uuid (get-in response [:body :uuid])))
++
++;; Each write route: [label setup write expected transactions?]. setup runs unflagged and returns more
++;; keys for the graph; write is the flagged call; expected gives the UUIDs it must stamp, and nothing
++;; else; transactions is how many the call commits when it isn't one.
++(defn- write-routes []
++  (let [[n1 n2 n3] (repeatedly 3 random-uuid)]
++    [["insertBlockTree, a parent and its child, appended after A, B and C"
++      nil
++      (fn [{:keys [self notes]}]
++        (request! self "POST" "/semantic/block-trees"
++                  {:target-id (str notes)
++                   :blocks [{:uuid (str n1) :title "N1" :children [{:uuid (str n2) :title "N2"}]}]}
++                  :headers stamped))
++      (constantly #{n1 n2})]
++     ["insertBlockChildren"
++      nil
++      (fn [{:keys [self b]}]
++        (request! self "POST" (str "/semantic/blocks/" b "/children")
++                  {:position "append" :blocks [{:uuid (str n1) :title "N1"}]} :headers stamped))
++      (constantly #{n1})]
++     ["batchInsertBlockTrees, into Notes and into a page it creates"
++      nil
++      (fn [{:keys [self notes]}]
++        (request! self "POST" "/semantic/block-trees/batch"
++                  {:entries [{:target-id (str notes)
++                              :blocks [{:uuid (str n1) :title "N1" :children [{:uuid (str n2) :title "N2"}]}]}
++                             {:page "Fresh" :blocks [{:uuid (str n3) :title "N3"}]}]}
++                  :headers stamped))
++      (constantly #{n1 n2 n3})]
++     ["captureToToday, which creates today's journal"
++      nil
++      (fn [{:keys [self]}]
++        (request! self "POST" "/semantic/capture" {:blocks [{:uuid (str n1) :title "Captured"}]} :headers stamped))
++      (constantly #{n1})
++      2]
++     ["createTask"
++      nil
++      (fn [{:keys [self notes]}]
++        (request! self "POST" "/semantic/tasks" {:title "Call Sam" :page-id (str notes) :status "todo"
++                                                 :priority "high"}
++                  :headers stamped))
++      (fn [_ response] #{(response-uuid response)})]
++     ["updateBlock"
++      nil
++      (fn [{:keys [self a]}] (update-block! self a "A edited" stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a text value (stored in a property value block)"
++      nil
++      (fn [{:keys [self a]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" mood-param) {:value "happy"}
++                  :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, tags"
++      (fn [{:keys [self]}] (request! self "POST" "/semantic/tags" {:title "Food"}))
++      (fn [{:keys [self a]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "block/tags"))
++                  {:value "Food"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a choice"
++      nil
++      (fn [{:keys [self a]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "logseq.property/priority"))
++                  {:value "High"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["batchSetBlockProperty, on a block and on a page"
++      nil
++      (fn [{:keys [self a notes]}]
++        (request! self "POST" "/semantic/block-properties/batch-set"
++                  {:entries [{:block-id (str a) :property-id "user.property/mood" :value "calm"}
++                             {:block-id (str notes) :property-id "user.property/mood" :value "busy"}]}
++                  :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["deleteBlockProperty"
++      (fn [{:keys [self a]}] (set-mood! self a "happy"))
++      (fn [{:keys [self a]}]
++        (request! self "DELETE" (str "/semantic/blocks/" a "/properties/" mood-param) nil :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["batchDeleteBlockProperty"
++      (fn [{:keys [self a b]}] (p/do (set-mood! self a "happy") (set-mood! self b "sad")))
++      (fn [{:keys [self a b]}]
++        (request! self "POST" "/semantic/block-properties/batch-delete"
++                  {:entries [{:block-id (str a) :property-id "user.property/mood"}
++                             {:block-id (str b) :property-id "user.property/mood"}]}
++                  :headers stamped))
++      (fn [{:keys [a b]} _] #{a b})]
++     ["deleteBlockProperty, the block's tags (a retraction only)"
++      (fn [{:keys [self a]}]
++        (p/do (request! self "POST" "/semantic/tags" {:title "Food"})
++              (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "block/tags"))
++                        {:value "Food"} :headers signed)))
++      (fn [{:keys [self a]}]
++        (request! self "DELETE" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "block/tags")) nil
++                  :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["batchSetBlockProperty, a reset to fewer tags (a retraction only)"
++      (fn [{:keys [self a]}]
++        (p/do (request! self "POST" "/semantic/tags" {:title "Food"})
++              (request! self "POST" "/semantic/tags" {:title "Recipe"})
++              (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "block/tags"))
++                        {:value ["Food" "Recipe"]} :headers signed)))
++      (fn [{:keys [self a]}]
++        (request! self "POST" "/semantic/block-properties/batch-set"
++                  {:isResetExistingValues true
++                   :entries [{:block-id (str a) :property-id "block/tags" :value ["Food"]}]}
++                  :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ;; Class sweep: a value of every property type, and a property of every namespace kind (user,
++     ;; built-in, a built-in in a sub-namespace, library, plugin), changes the holder through its
++     ;; property attribute alone.
++     ["setBlockProperty, a number"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/count {:logseq.property/type :number} "count")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/count"))
++                  {:value 3} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a node (a page)"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/related {:logseq.property/type :node} "related")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/related"))
++                  {:value (str other)} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a URL"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/link {:logseq.property/type :url} "link")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/link"))
++                  {:value "https://example.com/a"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a date (a journal)"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/due {:logseq.property/type :date} "due")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/due"))
++                  {:value (str journal)} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a datetime"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/when {:logseq.property/type :datetime} "when")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/when"))
++                  {:value 1700000000000} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a checkbox"
++      (fn [{:keys [conn]}]
++        (user-property! conn :user.property/done {:logseq.property/type :checkbox} "done")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "user.property/done"))
++                  {:value true} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a library property"
++      (fn [{:keys [conn]}]
++        (user-property! conn :schema.property/genre {} "genre")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "schema.property/genre"))
++                  {:value "jazz"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a plugin property"
++      (fn [{:keys [conn]}]
++        (user-property! conn :plugin.property.demo/rating {} "rating")
++        (let [journal (random-uuid)]
++          (d/transact! conn [(raw-page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                       :block/tags #{:logseq.class/Journal})])
++          {:journal journal}))
++      (fn [{:keys [self a other journal]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "plugin.property.demo/rating"))
++                  {:value "five"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["setBlockProperty, a built-in in a sub-namespace (a code block's language)"
++      nil
++      (fn [{:keys [self a]}]
++        (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "logseq.property.code/lang"))
++                  {:value "clojure"} :headers stamped))
++      (fn [{:keys [a]} _] #{a})]
++     ["moveBlocks, same parent, after a sibling"
++      nil
++      (fn [{:keys [self a c]}]
++        (request! self "POST" "/semantic/block-moves" {:block-ids [(str c)] :target-id (str a) :position "after"}
++                  :headers stamped))
++      (fn [{:keys [c]} _] #{c})]
++     ["moveBlocks, same parent, before the first sibling"
++      nil
++      (fn [{:keys [self a c]}]
++        (request! self "POST" "/semantic/block-moves" {:block-ids [(str c)] :target-id (str a) :position "before"}
++                  :headers stamped))
++      (fn [{:keys [c]} _] #{c})]
++     ["moveBlocks, to a new parent on the same page"
++      nil
++      (fn [{:keys [self a c]}]
++        (request! self "POST" "/semantic/block-moves" {:block-ids [(str c)] :target-id (str a) :position "last-child"}
++                  :headers stamped))
++      (fn [{:keys [c]} _] #{c})]
++     ["moveBlocks, to another page, carrying three descendants"
++      nil
++      (fn [{:keys [self notes d]}]
++        (request! self "POST" "/semantic/block-moves" {:block-ids [(str d)] :target-id (str notes) :position "last-child"}
++                  :headers stamped))
++      (fn [{:keys [d]} _] #{d})]
++     ["batchMoveBlocks, a reorder and a cross-page move carrying a child"
++      nil
++      (fn [{:keys [self notes a c e]}]
++        (request! self "POST" "/semantic/block-moves/batch"
++                  {:moves [{:block-ids [(str a)] :target-id (str c) :position "after"}
++                           {:block-ids [(str e)] :target-id (str notes) :position "last-child"}]}
++                  :headers stamped))
++      (fn [{:keys [a e]} _] #{a e})]
++     ["refreshRefs with apply"
++      (fn [{:keys [conn notes]}]
++        (outliner-core/insert-blocks! conn [{:block/uuid n1 :block/title "Buy #Unknownword"}]
++                                      (d/entity @conn [:block/uuid notes])
++                                      {:sibling? false :keep-uuid? true :bottom? true})
++        nil)
++      (fn [{:keys [self]}] (request! self "POST" "/semantic/refresh-refs" {:apply true} :headers stamped))
++      (constantly #{n1})]
++     ["createAsset"
++      nil
++      (fn [{:keys [self notes]}] (asset-upload! self notes stamped))
++      (fn [_ response] #{(response-uuid response)})]
++     ["deleteBlock (a deleted block is not stamped)"
++      nil
++      (fn [{:keys [self d]}] (request! self "DELETE" (str "/semantic/blocks/" d) nil :headers stamped))
++      (constantly #{})]
++     ["deleteBlocks"
++      nil
++      (fn [{:keys [self a b]}]
++        (request! self "DELETE" "/semantic/blocks" {:block-ids [(str a) (str b)]} :headers stamped))
++      (constantly #{})]
++     ["createPage (pages are not stamped)"
++      nil
++      (fn [{:keys [self]}] (request! self "POST" "/semantic/pages" {:title "Fresh page"} :headers stamped))
++      (constantly #{})]
++     ["createTag (tags are not stamped)"
++      nil
++      (fn [{:keys [self]}] (request! self "POST" "/semantic/tags" {:title "Recipe"} :headers stamped))
++      (constantly #{})]
++     ["createProperty with choices (properties and closed values are not stamped)"
++      nil
++      (fn [{:keys [self]}]
++        (request! self "POST" "/semantic/properties" {:title "colour" :type "default" :choices [{:title "red"}]}
++                  :headers stamped))
++      (constantly #{})]]))
++
++;; Before the fix every write left every block unstamped, e.g. for updateBlock:
++;;   expected: (= (set expected) (set (keys all)))  actual: (not (= #{#uuid "…"} #{}))
++(deftest every-write-route-stamps-exactly-its-own-blocks-test
++  (async done
++    (let [ran (atom 0)
++          routes (write-routes)]
++      (-> (p/doseq [[label setup write expected transactions] routes]
++            (p/let [graph (seed-stamp-graph)
++                    more (when setup (setup graph))
++                    graph (merge graph (when (map? more) more))
++                    traced (traced! (:conn graph) #(write graph))]
++              (swap! ran inc)
++              (testing label
++                (check-stamps! (:conn graph) traced (expected graph (:response traced))
++                               :transactions (or transactions 1)))))
++          (p/then #(is (= (count routes) @ran) "every route ran"))
++          (p/catch #(is false (str % (some-> % .-stack))))
++          (p/finally done)))))
++
++;; Siblings, a moved block's carried descendants and the page are named here as well as by the exact
++;; set above, so a mutation that stamps them is reported by name.
++;; Before the fix nothing was stamped, so the first assertion failed:
++;;   expected: (= #{d} (set (keys (stamps @conn))))  actual: (not (= #{#uuid "…"} #{}))
++(deftest moves-stamp-the-moved-block-only-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self notes other a b c d e f g]} (seed-stamp-graph)
++                cross (request! self "POST" "/semantic/block-moves"
++                                {:block-ids [(str d)] :target-id (str notes) :position "last-child"}
++                                :headers stamped)
++                _ (is (= 200 (:status cross)) (pr-str cross))
++                _ (is (= #{d} (set (keys (stamps @conn)))))
++                _ (testing "descendants carried to the new page are not stamped"
++                    (doseq [id [e f g]]
++                      (is (= notes (:block/uuid (:block/page (d/entity @conn [:block/uuid id])))))
++                      (is (nil? (get (stamps @conn) id)) (title conn id))))
++                reorder (request! self "POST" "/semantic/block-moves"
++                                  {:block-ids [(str c)] :target-id (str a) :position "before"}
++                                  :headers stamped)]
++          (is (= 200 (:status reorder)) (pr-str reorder))
++          (testing "siblings of a reordered block are not stamped"
++            (is (= #{c d} (set (keys (stamps @conn)))))
++            (doseq [id [a b]] (is (nil? (get (stamps @conn) id)) (title conn id))))
++          (testing "pages are not stamped"
++            (doseq [id [notes other]] (is (nil? (get (stamps @conn) id))))))))))
++
++;; A move whose new order key equals the block's old one changes only :block/parent; the block is
++;; still stamped. The block's order is set to the key the move will generate first.
++(deftest a-move-that-changes-only-the-parent-stamps-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self a b]} (seed-stamp-graph)
++                probe (d/conn-from-db @conn)
++                ;; The key a move to B's first child gets, found on a copy.
++                _ (request! #js {:conn probe :sql (test-sql/make-sql) :schema-ready true
++                                 :env #js {"TIMEZONE" "UTC"}}
++                            "POST" "/semantic/block-moves"
++                            {:block-ids [(str a)] :target-id (str b) :position "last-child"})
++                key (:block/order (d/entity @probe [:block/uuid a]))
++                _ (d/transact! conn [[:db/add [:block/uuid a] :block/order key]])
++                traced (traced! conn #(request! self "POST" "/semantic/block-moves"
++                                                {:block-ids [(str a)] :target-id (str b) :position "last-child"}
++                                                :headers stamped))
++                a-id (:db/id (d/entity @conn [:block/uuid a]))
++                changed (set (keep #(when (and (= a-id (:e %)) (:added %)) (:a %)) (mapcat :tx-data (:reports traced))))]
++          (is (= b (:block/uuid (:block/parent (d/entity @conn [:block/uuid a])))))
++          (is (contains? changed :block/parent))
++          (is (not (contains? changed :block/order)) (str "only the parent changed: " (pr-str changed)))
++          (check-stamps! conn traced #{a}))))))
++
++;; A property delete changes the holder by retraction only; a block whose only change is a
++;; :block/refs retraction (it linked to a block that was deleted) is not stamped.
++;; Before the fix the holder was not stamped:
++;;   expected: (= #{a} (set (keys (stamps @conn))))  actual: (not (= #{#uuid "…"} #{}))
++(deftest retractions-stamp-only-property-holders-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self a b c]} (seed-stamp-graph)
++                _ (set-mood! self a "happy")
++                ;; B links to C through :block/refs only, as a stale ref would.
++                _ (d/transact! conn [[:db/add [:block/uuid b] :block/refs [:block/uuid c]]])
++                deleted (request! self "DELETE" (str "/semantic/blocks/" a "/properties/" mood-param) nil
++                                  :headers stamped)
++                _ (is (= 200 (:status deleted)) (pr-str deleted))
++                _ (is (nil? (get (d/entity @conn [:block/uuid a]) mood-ident)))
++                _ (is (= #{a} (set (keys (stamps @conn)))))
++                removed (request! self "DELETE" (str "/semantic/blocks/" c) nil :headers stamped)]
++          (is (= 200 (:status removed)) (pr-str removed))
++          (is (empty? (:block/refs (d/entity @conn [:block/uuid b]))) "B's ref to C was retracted")
++          (is (= #{a} (set (keys (stamps @conn)))) "B is not stamped"))))))
++
++;; Before the fix the first read found no stamp:
++;;   expected: (number? first-at)  actual: (not (number? nil))
++(deftest a-later-write-moves-claude-edited-at-forward-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a]}]
++        (p/let [_ (update-block! self a "A once" stamped)
++                first-at (:at (get (stamps @conn) a))
++                _ (p/delay 5)
++                traced (traced! conn #(update-block! self a "A twice" stamped))
++                {:keys [at at-tx by]} (get (stamps @conn) a)]
++          (is (number? first-at))
++          (is (> at first-at) "claudeEditedAt moved forward")
++          (is (= (some-> traced :reports first :tx-data first :tx) at-tx) "in the later write's tx")
++          (is (= (:db/id (d/entity @conn [:block/uuid choice-uuid])) by))
++          (is (= 1 (count (d/datoms @conn :eavt (:db/id (d/entity @conn [:block/uuid a])) at-ident)))
++              "one value, replaced"))))))
++
++;; With the schema already in place (A stamped by a first flagged write), writes that aren't flagged
++;; stamp nothing. Before the fix these passed too (nothing stamped anything); they pin that the stamp
++;; follows the flag, not the schema.
++(deftest only-flagged-writes-stamp-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a b notes]}]
++        (p/let [_ (update-block! self a "A edited" stamped)
++                _ (is (= #{a} (set (keys (stamps @conn)))))
++                responses (p/all
++                           (for [[label headers e2ee? dry?]
++                                 [["no header" signed false false]
++                                  ["another value" (conj signed ["x-logseq-edit-stamp" "Claude"]) false false]
++                                  ["no actor" [["x-logseq-edit-stamp" "claude"]] false false]
++                                  ["a dry run" stamped false true]
++                                  ["an E2EE graph" stamped true false]]]
++                             (p/let [response (request! self "POST" (str "/semantic/block-moves" (when dry? "?dry-run=true"))
++                                                        {:block-ids [(str b)] :target-id (str notes) :position "last-child"}
++                                                        :headers headers :e2ee? e2ee?)]
++                               [label response])))]
++          (doseq [[label response] responses]
++            (testing label (is (= 200 (:status response)) (pr-str response))))
++          (is (= #{a} (set (keys (stamps @conn)))) "B is not stamped"))))))
++
++(def ^:private fixed-ids (vec (repeatedly 9 random-uuid)))
++
++;; The first flagged write (which creates the schema) and a later one answer exactly as the same
++;; write without the header, on two graphs seeded alike.
++;; Before the fix these passed (nothing was added); they pin that stamping adds nothing to responses.
++(deftest responses-are-unchanged-by-the-stamp-test
++  (async done
++    (let [[t1 t2] (repeatedly 2 random-uuid)
++          calls [["updateBlock" (fn [{:keys [self a]} headers] (update-block! self a "A edited" headers))]
++                 ["insertBlockTree"
++                  (fn [{:keys [self notes]} headers]
++                    (request! self "POST" "/semantic/block-trees"
++                              {:target-id (str notes) :verbose true
++                               :blocks [{:uuid (str t1) :title "T1" :children [{:uuid (str t2) :title "T2"}]}]}
++                              :headers headers))]
++                 ["batchMoveBlocks"
++                  (fn [{:keys [self notes a d]} headers]
++                    (request! self "POST" "/semantic/block-moves/batch"
++                              {:moves [{:block-ids [(str a)] :target-id (str notes) :position "last-child"}
++                                       {:block-ids [(str d)] :target-id (str a) :position "after"}]}
++                              :headers headers))]
++                 ["setBlockProperty"
++                  (fn [{:keys [self b]} headers]
++                    (request! self "PUT" (str "/semantic/blocks/" b "/properties/" mood-param) {:value "ok"}
++                              :headers headers))]]]
++      (-> (p/let [plain (seed-stamp-graph fixed-ids)
++                  flagged (seed-stamp-graph fixed-ids)
++                  results (p/loop [[[label call] & more] calls acc []]
++                            (if-not label
++                              acc
++                              (p/let [without (call plain signed)
++                                      with (call flagged stamped)]
++                                (p/recur more (conj acc [label without with])))))]
++            (is (seq (stamps @(:conn flagged))) "the flagged graph was stamped")
++            (is (empty? (holders-of @(:conn plain) at-ident)))
++            (doseq [[label without with] results]
++              (testing label
++                (is (<= 200 (:status without) 299) (pr-str without))
++                (is (= without with)))))
++          (p/catch #(is false (str % (some-> % .-stack))))
++          (p/finally done)))))
++
++;; Refusals with the header still answer 4xx naming the entry, and leave no stamp (and nothing else).
++;; Before the fix they refused the same way (nothing stamped); they pin that a refused write's stamp
++;; is discarded with it.
++(deftest refused-writes-leave-no-stamp-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a b c]}]
++        (p/let [food (request! self "POST" "/semantic/tags" {:title "Food"})
++                _ (update-block! self c "C edited" stamped)
++                before (snapshot conn)
++                private-tag (request! self "POST" "/semantic/block-properties/batch-set"
++                                      {:entries [{:block-id (str b) :property-id "block/tags" :value "Food"}
++                                                 {:block-id (str a) :property-id "block/tags" :value ["Journal"]}]}
++                                      :headers stamped)
++                choice (request! self "POST" "/semantic/block-properties/batch-set"
++                                 {:entries [{:block-id (str a) :property-id "block/tags" :value "Food"}
++                                            {:block-id (str b) :property-id "logseq.property/priority" :value "Someday"}]}
++                                 :headers stamped)
++                single (request! self "PUT" (str "/semantic/blocks/" b "/properties/" (js/encodeURIComponent "logseq.property/priority"))
++                                 {:value "Someday"} :headers stamped)]
++          (is (= 201 (:status food)))
++          (is (= 400 (:status private-tag)) (pr-str private-tag))
++          (is (string/starts-with? (str (get-in private-tag [:body :error])) "entry 1: Tags: "))
++          (is (= 400 (:status choice)) (pr-str choice))
++          (is (string/starts-with? (str (get-in choice [:body :error])) "entry 1: "))
++          (is (= 400 (:status single)) (pr-str single))
++          (is (= before (snapshot conn)) "nothing is written")
++          (is (= #{c} (set (keys (stamps @conn))))))))))
++
++(defn- server-message [entry property-title]
++  (str "entry " entry ": " property-title " is set by the server and can't be written"))
++
++;; The stamp properties can't be written through the property tools, given by title, ident or UUID,
++;; with or without the header; the refusal names the entry and nothing is written.
++;; Before the fix the writes went through, e.g.:
++;;   expected: (= 400 (:status response))  actual: (not (= 400 200))
++(deftest the-stamp-properties-cannot-be-written-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self a b c]} (seed-stamp-graph)
++                _ (update-block! self a "A edited" stamped)
++                {:keys [by at]} (schema-entities @conn)
++                ;; Every way a property can be named, for each stamp property.
++                names {"editedBy" ["editedBy" "user.property/claude-editedBy" (str (:block/uuid by))]
++                       "claudeEditedAt" ["claudeEditedAt" "user.property/claude-editedAt" (str (:block/uuid at))]}
++                values {"editedBy" "claude" "claudeEditedAt" 1700000000000}
++                before (snapshot conn)
++                refusals (p/all
++                          (for [headers [signed stamped]
++                                [property-title ids] names
++                                id ids
++                                :let [param (js/encodeURIComponent id)
++                                      value (get values property-title)
++                                      label (str property-title " as " id (when (= headers stamped) ", flagged"))]]
++                            (p/let [set-one (request! self "PUT" (str "/semantic/blocks/" b "/properties/" param)
++                                                      {:value value} :headers headers)
++                                    delete-one (request! self "DELETE" (str "/semantic/blocks/" a "/properties/" param)
++                                                         nil :headers headers)
++                                    batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                                        {:entries [{:block-id (str b) :property-id "user.property/mood" :value "ok"}
++                                                                   {:block-id (str c) :property-id id :value value}]}
++                                                        :headers headers)
++                                    batch-set-first (request! self "POST" "/semantic/block-properties/batch-set"
++                                                              {:entries [{:block-id (str c) :property-id id :value value}
++                                                                         {:block-id (str b) :property-id "user.property/mood" :value "ok"}]}
++                                                              :headers headers)
++                                    batch-delete (request! self "POST" "/semantic/block-properties/batch-delete"
++                                                           {:entries [{:block-id (str b) :property-id "user.property/mood"}
++                                                                      {:block-id (str a) :property-id id}]}
++                                                           :headers headers)]
++                              [label property-title {:set set-one :delete delete-one :batch-set batch-set
++                                                     :batch-set-first batch-set-first :batch-delete batch-delete}])))]
++          (doseq [[label property-title {:keys [set delete batch-set batch-set-first batch-delete]}] refusals]
++            (testing label
++              (doseq [[call response entry] [["set" set 0] ["delete" delete 0] ["batch set" batch-set 1]
++                                             ["batch set, refused entry first" batch-set-first 0]
++                                             ["batch delete" batch-delete 1]]]
++                (is (= [400 (server-message entry property-title)]
++                       [(:status response) (get-in response [:body :error])])
++                    call))))
++          (is (= before (snapshot conn)) "nothing is written")
++          (testing "two stamp properties in one batch: the first is named, in either order"
++            (p/let [both (request! self "POST" "/semantic/block-properties/batch-set"
++                                   {:entries [{:block-id (str b) :property-id "claudeEditedAt" :value 1}
++                                              {:block-id (str b) :property-id "editedBy" :value "claude"}]})
++                    reversed (request! self "POST" "/semantic/block-properties/batch-delete"
++                                       {:entries [{:block-id (str a) :property-id "editedBy"}
++                                                  {:block-id (str a) :property-id "claudeEditedAt"}]})]
++              (is (= (server-message 0 "claudeEditedAt") (get-in both [:body :error])))
++              (is (= (server-message 0 "editedBy") (get-in reversed [:body :error])))
++              (is (= before (snapshot conn))))))))))
++
++;; What the refusal must not catch: other property writes on a stamped block, a re-send, a reset
++;; and a property whose title only starts like a stamp property, with and without the header. The
++;; stamp survives them all.
++;; Before the fix these answered 2xx too; they pin the refusal's reach.
++(deftest property-writes-on-stamped-blocks-still-work-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self a b]} (seed-stamp-graph)
++                _ (update-block! self a "A edited" stamped)
++                at (:at (get (stamps @conn) a))
++                _ (user-property! conn :user.property/edited-by-me {} "editedByMe")
++                results (p/loop [[headers & more] [signed stamped] acc []]
++                          (if-not headers
++                            acc
++                            (p/let [set-one (request! self "PUT" (str "/semantic/blocks/" a "/properties/" mood-param)
++                                                      {:value "happy"} :headers headers)
++                                    resent (request! self "PUT" (str "/semantic/blocks/" a "/properties/" mood-param)
++                                                     {:value "happy"} :headers headers)
++                                    lookalike (request! self "PUT" (str "/semantic/blocks/" a "/properties/editedByMe")
++                                                        {:value "me"} :headers headers)
++                                    reset (request! self "POST" "/semantic/block-properties/batch-set"
++                                                    {:isResetExistingValues true
++                                                     :entries [{:block-id (str a) :property-id "user.property/mood" :value "calm"}
++                                                               {:block-id (str b) :property-id "user.property/mood" :value "calm"}]}
++                                                    :headers headers)
++                                    deleted (request! self "DELETE" (str "/semantic/blocks/" a "/properties/" mood-param)
++                                                      nil :headers headers)
++                                    batch-deleted (request! self "POST" "/semantic/block-properties/batch-delete"
++                                                            {:entries [{:block-id (str b) :property-id "user.property/mood"}
++                                                                       {:block-id (str a) :property-id "editedByMe"}]}
++                                                            :headers headers)]
++                              (p/recur more (conj acc [(if (= headers signed) "unflagged" "flagged")
++                                                       {:set set-one :resent resent :lookalike lookalike :reset reset
++                                                        :deleted deleted :batch-deleted batch-deleted}])))))]
++          (doseq [[label calls] results
++                  [call response] calls]
++            (testing (str label " " (name call))
++              (is (= 200 (:status response)) (pr-str response))))
++          (is (some? (get (stamps @conn) a)) "A keeps its stamp")
++          (is (<= at (:at (get (stamps @conn) a)))))))))
++
++;; The semantic read API leaves the stamps out (hide? only hides them in the app; the reads list every
++;; user property, so the stamp idents are left out by name).
++;; Before the fix there was no stamp to leave out:
++;;   expected: (some? (get (stamps @conn) a))  actual: (not (some? nil))
++(deftest get-block-leaves-the-stamps-out-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a notes]}]
++        (p/let [_ (update-block! self a "A edited" stamped)
++                one (request! self "GET" (str "/semantic/blocks/" a) nil)
++                many (request! self "GET" (str "/semantic/blocks?ids=" a) nil)
++                outline (request! self "GET" (str "/semantic/pages/" notes "/outline") nil)]
++          (is (some? (get (stamps @conn) a)))
++          (is (string/includes? (pr-str (:body outline)) "A edited"))
++          (doseq [[label response] [["getBlock" one] ["getBlocks" many] ["getPageOutline" outline]]]
++            (testing label
++              (is (= 200 (:status response)) (pr-str response))
++              (is (not (re-find #"(?i)editedby|claudeeditedat|claude-edited" (pr-str (:body response))))
++                  (pr-str (:body response))))))))))
++
++;; A client replaying the logged, normalized tx-data ends up with the same stamps, schema included.
++;; Before the fix the client had no stamp either:
++;;   expected: (some? server)  actual: (not (some? nil))
++(deftest stamped-writes-replay-on-a-client-test
++  (async done
++    (with-graph done
++      (fn [_]
++        (p/let [{:keys [conn self notes a d n]} (assoc (seed-stamp-graph) :n (random-uuid))
++                client (d/conn-from-db @conn)
++                logged (atom [])
++                _ (d/listen! conn ::log (fn [{:keys [db-after db-before tx-data]}]
++                                          (swap! logged conj (db-normalize/normalize-tx-data db-after db-before tx-data))))
++                _ (update-block! self a "A edited" stamped)
++                _ (request! self "POST" "/semantic/block-trees"
++                            {:target-id (str notes) :blocks [{:uuid (str n) :title "N"}]} :headers stamped)
++                _ (request! self "POST" "/semantic/block-moves"
++                            {:block-ids [(str d)] :target-id (str notes) :position "last-child"} :headers stamped)
++                _ (d/unlisten! conn ::log)
++                _ (doseq [tx-data @logged] (d/transact! client tx-data))
++                view (fn [db] (into {} (map (fn [[id {:keys [by at]}]]
++                                              [id {:by (:block/uuid (d/entity db by)) :at at}]))
++                                    (stamps db)))
++                server (view @conn)]
++          (is (= 3 (count @logged)) "one transaction per write")
++          (is (= #{a n d} (set (keys server))))
++          (is (every? #(= choice-uuid (:by %)) (vals server)))
++          (is (= server (view @client))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f2e1e92..07f3b43 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

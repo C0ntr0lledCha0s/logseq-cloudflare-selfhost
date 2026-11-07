@@ -1088,6 +1088,13 @@ describe("hand-written tools", () => {
     );
   });
 
+  it("connector_help says the edit-stamp properties are set by the server and refused by the property tools", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "editedBy and claudeEditedAt are set by the server; set_block_property, batch_set_block_property, delete_block_property and batch_delete_block_property refuse them, naming the entry",
+    );
+  });
+
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);

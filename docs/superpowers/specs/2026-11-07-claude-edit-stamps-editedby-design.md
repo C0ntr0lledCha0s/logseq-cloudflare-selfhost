@@ -36,7 +36,7 @@ Acceptance (issue):
 
 **Moves don't re-key siblings.** The panel's safety judge cited `semantic.cljs:3191-3193` as move code that re-keys many blocks' `:block/order`. Those lines are in the property update handler and re-key a property's closed values (choices), not blocks. The outliner's `move-block` (`deps/outliner/src/logseq/outliner/core.cljs:1414-1442`) writes `:block/parent` and `:block/order` for the moved block only, `:block/page` for its children when the page changes, and `:block/updated-at` for the source and target pages. Inserts key only the inserted blocks (`core.cljs:735-744`). So siblings of a moved or inserted block get no datom at all, and a same-parent move changes only the moved block's `:block/order`. Section 3.2 uses this.
 
-**Hiding a property.** `:logseq.property/hide?` on a property is the "Hide this property" flag. `property-with-position?` (`deps/outliner/src/logseq/outliner/property.cljs:1153`) leaves such a property out of a block's property area. `update_property` can't set it (the handler allows only some flags, and on built-ins only hide-empty-value and description), so the patch must set it when it creates the property. `entity-util/hidden?` (`deps/db/src/logseq/db/frontend/entity_util.cljs:69`) is then true for the property entity, which also drops it from the semantic API's `list_properties` and `get_block`.
+**Hiding a property.** `:logseq.property/hide?` on a property is the "Hide this property" flag. `property-with-position?` (`deps/outliner/src/logseq/outliner/property.cljs:1153`) leaves such a property out of a block's property area. `update_property` can't set it (the handler allows only some flags, and on built-ins only hide-empty-value and description), so the patch must set it when it creates the property. `entity-util/hidden?` (`deps/db/src/logseq/db/frontend/entity_util.cljs:69`) is then true for the property entity, which also drops it from the semantic API's `list_properties`. (It does not drop it from `get_block`, which lists every user property; Stage 2 leaves the two stamp idents out of the reads by name, section 12.)
 
 **The semantic index.** The indexer embeds a block only when its document hash changes (`connector/src/semantic/indexer.ts:150`), and the document holds no properties (`connector/src/semantic/document.ts`). A stamp always rides with a real change in the same transaction. So stamps cost no extra neurons, whether or not they touch `:block/updated-at`.
 
@@ -231,3 +231,28 @@ Notes from the build, newest stage last. Each says what was checked and how.
 - **Authorship.** The schema is created after the authorship datoms, so `created-by-ref` describes only what the caller's write created.
 
 **Cost.** A few dozen datoms once per graph (two properties and the choice); per flagged write, two ident lookups, one UUID lookup and two `:block/name` index reads, before and again after the mutation. No Worker request, D1 row or neuron.
+
+### Stage 2: the stamp and the refusal
+
+**What is stamped.** `stamp-tx` runs in `authored-write!`'s `tx-conn`, after the authorship datoms and `ensure-stamp-schema!`, over the write's `tx-data`, and its datoms are transacted there, so they share the write's tx id. Each entity gets two datoms however many of its datoms qualify. A datom qualifies when:
+
+- it adds `:block/title`, `:block/parent` or `:block/order`; or
+- it adds or retracts `:block/tags`, or a property attribute: one whose namespace contains `.property`, which is upstream's own test in `db-property/property?` (`user-property-namespace?`). That covers user (`user.property`), library (`schema.property`), plugin (`plugin.property.*`) and every built-in namespace (`logseq.property`, `logseq.property.code` and the rest).
+
+An entity is a target when, in the after-db, it has `:block/page` and no `:logseq.property/created-from-property`.
+
+**Changes from section 3.2, each found by a test or a mutation:**
+
+- **Tags removed by retraction stamp the block.** `delete_block_property` on Tags and a reset to fewer tags only retract `:block/tags`. With the spec's set (tags qualifying only when added) the block wasn't stamped, though 3.2 says a property delete stamps its holder. `:block/tags` now qualifies both ways, as a property attribute does.
+- **Property attributes by upstream's rule, not three namespaces.** A library property (`schema.property/genre`) and a built-in in a sub-namespace (`logseq.property.code/lang`) changed the block without stamping it under `user.property/*`, `logseq.property/*` and `plugin.property*`.
+- **Dropped as unreachable.** Mutations showed these rules change no outcome, so they were removed: `:block/link` (no write changes it alone), the `:block/uuid`, page, tag, property and closed-value checks (pages, tags and properties have no `:block/page`; closed values carry `created-from-property`), and the exclusion of the stamp attributes and `created-by-ref` (stamps are added after `tx-data` is read; `created-by-ref` is only added to a block whose UUID or first title is added in the same write). Tests pin each outcome: `createPage`, `createTag`, `createProperty` with choices and the schema's own choice are never stamped.
+- **Reads leave the stamps out by ident.** `hide?` doesn't drop a property from `get_block`, `get_blocks` or `get_page_outline` (they list every user property). `shown-property?` now leaves out the two stamp idents, and only those: a property the owner hides is still listed.
+- **`now`** is read once per flagged write, in `authored-write!`; the authorship datoms keep their own clock read.
+
+**The refusal.** `set_block_property` and `delete_block_property` answer 400 `entry 0: editedBy is set by the server and can't be written` (or `claudeEditedAt`) once the property resolves to a stamp ident, by title, ident or UUID, with or without the header. In `batch_set_block_property` and `batch_delete_block_property` the check is in `batch-entries-error`, so the first refused entry is named and nothing is written. A property whose title only starts like a stamp property (`editedByMe`), re-sends, resets and other property writes on a stamped block still succeed, and the stamp survives them.
+
+**Not stamped, out of scope.** `delete_page`, `delete_tag` and `delete_property` write through `outliner-page/delete!` outside `authored-write!`, so their holders, which lose a tag or a value, are not stamped (they get no authorship either). Insert inputs (`properties` on a BlockTree node) can still name the stamp properties; on a flagged write the stamp overwrites them, on an unflagged one they stay. Both are backlog items.
+
+**Mutation check** (one line each, in a scratch copy): leaving out `:block/title`, `:block/parent`, `:block/order`, tag retractions, property attributes, property retractions, the `:block/page` check or the value-block exclusion, transacting the stamp outside the `tx-conn`, or removing the refusal from the single set, the single delete or the batch check each fails a test. `:block/parent` survived until a test moved a block whose new order key equals its old one.
+
+**Cost.** Two datoms per stamped block and one pass over the write's datoms, with an entity read for each distinct entity a qualifying datom names. No query per block, no Worker request, D1 row or neuron.
