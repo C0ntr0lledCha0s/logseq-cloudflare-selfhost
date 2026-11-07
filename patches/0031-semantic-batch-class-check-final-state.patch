@@ -155,10 +155,10 @@ index a8de8df..4666738 100644
    "Applies resolved insert entries in order. A `page` entry uses the page that names (insert-page), or creates it."
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
 new file mode 100644
-index 0000000..d515586
+index 0000000..b4b696f
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,347 @@
 +(ns logseq.db-sync.semantic-batch-class-check-test
 +  "A property limited to classes, written in a batch: the class check judges the batch's final
 +  state, so a tag one entry gives a page counts for a value another entry sets to that page, in
@@ -439,6 +439,27 @@ index 0000000..d515586
 +          (is (= 200 (:status response)) (str (:body response)))
 +          (is (= acme-ltd (stored conn b0 about)) "the value reads back")
 +          (is (= #{"Page" "Client"} (tag-titles conn acme-ltd)) "the page keeps Page and gains Client"))))))
++
++(deftest batch-set-reset-single-tag-adds-test
++  ;; Under isResetExistingValues only a tag list replaces; a single tag adds. So entry giving Acme
++  ;; (already a Client) the single tag Service leaves it a Client, and a for-client value of Acme
++  ;; elsewhere in the batch is in class once the batch applies, in either order.
++  (async done
++    (-> (p/all
++         (for [tag-first? [true false]]
++           (p/let [{:keys [conn self blocks acme fc for-client]} (graph!)
++                   b0 (first blocks)
++                   entries [(tag-entry acme "Service")
++                            {:block-id (str b0) :property-id fc :value (str acme)}]
++                   response (batch-set! self (if tag-first? entries (vec (reverse entries)))
++                                        {:isResetExistingValues true})]
++             (testing (if tag-first? "tag entry first" "value entry first")
++               (is (= 200 (:status response)) (str (:body response)))
++               (is (= acme (stored conn b0 for-client)) "the value reads back")
++               (is (= #{"Page" "Client" "Service"} (tag-titles conn acme))
++                   "the single tag adds Service and Acme keeps Client")))))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
 +
 +(defn- insert-batch! [self entries]
 +  (request! self "POST" "/semantic/block-trees/batch" {:entries entries}))
