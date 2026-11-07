@@ -236,6 +236,38 @@ describe("kb_index", () => {
     expect(syncRequests).toHaveLength(1);
   });
 
+  it("marks the cache dirty when promote_page_to_tag succeeds, and passes its refusals through without marking it", async () => {
+    // The mark is written in a waitUntil the tool registers while its response streams, after
+    // callTool's waitOnExecutionContext, so a success is awaited with waitFor. A refusal never
+    // registers one: runTool throws before onSuccess.
+    const dirty = async () => (await env.KB_INDEX_KV.list({ prefix: "kb-index-dirty:" })).keys.map((k) => k.name);
+    const promote = () => callTool("promote_page_to_tag", { graph: "work", "page-id": "p1" });
+    for (const [status, error] of [
+      [400, 'page-id: "Journal Day" (p1) is a journal; journals can\'t become tags'],
+      [409, 'page-id: "Recipe" is already a tag (p1); use update_tag to change it'],
+    ] as const) {
+      syncHandler = () => Response.json({ error }, { status });
+      expect(await promote()).toEqual({ isError: true, text: error });
+      expect(await dirty()).toEqual([]);
+    }
+
+    syncRequests = [];
+    syncHandler = () =>
+      Response.json({
+        uuid: "p1",
+        ident: "user.class/Recipe-abcdefgh",
+        title: "Recipe",
+        extends: [{ uuid: "root", title: "Root Tag" }],
+        properties: [],
+        promoted: { blocks: 3, references: 2 },
+      });
+    const promoted = await promote();
+    expect(promoted.isError).toBe(false);
+    expect(JSON.parse(promoted.text).promoted).toEqual({ blocks: 3, references: 2 });
+    expect(syncRequests.map((u) => u.pathname)).toEqual([`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`]);
+    await vi.waitFor(async () => expect(await dirty()).toEqual(["kb-index-dirty:work"]));
+  });
+
   it("rebuilds when asked, when the cache is older than two cron periods, or when it holds another graph", async () => {
     await callTool("kb_index", { graph: "work" });
     syncRequests = [];

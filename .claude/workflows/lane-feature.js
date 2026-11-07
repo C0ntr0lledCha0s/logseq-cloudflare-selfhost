@@ -45,7 +45,7 @@ const J = x => JSON.stringify(x, null, 2)
 // How a code-changing stage runs tests while it iterates, and the gate it ends with.
 const ITERATE = `While you iterate on a patch, run only the namespaces you are changing with \`scripts/upstream-test.sh <checkout> <namespace-regex>\` (a warm compiler: seconds per run, not a minute). Run \`scripts/check.sh --upstream\` once, at the end of the stage, as the gate. Connector-only or scripts-only work runs its own suite while iterating (\`npm --prefix connector test\` or \`npm test\`) and ends with \`scripts/check.sh\`. If you need a copy of upstream, put it under the session scratchpad at lane-scratch/<your label>/, copy only what you need, and at the end run \`scripts/upstream-test.sh <copy> --stop\` and delete the copy.`
 // Item 23: a fix that narrowed a type or resolver kept being reopened for the next input kind.
-const CLASS_SWEEP = `Class sweep: if the fix narrows a type, a resolver or what an input may be, list every property type or input kind that reaches the same resolver (for example number, node, default, url, date, datetime, checkbox, a choice, a UUID, a title, a bare integer) and add a test with a representative input for each, saying in notes which kinds you covered and why any were left out. Before the stage ends, run the mutation step on your own new rules: for each rule or branch you added, make a one-line mutation that removes it in a scratch copy, run its namespace, restore it, and add a test for any rule that survives.`
+const CLASS_SWEEP = `Class sweep: if the fix narrows a type, a resolver or what an input may be, list every property type or input kind that reaches the same resolver (for example number, node, default, url, date, datetime, checkbox, a choice, a UUID, a title, a bare integer) and add a test with a representative input for each, saying in notes which kinds you covered and why any were left out. Before the stage ends, run the mutation step on your own new rules: for each rule or branch you added in this stage (at most 12, choosing first the rules with no test that clearly targets them, then the rules guarding writes, deletes and refusals; list the rest in notes), make a one-line mutation that removes it in a scratch copy, run its namespace in one warm watch, restore it, and add a test for any rule that survives.`
 
 // ---------- schemas ----------
 const BRIEF_SCHEMA = {
@@ -361,6 +361,8 @@ for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
     brief,
     round,
     open,
+    // Later rounds mutate only what changed since the previous round's HEAD.
+    mutation_base: (rounds.filter(r => r.head).slice(-1)[0] || {}).head,
     context: `Feature built from spec ${spec.path} and plan ${plan.path}. Stages: ${built.map(b => `${b.stage.id}: ${b.change.summary}`).join(' | ')}`,
   })
   if (!review) { log('lane-review returned nothing; stopping the review loop.'); break }
