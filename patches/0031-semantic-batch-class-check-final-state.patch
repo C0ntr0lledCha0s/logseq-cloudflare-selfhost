@@ -1,0 +1,499 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index a8de8df..4666738 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -729,6 +729,21 @@
+   [classes]
+   (string/join " or " (map #(str "#" (:block/title %)) (sort-by :db/id classes))))
+ 
++(def ^:dynamic ^:private *final-tags*
++  "While a batch is resolved, a map from the db id of each existing entity the batch tags to the tag
++  entities it holds once the whole batch has applied (final-tags), else nil. A class check judges
++  such an entity by these tags, so a tag another entry gives it counts whatever the entry order,
++  and a tag a reset list in the batch removes doesn't."
++  nil)
++
++(defn- class-object
++  "The entity with db id `id` as a class check sees it: with its final tags when the batch being
++  resolved tags it (*final-tags*), else as it is in `db`."
++  [db id]
++  (if-let [tags (get *final-tags* id)]
++    {:db/id id :block/tags tags}
++    (d/entity db id)))
++
+ (defn- title-candidates
+   "The entities a ref property value given by title can mean, or {::error reason}. Another
+   property's choice or value block is never one, nor is a hidden entity. A property limited to
+@@ -749,7 +764,7 @@
+         prefer (fn [entities pred] (let [preferred (filter pred entities)] (if (seq preferred) preferred entities)))
+         classes (:logseq.property/classes property)
+         of-class (if (seq classes)
+-                   (filter (fn [entity] (some #(db-db/class-instance? % entity) classes)) found)
++                   (filter (fn [entity] (some #(db-db/class-instance? % (class-object db (:db/id entity))) classes)) found)
+                    found)
+         ranked (-> of-class (prefer page?) (prefer (complement entity-util/built-in?)))
+         own-value? #(= (:db/id property) (:db/id (:logseq.property/created-from-property %)))]
+@@ -892,7 +907,7 @@
+   [db property value id]
+   (let [classes (:logseq.property/classes property)]
+     (when (and (seq classes) (number? id)
+-               (not (some #(db-db/class-instance? % (d/entity db id)) classes)))
++               (not (some #(db-db/class-instance? % (class-object db id)) classes)))
+       {::error (str "no " (classes-label classes) " object "
+                     (if (keyword? value) (subs (str value) 1) (str value)))})))
+ 
+@@ -1084,15 +1099,32 @@
+       (::held-tags scope) (assoc ::held-tags (::held-tags scope)))
+     scope))
+ 
++(defn- property-tag-ids
++  "The tag db ids a `properties` object gives the block `scope`. The tags are resolved for `scope`
++  itself, so a private tag the block holds doesn't drop the list's other tags."
++  [db scope properties e2ee?]
++  (tag-ids (some (fn [[k value]]
++                   (when (= :block/tags (resolve-property-ident db (property-selector k)))
++                     (:value (prepare-property-value db :block/tags value e2ee? scope))))
++                 properties)))
++
+ (defn- with-property-tags
+-  "`scope` with the tags that a `properties` object adds to the block. The tags are resolved for
+-  `scope` itself, so a private tag the block holds doesn't drop the list's other tags."
++  "`scope` with the tags that a `properties` object adds to the block."
+   [db scope properties e2ee?]
+-  (scope-with-tags db scope
+-                   (tag-ids (some (fn [[k value]]
+-                                    (when (= :block/tags (resolve-property-ident db (property-selector k)))
+-                                      (:value (prepare-property-value db :block/tags value e2ee? scope))))
+-                                  properties))))
++  (scope-with-tags db scope (property-tag-ids db scope properties e2ee?)))
++
++(defn- final-tags
++  "*final-tags* for a batch's tag writes, [[db-id tag-ids replace?] ...] in request order, applied
++  as set-prepared-tags! applies them: a write adds its tags, and one that replaces (a list under
++  reset) first drops the user tags the entity holds and keeps the private ones."
++  [db writes]
++  (let [private? #(contains? ldb/private-tags (:db/ident (d/entity db %)))]
++    (->> (reduce (fn [result [id ids replace?]]
++                   (let [held (get result id (set (map :db/id (:block/tags (d/entity db id)))))]
++                     (assoc result id (into (if replace? (set (filter private? held)) held) ids))))
++                 {} writes)
++         (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
++         (into {}))))
+ 
+ (defn- prepare-properties
+   "Resolves a `properties` object for the block `scope` (see prepare-property-value) to
+@@ -2233,11 +2265,21 @@
+     (p/let [body (body-clj request)
+             entries (:entries body)
+             reset? (true? (:isResetExistingValues body))
++            ;; A class check judges a value by the tags it holds once the whole batch has applied,
++            ;; so every entry's tag write is resolved first.
++            tag-writes (when (sequential? entries)
++                         (keep (fn [{:keys [block-id property-id value]}]
++                                 (let [block (find-entity db block-id)]
++                                   (when (and block (= :block/tags (resolve-property-ident db property-id)))
++                                     (when-let [ids (:value (prepare-property-value db :block/tags value e2ee? block))]
++                                       [(:db/id block) (tag-ids ids) (and reset? (coll? ids))]))))
++                               entries))
+             ;; An entry's block is scoped with the tags earlier entries in the batch give it. As
+             ;; set-prepared-property! writes them, under reset a list of tags replaces the block's
+             ;; tags and a single tag adds to them.
+             resolved (when (sequential? entries)
+-                       (:entries
++                       (binding [*final-tags* (final-tags db tag-writes)]
++                        (:entries
+                         (reduce (fn [{:keys [added replaced] :as result} {:keys [block-id property-id value]}]
+                                   (let [property-ident (resolve-property-ident db property-id)
+                                         block (find-entity db block-id)
+@@ -2257,7 +2299,7 @@
+                                                      (tag-ids (:value prepared)))
+                                           (cond-> replace? (update :replaced conj (:db/id block)))))))
+                                 {:entries [] :added {} :replaced #{}}
+-                                entries)))]
++                                entries))))]
+       (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
+         (http/bad-request error)
+         (refusing-labels
+@@ -3809,13 +3851,27 @@
+                      :properties (:properties properties)
+                      :nodes (:nodes tree)}})))
+ 
++(defn- insert-tag-writes
++  "The tag writes (see final-tags) of batch insert entries' `properties` on an existing target or page."
++  [db e2ee? entries]
++  (keep (fn [entry]
++          (when (and (map? entry) (map? (:properties entry)))
++            (let [page (:page entry)
++                  existing (if (contains? entry :target-id)
++                             (:ok (resolve-page-selector db (:target-id entry) "target-id" {:e2ee? e2ee? :find find-entity}))
++                             (when (and (non-blank-string? page) (not e2ee?)) (insert-page db page)))
++                  ids (when existing (property-tag-ids db existing (:properties entry) e2ee?))]
++              (when (seq ids) [(:db/id existing) ids false]))))
++        entries))
++
+ (defn- resolve-insert-entries
+   "Batch insert entries as {:entries [...]}, or {:error reason}. A block uuid may appear only once
+-  in the whole batch."
++  in the whole batch. A class check judges a value by the tags the whole batch leaves it with."
+   [db e2ee? entries]
+   (if-not (and (sequential? entries) (<= 1 (count entries) max-batch-size))
+     {:error (str "entries must be an array of 1 to " max-batch-size " entries")}
+-    (-> (reduce (fn [{:keys [uuids added] :as result} [index entry]]
++    (binding [*final-tags* (final-tags db (insert-tag-writes db e2ee? entries))]
++     (-> (reduce (fn [{:keys [uuids added] :as result} [index entry]]
+                   (let [{:keys [error] :as resolved} (if (map? entry)
+                                                        (insert-entry db e2ee? added index entry)
+                                                        {:error (str "entries[" index "]: must be an object")})
+@@ -3833,7 +3889,7 @@
+                                                    properties))))))
+                 {:entries [] :uuids #{} :added {}}
+                 (map-indexed vector entries))
+-        (dissoc :added))))
++        (dissoc :added)))))
+ 
+ (defn- insert-entries!
+   "Applies resolved insert entries in order. A `page` entry uses the page that names (insert-page), or creates it."
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+new file mode 100644
+index 0000000..d515586
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+@@ -0,0 +1,326 @@
++(ns logseq.db-sync.semantic-batch-class-check-test
++  "A property limited to classes, written in a batch: the class check judges the batch's final
++  state, so a tag one entry gives a page counts for a value another entry sets to that page, in
++  any entry order and however the value is given (title, UUID, ident or db id). A batch whose final
++  state puts an object outside the classes is refused up front, naming the entry, and writes
++  nothing. Covers batchSetBlockProperty and batchInsertBlockTrees.
++  The graph has tags Client, Service and VIP (VIP extends Client), a Client page Acme, a Service
++  page Audit, and untagged pages Acme Ltd, Beta Ltd, Gamma Ltd and Globex (which has an ident).
++  for-client (one) and clients (many) are node properties limited to Client."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- ident-str [ident] (subs (str ident) 1))
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid id]))
++
++(defn- graph!
++  "A fresh graph as the namespace doc describes it, with for-client and clients limited to Client."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          tag! (fn [title] (p/let [r (request! self "POST" "/semantic/tags" {:title title})]
++                             (entity conn (uuid (get-in r [:body :uuid])))))
++          client (tag! "Client")
++          service (tag! "Service")
++          vip (tag! "VIP")
++          _ (d/transact! conn [[:db/add (:db/id vip) :logseq.property.class/extends (:db/id client)]])
++          page-id (random-uuid)
++          [acme audit acme-ltd beta gamma globex] (repeatedly 6 random-uuid)
++          blocks (vec (repeatedly 6 random-uuid))
++          page (fn [id title tags]
++                 {:block/uuid id :block/name (string/lower-case title) :block/title title
++                  :block/tags (into #{:logseq.class/Page} tags) :block/created-at 1 :block/updated-at 1})
++          _ (d/transact! conn (concat
++                               [(page page-id "Notes" [])
++                                (page acme-ltd "Acme Ltd" [])
++                                (page beta "Beta Ltd" [])
++                                (page gamma "Gamma Ltd" [])
++                                (assoc (page globex "Globex" []) :db/ident :user.page/globex)
++                                (page acme "Acme" [(:db/id client)])
++                                (page audit "Audit" [(:db/id service)])]
++                               (map-indexed (fn [index id]
++                                              {:block/uuid id :block/title (str "Block " index)
++                                               :block/page [:block/uuid page-id]
++                                               :block/parent [:block/uuid page-id]
++                                               :block/order (str "a" index)
++                                               :block/created-at 1 :block/updated-at 1})
++                                            blocks)))
++          for-client (outliner-property/upsert-property!
++                      conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                      {:property-name "for-client"})
++          clients (outliner-property/upsert-property!
++                   conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/many}
++                   {:property-name "clients"})
++          for-client (:db/ident for-client)
++          clients (:db/ident clients)
++          r1 (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent (ident-str for-client)))
++                       {:classes {:set ["Client"]}})
++          r2 (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent (ident-str clients)))
++                       {:classes {:set ["Client"]}})]
++    (is (= [200 200] [(:status r1) (:status r2)]) "for-client and clients are limited to Client")
++    {:conn conn :self self :page-id page-id :blocks blocks
++     :client client :service service :vip vip
++     :acme acme :audit audit :acme-ltd acme-ltd :beta beta :gamma gamma :globex globex
++     :for-client for-client :clients clients
++     :fc (ident-str for-client) :cl (ident-str clients)}))
++
++(defn- run [done f]
++  (-> (p/let [g (graph!)] (f g))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- stored [conn id property]
++  (let [value (get (entity conn id) property)]
++    (if (set? value) (set (map :block/uuid value)) (:block/uuid value))))
++
++(defn- tag-titles [conn id]
++  (set (map :block/title (:block/tags (entity conn id)))))
++
++(defn- batch-set! [self entries & [opts]]
++  (request! self "POST" "/semantic/block-properties/batch-set" (merge {:entries entries} opts)))
++
++(defn- tag-entry [page tag]
++  {:block-id (str page) :property-id "block/tags" :value tag})
++
++(defn- permutations [xs]
++  (if (empty? xs)
++    [[]]
++    (for [x xs
++          rest-perm (permutations (remove #{x} xs))]
++      (cons x rest-perm))))
++
++(deftest batch-set-sees-tag-from-earlier-entry-test
++  ;; Entry 0 makes an untagged page a Client; entry 1 sets for-client to it. Each way of naming
++  ;; the value reaches the class check: a title (title-candidates), a UUID, an ident and a db id
++  ;; (class-refusal).
++  (async done
++    (run done
++      (fn [{:keys [conn self blocks acme-ltd beta gamma globex for-client fc]}]
++        (let [[b0 b1 b2 b3] blocks
++              gamma-id (:db/id (entity conn gamma))]
++          (p/let [by-title (batch-set! self [(tag-entry acme-ltd "Client")
++                                             {:block-id (str b0) :property-id fc :value "Acme Ltd"}])
++                  by-uuid (batch-set! self [(tag-entry beta "Client")
++                                            {:block-id (str b1) :property-id fc :value (str beta)}])
++                  by-db-id (batch-set! self [(tag-entry gamma "Client")
++                                             {:block-id (str b2) :property-id fc :value gamma-id}])
++                  by-ident (batch-set! self [(tag-entry globex "Client")
++                                             {:block-id (str b3) :property-id fc :value "user.page/globex"}])]
++            (doseq [[label response block page] [["title" by-title b0 acme-ltd]
++                                                 ["UUID" by-uuid b1 beta]
++                                                 ["db id" by-db-id b2 gamma]
++                                                 ["ident" by-ident b3 globex]]]
++              (testing (str "value by " label)
++                (is (= 200 (:status response)) (str (:body response)))
++                (is (= page (stored conn block for-client)) "the value reads back")
++                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))))))))
++
++(deftest batch-set-sees-tag-from-later-entry-test
++  ;; The final state is valid whichever entry comes first.
++  (async done
++    (run done
++      (fn [{:keys [conn self blocks acme-ltd beta gamma globex for-client fc]}]
++        (let [[b0 b1 b2 b3] blocks
++              gamma-id (:db/id (entity conn gamma))]
++          (p/let [by-title (batch-set! self [{:block-id (str b0) :property-id fc :value "Acme Ltd"}
++                                             (tag-entry acme-ltd "Client")])
++                  by-uuid (batch-set! self [{:block-id (str b1) :property-id fc :value (str beta)}
++                                            (tag-entry beta "Client")])
++                  by-db-id (batch-set! self [{:block-id (str b2) :property-id fc :value gamma-id}
++                                             (tag-entry gamma "Client")])
++                  by-ident (batch-set! self [{:block-id (str b3) :property-id fc :value "user.page/globex"}
++                                             (tag-entry globex "Client")])]
++            (doseq [[label response block page] [["title" by-title b0 acme-ltd]
++                                                 ["UUID" by-uuid b1 beta]
++                                                 ["db id" by-db-id b2 gamma]
++                                                 ["ident" by-ident b3 globex]]]
++              (testing (str "value by " label)
++                (is (= 200 (:status response)) (str (:body response)))
++                (is (= page (stored conn block for-client)) "the value reads back")
++                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))))))))
++
++(deftest batch-set-tag-forms-test
++  ;; The other ways a batch can make the page an object of the class: a subclass (VIP extends
++  ;; Client), a tag list under isResetExistingValues, and a tag given by UUID.
++  (async done
++    (run done
++      (fn [{:keys [conn self blocks client acme-ltd beta gamma for-client fc]}]
++        (let [[b0 b1 b2] blocks]
++          (p/let [subclass (batch-set! self [(tag-entry acme-ltd "VIP")
++                                             {:block-id (str b0) :property-id fc :value (str acme-ltd)}])
++                  reset-list (batch-set! self [(tag-entry beta ["Client"])
++                                               {:block-id (str b1) :property-id fc :value (str beta)}]
++                                         {:isResetExistingValues true})
++                  tag-by-uuid (batch-set! self [(tag-entry gamma (str (:block/uuid client)))
++                                                {:block-id (str b2) :property-id fc :value "Gamma Ltd"}])]
++            (is (= 200 (:status subclass)) (str (:body subclass)))
++            (is (= acme-ltd (stored conn b0 for-client)))
++            (is (= 200 (:status reset-list)) (str (:body reset-list)))
++            (is (= beta (stored conn b1 for-client)))
++            (is (= 200 (:status tag-by-uuid)) (str (:body tag-by-uuid)))
++            (is (= gamma (stored conn b2 for-client)))))))))
++
++(deftest batch-set-chain-in-every-order-test
++  ;; Three entries: tag Acme Ltd with Client, set b0's for-client to it by UUID, and set b1's
++  ;; clients to [Acme Ltd, Acme] by title. Every order has the same valid final state.
++  (async done
++    (-> (p/all
++         (for [order (permutations [:tag :one :many])]
++           (p/let [{:keys [conn self blocks acme acme-ltd for-client clients fc cl]} (graph!)
++                   [b0 b1] blocks
++                   entry {:tag (tag-entry acme-ltd "Client")
++                          :one {:block-id (str b0) :property-id fc :value (str acme-ltd)}
++                          :many {:block-id (str b1) :property-id cl :value ["Acme Ltd" "Acme"]}}
++                   response (batch-set! self (mapv entry order))]
++             (testing (str "order " (pr-str order))
++               (is (= 200 (:status response)) (str (:body response)))
++               (is (= acme-ltd (stored conn b0 for-client)))
++               (is (= #{acme-ltd acme} (stored conn b1 clients)))
++               (is (contains? (tag-titles conn acme-ltd) "Client"))))))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
++
++(deftest batch-set-wrong-class-still-refused-test
++  ;; Tagging the page with a class that isn't the property's doesn't let it through: the batch is
++  ;; refused naming the entry, in either order, and nothing is written.
++  (async done
++    (run done
++      (fn [{:keys [conn self blocks acme-ltd beta fc for-client]}]
++        (let [[b0 b1 b2] blocks]
++          (p/let [by-uuid (batch-set! self [(tag-entry beta "Service")
++                                            {:block-id (str b0) :property-id fc :value (str beta)}])
++                  reversed (batch-set! self [{:block-id (str b1) :property-id fc :value (str beta)}
++                                             (tag-entry beta "Service")])
++                  by-title (batch-set! self [(tag-entry acme-ltd "Service")
++                                             {:block-id (str b2) :property-id fc :value "Acme Ltd"}])]
++            (is (= 400 (:status by-uuid)) (str (:body by-uuid)))
++            (is (= (str "entry 1: no #Client object " beta) (get-in by-uuid [:body :error])))
++            (is (= 400 (:status reversed)) (str (:body reversed)))
++            (is (= (str "entry 0: no #Client object " beta) (get-in reversed [:body :error])))
++            (is (= 400 (:status by-title)) (str (:body by-title)))
++            (is (= "entry 1: no #Client object titled \"Acme Ltd\"" (get-in by-title [:body :error])))
++            (is (= #{"Page"} (tag-titles conn beta)) "the tag entry isn't written")
++            (is (= #{"Page"} (tag-titles conn acme-ltd)))
++            (doseq [b [b0 b1 b2]]
++              (is (nil? (stored conn b for-client)) "no value is written"))))))))
++
++(deftest batch-set-reset-removing-class-refused-test
++  ;; The converse: under isResetExistingValues a tag list [Service] takes Client away from Acme,
++  ;; so a for-client value of Acme elsewhere in the batch would be out of class once the batch
++  ;; applies. The outliner doesn't check classes on server writes, so the handler must refuse it,
++  ;; naming the entry that sets the value, in either order and however Acme is named. Each case
++  ;; runs on its own graph, so one wrongly accepted batch can't change the next.
++  (async done
++    (-> (p/all
++         (for [[label form tag-first? expected]
++               [["UUID, tag entry first" :uuid true "entry 1: no #Client object %s"]
++                ["UUID, value entry first" :uuid false "entry 0: no #Client object %s"]
++                ["db id, tag entry first" :db-id true "entry 1: no #Client object %d"]
++                ["title, tag entry first" :title true "entry 1: no #Client object titled \"Acme\""]
++                ["title, value entry first" :title false "entry 0: no #Client object titled \"Acme\""]]]
++           (p/let [{:keys [conn self blocks acme fc for-client]} (graph!)
++                   b0 (first blocks)
++                   acme-id (:db/id (entity conn acme))
++                   value (case form :uuid (str acme) :db-id acme-id :title "Acme")
++                   entries [(tag-entry acme ["Service"])
++                            {:block-id (str b0) :property-id fc :value value}]
++                   response (batch-set! self (if tag-first? entries (vec (reverse entries)))
++                                        {:isResetExistingValues true})]
++             (testing label
++               (is (= 400 (:status response)) (str (:body response)))
++               (is (= (-> expected
++                          (string/replace "%s" (str acme))
++                          (string/replace "%d" (str acme-id)))
++                      (get-in response [:body :error])))
++               (is (contains? (tag-titles conn acme) "Client") "Acme keeps Client")
++               (is (nil? (stored conn b0 for-client)) "no out-of-class value is stored")))))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
++
++(deftest batch-set-reset-keeps-private-tags-test
++  ;; Under reset a tag list replaces a page's user tags but the page keeps the private tags it
++  ;; holds (Page), as set-prepared-tags! writes them. So a property limited to Page still takes the
++  ;; page as a value in the same batch: the final state keeps Page.
++  (async done
++    (run done
++      (fn [{:keys [conn self blocks acme-ltd]}]
++        (p/let [about (outliner-property/upsert-property!
++                       conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                       {:property-name "about-page"})
++                about (:db/ident about)
++                limited (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent (ident-str about)))
++                                  {:classes {:set ["Page"]}})
++                b0 (first blocks)
++                response (batch-set! self [(tag-entry acme-ltd ["Client"])
++                                           {:block-id (str b0) :property-id (ident-str about) :value (str acme-ltd)}]
++                                     {:isResetExistingValues true})]
++          (is (= 200 (:status limited)) (str "about-page is limited to Page " (:body limited)))
++          (is (= 200 (:status response)) (str (:body response)))
++          (is (= acme-ltd (stored conn b0 about)) "the value reads back")
++          (is (= #{"Page" "Client"} (tag-titles conn acme-ltd)) "the page keeps Page and gains Client"))))))
++
++(defn- insert-batch! [self entries]
++  (request! self "POST" "/semantic/block-trees/batch" {:entries entries}))
++
++(deftest batch-insert-sees-tag-from-another-entry-test
++  ;; batchInsertBlockTrees: one entry tags an existing page with Client through its properties,
++  ;; another inserts a block whose for-client is that page. Either order, a title or a UUID, both
++  ;; in one entry, and a tag entry that names its page by title (page) rather than target-id.
++  (async done
++    (run done
++      (fn [{:keys [conn self page-id acme-ltd beta gamma globex for-client fc]}]
++        (let [[n0 n1 n2 n3] (repeatedly 4 random-uuid)
++              insert (fn [id value] {:target-id (str page-id)
++                                     :blocks [{:uuid (str id) :title "Inserted" :properties {fc value}}]})
++              tag (fn [page] {:target-id (str page) :properties {"Tags" "Client"}})]
++          (p/let [tag-first (insert-batch! self [(tag acme-ltd) (insert n0 "Acme Ltd")])
++                  insert-first (insert-batch! self [(insert n1 (str beta)) (tag beta)])
++                  one-entry (insert-batch! self [{:target-id (str gamma) :properties {"Tags" "Client"}
++                                                  :blocks [{:uuid (str n2) :title "Inserted"
++                                                            :properties {fc "Gamma Ltd"}}]}])
++                  by-page-title (insert-batch! self [(insert n3 (str globex))
++                                                     {:page "Globex" :properties {"Tags" "Client"}}])]
++            (doseq [[label response block page] [["tag entry first" tag-first n0 acme-ltd]
++                                                 ["insert entry first" insert-first n1 beta]
++                                                 ["one entry" one-entry n2 gamma]
++                                                 ["tag entry by page title" by-page-title n3 globex]]]
++              (testing label
++                (is (= 201 (:status response)) (str (:body response)))
++                (is (= page (stored conn block for-client)) "the value reads back")
++                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))))))))
++
++(deftest batch-insert-wrong-class-still-refused-test
++  (async done
++    (run done
++      (fn [{:keys [conn self page-id beta fc]}]
++        (let [n0 (random-uuid)]
++          (p/let [response (insert-batch! self [{:target-id (str beta) :properties {"Tags" "Service"}}
++                                                {:target-id (str page-id)
++                                                 :blocks [{:uuid (str n0) :title "Inserted"
++                                                           :properties {fc (str beta)}}]}])]
++            (is (= 400 (:status response)) (str (:body response)))
++            (is (string/starts-with? (str (get-in response [:body :error])) "entries[1]")
++                (str (:body response)))
++            (is (string/includes? (str (get-in response [:body :error])) (str "no #Client object " beta)))
++            (is (= #{"Page"} (tag-titles conn beta)) "the tag entry isn't written")
++            (is (nil? (entity conn n0)) "the block isn't inserted")))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index d71fd8a..5e3ab34 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -9,6 +9,7 @@
+             [logseq.db-sync.node-assets-test]
+             [logseq.db-sync.node-config-test]
+             [logseq.db-sync.node-server-test]
++            [logseq.db-sync.semantic-batch-class-check-test]
+             [logseq.db-sync.semantic-bulk-test]
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
