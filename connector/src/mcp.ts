@@ -7,6 +7,7 @@ import { GraphStore } from "./graphs";
 import { registerAssetTools } from "./tools/assets";
 import { logTool } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
+import type { OnSuccess } from "./tools/readable";
 import { KB_INDEX_WRITE_TOOLS, markKbIndexDirty, registerKbIndexTool } from "./tools/kb-index";
 import { type GraphAccess, type GraphTool, buildGraphTools, registerGraphTools } from "./tools/semantic";
 import { type SemanticBindings, semanticBindings } from "./semantic/config";
@@ -67,7 +68,8 @@ async function markDirty(env: Env, tool: string, alias: string): Promise<void> {
 /** The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are now. */
 export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler {
   const { store, access, graphTools, semantic } = isolateTools(env);
-  const onSuccess = (tool: string, alias: string) => {
+  // A write's outcome (its reason and targets) is for item 28's audit log; today's uses ignore it.
+  const onSuccess: OnSuccess = (tool, alias) => {
     ctx.waitUntil(touch(store, tool, alias));
     if (KB_INDEX_WRITE_TOOLS.has(tool)) ctx.waitUntil(markDirty(env, tool, alias));
   };

@@ -17,7 +17,8 @@ There are two kinds of tool:
    - a description that says what it returns and when to use it,
    - a zod `inputSchema` (the graph argument uses `ALIAS_PATTERN` and `GRAPH_PARAM_DESCRIPTION` from `spec.mjs`),
    - `annotations: annotationsFor("<name>")`, with the tool's entry added to `ANNOTATIONS` in `spec.mjs` (one of `READ`, `DESTRUCTIVE`, `DESTRUCTIVE_IDEMPOTENT` or `ADDITIVE`; `openWorldHint` only when it fetches outside the graph), and
-   - its body wrapped in `runTool`.
+   - for a tool that isn't a read, `reason: reasonSchema` in its schema, with `takeReason` run before anything else and the result passed through `withSummary` (`src/tools/readable.ts`; `registerAssetTools`'s `handle` shows how). Generated tools get this from `registerGraphTools`, and a test fails for any write without it, and
+   - its body wrapped in `runTool`, passing `reasonGiven(args)` for a write so the log says `reason=yes|no`.
 3. **List it** in `HANDWRITTEN_TOOLS` in `spec.mjs` (and `SEMANTIC_TOOLS` if it depends on semantic search), then run `npm --prefix connector run update:manifest`.
 4. **Teach Claude.** Update `connector_help` (`CONNECTOR_HELP` in `handwritten.ts`) if the tool changes how Claude should work, and README §11.8.
 5. **Cost.** Write down rows, operations and neurons per call (REVIEW.md, *Cost*). Responses stay compact: IDs and counts, not echoed trees.

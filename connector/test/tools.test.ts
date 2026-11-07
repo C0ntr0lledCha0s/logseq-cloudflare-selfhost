@@ -5,7 +5,10 @@ import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
-import { buildGraphTools } from "../src/tools/semantic";
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
+import { registerAssetTools } from "../src/tools/assets";
+import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import {
   ANNOTATIONS,
   type OpenApiSpec,
@@ -321,6 +324,196 @@ describe("annotations", () => {
   });
 });
 
+const REASON = "tidy duplicate notes";
+const PAGE_UUID = "55555555-5555-4555-8555-555555555555";
+
+/** One write per input shape the generated tools have: a body object, a body list, no body, query flags, path and body. */
+const WRITE_CALLS: [string, Record<string, unknown>][] = [
+  ["update_block", { graph: "work", "block-id": "b1", body: { title: "New title" } }],
+  ["delete_blocks", { graph: "work", body: { "block-ids": ["b1", "b2"] } }],
+  ["delete_block", { graph: "work", "block-id": "b1" }],
+  ["delete_page", { graph: "work", "page-id": PAGE_UUID, "dry-run": true }],
+  ["create_page", { graph: "work", body: { title: "Standup" } }],
+  ["set_block_property", { graph: "work", "block-id": "b1", "property-id": "p1", body: { value: 1 } }],
+  ["move_blocks", { graph: "work", body: { "block-ids": ["b1"], "target-id": "b2", position: "after" } }],
+  ["capture_to_today", { graph: "work", body: { blocks: [{ title: "Note" }] } }],
+  ["promote_page_to_tag", { graph: "work", "page-id": PAGE_UUID }],
+];
+
+/** tools/call with the result's content items kept apart. */
+async function callContent(name: string, args: Record<string, unknown>, handler: Handler = connector()) {
+  const result = await rpc(handler, "tools/call", { name, arguments: args });
+  return { isError: result.isError === true, content: result.content as { type: string; text: string }[] };
+}
+
+/** A server registered as mcpHandler registers the writing tools, with `onSuccess` observed. */
+function observedConnector(onSuccess: (...args: unknown[]) => void): Handler {
+  return (request, _env, ctx) => {
+    const e = testEnv();
+    const access = { env: e, resolve: (alias: string) => store().resolve(alias) };
+    const tools = buildGraphTools(spec, access);
+    return createMcpHandler(
+      () => {
+        const server = new McpServer({ name: "test", version: "0.0.0" });
+        registerGraphTools(server, tools, onSuccess);
+        registerAssetTools(server, access, onSuccess);
+        return server;
+      },
+      { route: "/mcp" },
+    )(request, e, ctx);
+  };
+}
+
+/** A sync stub answering every call with an empty JSON object, and uploads like createAsset. */
+function acceptEverything(): void {
+  syncHandler = (request) =>
+    new URL(request.url).pathname.endsWith("/assets")
+      ? Response.json({ uuid: "a1", "page-id": PAGE_UUID, "page-title": "Nov 5th, 2026" }, { status: 201 })
+      : Response.json({ ok: true });
+}
+
+describe("reason", () => {
+  it("reason in every write schema, none on reads", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const writes = tools.filter((t: { annotations: { readOnlyHint: boolean } }) => !t.annotations.readOnlyHint);
+    const reads = tools.filter((t: { annotations: { readOnlyHint: boolean } }) => t.annotations.readOnlyHint);
+    expect(writes.length).toBeGreaterThan(20);
+    expect(reads.length).toBeGreaterThan(15);
+    const missing = writes.filter((t: any) => t.inputSchema.properties?.reason === undefined).map((t: any) => t.name);
+    expect(missing).toEqual([]);
+    for (const tool of writes) {
+      const reason = tool.inputSchema.properties.reason;
+      expect(reason.type, tool.name).toBe("string");
+      expect(reason.description, tool.name).toContain("at most 200 characters");
+      expect(tool.inputSchema.required ?? [], tool.name).not.toContain("reason");
+    }
+    for (const name of ["save_document", "save_file_from_url", "delete_block", "delete_page", "update_block"]) {
+      expect(writes.map((t: { name: string }) => t.name), name).toContain(name);
+    }
+    const onReads = reads.filter((t: any) => t.inputSchema.properties?.reason !== undefined).map((t: any) => t.name);
+    expect(onReads).toEqual([]);
+  });
+
+  it("reason never reaches the server, whatever the write's shape", async () => {
+    acceptEverything();
+    for (const [name, args] of WRITE_CALLS) {
+      syncRequests = [];
+      const withReason = await callContent(name, { ...args, reason: REASON });
+      expect(withReason.isError, name).toBe(false);
+      const sentWith = syncRequests.map(({ method, url, body }) => ({ method, url, body }));
+      syncRequests = [];
+      await callContent(name, args);
+      const sentWithout = syncRequests.map(({ method, url, body }) => ({ method, url, body }));
+      // The request is exactly the one the call makes without a reason.
+      expect(sentWith, name).toEqual(sentWithout);
+      expect(sentWith, name).toHaveLength(1);
+      expect(new URL(sentWith[0].url).searchParams.has("reason"), name).toBe(false);
+      expect(sentWith[0].url, name).not.toContain("tidy");
+      expect(sentWith[0].body, name).not.toContain("tidy");
+      expect(sentWith[0].body, name).not.toContain("reason");
+    }
+  });
+
+  it("reason over 200 characters is refused before any fetch", async () => {
+    acceptEverything();
+    for (const reason of ["x".repeat(201), "🙂".repeat(201)]) {
+      for (const [name, args] of [...WRITE_CALLS, ["delete_block", { graph: "nope", "block-id": "b1" }] as const]) {
+        const result = await callContent(name, { ...args, reason });
+        expect(result, name).toEqual({
+          isError: true,
+          content: [{ type: "text", text: "reason is 201 characters; at most 200 are accepted — shorten it" }],
+        });
+      }
+    }
+    expect(syncRequests).toHaveLength(0);
+    // Exactly 200 characters, emoji counted as one each, is accepted.
+    for (const reason of ["x".repeat(200), "🙂".repeat(200)]) {
+      const ok = await callContent("delete_block", { graph: "work", "block-id": "b1", reason });
+      expect(ok.isError).toBe(false);
+      expect(ok.content[0].text).toBe(`Reason: ${reason}`);
+    }
+    expect(syncRequests).toHaveLength(2);
+  });
+
+  it("reason is repeated as the first content item, ahead of the unchanged result", async () => {
+    syncHandler = () => Response.json({ uuid: "b1", title: "New title" });
+    const args = { graph: "work", "block-id": "b1", body: { title: "New title" } };
+    const without = await callContent("update_block", args);
+    expect(without.content).toHaveLength(1);
+    const withReason = await callContent("update_block", { ...args, reason: `  ${REASON} ` });
+    expect(withReason).toEqual({
+      isError: false,
+      content: [{ type: "text", text: `Reason: ${REASON}` }, ...without.content],
+    });
+    // No reason, an empty one or one of only spaces leaves the result as it was.
+    for (const reason of ["", "   "]) {
+      expect(await callContent("update_block", { ...args, reason }), JSON.stringify(reason)).toEqual(without);
+    }
+    // A write the server refuses carries only the refusal.
+    syncHandler = () => Response.json({ error: "block not found" }, { status: 409 });
+    expect(await callContent("update_block", { ...args, reason: REASON })).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "block not found" }],
+    });
+  });
+
+  it("log carries reason=yes|no, never the text", async () => {
+    acceptEverything();
+    await callContent("update_block", { graph: "work", "block-id": "b1", body: { title: "x" }, reason: REASON });
+    await callContent("update_block", { graph: "work", "block-id": "b1", body: { title: "x" } });
+    await callContent("update_block", { graph: "work", "block-id": "b1", body: { title: "x" }, reason: " " });
+    await callContent("delete_block", { graph: "work", "block-id": "b1", reason: "y".repeat(201) });
+    await callContent("delete_block", { graph: "notes", "block-id": "b1", reason: REASON });
+    await callContent("get_page", { graph: "work", "page-id": "p1" });
+    // A read given a reason anyway: the schema has none, so it is dropped and not logged.
+    await callContent("get_page", { graph: "work", "page-id": "p1", reason: REASON });
+    const lines = logged().map((line) => line.replace(/ms=\d+$/, "ms=N"));
+    expect(lines).toEqual([
+      "tool update_block graph=work status=ok reason=yes ms=N",
+      "tool update_block graph=work status=ok reason=no ms=N",
+      "tool update_block graph=work status=ok reason=no ms=N",
+      "tool delete_block graph=work status=refused reason=yes ms=N",
+      "tool delete_block graph=notes status=read-only reason=yes ms=N",
+      "tool get_page graph=work status=ok ms=N",
+      "tool get_page graph=work status=ok ms=N",
+    ]);
+    for (const line of lines) {
+      expect(line).not.toContain("tidy");
+      expect(line).not.toContain("yyy");
+    }
+  });
+
+  it("onSuccess receives {reason, targets: []} on writes and nothing more on reads", async () => {
+    acceptEverything();
+    const onSuccess = vi.fn();
+    const handler = observedConnector(onSuccess);
+    await callContent("update_block", { graph: "work", "block-id": "b1", body: { title: "x" }, reason: REASON }, handler);
+    await callContent("delete_page", { graph: "work", "page-id": PAGE_UUID }, handler);
+    await callContent("save_document", { graph: "work", fileName: "a.md", text: "a", reason: REASON }, handler);
+    await callContent("get_page", { graph: "work", "page-id": "p1" }, handler);
+    // Refused calls never reach onSuccess.
+    await callContent("delete_block", { graph: "work", "block-id": "b1", reason: "x".repeat(201) }, handler);
+    syncHandler = () => Response.json({ error: "no" }, { status: 409 });
+    await callContent("delete_block", { graph: "work", "block-id": "b1", reason: REASON }, handler);
+    expect(onSuccess.mock.calls).toEqual([
+      ["update_block", "work", { reason: REASON, targets: [] }],
+      ["delete_page", "work", { reason: undefined, targets: [] }],
+      ["save_document", "work", { reason: REASON, targets: [] }],
+      ["get_page", "work"],
+    ]);
+    expect(Object.keys(onSuccess.mock.calls[1][2])).toEqual(["reason", "targets"]);
+  });
+
+  it("a generated operation that already takes a reason stops the build", () => {
+    const changed = structuredClone(spec);
+    const op = changed.paths["/api/v1/graphs/{graph-id}/blocks/{block-id}"].delete;
+    op.parameters = [...(op.parameters ?? []), { name: "reason", in: "query", schema: { type: "string" } }];
+    expect(() => buildGraphTools(changed, { env: testEnv(), resolve: async () => null })).toThrow(
+      "deleteBlock already takes a reason argument; the connector's reason would hide it",
+    );
+  });
+});
+
 describe("routing", () => {
   it("create_page on alias routes to /api/v1/graphs/<graph-id>/pages with that graph's PAT", async () => {
     syncHandler = () => Response.json({ id: "p1", title: "Standup [[Ann]]" }, { status: 201 });
@@ -344,7 +537,7 @@ describe("routing", () => {
     // Logs carry the tool, alias, status and duration only.
     const lines = logged();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^tool create_page graph=work status=ok ms=\d+$/);
+    expect(lines[0]).toMatch(/^tool create_page graph=work status=ok reason=no ms=\d+$/);
   });
 
   it("passes other path and query arguments through and reads with the read-only graph's own PAT", async () => {
@@ -469,7 +662,7 @@ describe("errors", () => {
     expect(syncRequests).toHaveLength(1);
     expect((await store().get("work"))?.lastUsedAt).toBeNull();
 
-    expect(logged().at(-1)).toMatch(/^tool create_page graph=work status=http-429 ms=\d+$/);
+    expect(logged().at(-1)).toMatch(/^tool create_page graph=work status=http-429 reason=no ms=\d+$/);
   });
 
   it("400 maps to the server's message", async () => {
@@ -727,6 +920,9 @@ describe("hand-written tools", () => {
       "convert_values",
       "choices and convert_values are refused on E2EE graphs",
       "are marked destructive, so claude.ai asks before running them",
+      "Give every write and delete a reason",
+      "at most 200 characters",
+      "never sent to or stored on the graph",
     ]) {
       expect(result.text).toContain(phrase);
     }

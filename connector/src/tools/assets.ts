@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { ResolvedGraph } from "../graphs";
 import { SafeFetchError, readUpTo, safeFetch } from "../net/safe-fetch";
 import { RESULT_CHAR_LIMIT, ToolError, aliasArg, runTool, textResult } from "./common";
+import { type OnSuccess, reasonGiven, reasonSchema, summarise, takeReason, withSummary } from "./readable";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
@@ -255,22 +256,36 @@ async function readFile(access: GraphAccess, alias: string, assetUuid: string): 
   return textResult(fileText(text, complete, fileName, meta.size));
 }
 
-/** `save_document`, `save_file_from_url` and `read_file`. `onSuccess` runs after each successful call. */
-export function registerAssetTools(
-  server: McpServer,
-  access: GraphAccess,
-  onSuccess: (tool: string, alias: string) => void,
-): void {
-  function handle<A>(name: string, call: (alias: string, args: A) => Promise<CallToolResult>) {
+/**
+ * `save_document`, `save_file_from_url` and `read_file`. `onSuccess` runs after each successful call.
+ * The two writes take a `reason`, which is taken out of their arguments before anything else runs
+ * (it is never sent anywhere) and repeated as the result's first content item.
+ */
+export function registerAssetTools(server: McpServer, access: GraphAccess, onSuccess: OnSuccess): void {
+  function handle<A extends Record<string, unknown>>(
+    name: string,
+    call: (alias: string, args: Omit<A, "reason">) => Promise<CallToolResult>,
+  ) {
+    const write = !annotationsFor(name).readOnlyHint;
     return (args: A) => {
       const alias = aliasArg(args);
-      return runTool(name, alias, async () => {
-        // The input schema requires a well-formed alias, so a call that got this far has one.
-        if (alias === undefined) throw new Error("file tool ran without a valid alias");
-        const result = await call(alias, args);
-        onSuccess(name, alias);
-        return result;
-      });
+      return runTool(
+        name,
+        alias,
+        async () => {
+          const { reason, rest } = write ? takeReason(args) : { reason: undefined, rest: args };
+          // The input schema requires a well-formed alias, so a call that got this far has one.
+          if (alias === undefined) throw new Error("file tool ran without a valid alias");
+          const result = await call(alias, rest);
+          if (!write) {
+            onSuccess(name, alias);
+            return result;
+          }
+          onSuccess(name, alias, { reason, targets: [] });
+          return withSummary(result, summarise([], { reason }));
+        },
+        write ? reasonGiven(args) : undefined,
+      );
     };
   }
 
@@ -285,6 +300,7 @@ export function registerAssetTools(
         text: z.string().optional().describe("The document as text, saved as utf-8. Pass this or base64."),
         base64: z.string().optional().describe("The document's bytes, base64-encoded. Pass this or text."),
         page: pageArg,
+        reason: reasonSchema,
       }),
       annotations: annotationsFor("save_document"),
     },
@@ -320,6 +336,7 @@ export function registerAssetTools(
           .optional()
           .describe("File name with an extension; defaults to the URL's last path segment"),
         page: pageArg,
+        reason: reasonSchema,
       }),
       annotations: annotationsFor("save_file_from_url"),
     },

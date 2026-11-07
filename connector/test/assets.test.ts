@@ -701,6 +701,63 @@ describe("read_file", () => {
   });
 });
 
+describe("reason", () => {
+  const REASON = "keep the standup transcript";
+
+  it("save_document and save_file_from_url send the same upload with or without a reason, and repeat it first", async () => {
+    acceptUploads();
+    const pdf = new TextEncoder().encode("%PDF-1.7 report");
+    const calls: [string, Record<string, unknown>][] = [
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup", page: PAGE_ID }],
+      ["save_document", { graph: "work", fileName: "blob.bin", base64: base64(new Uint8Array([1, 2, 3])) }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf", page: PAGE_ID }],
+    ];
+    for (const [name, args] of calls) {
+      fetchSpy.mockImplementation(async () => new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+      syncCalls = [];
+      const without = await callTool(name, args);
+      const sentWithout = syncCalls.map(({ method, url, bytes }) => ({ method, url: url.href, bytes }));
+      syncCalls = [];
+      fetchSpy.mockClear();
+      const withReason = await callTool(name, { ...args, reason: REASON });
+      const sentWith = syncCalls.map(({ method, url, bytes }) => ({ method, url: url.href, bytes }));
+      expect(sentWith, name).toEqual(sentWithout);
+      expect(sentWith, name).toHaveLength(1);
+      expect(sentWith[0].url, name).not.toContain("reason");
+      expect(sentWith[0].url, name).not.toContain("standup%20transcript");
+      expect(new TextDecoder().decode(sentWith[0].bytes), name).not.toContain(REASON);
+      // The public fetch, when there is one, goes to the URL as given.
+      for (const [input] of fetchSpy.mock.calls) expect(String(input), name).not.toContain("transcript");
+      expect(without.content, name).toHaveLength(1);
+      expect(withReason, name).toEqual({
+        isError: false,
+        content: [{ type: "text", text: `Reason: ${REASON}` }, ...without.content],
+      });
+    }
+  });
+
+  it("a reason over 200 characters is refused before any sync call or public fetch", async () => {
+    acceptUploads();
+    for (const [name, args] of [
+      ["save_document", { graph: "work", fileName: "a.md", text: "a" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/a.pdf" }],
+    ] as const) {
+      const result = await callTool(name, { ...args, reason: "r".repeat(201) });
+      expect(result, name).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "reason is 201 characters; at most 200 are accepted — shorten it" }],
+      });
+    }
+    expect(syncCalls).toHaveLength(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const lines = consoleSpies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
+    expect(lines.map((line) => line.replace(/ms=\d+$/, "ms=N"))).toEqual([
+      "tool save_document graph=work status=refused reason=yes ms=N",
+      "tool save_file_from_url graph=work status=refused reason=yes ms=N",
+    ]);
+  });
+});
+
 describe("logging", () => {
   it("file tools log only tool, alias, status and duration — no PAT, URL or hostname", async () => {
     acceptUploads();
@@ -726,9 +783,9 @@ describe("logging", () => {
 
     const lines = consoleSpies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
     expect(lines.map((line) => line.replace(/ms=\d+$/, "ms=N"))).toEqual([
-      "tool save_document graph=work status=ok ms=N",
-      "tool save_file_from_url graph=work status=ok ms=N",
-      "tool save_file_from_url graph=work status=refused ms=N",
+      "tool save_document graph=work status=ok reason=no ms=N",
+      "tool save_file_from_url graph=work status=ok reason=no ms=N",
+      "tool save_file_from_url graph=work status=refused reason=no ms=N",
       "tool read_file graph=work status=ok ms=N",
     ]);
     for (const line of lines) {

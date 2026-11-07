@@ -10,6 +10,7 @@ import {
 import { BindingError } from "../semantic/indexer";
 import { reciprocalRankFusion } from "../semantic/rrf";
 import type { SemanticStore, StoredBlock } from "../semantic/store";
+import type { OnSuccess } from "./readable";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
@@ -116,7 +117,7 @@ export async function hybridSearch(
 export function registerSemanticTools(
   server: McpServer,
   deps: HybridSearchDeps,
-  onSuccess: (tool: string, alias: string) => void,
+  onSuccess: OnSuccess,
 ): void {
   const graph = z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION);
 

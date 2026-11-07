@@ -786,6 +786,8 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
   Saving and reading back small files works. Whether large files, such as a 25 MiB download or a 3.75 MiB image, stay inside the Workers Free plan's CPU time and memory per request hasn't been measured. If one fails with error 1102, switch to the paid plan (section 8).
 - **Flashcards:** Claude tags a block with the `Card` tag, which makes it a flashcard in Logseq's review. Reviews stay in Logseq.
 
+- **Every write says why.** Each tool that isn't a read (every write and delete, `save_document` and `save_file_from_url` included) takes an optional `reason`, a plain sentence of at most 200 characters (a longer one is refused before anything is sent), and `connector_help` asks Claude to fill it. claude.ai shows it with the call's arguments on the approval card. The connector takes it out of the arguments before calling the sync server, so it is never sent to or stored on the graph, and repeats it as the first line of the result (`Reason: tidy duplicate notes`), ahead of the server's answer. The log records only `reason=yes` or `reason=no`.
+
 **Limits:**
 
 - **Read-only graphs refuse every write tool** before anything reaches the sync server.
@@ -806,7 +808,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 - **Tokens are encrypted.** Each PAT is stored in the connector's D1 database with AES-GCM under `GRAPH_TOKEN_KEY`. No tool returns a token, and the wizard never shows one again. Treat `GRAPH_TOKEN_KEY` like the tokens themselves.
 - **Only unencrypted graphs.** The wizard refuses end-to-end encrypted graphs. Everything in section 3 about unencrypted graphs applies, and the connector is one more piece of deployed code that can read them.
 - **Narrow access per graph.** Connect a graph read-only, with a `read` token, when Claude only needs to read it.
-- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames. The hourly `kb_index` rebuild logs one line per graph, such as `kb-index graph=work status=ok pages=812 ms=1530`. Workers Logs (observability, on for the connector) also record each request's URL and metadata, privately in your Cloudflare dashboard.
+- **Logs** hold the tool name, graph alias, status and duration only: never arguments, results, tokens or hostnames. A write's line also says `reason=yes` or `reason=no`, never the reason's text, which may quote private notes. The hourly `kb_index` rebuild logs one line per graph, such as `kb-index graph=work status=ok pages=812 ms=1530`. Workers Logs (observability, on for the connector) also record each request's URL and metadata, privately in your Cloudflare dashboard.
 - **The `kb_index` cache holds page content.** `KB_INDEX_KV` stores each graph's page titles, tags, summaries and UUIDs, unencrypted like the graph itself, for up to 7 days after the last rebuild. Pages tagged `private` are never fetched. Disconnecting a graph doesn't delete its cache entry; it expires.
 - **Not backed up.** `backup.yml` doesn't back up the connector's D1 database or the `kb_index` cache, which is rebuilt from the graphs. It holds only aliases, graph IDs, modes and encrypted tokens, and tokens can be re-issued in Logseq. D1 Time Travel covers accidents.
 - **Key rotation** (section 9): rotating `GRAPH_TOKEN_KEY` makes every stored token unreadable, so you must replace the token for each graph. Rotating `COOKIE_ENCRYPTION_KEY` signs you out of the wizard.

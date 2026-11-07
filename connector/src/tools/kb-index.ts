@@ -3,6 +3,7 @@ import { z } from "zod";
 import { GraphStore } from "../graphs";
 import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
+import type { OnSuccess } from "./readable";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 // kb_index (design: README §11.8) answers "what is in this graph?" in one call. The sync server's
@@ -183,7 +184,7 @@ export function renderKbIndex(
 export function registerKbIndexTool(
   server: McpServer,
   access: GraphAccess,
-  onSuccess: (tool: string, alias: string) => void,
+  onSuccess: OnSuccess,
 ): void {
   server.registerTool(
     "kb_index",

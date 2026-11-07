@@ -23,9 +23,13 @@ export function aliasArg(args: unknown): string | undefined {
   return typeof graph === "string" && ALIAS.test(graph) ? graph : undefined;
 }
 
-/** The connector's only log line about tools: never arguments, results, tokens or hostnames. */
-export function logTool(name: string, alias: string | undefined, status: string, started: number): void {
-  console.log(`tool ${name} graph=${alias ?? "-"} status=${status} ms=${Date.now() - started}`);
+/**
+ * The connector's only log line about tools: never arguments, results, tokens or hostnames. For a
+ * write, `reasonGiven` adds `reason=yes|no`, never the reason's text, which may quote private notes.
+ */
+export function logTool(name: string, alias: string | undefined, status: string, started: number, reasonGiven?: boolean): void {
+  const reason = reasonGiven === undefined ? "" : ` reason=${reasonGiven ? "yes" : "no"}`;
+  console.log(`tool ${name} graph=${alias ?? "-"} status=${status}${reason} ms=${Date.now() - started}`);
 }
 
 /** Truncates the result's text content to `RESULT_CHAR_LIMIT` characters in total, notice included. */
@@ -53,11 +57,13 @@ export function capResult(result: CallToolResult): CallToolResult {
 /**
  * Runs one tool call with the connector's logging and result cap. A `ToolError` becomes an error
  * result with its message; any other error propagates to the MCP server, which reports it as a failed call.
+ * Writes pass `reasonGiven`, so the log line says whether the call gave a reason.
  */
 export async function runTool(
   name: string,
   alias: string | undefined,
   call: () => Promise<CallToolResult>,
+  reasonGiven?: boolean,
 ): Promise<CallToolResult> {
   const started = Date.now();
   let status = "error";
@@ -70,7 +76,7 @@ export async function runTool(
     status = error.status;
     return { isError: true, content: [{ type: "text", text: error.message }] };
   } finally {
-    logTool(name, alias, status, started);
+    logTool(name, alias, status, started, reasonGiven);
   }
 }
 
