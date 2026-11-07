@@ -3,7 +3,7 @@
 //        ENV_FILE_VALUE=<value> env-file.mjs set NAME [--file <path>]
 // Reads or rewrites one line of an env file (default: .env.local at the repo root). The new value
 // comes from ENV_FILE_VALUE, never argv, and is never printed. `set` first copies the file to
-// `<file>.bak-YYYYMMDDHHMMSS` (UTC, mode 600), then replaces the first `NAME=` line through a
+// `<file>.bak-YYYYMMDDHHMMSS` (UTC, mode 600), then replaces the `NAME=` line through a
 // temp file and a rename, so the file is never half-written. Only that line changes, and it keeps
 // its `export ` prefix, indentation and line ending.
 //
@@ -21,15 +21,21 @@ function checkName(name) {
   if (!NAME.test(name)) throw new Error(`invalid name: ${JSON.stringify(name)}`);
 }
 
-/** Splits `text` into lines and finds the first `NAME=` line. Returns { lines, index, match }. */
-function findLine(text, name) {
+/**
+ * Splits `text` into lines and finds the one `NAME=` line. Returns { lines, index, match }, with
+ * index -1 when there is none. A name on more than one line is refused: init-env.sh reads the last
+ * such line, so editing or reading any other would silently disagree with what gets pushed.
+ */
+function findLine(text, name, path) {
   const pattern = new RegExp(`^(\\s*(?:export\\s+)?${name}=)(.*?)(\\r?)$`);
   const lines = text.split("\n");
+  const found = [];
   for (const [index, line] of lines.entries()) {
     const match = pattern.exec(line);
-    if (match) return { lines, index, match };
+    if (match) found.push({ index, match });
   }
-  return { lines, index: -1, match: null };
+  if (found.length > 1) throw new Error(`${name} appears ${found.length} times in ${path}; keep one line`);
+  return found.length === 1 ? { lines, ...found[0] } : { lines, index: -1, match: null };
 }
 
 function unquote(value) {
@@ -38,10 +44,10 @@ function unquote(value) {
   return value;
 }
 
-/** The value of the first `NAME=` line, or undefined when there is none. */
+/** The value of the `NAME=` line, or undefined when there is none. */
 export function readEnvValue(path, name) {
   checkName(name);
-  const { match } = findLine(readFileSync(path, "utf8"), name);
+  const { match } = findLine(readFileSync(path, "utf8"), name, path);
   return match ? unquote(match[2]) : undefined;
 }
 
@@ -50,7 +56,7 @@ function stamp(now) {
 }
 
 /**
- * Replaces the first `NAME=` line with `NAME=value` after backing the file up. Returns the backup
+ * Replaces the `NAME=` line with `NAME=value` after backing the file up. Returns the backup
  * path. Refuses a value with whitespace, a quote or `$` (it is written unquoted and would not read
  * back as itself in a shell), and an empty one. Error messages never include the value.
  */
@@ -60,7 +66,7 @@ export function setEnvLine(path, name, value, { now = new Date() } = {}) {
     throw new Error(`refusing value for ${name}: it must be non-empty and contain no whitespace, quote or $`);
   }
   const original = readFileSync(path);
-  const { lines, index, match } = findLine(original.toString("utf8"), name);
+  const { lines, index, match } = findLine(original.toString("utf8"), name, path);
   if (!match) throw new Error(`${name} is not in ${path}; add it with scripts/init-env.sh --add-missing`);
 
   // Flag "wx": two edits in the same second must not replace the earlier backup.

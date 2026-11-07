@@ -122,11 +122,36 @@ test("readEnvValue reads NAME=, export NAME=, indented, CRLF and quoted lines", 
     },
   ));
 
-test("readEnvValue reads the line setEnvLine rewrites when a name appears twice", () =>
-  withEnvFile("A=first\nA=second\n", (file) => {
-    assert.equal(readEnvValue(file, "A"), "first");
-    setEnvLine(file, "A", "new", { now: NOW });
-    assert.equal(readFileSync(file, "utf8"), "A=new\nA=second\n");
+test("a name on more than one line is refused by readEnvValue and setEnvLine, with nothing written", () =>
+  withEnvFile("A=first\nexport A=second\n  A=third\n# A=comment\nB=1\n", (file, dir) => {
+    const before = readFileSync(file, "utf8");
+    const message = `A appears 3 times in ${file}; keep one line`;
+    assert.throws(() => readEnvValue(file, "A"), (e) => e.message === message);
+    assert.throws(() => setEnvLine(file, "A", "new", { now: NOW }), (e) => e.message === message);
+    assert.equal(readFileSync(file, "utf8"), before);
+    assert.deepEqual(readdirSync(dir), [".env.local"]);
+    // Another name in the same file is unaffected.
+    assert.equal(readEnvValue(file, "B"), "1");
+  }));
+
+test("a name with one line and a commented copy is accepted", () =>
+  withEnvFile("# A=old\nA=1\n", (file) => {
+    assert.equal(readEnvValue(file, "A"), "1");
+    setEnvLine(file, "A", "2", { now: NOW });
+    assert.equal(readFileSync(file, "utf8"), "# A=old\nA=2\n");
+  }));
+
+test("CLI get and set exit non-zero on a duplicated name, and change nothing", () =>
+  withEnvFile("A=first\nA=second\n", async (file, dir) => {
+    const get = await runScript(script, ["get", "A", "--file", file]);
+    assert.equal(get.status, 1);
+    assert.equal(get.stdout, "");
+    assert.match(get.stderr, /A appears 2 times in .*; keep one line/);
+    const set = await runScript(script, ["set", "A", "--file", file], { env: { ENV_FILE_VALUE: "new" } });
+    assert.equal(set.status, 1);
+    assert.match(set.stderr, /A appears 2 times in .*; keep one line/);
+    assert.equal(readFileSync(file, "utf8"), "A=first\nA=second\n");
+    assert.deepEqual(readdirSync(dir), [".env.local"]);
   }));
 
 test("CLI get prints the value", () =>
