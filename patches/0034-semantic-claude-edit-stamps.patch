@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index f65a3a1..c260115 100644
+index f65a3a1..b062530 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1322,12 +1322,110 @@
@@ -116,16 +116,20 @@ index f65a3a1..c260115 100644
  
  (defn- created-by-tx [before after datoms creator]
    (let [targets (into #{}
-@@ -1362,6 +1460,8 @@
+@@ -1361,7 +1459,12 @@
+     (apply mutate conn args)
      (let [result (volatile! nil)
            metadata (volatile! nil)
++          ;; Only the mutation's own transactions name the op; the stamp schema's upserts carry
++          ;; theirs too, and must not relabel the write in tx_log.
++          capture? (volatile! true)
            before @conn]
 +      ;; A stamp property in the way refuses the write before it runs.
 +      (when (:stamp? creator) (refuse-stamp-conflict! before))
        ;; Keep identity scoped to synchronous work on an isolated connection.
        ;; The author and operation reach storage in the same transaction.
        (ldb/batch-transact-with-temp-conn!
-@@ -1369,7 +1469,12 @@
+@@ -1369,9 +1472,15 @@
         (fn [tx-conn tx-data]
           (vreset! result (apply mutate tx-conn args))
           (when-let [authorship (seq (created-by-tx before @tx-conn @tx-data creator))]
@@ -135,11 +139,15 @@ index f65a3a1..c260115 100644
 +           ;; So does one the write itself made (a new or renamed property); throwing here
 +           ;; discards the temp conn, so nothing reaches `conn`.
 +           (refuse-stamp-conflict! @tx-conn)
++           (vreset! capture? false)
 +           (ensure-stamp-schema! tx-conn)))
         :listen-db (fn [report]
-                     (when (:outliner-op (:tx-meta report))
+-                    (when (:outliner-op (:tx-meta report))
++                    (when (and @capture? (:outliner-op (:tx-meta report)))
                        (vreset! metadata (:tx-meta report))))
-@@ -2733,7 +2838,8 @@
+        :transform-tx-meta (fn [_] @metadata))
+       @result)))
+@@ -2733,7 +2842,8 @@
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
                (p/catch (fn [error]
@@ -149,7 +157,7 @@ index f65a3a1..c260115 100644
  
      :semantic/assets-get
      (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
-@@ -4437,6 +4543,17 @@
+@@ -4437,6 +4547,17 @@
      (= :semantic/block-changes handler) (handle-block-changes context)
      :else (http/not-found)))
  
@@ -167,7 +175,7 @@ index f65a3a1..c260115 100644
  (defn handle [{:keys [^js self route ^js url] :as context}]
    (let [conn (ensure-conn! self)
          handler (:handler route)
-@@ -4454,9 +4571,10 @@
+@@ -4454,9 +4575,10 @@
          context (assoc context :conn conn :db db :handler handler :e2ee? e2ee?
                         :path-params (:path-params route)
                         :creator (request-creator (:request context) e2ee?))]
@@ -186,10 +194,10 @@ index f65a3a1..c260115 100644
 +        (dispatch-handle context handler)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 new file mode 100644
-index 0000000..4351c86
+index 0000000..5e470f5
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,663 @@
 +(ns logseq.db-sync.semantic-edit-stamps-test
 +  "Claude edit stamps (patch 0034), stage 1: the flag and the schema. A write whose request carries
 +  x-logseq-edit-stamp: claude, from a real actor on a graph that isn't E2EE, creates two hidden
@@ -801,6 +809,58 @@ index 0000000..4351c86
 +          (is (string/starts-with? (str (get-in batch [:body :error])) "entry 1: Tags: "))
 +          (is (= before (snapshot conn)))
 +          (is (no-schema? conn)))))))
++
++(defn- ops-of!
++  "Runs `(write graph)` with a listener on the graph's conn and returns the :outliner-op of each
++  transaction it commits: the op storage writes to tx_log and pulling clients replay."
++  [{:keys [conn] :as graph} write]
++  (let [ops (atom [])]
++    (d/listen! conn ::ops #(swap! ops conj (:outliner-op (:tx-meta %))))
++    (-> (p/let [response (write graph)]
++          (is (<= 200 (:status response) 299) (pr-str response))
++          @ops)
++        (p/finally #(d/unlisten! conn ::ops)))))
++
++;; Each write kind, as (fn [graph headers]) on a fresh graph. The flagged run is the graph's first
++;; flagged write, so it is the one that creates the stamp schema.
++(def ^:private write-kinds
++  {:save-block (fn [{:keys [self a]} headers] (update-block! self a "A edited" headers))
++   :delete-blocks (fn [{:keys [self a]} headers]
++                    (request! self "DELETE" (str "/semantic/blocks/" a) nil :headers headers))
++   :delete-blocks-batch (fn [{:keys [self a b]} headers]
++                          (request! self "DELETE" "/semantic/blocks" {:block-ids [(str a) (str b)]}
++                                    :headers headers))
++   :move-blocks (fn [{:keys [self a c]} headers]
++                  (request! self "POST" "/semantic/block-moves"
++                            {:block-ids [(str a)] :target-id (str c) :position "after"} :headers headers))
++   :create-page (fn [{:keys [self]} headers]
++                  (request! self "POST" "/semantic/pages" {:title "Fresh page"} :headers headers))
++   :batch-set-property (fn [{:keys [self a]} headers]
++                         (request! self "POST" "/semantic/block-properties/batch-set"
++                                   {:entries [{:block-id (str a) :property-id "logseq.property/heading"
++                                               :value 2}]}
++                                   :headers headers))})
++
++;; Before the fix the first flagged write committed under the op of the schema's last upsert:
++;;   expected: (= [:save-block] flagged)  actual: (not (= [:save-block] [:upsert-closed-value]))
++(deftest first-flagged-write-keeps-its-own-outliner-op-test
++  (async done
++    (let [seen (atom [])]
++      (-> (reduce (fn [chain [kind write]]
++                    (p/let [_ chain
++                            unflagged (ops-of! (seed-graph) #(write % signed))
++                            graph (seed-graph)
++                            flagged (ops-of! graph #(write % stamped))]
++                      (swap! seen conj kind)
++                      (testing (name kind)
++                        (is (= 1 (count unflagged)) (pr-str unflagged))
++                        (is (some? (first unflagged)) "the unflagged write carries an op")
++                        (is (= unflagged flagged) "the first flagged write commits under its own op")
++                        (is (some? (:by (schema-entities @(:conn graph)))) "and it created the schema"))))
++                  (p/resolved nil) write-kinds)
++          (p/then #(is (= (set (keys write-kinds)) (set @seen)) "every write kind ran"))
++          (p/catch #(is false (str % (some-> % .-stack))))
++          (p/finally done)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f2e1e92..07f3b43 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
