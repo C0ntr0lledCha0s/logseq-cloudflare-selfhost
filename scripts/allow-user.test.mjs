@@ -45,6 +45,34 @@ test("parseRefusal does not take a UUID typed into the email address as the sub"
   assert.deepEqual(parseRefusal(event), { sub: SUB, email });
 });
 
+test("parseRefusal takes the sub from its own key, not from another UUID earlier in the event", () => {
+  const other = "99999999-8888-4777-8666-555555555555";
+  const want = { sub: SUB, email: "a@example.com" };
+  const scriptVersion = { scriptName: "logseq-sync", scriptVersion: { id: other }, requestId: other };
+  assert.deepEqual(parseRefusal({ $workers: scriptVersion, ...textEvent(SUB, "a@example.com") }), want);
+  assert.deepEqual(parseRefusal({ $workers: scriptVersion, ...objectEvent(SUB, "a@example.com") }), want);
+  // The sub comes before the email in some events and after it in others.
+  assert.deepEqual(parseRefusal({ $workers: scriptVersion, message: `user-not-allowed {:email "a@example.com", :sub "${SUB}"}` }), want);
+});
+
+test("parseRefusal reads a map logged as an embedded JSON string and tolerates whitespace", () => {
+  const want = { sub: SUB, email: "a@example.com" };
+  const embedded = JSON.stringify({ sub: SUB, email: "a@example.com" });
+  assert.deepEqual(parseRefusal({ $metadata: { message: `user-not-allowed ${embedded}` } }), want);
+  const pretty = JSON.stringify({ sub: SUB, email: "a@example.com" }, null, 2);
+  assert.deepEqual(parseRefusal({ message: `user-not-allowed ${pretty}` }), want);
+  assert.deepEqual(parseRefusal({ message: `user-not-allowed {:sub   "${SUB}",\n :email  "a@example.com"}` }), want);
+  assert.deepEqual(parseRefusal(JSON.parse(`{"message":"user-not-allowed","source":{"sub" : "${SUB}", "email" :"a@example.com"}}`)), want);
+});
+
+test("parseRefusal gives null when a UUID is present but no sub key anchors it", () => {
+  assert.equal(parseRefusal({ message: `user-not-allowed ${SUB}` }), null);
+  assert.equal(parseRefusal({ message: `user-not-allowed {:id "${SUB}"}` }), null);
+  assert.equal(parseRefusal({ message: "user-not-allowed", $workers: { scriptVersion: { id: SUB } } }), null);
+  assert.equal(parseRefusal({ message: `user-not-allowed {:subject "${SUB}"}` }), null);
+  assert.equal(parseRefusal({ message: `user-not-allowed {:sub "not-a-uuid", :id "${SUB}"}` }), null);
+});
+
 test("findRefusals asks for the refusal events of the sync Worker and keeps one per sub", async () => {
   const stub = await cfStub({
     [TELEMETRY]: () =>

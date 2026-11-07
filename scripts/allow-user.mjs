@@ -24,25 +24,33 @@ import { readEnvValue, setEnvLine } from "./env-file.mjs";
 import { tokenLink } from "./token-link.mjs";
 
 const NAME = "DB_SYNC_ALLOWED_USERS";
-const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
-const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const EMAIL = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}";
 const LOOKBACK_MS = 30 * 60 * 1000;
 const POLL_OVERLAP_MS = 60 * 1000;
 const USAGE = "usage: allow-user.mjs [--owner] [--wait <minutes>] [--show-ids]";
 
+// A value written after its key, in the forms the event can take once serialised: EDN text (`:sub "x"`),
+// a JSON member (`"sub":"x"`), and a JSON object embedded in a string (`\"sub\":\"x\"`). Whitespace,
+// including the escaped `\n` of an embedded string, may sit between the key and the value.
+const GAP = String.raw`(?:\s|\\[nrt])*`;
+const keyedValue = (key, value) =>
+  new RegExp(String.raw`(?::${key}|\\?"${key}\\?"${GAP}:)${GAP}\\?"(${value})\\?"`);
+const SUB = keyedValue("sub", UUID);
+const EMAIL_VALUE = keyedValue("email", EMAIL);
+
 /**
  * The `sub` and email in a `user-not-allowed` log event, or null when it isn't one. It reads the whole
- * serialised event, so it works whether the map was logged as text or as an object. The sub is the first
- * UUID outside the email address: a UUID typed into an email address can't stand in for the sub.
+ * serialised event, so it works whether the map was logged as text or as an object. Both values are
+ * taken from their own key: a real event carries other UUIDs (script version, trace ids), and a wrong ID
+ * would be written and pushed unnoticed. No `sub` key means no refusal, never an unanchored UUID.
  */
 export function parseRefusal(event) {
   const text = JSON.stringify(event) ?? "";
   if (!text.includes("user-not-allowed")) return null;
-  const emailMatch = EMAIL.exec(text);
-  const rest = emailMatch === null ? text : `${text.slice(0, emailMatch.index)} ${text.slice(emailMatch.index + emailMatch[0].length)}`;
-  const sub = UUID.exec(rest)?.[0];
+  const sub = SUB.exec(text)?.[1];
   if (sub === undefined) return null;
-  return { sub, email: emailMatch === null ? null : emailMatch[0] };
+  return { sub, email: EMAIL_VALUE.exec(text)?.[1] ?? null };
 }
 
 /** The refused sign-ins logged by the sync Worker between the two times (ms), one per sub. */
