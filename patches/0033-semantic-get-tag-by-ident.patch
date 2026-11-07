@@ -1,0 +1,77 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 6752ed4..f65a3a1 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -329,6 +329,14 @@
+   (when-let [entity (find-entity db id)]
+     (when-not (entity-util/hidden? entity) entity)))
+ 
++(declare find-tag)
++
++(defn- find-visible-tag
++  "getTag's tag-id: what updateTag's find-tag resolves (a UUID or a qualified ident), unless hidden."
++  [db id]
++  (when-let [entity (find-tag db id)]
++    (when-not (entity-util/hidden? entity) entity)))
++
+ (defn- page-root-blocks [db page]
+   (let [page-id (:db/id page)]
+     (->> (d/datoms db :avet :block/page page-id)
+@@ -2501,7 +2509,7 @@
+               (http/json-response nil (tag-detail-response (d/entity @conn [:block/uuid tag-id])) 201))))))
+ 
+     :semantic/tags-get
+-    (if-let [tag (find-visible-entity db (:tag-id path-params))]
++    (if-let [tag (find-visible-tag db (:tag-id path-params))]
+       (if (tag? tag) (http/json-response nil (tag-detail-response tag)) (http/not-found))
+       (http/not-found))
+ 
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 2a09cbb..a45c272 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -155,7 +155,7 @@
+    "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by page-id (its UUID or title), into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+    "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
+-   "getTag" ["Get a tag" "Returns one tag by UUID, with the tags it extends and its tag properties."]
++   "getTag" ["Get a tag" "Returns one tag by UUID or ident (as updateTag takes it), with the tags it extends and its tag properties. Answers 404 for an id that names no visible tag."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+    "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
+    "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+index 8e05d32..050675e 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+@@ -679,6 +679,31 @@
+           (is (= 200 (:status response)) (str (:body response)))
+           (is (= #{for-client for-service partner} (tag-property-idents conn (:block/uuid client)))))))))
+ 
++;; getTag takes the same tag-id as updateTag: a UUID or a qualified ident, so the connector's audit
++;; log can read a tag before an update by ident overwrites it. Anything else names no tag: a
++;; property's ident, a title, an unqualified word, an ident nothing has, and a tag in the Recycle bin.
++(deftest get-tag-by-qualified-ident-test
++  (async done
++    (with-tags done
++      (fn [{:keys [conn self client for-service]}]
++        (p/let [by-uuid (request! self "GET" (tag-path (:block/uuid client)) nil)
++                by-ident (request! self "GET" (tag-path (:db/ident client)) nil)
++                built-in (request! self "GET" (tag-path :logseq.class/Task) nil)
++                property (request! self "GET" (tag-path for-service) nil)
++                title (request! self "GET" (str "/semantic/tags/" (js/encodeURIComponent "Client")) nil)
++                missing (request! self "GET" (tag-path :user.class/No-such-tag) nil)
++                _ (d/transact! conn [{:db/id (:db/id client) :logseq.property/deleted-at 1}])
++                deleted (request! self "GET" (tag-path (:db/ident client)) nil)]
++          (is (= 200 (:status by-uuid)) (str (:body by-uuid)))
++          (is (= 200 (:status by-ident)) (str (:body by-ident)))
++          (is (= (:body by-uuid) (:body by-ident)))
++          (is (= 200 (:status built-in)) (str (:body built-in)))
++          (is (= "Task" (get-in built-in [:body :title])))
++          (is (= 404 (:status property)) "a property's ident names no tag")
++          (is (= 404 (:status title)) "a title is not a tag-id")
++          (is (= 404 (:status missing)))
++          (is (= 404 (:status deleted)) "a tag in the Recycle bin stays hidden by ident"))))))
++
+ (deftest tag-write-is-one-transaction-test
+   (async done
+     (with-tags done

@@ -41,18 +41,30 @@ export interface ActivityLogDeps {
 const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/;
 
+/**
+ * One formatter per use and time zone, built once: building an Intl.DateTimeFormat costs about 50 µs
+ * of CPU, so one per entry spent most of the Free plan's 10 ms on a page of 200.
+ */
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+function formatter(use: "offset" | "when", timeZone: string): Intl.DateTimeFormat {
+  const key = `${use} ${timeZone}`;
+  let f = formatters.get(key);
+  if (f === undefined) {
+    f = new Intl.DateTimeFormat(
+      "en-US",
+      use === "offset"
+        ? { timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" }
+        : { timeZone, hourCycle: "h23", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" },
+    );
+    formatters.set(key, f);
+  }
+  return f;
+}
+
 /** The time zone's offset from UTC at `t`, in ms (positive east of Greenwich). */
 function offsetAt(t: number, timeZone: string): number {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-    hour: "numeric",
-    minute: "numeric",
-    second: "numeric",
-  }).formatToParts(t);
+  const parts = formatter("offset", timeZone).formatToParts(t);
   const get = (type: string) => Number(parts.find((p) => p.type === type)?.value);
   const wall = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
   return wall - (t - (((t % 1000) + 1000) % 1000));
@@ -127,15 +139,7 @@ function ordinal(day: number): string {
 
 /** `t` as the journal titles show a date, with the local time: Nov 5th, 2026 14:02. */
 export function formatWhen(t: number, timeZone: string): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).formatToParts(t);
+  const parts = formatter("when", timeZone).formatToParts(t);
   const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
   return `${get("month")} ${ordinal(Number(get("day")))}, ${get("year")} ${get("hour")}:${get("minute")}`;
 }

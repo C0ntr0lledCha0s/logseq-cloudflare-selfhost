@@ -766,6 +766,17 @@ describe("snapshot cost", () => {
     expect(none.entries).toHaveLength(scan);
     expect(none.rowsRead).toBe(2 * scan);
   });
+
+  it("the first entry is returned whole even when its snapshot alone passes the budget, and the cursor resumes after it", async () => {
+    const top = Date.now() - 1000;
+    const before = { source: "getBlocks", data: "x".repeat(95_000) };
+    const first = await row({ at: top, tool: "delete_blocks", pages: "notes", before });
+    await row({ at: top - 1, tool: "delete_blocks", pages: "notes", before });
+    const page = await new AuditLog(env.DB).query(WORK_ID, { since: top - DAY, until: top + 1, limit: 200, includeSnapshot: true, snapshotChars: 1_000 });
+    expect(page.entries.map((e) => e.id)).toEqual([first]);
+    expect(page.entries[0].before).toBe(JSON.stringify(before));
+    expect(page.nextCursor).toEqual({ at: top, id: first });
+  });
 });
 
 describe("errors name the input", () => {
@@ -835,6 +846,32 @@ describe("its own cost", () => {
     expect(JSON.parse(reads[0].addressed)).toEqual([expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*\/\d{4}-\d{2}-\d{2}T/)]);
     expect(first.json.entries).toHaveLength(10);
     expect(first.json.entries.every((e) => e.tool === "update_block")).toBe(true);
+  });
+
+  it("a page of 200 entries builds its date formatters once per time zone, not once per entry (10 ms CPU)", async () => {
+    await bulk(200, Date.now() - 1000);
+    const real = Intl.DateTimeFormat;
+    let built = 0;
+    Intl.DateTimeFormat = new Proxy(real, {
+      construct(target, args) {
+        built += 1;
+        return Reflect.construct(target, args);
+      },
+      apply(target, self, args) {
+        built += 1;
+        return Reflect.apply(target, self, args);
+      },
+    });
+    try {
+      // since and until pass through offsetAt; the header and every line through formatWhen.
+      const day = (n: number) => new Date(Date.now() + n * DAY).toISOString().slice(0, 10);
+      const page = await activity({ since: day(-3), until: day(2), limit: 200 });
+      expect(page.lines).toHaveLength(200);
+      // One formatter for offsetAt and one for formatWhen, at most, whatever the page's length.
+      expect(built).toBeLessThanOrEqual(2);
+    } finally {
+      Intl.DateTimeFormat = real;
+    }
   });
 
   it("recordRead's INSERT writes READ_ROW_WRITES rows, measured", async () => {
