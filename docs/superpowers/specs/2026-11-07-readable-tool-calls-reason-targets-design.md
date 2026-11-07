@@ -102,6 +102,7 @@ Accepted on the single-target block writes as a query parameter (`insert_block_c
 - The remaining segments match, from the last one backwards, the target's own snippet and then its nearest ancestors in order. Ancestors above the topmost segment may be left out, so "Nov 5th, 2026 > Notes" fits a `Notes` block at any depth. A page target takes the page-only form.
 - Each such segment must be a case-insensitive prefix of the snippet it matches and at least 3 characters long, unless the snippet itself is shorter, in which case it must equal it. Empty segments are refused.
 - A label with more segments than the target has levels is a mismatch.
+- As built (review round 2): a block whose first line is empty is named by its page and parent blocks alone, since an empty segment is refused. What a mismatch reports as found leaves out an empty target line, and an empty parent line with the blocks above it, so the found text is always a label that fits. A batch insert entry's `page` given as a YYYY-MM-DD is checked against the journal it names (an existing one, or the title the new journal gets), not the date text.
 
 Every label in the call is checked before any mutation, inside the transaction. Any mismatch refuses the whole call with 409 and writes nothing. The message lists each failing entry with what was given and what was found: `entry 2: target-label "Nov 5th, 2026 > Notes" does not match target "Nov 5th, 2026 > Meeting > Agenda"`. The label is a guard only; it never selects a target.
 
@@ -165,10 +166,12 @@ A mismatch answers 409, writes nothing, and names each failing entry with the gi
 | Class | Tools | Hints |
 |---|---|---|
 | Read | every GET, `connector_help`, `list_graphs`, `kb_index`, `semantic_search`, `semantic_index_status`, `read_file`, `list_assets` | read-only, idempotent |
-| Destructive | every `delete_*`, `batch_delete_block_property`, `update_page`, `update_block`, `update_tag`, `update_property`, `set_block_property`, `batch_set_block_property`, `refresh_refs`, `promote_page_to_tag` | destructive; idempotent for deletes and `set_*` |
-| Additive write | `create_*`, `insert_*`, `batch_insert_block_trees`, `capture_to_today`, `move_blocks`, `batch_move_blocks`, `save_document`, `save_file_from_url` | not read-only, not destructive, not idempotent |
+| Destructive | every `delete_*`, `batch_delete_block_property`, `update_page`, `update_block`, `update_tag`, `update_property`, `set_block_property`, `batch_set_block_property`, `refresh_refs`, `promote_page_to_tag`, `batch_insert_block_trees` | destructive; idempotent for deletes and `set_*` |
+| Additive write | `create_*`, `insert_*`, `capture_to_today`, `move_blocks`, `batch_move_blocks`, `save_document`, `save_file_from_url` | not read-only, not destructive, not idempotent |
 
 `openWorldHint` is false for every graph tool and true for `save_file_from_url`, which fetches an outside URL. Annotations are static per tool, so `refresh_refs` and `update_property` are destructive even in their harmless modes.
+
+As built (review round 2): `batch_insert_block_trees` moved from additive to destructive (not idempotent), because an entry that names an existing page or block and gives properties replaces that target's values, the same write `batch_set_block_property` makes.
 
 **Internal.** `readable.ts` exports `toAffectedTargets(response)` and `summarise(targets)`. `onSuccess(tool, alias, {reason, targets})`.
 

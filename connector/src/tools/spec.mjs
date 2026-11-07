@@ -35,7 +35,8 @@ export const SEMANTIC_TOOLS = ["semantic_index_status", "semantic_search"];
 
 // The four classes of spec section 4 (docs/superpowers/specs/2026-11-07-readable-tool-calls-reason-targets-design.md).
 // Annotations are static per tool, so a tool that can lose data in any mode is destructive in every
-// mode (update_property, refresh_refs). Only save_file_from_url reaches outside the owner's graphs.
+// mode (update_property, refresh_refs, and batch_insert_block_trees, whose entry properties replace an
+// existing target's values). Only save_file_from_url reaches outside the owner's graphs.
 /** Reads: change nothing, so repeating them is harmless. */
 const READ = Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
 /** Writes that overwrite or remove data, where a second identical call changes something more or is refused. */
@@ -53,7 +54,7 @@ const ADDITIVE = Object.freeze({ readOnlyHint: false, destructiveHint: false, id
  */
 export const ANNOTATIONS = Object.freeze({
   batch_delete_block_property: DESTRUCTIVE_IDEMPOTENT,
-  batch_insert_block_trees: ADDITIVE,
+  batch_insert_block_trees: DESTRUCTIVE,
   batch_move_blocks: ADDITIVE,
   batch_set_block_property: DESTRUCTIVE_IDEMPOTENT,
   capture_to_today: ADDITIVE,

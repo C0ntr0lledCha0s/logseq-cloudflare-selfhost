@@ -229,9 +229,10 @@ const DESTRUCTIVE_NAMED = [
   "batch_set_block_property",
   "refresh_refs",
   "promote_page_to_tag",
+  // Its entries' properties replace an existing target's values.
+  "batch_insert_block_trees",
 ];
 const ADDITIVE_NAMED = [
-  "batch_insert_block_trees",
   "capture_to_today",
   "move_blocks",
   "batch_move_blocks",
@@ -313,13 +314,14 @@ describe("annotations", () => {
       "set_block_property",
       "refresh_refs",
       "promote_page_to_tag",
+      "batch_insert_block_trees",
     ]) {
       expect(ANNOTATIONS[name], name).toMatchObject({ readOnlyHint: false, destructiveHint: true });
     }
     for (const name of ["delete_blocks", "delete_page", "set_block_property", "batch_set_block_property"]) {
       expect(ANNOTATIONS[name].idempotentHint, name).toBe(true);
     }
-    for (const name of ["update_block", "move_blocks", "save_document"]) {
+    for (const name of ["update_block", "move_blocks", "save_document", "batch_insert_block_trees"]) {
       expect(ANNOTATIONS[name].idempotentHint, name).toBe(false);
     }
     expect(Object.keys(ANNOTATIONS).filter((name) => ANNOTATIONS[name].openWorldHint)).toEqual(["save_file_from_url"]);

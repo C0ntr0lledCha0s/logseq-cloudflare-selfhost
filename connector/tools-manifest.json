@@ -16,7 +16,7 @@
     "path": "/api/v1/graphs/{graph-id}/block-trees/batch",
     "annotations": {
       "readOnlyHint": false,
-      "destructiveHint": false,
+      "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
     }
