@@ -225,6 +225,8 @@ FROM audit_log
 
 It shows entries kept, entries today, rows written by the log, rows read by `get_activity_log`, and snapshot and target bytes. The GraphQL query gains `d1StorageAdaptiveGroups { max { databaseSizeBytes } }` for the connector database, shown against the 500 MB per-database limit. The query reads the table once a day (about 27k rows at 300 writes a day for 90 days); it runs from GitHub Actions, not the Worker.
 
+**As built (stage 5).** The query names its columns and counts bytes as stored, `sum(length(CAST(before AS BLOB)))` and the same for `targets`, as two sums the script adds (SQLite's `length` of TEXT counts characters, and `null + n` is null in SQL). Every null sum on an empty table prints as 0. `?today` is 00:00 UTC in ms, and an entry at exactly 00:00 counts as today's. The size is the newest daily `d1StorageAdaptiveGroups` group of the last 3 days (`size not reported yet` when there is none), shown against 500,000,000 bytes, and only the daily GraphQL call asks for it. Without `CONNECTOR_D1_DATABASE_ID` neither the D1 query nor the size is requested. A failed D1 query (a 403 names D1 Read) prints `Failed: <reason>` in the section, keeps the allowances table, and makes the run exit 1. The size is shown, not alerted on.
+
 `rows_written` on each entry is the INSERT's own `meta.rows_written`; the UPDATE's cost (1 row, since it changes no indexed column) is a constant added at insert time and pinned by a test that reads D1 `meta` in the vitest pool. The workflow's Cloudflare token needs **D1 Read** and the connector database id; the README says so.
 
 ### 3.8 Client and session

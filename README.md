@@ -104,7 +104,18 @@ To turn it on:
 
 3. Run it once: **Actions → usage → Run workflow**, or `gh workflow run usage.yml`.
 
-To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`.
+**The Audit log section.** With the connector on (section 11), the report can also cover the connector's audit log (the D1 table `audit_log`, section 11.8). It runs one aggregate query over the table through the D1 REST API, from GitHub Actions rather than the Worker, so each run reads every row once (about 27,000 at 300 writes a day kept for 90 days) and writes nothing. Over the entries kept, it shows the number of entries, how many are from today (UTC), the D1 rows the log's own inserts and updates wrote, the D1 rows `get_activity_log` read, and the bytes held in snapshots (`before`) and targets. Above them is the connector database's size from the GraphQL Analytics API, against the Free plan's 500 MB per database. To turn it on:
+
+1. Edit the `CLOUDFLARE_ANALYTICS_TOKEN` token (**Manage Account → Account API Tokens**) and add a second permission: **Account** → your account → **D1** Read.
+2. Set the `production` variable `CONNECTOR_D1_DATABASE_ID` to the connector database's ID, shown under **Storage & Databases → D1 → logseq-connector**, or by `tofu -chdir=infra output -raw connector_d1_id`:
+
+   ```bash
+   gh variable set CONNECTOR_D1_DATABASE_ID --env production --body <database-id>
+   ```
+
+Without the variable, the section reads `Skipped: CONNECTOR_D1_DATABASE_ID not set.` and the rest of the report is unchanged. If the query fails, the section says why (a token without D1 Read answers `D1 query failed: HTTP 403. The token needs the D1 Read permission (Account → D1 → Read) …`) and the run fails so you see it; the allowances table is still printed.
+
+To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`. Add `CONNECTOR_D1_DATABASE_ID=<database-id>` in front for the Audit log section.
 
 ## Prerequisites
 
@@ -290,7 +301,7 @@ Then add the secrets:
 | `GRAPH_TOKEN_KEY` | Only with the connector |
 | `CLOUDFLARE_ANALYTICS_TOKEN` | Only with the usage report ([Watching your usage](#watching-your-usage)) |
 
-**Two settings are variables, not secrets.** `CONNECTOR_ENABLED` turns the optional connector on (section 11), and `USAGE_REPORT_ENABLED` the usage report ([Watching your usage](#watching-your-usage)). Leave them unset for now: unset means off.
+**Two settings are variables, not secrets.** `CONNECTOR_ENABLED` turns the optional connector on (section 11), and `USAGE_REPORT_ENABLED` the usage report ([Watching your usage](#watching-your-usage)). Leave them unset for now: unset means off. A third, the `production` variable `CONNECTOR_D1_DATABASE_ID`, adds the connector's audit log to the usage report once both are on.
 
 **Two secrets are renamed on the way.** GitHub forbids secret names that start with `GITHUB_`, so the OAuth app's client ID and secret are stored as `CONNECTOR_GITHUB_CLIENT_ID` and `CONNECTOR_GITHUB_CLIENT_SECRET`. `.env.local` keeps the `GITHUB_*` names, which are the names the connector Worker uses; `init-env.sh --push` and `deploy.yml` translate between them.
 
@@ -604,6 +615,7 @@ A fresh install starts with `DB_SYNC_ALLOWED_USERS=none`, so the first deploy pa
 | `403 forbidden` from the REST API | The PAT belongs to a different graph, or its permission doesn't cover the operation. |
 | Backups, the weekly bump or the usage report stopped running | GitHub disabled the `schedule` triggers after 60 days without repository activity. Re-enable in the Actions tab or `gh workflow enable backup.yml` / `gh workflow enable bump-upstream.yml` / `gh workflow enable usage.yml` (section 7). |
 | The usage report fails with `not authorized` | `CLOUDFLARE_ANALYTICS_TOKEN` lacks **Account Analytics** Read, or belongs to another account ([Watching your usage](#watching-your-usage)). |
+| The usage report's Audit log section says `D1 query failed: HTTP 403` | `CLOUDFLARE_ANALYTICS_TOKEN` lacks **D1** Read, or `CONNECTOR_D1_DATABASE_ID` names a database in another account ([Watching your usage](#watching-your-usage)). |
 | Backup fails with 403 on the bucket check | The token can't list buckets. Set `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` (section 7), or give the token the R2 permissions from 1.1. |
 | The bump workflow can't create its pull request | Enable **Allow GitHub Actions to create and approve pull requests** in Settings → Actions → General (1.8). |
 | Local deploy rolled the server back | `.upstream` was older than `UPSTREAM_REF`. `rm -rf .upstream`, redo 1.5, deploy again (section 2). |
