@@ -259,8 +259,15 @@ export async function runDoctor({ env, cfCall, gh, originUrl, now, repoRoot = de
     }
 
     if (syncHostOk && zoneUsable) {
-      checkZone("", syncHost, syncZone);
-      if (syncZone !== null) await checkDns("", syncHost, syncWorker, syncZone);
+      if (syncZone === null && (await deployed())) {
+        // A token without Zone Read can get an empty zone list (200) rather than a 403. On an install
+        // that is already deployed that is a warning, as for a 403 (spec D11); before the first deploy
+        // it stays a FAIL, because the dns check is what stops a deploy taking over a hostname in use.
+        add("warn", "zone", `can't see the zone of ${syncHost} (the token may lack Zone Read; skipped checks: dns). Make a new token with ${link}`);
+      } else {
+        checkZone("", syncHost, syncZone);
+        if (syncZone !== null) await checkDns("", syncHost, syncWorker, syncZone);
+      }
     }
 
     if (connectorOn) {

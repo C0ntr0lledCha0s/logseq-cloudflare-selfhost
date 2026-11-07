@@ -412,6 +412,23 @@ test("perm:zone missing is a warn that skips zone and dns when deployed, and a F
   assert.equal(fresh.exitCode, 1);
 });
 
+test("a deployed install whose token sees no zone (200, empty list) is a zone warn that skips dns; before the first deploy it's a FAIL", async () => {
+  // A token without Zone Read can get an empty list rather than a 403.
+  const noZones = { "GET /zones": () => [200, ok([])] };
+  const deployed = await doctor({ routes: greenRoutes({ ...noZones, ...DEPLOYED }) });
+  const warn = only(deployed.results, "zone");
+  assert.equal(warn.level, "warn");
+  assert.ok(warn.detail.includes("can't see the zone"), warn.detail);
+  assert.ok(warn.detail.includes("Zone Read"), warn.detail);
+  assert.ok(warn.detail.includes("skipped checks: dns"), warn.detail);
+  assert.equal(named(deployed.results, "dns").length, 0);
+  assert.equal(deployed.exitCode, 0);
+
+  const fresh = await doctor({ routes: greenRoutes(noZones) });
+  assert.equal(levelOf(fresh.results, "zone"), "FAIL");
+  assert.equal(fresh.exitCode, 1);
+});
+
 test("a permission the deploy already uses is always a FAIL, even when deployed", async () => {
   const routes = greenRoutes({ ...DEPLOYED, "GET /accounts/acct/d1/database": () => [403, fail(10000, "Authentication error")] });
   const { results, exitCode } = await doctor({ routes });

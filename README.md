@@ -265,7 +265,7 @@ This one account-owned token is the only Cloudflare credential. The quickest way
 - **Workers KV Storage Edit** is only used by the optional connector (section 11), for its OAuth store. Add it before you enable the connector; a token without it can't create the KV namespace.
 - **Vectorize Write** is only used by the connector's optional semantic search (11.11), to create its index and deploy the binding.
 - **DNS Edit** was granted in the verified setup. It may not be needed, but that hasn't been proven either way.
-- **An older token keeps working.** `scripts/doctor.sh` warns about Zone Read and Workers Observability Write when they're missing on a server that is already deployed; it doesn't fail. Add them when you want `allow-user.sh`, or make a new token with the link.
+- **An older token keeps working.** `scripts/doctor.sh` warns about Zone Read and Workers Observability Write when they're missing on a server that is already deployed; it doesn't fail. A token without Zone Read can also see no zone at all rather than be refused, which doctor reports as a `zone` warning on a deployed server. Add them when you want `allow-user.sh`, or make a new token with the link.
 
 You don't create separate R2 S3 keys. `scripts/with-r2-credentials.sh` derives them from this token: the access key ID is the token's ID, and the secret is the SHA-256 of the token value. It exports them only to the command it wraps. There are no `R2_*` or `AWS_*` secrets anywhere.
 
