@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d353090..2e60e72 100644
+index d353090..bb7c5be 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -954,6 +954,21 @@
@@ -34,21 +34,23 @@ index d353090..2e60e72 100644
              (refusal property refused)
              {:value (if many-input? resolved (first resolved))})
            ;; Text that isn't a finite number (NaN, Infinity) for a number property without choices,
-@@ -994,13 +1010,34 @@
+@@ -994,13 +1010,36 @@
                      :else
                      "property value must resolve to an existing entity by UUID, ident, or title")})))))
  
 +(defn- set-prepared-tags!
 +  "Writes a resolved :block/tags `value` (one id or several) on `block-id`. A tag the block already
 +  holds isn't set again, because the outliner refuses Tag even on a tag that holds it. Under reset a
-+  list replaces the block's tags, so only the tags it leaves out are removed: removing them all first
-+  would remove Page or Tag, which the outliner refuses. So sending a page's or tag's own tags back is
-+  a no-op, not a server error."
++  list replaces the block's user tags, as the app's tag editor does: only the user tags it leaves out
++  are removed, and the private tags the block holds (ldb/private-tags: Page, Tag, Journal, Property,
++  Asset and the like), which the outliner refuses to remove, are kept. So sending a page's or tag's
++  own tags back is a no-op, and a list without them (or []) sets its user tags, not a server error."
 +  [conn block-id value reset-existing-values?]
 +  (let [ids (if (coll? value) value [value])
-+        held #(set (map :db/id (:block/tags (d/entity @conn block-id))))]
++        held #(set (map :db/id (:block/tags (d/entity @conn block-id))))
++        private? #(contains? ldb/private-tags (:db/ident (d/entity @conn %)))]
 +    (when (and reset-existing-values? (coll? value))
-+      (doseq [id (remove (set ids) (held))]
++      (doseq [id (remove (some-fn (set ids) private?) (held))]
 +        (outliner-property/delete-property-value! conn block-id :block/tags id)))
 +    (doseq [id ids :when (not (contains? (held) id))]
 +      (if (coll? value)
@@ -70,7 +72,7 @@ index d353090..2e60e72 100644
      (outliner-property/set-block-property! conn block-id property-ident value)))
  
  ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
-@@ -1286,19 +1323,27 @@
+@@ -1286,19 +1325,27 @@
         (filter #(or (page? %) (tag? %) (property? %)))
         (sort-by :db/id)))
  
@@ -111,7 +113,7 @@ index d353090..2e60e72 100644
  
  ;; deletePage, deleteTag and deleteProperty refuse to lose references, holders, child tags or
  ;; values unless the matching acknowledge-* query flag is true; dry-run=true reports the counts.
-@@ -1754,7 +1799,130 @@
+@@ -1754,7 +1801,130 @@
            (broadcast-change! self)
            (http/json-response nil {:deleted (count resolved)}))))))
  
@@ -243,7 +245,7 @@ index d353090..2e60e72 100644
  
  (defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1783,7 +1951,8 @@
+@@ -1783,7 +1953,8 @@
          (cond
            (not (non-blank-string? (:title body))) (http/bad-request "missing title")
            error (http/bad-request error)
@@ -253,7 +255,7 @@ index d353090..2e60e72 100644
            :else
            (rejecting
             #(let [tag-id (atomic-write! conn creator false :create-page
-@@ -1833,6 +2002,40 @@
+@@ -1833,6 +2004,42 @@
                (broadcast-change! self)
                (http/json-response nil (tag-detail-response (d/entity @conn (:db/id tag)))))))))
  
@@ -289,12 +291,14 @@ index d353090..2e60e72 100644
 +                  response (run-promotion (if dry-run? (dry-run-conn conn) conn) creator page (:tx promotion)
 +                                          (:parents schema))]
 +              (when-not dry-run? (broadcast-change! self))
-+              (http/json-response nil (cond-> response dry-run? (assoc :dry-run true))))))))
++              ;; A dry run leaves ident out: build-new-class gives each call a random suffix, so the
++              ;; copy's ident is never the one the real call stores.
++              (http/json-response nil (cond-> response dry-run? (-> (dissoc :ident) (assoc :dry-run true)))))))))
 +
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
        (if-not (tag? tag)
-@@ -2492,29 +2695,31 @@
+@@ -2492,29 +2699,31 @@
    "Checks createTag's or updateTag's extends and properties for `tag` (nil when creating):
    {:parents [tag ...] :properties {:mode :properties}}, each key only when given, or {:error message}
    naming every refused entry. extends replaces the tags it extends and names at least one;
@@ -349,7 +353,7 @@ index d353090..2e60e72 100644
  
  (defn- write-tag-schema!
    "Inside atomic-write!: replaces what the tag with db id `tag-id` extends with `parents`, and changes
-@@ -3458,7 +3663,7 @@
+@@ -3458,7 +3667,7 @@
  
  (def ^:private capture-and-tag-handlers
    #{:semantic/capture :semantic/tags-list :semantic/tags-create :semantic/tags-get :semantic/tags-objects
@@ -359,7 +363,7 @@ index d353090..2e60e72 100644
  (def ^:private task-handlers
    #{:semantic/tasks-list :semantic/tasks-create})
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c20b05b..b8393cc 100644
+index c20b05b..cdf8ac9 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -28,6 +28,8 @@
@@ -371,11 +375,20 @@ index c20b05b..b8393cc 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
      :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
-@@ -150,8 +152,9 @@
+@@ -143,15 +145,16 @@
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
+    "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+    "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+-   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. " value-notes)]
++   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like) are kept. " value-notes)]
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+-   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
++   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
     "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
-+   "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by UUID, into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (the ident the tag would get and the counts), with nothing written. Unavailable for E2EE graphs."]
++   "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by UUID, into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
 -   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
 +   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
@@ -388,7 +401,7 @@ index c20b05b..b8393cc 100644
     "updateProperty" [(delete-flag-parameter "acknowledge-holders" "Set true to retire choices (choices.retire) that blocks hold or that are the property's default value; those blocks lose the value and the default is cleared. Omitted or false, such a retire is refused with 409 and nothing is changed.")
 -                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired, converted and the conversion mapping, and dry-run: true. A retire with holders is previewed without acknowledge-holders.")]})
 +                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired, converted and the conversion mapping, and dry-run: true. A retire with holders is previewed without acknowledge-holders.")]
-+   "promotePageToTag" [(delete-flag-parameter "dry-run" "When true, check and convert a throwaway copy of the graph and answer the same body with dry-run: true: the ident the tag would get, what it would extend and the promoted counts. A dry run writes nothing; refusals are the same as the real call's.")]})
++   "promotePageToTag" [(delete-flag-parameter "dry-run" "When true, check and convert a throwaway copy of the graph and answer the same body with dry-run: true: what the tag would extend and the promoted counts, without ident, which only the real call assigns (it carries a random suffix). A dry run writes nothing; refusals are the same as the real call's.")]})
  
  (def ^:private summary-prefix-parameter
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
@@ -453,16 +466,16 @@ index c20b05b..b8393cc 100644
 +                                              :properties {:promoted {:type "object" :required ["blocks" "references"]
 +                                                                      :properties {:blocks {:type "integer" :description "The page's own blocks, kept on the tag."}
 +                                                                                   :references {:type "integer" :description "Other blocks and pages that link to it, embed it, alias it or hold it as a property value; they still point at it."}}}
-+                                                           :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written."}}}]}
++                                                           :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written, and ident is left out because the real call generates it."}}}]}
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
 new file mode 100644
-index 0000000..6193ce7
+index 0000000..f011645
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1066 @@
 +(ns logseq.db-sync.semantic-promote-page-to-tag-test
 +  "Turning a page into a tag. Tag can't be set as a tags value, on any write path: the outliner
 +  refuses it (Can't set tag with built-in #Tag), which the handler answered as a 500. It is refused
@@ -668,6 +681,46 @@ index 0000000..6193ce7
 +          (is (= 200 (:status reset)) (pr-str reset))
 +          (is (= #{"Page"} (tag-titles conn diner)) "Food is removed, Page kept")
 +          (is (= #{"Page" "Cuisine"} (tag-titles conn restaurant))))))))
++
++;; A replace-style tags write (set_block_property with a list, or batch-set under
++;; isResetExistingValues) that leaves out a private tag the entity holds keeps that tag and removes
++;; only the user tags the list leaves out, as the app's tag editor does. Each kind that holds a
++;; private tag is covered: a page (Page), a tag (Tag), a journal (Journal), a property (Property) and
++;; an asset (Asset), with a plain block as the control. Before this change:
++;;   page ["Food"] or []: 500 {:error "server error", :debug-message "... This page cannot be converted to a block ..."}
++;;   tag ["Food"]:        500 {:error "server error", :debug-message "... Can't remove tag with built-in #Tag ..."}
++(deftest replace-style-tags-write-keeps-private-tags-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self cuisine restaurant note-block]}]
++        (p/let [{:keys [journal asset]} (seed-refusal-kinds conn)
++                ;; The seeded asset only needs to be an asset; a write validates the whole entity.
++                _ (d/transact! conn [{:block/uuid asset :logseq.property.asset/checksum "abc"
++                                      :logseq.property.asset/size 1 :block/created-at 1}])
++                property (outliner-property/upsert-property!
++                          conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                          {:property-name "rating"})
++                property (:block/uuid property)
++                put (fn [id value] (set-tags! self id value))
++                reset (fn [id value]
++                        (request! self "POST" "/semantic/block-properties/batch-set"
++                                  {:isResetExistingValues true
++                                   :entries [{:block-id (str id) :property-id "block/tags" :value value}]}))]
++          (p/doseq [[path call kind id value expected]
++                    (for [[path call] [["set_block_property" put] ["batch-set under reset" reset]]
++                          [kind id private] [["a page" restaurant #{"Page"}]
++                                             ["a tag" cuisine #{"Tag"}]
++                                             ["a journal" journal #{"Journal"}]
++                                             ["a property" property #{"Property"}]
++                                             ["an asset" asset #{"Asset"}]
++                                             ["a block" note-block #{}]]
++                          [value expected] [[["Food"] (conj private "Food")]
++                                            [[] private]]]
++                      [path call kind id value expected])]
++            (p/let [response (call id value)]
++              (testing (str path ", " kind ", " (pr-str value))
++                (is (= 200 (:status response)) (pr-str response))
++                (is (= expected (tag-titles conn id)))))))))))
 +
 +;; updatePage takes only a title (and an encrypted name): a tags field is ignored, so Tag sent there
 +;; changes nothing and the page stays a page. Passed before this change too; it pins that update_page
@@ -1291,7 +1344,10 @@ index 0000000..6193ce7
 +              (pr-str response)))))))
 +
 +;; dry-run=true runs the same validation and write on a throwaway copy, answers the same body with
-+;; dry-run: true, and leaves the graph as it was, with or without extends. Nobody is told the graph
++;; dry-run: true but without ident (the real call generates a fresh random suffix, so the copy's ident
++;; is never the one the tag gets; before this change the dry run answered e.g.
++;; user.class/Recipe-RIKKdQJq and the real call user.class/Recipe-N_WuNMgS), and leaves the graph as
++;; it was, with or without extends. Nobody is told the graph
 +;; changed. dry-run=false promotes for real; any other value is refused.
 +(deftest promote-dry-run-test
 +  (async done
@@ -1307,8 +1363,8 @@ index 0000000..6193ce7
 +                        (testing kind
 +                          (is (= 200 (:status response)) (pr-str response))
 +                          (is (true? (get-in response [:body :dry-run])))
-+                          (is (string/starts-with? (str (get-in response [:body :ident])) "user.class/Recipe")
-+                              "the ident the tag would get")
++                          (is (not (contains? (:body response) :ident))
++                              "no ident: the real call generates its own, so a dry-run one would never match")
 +                          (is (= [(str recipe) "Recipe"] [(get-in response [:body :uuid]) (get-in response [:body :title])]))
 +                          (is (= {:blocks 3 :references 2} (get-in response [:body :promoted])))
 +                          (is (= expected (extends-titles response)))
@@ -1325,6 +1381,8 @@ index 0000000..6193ce7
 +                  real (promote! self recipe {:extends ["Food"]} "dry-run=false")]
 +            (is (= 200 (:status real)) (pr-str real))
 +            (is (nil? (get-in real [:body :dry-run])) "a real promotion isn't marked dry-run")
++            (is (= (some-> (:db/ident (entity conn recipe)) str (subs 1)) (get-in real [:body :ident]))
++                "the real call answers the ident it stored")
 +            (is (= #{"Tag" "Food"} (tag-titles conn recipe)))
 +            (is (= #{"Food"} (stored-extends conn recipe)))
 +            (is (= ["changed"] (map #(aget (js/JSON.parse %) "type") @sent)))))))))
