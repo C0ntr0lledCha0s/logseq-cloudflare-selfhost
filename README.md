@@ -903,6 +903,7 @@ To turn it on, with the connector already on (11.5):
 14. **Move holders when retiring a choice.** Retiring a choice with holders clears the value from them. A `replace-with` option would move them to another choice in the same transaction. Today, convert by hand and then retire.
 15. **Titles of entities created in the same batch.** A node property in `batch_insert_block_trees` can't yet name, by title, a page created earlier in the same call.
 16. **Blank page titles in batch inserts.** A `batch_insert_block_trees` entry whose `page` is only whitespace (`"  "`) passes the non-blank check, which tests only that the string isn't empty, and creates a page with an empty title (201). Trim the title before the check and refuse a blank one, naming the entry.
+17. **Class check reads `extends` and `classes` from before the batch.** Since patch 0031 the class check in `batch_set_block_property` and `batch_insert_block_trees` judges a value's final tags, but it still reads each tag's `extends` and the property's `classes` as they were before the batch. A batch that resets a tag's `extends`, or a property's `classes`, in the same call as a value that depends on it can store an out-of-class value. The `classes` case predates patch 0031. Run the reset in its own call first.
 
 ## Licence and credits
 
