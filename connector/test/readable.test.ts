@@ -3,12 +3,13 @@ import { z } from "zod";
 import manifest from "../tools-manifest.json";
 import openapi from "../vendor/openapi.json";
 import { resolveOpenApiRefs } from "../vendor/semantic_api_tools.mjs";
-import { ToolError } from "../src/tools/common";
+import { RESULT_CHAR_LIMIT, ToolError } from "../src/tools/common";
 import {
   type AffectedTarget,
   CONTEXT_TOOLS,
   NO_CONTEXT_TOOLS,
   REASON_MAX,
+  capWriteResult,
   contextClassFor,
   describeWrite,
   summarise,
@@ -386,5 +387,53 @@ describe("context classes", () => {
     expect(() => contextClassFor("not_a_tool")).toThrow(
       "no context class for write tool not_a_tool: add it to CONTEXT_TOOLS or NO_CONTEXT_TOOLS",
     );
+  });
+});
+
+describe("capWriteResult", () => {
+  const texts = (r: { content: { type: string; text?: string }[] }) => r.content.map((c) => c.text ?? "");
+
+  it("leaves a result under the cap as it is", () => {
+    const result = { content: [{ type: "text" as const, text: "Moved 1 block:" }, { type: "text" as const, text: "{}" }] };
+    expect(capWriteResult(result)).toEqual(result);
+  });
+
+  it("cuts the summary, not the JSON, when the JSON alone fits", () => {
+    const json = JSON.stringify({ moved: 1, pad: "j".repeat(140_000) });
+    const capped = capWriteResult({ content: [{ type: "text", text: "s".repeat(20_000) }, { type: "text", text: json }] });
+    const [summary, kept] = texts(capped);
+    expect(kept).toBe(json);
+    expect(summary.length + kept.length).toBe(RESULT_CHAR_LIMIT);
+    expect(summary).toMatch(/^s+\n\n\[summary cut: the write was applied; the JSON result below is complete\]$/);
+  });
+
+  it("when the JSON alone is over the cap, keeps the summary and cuts the JSON with a write's notice", () => {
+    const capped = capWriteResult({ content: [{ type: "text", text: "Moved 1 block:" }, { type: "text", text: "j".repeat(200_000) }] });
+    const [summary, json] = texts(capped);
+    expect(summary).toBe("Moved 1 block:");
+    expect(summary.length + json.length).toBe(RESULT_CHAR_LIMIT);
+    expect(json).toMatch(/\[truncated: the write was applied; its result had 200014 characters and the limit is 150000, so the JSON is cut\. Read the pages it names to see the outcome\.\]$/);
+  });
+});
+
+describe("summarise, long results", () => {
+  const t = (i: number, pageTitle: string): AffectedTarget => ({
+    uuid: `u${i}`, kind: "block", role: "affected", pageTitle, breadcrumb: ["Parent"], snippet: `Block ${i}`,
+  });
+
+  it("lists at most 20 blocks per section and says how many more the JSON holds", () => {
+    const lines = summarise(Array.from({ length: 21 }, (_, i) => t(i, "Page")), { tool: "delete_blocks" }).split("\n");
+    expect(lines[0]).toBe("Deleted 21 blocks:");
+    expect(lines.slice(1)).toEqual([...Array.from({ length: 20 }, (_, i) => `- Page > Parent > "Block ${i}"`), "- … and 1 more, listed in the JSON result"]);
+    const twenty = summarise(Array.from({ length: 20 }, (_, i) => t(i, "Page")), { tool: "delete_blocks" });
+    expect(twenty).not.toContain("more, listed");
+  });
+
+  it("cuts a page title to 80 characters (code points), as the server cuts snippets", () => {
+    const title = "😀".repeat(100);
+    const out = summarise([t(0, title)], { tool: "delete_blocks" });
+    expect(out.split("\n")[1]).toBe(`- ${"😀".repeat(80)} > Parent > "Block 0"`);
+    const moved = summarise([{ ...t(0, ""), from: { pageTitle: title, breadcrumb: [] }, to: { pageTitle: title, breadcrumb: [] } }], { tool: "move_blocks" });
+    expect(moved.split("\n")[1]).toBe(`- "Block 0" from ${"😀".repeat(80)} to ${"😀".repeat(80)}`);
   });
 });

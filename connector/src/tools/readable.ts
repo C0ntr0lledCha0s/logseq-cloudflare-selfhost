@@ -1,6 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { ToolError } from "./common";
+import { RESULT_CHAR_LIMIT, ToolError, capResult } from "./common";
 
 // What a write tool call says about itself: the caller's `reason` and the targets the server names in
 // its response, turned into a plain-text summary that leads the result (spec section 3.7,
@@ -213,6 +213,18 @@ export interface SummaryOptions {
 
 const E2EE_NOTE = "titles unavailable on an E2EE graph";
 
+/** The most blocks one section of a summary lists; the JSON result after it holds them all. */
+export const SUMMARY_MAX_ITEMS = 20;
+
+/** The longest page title a summary shows, in code points: the server cuts snippets and breadcrumbs to the same. */
+const TITLE_MAX = 80;
+
+function shortTitle(title: string | undefined): string {
+  if (title === undefined) return "?";
+  const chars = [...title];
+  return chars.length > TITLE_MAX ? chars.slice(0, TITLE_MAX).join("") : title;
+}
+
 /** `segments` joined with " > ", keeping the first and last two when there are more than four. */
 function path(segments: string[]): string {
   const shown = segments.length > 4 ? [segments[0], "…", ...segments.slice(-2)] : segments;
@@ -235,7 +247,7 @@ function counts(t: AffectedTarget): string {
 
 function where(loc: TargetLocation | undefined): string {
   if (!loc) return "(not read)";
-  return path([loc.pageTitle ?? "?", ...loc.breadcrumb]);
+  return path([shortTitle(loc.pageTitle), ...loc.breadcrumb]);
 }
 
 function line(t: AffectedTarget): string {
@@ -243,7 +255,7 @@ function line(t: AffectedTarget): string {
   const quoted = `"${t.snippet ?? ""}"`;
   if (t.from !== undefined || t.to !== undefined) return `${quoted} from ${where(t.from)} to ${where(t.to)}`;
   if (t.kind === "page" || t.kind === "journal") return `${t.kind} ${quoted}${counts(t)}`;
-  return `${path([t.pageTitle ?? "?", ...t.breadcrumb, quoted])}${counts(t)}`;
+  return `${path([shortTitle(t.pageTitle), ...t.breadcrumb, quoted])}${counts(t)}`;
 }
 
 /**
@@ -251,7 +263,8 @@ function line(t: AffectedTarget): string {
  * moved or inserted (or, when it names none and is not an insert, per block it wrote to; a batch
  * insert entry with no blocks is listed under "Set properties on", and today's journal under
  * "Cleared today's journal" since its page is kept), each as page > breadcrumb >
- * "snippet" with the middle of a long path elided, and the counts the server gave (descendants, and
+ * "snippet" with the middle of a long path elided and a page title cut to 80 characters, at most
+ * `SUMMARY_MAX_ITEMS` per section with a line saying how many more the JSON holds, and the counts the server gave (descendants, and
  * on a dry run references, a page's blocks and its first blocks); on a dry run, a line per page an
  * insert would create; then a line when the context could not be read; then `Reason: …`. Empty when
  * there is nothing to say. Only what the server returned is shown, so nothing here fetches.
@@ -264,13 +277,18 @@ export function summarise(targets: AffectedTarget[], opts: SummaryOptions): stri
   const shown = affected.length > 0 || present === "insert" ? affected : targets;
   // Insert entries that only set properties on their target say so, rather than count as inserts.
   const propertied = targets.filter((t) => t.propertiesOnly);
+  // A long batch lists its first blocks only: the JSON result after the summary names every one.
+  const list = (items: AffectedTarget[]) => {
+    for (const t of items.slice(0, SUMMARY_MAX_ITEMS)) lines.push(`- ${line(t)}`);
+    if (items.length > SUMMARY_MAX_ITEMS) lines.push(`- … and ${items.length - SUMMARY_MAX_ITEMS} more, listed in the JSON result`);
+  };
   const section = (items: AffectedTarget[], pastVerb: string, presentVerb: string, first: boolean) => {
     if (items.length === 0) return;
     const pages = items.every((t) => t.kind === "page" || t.kind === "journal");
     const noun = `${pages ? "page" : "block"}${items.length === 1 ? "" : "s"}`;
     const verb = opts.dryRun ? `${first ? "Dry run, nothing changed: would" : "Would"} ${presentVerb}` : pastVerb;
     lines.push(`${verb} ${items.length} ${noun}${items.some((t) => t.e2ee) ? ` (${E2EE_NOTE})` : ""}:`);
-    for (const t of items) lines.push(`- ${line(t)}`);
+    list(items);
   };
   if (opts.truncated !== undefined && shown.length > 0) {
     // Today's journal: Logseq deletes its blocks and keeps the page.
@@ -280,7 +298,7 @@ export function summarise(targets: AffectedTarget[], opts: SummaryOptions): stri
         ? "Dry run, nothing changed: would clear today's journal, deleting its blocks and keeping the page:"
         : `Cleared today's journal: ${cleared === undefined ? "its blocks were" : `${count(cleared, "block was", "blocks were")}`} deleted and the page kept:`,
     );
-    for (const t of shown) lines.push(`- ${line(t)}`);
+    list(shown);
   } else {
     section(shown, past, present, true);
   }
@@ -322,4 +340,35 @@ export function describeWrite(tool: string, result: CallToolResult, reason: stri
 export function withSummary(result: CallToolResult, summary: string): CallToolResult {
   if (summary === "") return result;
   return { ...result, content: [{ type: "text", text: summary }, ...result.content] };
+}
+
+function compact(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text));
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * A write's result (summary first, then the server's JSON) cut to `RESULT_CHAR_LIMIT` characters.
+ * Over the cap, the JSON is first written without indentation. The write was applied, so the read path's "request less" never applies: when the JSON alone fits,
+ * the summary is cut and the JSON kept whole; otherwise the summary is kept and the JSON cut with a
+ * notice that says the write was applied.
+ */
+export function capWriteResult(given: CallToolResult): CallToolResult {
+  const size = (r: CallToolResult) => r.content.reduce((n, c) => n + (c.type === "text" ? c.text.length : 0), 0);
+  if (size(given) <= RESULT_CHAR_LIMIT) return given;
+  // Over the cap, the JSON drops its indentation first: a 100-block move's is a fifth spaces.
+  const result = { ...given, content: given.content.map((c, i) => (i > 0 && c.type === "text" ? { ...c, text: compact(c.text) } : c)) };
+  const total = size(result);
+  if (total <= RESULT_CHAR_LIMIT) return result;
+  const [first, ...rest] = result.content;
+  const cut = "\n\n[summary cut: the write was applied; the JSON result below is complete]";
+  const budget = RESULT_CHAR_LIMIT - (total - (first?.type === "text" ? first.text.length : 0)) - cut.length;
+  if (first?.type === "text" && budget >= 0) return { ...result, content: [{ ...first, text: first.text.slice(0, budget) + cut }, ...rest] };
+  return capResult(
+    result,
+    (n) => `\n\n[truncated: the write was applied; its result had ${n} characters and the limit is ${RESULT_CHAR_LIMIT}, so the JSON is cut. Read the pages it names to see the outcome.]`,
+  );
 }

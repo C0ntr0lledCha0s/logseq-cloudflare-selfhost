@@ -1119,3 +1119,60 @@ describe("tools manifest", () => {
     expect(() => buildManifest(noGraph)).toThrow(/otherThing/);
   });
 });
+
+describe("large write results", () => {
+  const MOVES = { graph: "work", body: { moves: [{ "block-ids": ["b1"], "target-id": "b2", position: "after" }] } };
+
+  /** A batch_move_blocks answer naming `n` moved blocks, each on a page titled `title` under `crumbs`. */
+  function movedBody(n: number, title: string, crumbs: string[]) {
+    const page = { uuid: PAGE_UUID, title };
+    return {
+      moved: n,
+      affected: Array.from({ length: n }, (_, i) => ({
+        uuid: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+        kind: "block",
+        snippet: `Block ${i} `.padEnd(80, "s"),
+        from: { page, breadcrumb: crumbs },
+        to: { page, breadcrumb: crumbs },
+      })),
+    };
+  }
+
+  const total = (content: { text: string }[]) => content.reduce((n, c) => n + c.text.length, 0);
+
+  it("a 100-block batch_move_blocks keeps its JSON whole and lists only the first 20 blocks in the summary", async () => {
+    const cases: [string, string[]][] = [
+      ["t".repeat(40), ["c".repeat(40), "d".repeat(40)]],
+      ["t".repeat(40), Array.from({ length: 5 }, (_, i) => `${i}`.repeat(80))],
+      ["t".repeat(300), ["c".repeat(60), "d".repeat(60)]],
+    ];
+    for (const [title, crumbs] of cases) {
+      const body = movedBody(100, title, crumbs);
+      syncHandler = () => Response.json(body);
+      const { isError, content } = await callContent("batch_move_blocks", MOVES);
+      const label = `${title.length}-char title, ${crumbs.length} crumbs`;
+      expect(isError, label).toBe(false);
+      expect(content, label).toHaveLength(2);
+      expect(JSON.parse(content[1].text), label).toEqual(body);
+      const lines = content[0].text.split("\n");
+      expect(lines[0], label).toBe("Moved 100 blocks:");
+      expect(lines.filter((l) => l.startsWith('- "')), label).toHaveLength(20);
+      expect(lines, label).toContain("- … and 80 more, listed in the JSON result");
+      expect(content[0].text, label).not.toContain("t".repeat(81));
+      expect(total(content), label).toBeLessThan(RESULT_CHAR_LIMIT);
+      expect(content.map((c) => c.text).join(""), label).not.toContain("[truncated");
+    }
+  });
+
+  it("a write result still over the cap keeps its summary and says the write was applied, not to request less", async () => {
+    const body = movedBody(100, "t".repeat(3000), ["c"]);
+    syncHandler = () => Response.json(body);
+    const { isError, content } = await callContent("batch_move_blocks", MOVES);
+    expect(isError).toBe(false);
+    expect(total(content)).toBe(RESULT_CHAR_LIMIT);
+    expect(content[0].text.split("\n")[0]).toBe("Moved 100 blocks:");
+    expect(content[0].text).toContain("- … and 80 more, listed in the JSON result");
+    expect(content[1].text).toMatch(/\[truncated: the write was applied; its result had \d+ characters and the limit is 150000, so the JSON is cut\. Read the pages it names to see the outcome\.\]$/);
+    expect(content[1].text).not.toContain("request less");
+  });
+});

@@ -32,13 +32,20 @@ export function logTool(name: string, alias: string | undefined, status: string,
   console.log(`tool ${name} graph=${alias ?? "-"} status=${status}${reason} ms=${Date.now() - started}`);
 }
 
-/** Truncates the result's text content to `RESULT_CHAR_LIMIT` characters in total, notice included. */
-export function capResult(result: CallToolResult): CallToolResult {
+/**
+ * Truncates the result's text content to `RESULT_CHAR_LIMIT` characters in total, notice included.
+ * `notice` builds the notice from the total; by default it is the read path's "request less".
+ */
+export function capResult(
+  result: CallToolResult,
+  notice: (total: number) => string = (total) =>
+    `\n\n[truncated: the result had ${total} characters and the limit is ${RESULT_CHAR_LIMIT}; request less, e.g. a smaller limit with the cursor, or a narrower query]`,
+): CallToolResult {
   const texts = result.content.filter((c) => c.type === "text");
   const total = texts.reduce((n, c) => n + c.text.length, 0);
   if (total <= RESULT_CHAR_LIMIT) return result;
-  const notice = `\n\n[truncated: the result had ${total} characters and the limit is ${RESULT_CHAR_LIMIT}; request less, e.g. a smaller limit with the cursor, or a narrower query]`;
-  let budget = RESULT_CHAR_LIMIT - notice.length;
+  const cut = notice(total);
+  let budget = RESULT_CHAR_LIMIT - cut.length;
   const content: CallToolResult["content"] = [];
   for (const item of result.content) {
     if (item.type !== "text") {
@@ -47,7 +54,7 @@ export function capResult(result: CallToolResult): CallToolResult {
       content.push(item);
       budget -= item.text.length;
     } else if (budget >= 0) {
-      content.push({ ...item, text: item.text.slice(0, budget) + notice });
+      content.push({ ...item, text: item.text.slice(0, budget) + cut });
       budget = -1;
     }
   }
