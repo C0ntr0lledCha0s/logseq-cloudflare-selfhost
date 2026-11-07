@@ -901,6 +901,7 @@ To turn it on, with the connector already on (11.5):
 13. **Fixed-offset time zones.** `timeZone` accepts `+13:00` as well as an IANA name because `Intl` does, but a fixed offset ignores daylight saving. Refuse it in `render-wrangler` and the server if it causes a mistake.
 14. **Move holders when retiring a choice.** Retiring a choice with holders clears the value from them. A `replace-with` option would move them to another choice in the same transaction. Today, convert by hand and then retire.
 15. **Titles of entities created in the same batch.** A node property in `batch_insert_block_trees` can't yet name, by title, a page created earlier in the same call.
+16. **Blank page titles in batch inserts.** A `batch_insert_block_trees` entry whose `page` is only whitespace (`"  "`) passes the non-blank check, which tests only that the string isn't empty, and creates a page with an empty title (201). Trim the title before the check and refuse a blank one, naming the entry.
 
 ## Licence and credits
 
