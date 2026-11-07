@@ -541,6 +541,66 @@ describe("reason", () => {
   });
 });
 
+describe("target-label", () => {
+  const SINGLE = [
+    "insert_block_children",
+    "insert_block_tree",
+    "update_block",
+    "delete_block",
+    "set_block_property",
+    "delete_block_property",
+    "move_blocks",
+  ];
+  const BATCHES: Array<[string, string]> = [
+    ["batch_insert_block_trees", "entries"],
+    ["batch_move_blocks", "moves"],
+    ["batch_set_block_property", "entries"],
+    ["batch_delete_block_property", "entries"],
+  ];
+
+  it("the single-target writes take target-label, each batch entry takes one, and delete_blocks takes labels", async () => {
+    const tools = await listTools();
+    const tool = (name: string) => tools.find((t: any) => t.name === name);
+    for (const name of SINGLE) {
+      const label = tool(name).inputSchema.properties["target-label"];
+      expect(label?.type, name).toBe("string");
+      expect(label.description, name).toContain("never used to find it");
+      expect(tool(name).inputSchema.required ?? [], name).not.toContain("target-label");
+    }
+    for (const [name, field] of BATCHES) {
+      const entry = tool(name).inputSchema.properties.body.properties[field].items;
+      expect(entry.properties["target-label"]?.type, name).toBe("string");
+      expect(entry.required ?? [], name).not.toContain("target-label");
+    }
+    const labels = tool("delete_blocks").inputSchema.properties.body.properties.labels;
+    expect(labels?.type).toBe("array");
+    expect(labels.items.type).toBe("string");
+    expect(tool("delete_blocks").description).toContain("labels");
+  });
+
+  it("target-label reaches the server as a query parameter, and a mismatch comes back as the server words it", async () => {
+    const refusal = 'target-label "Nov 5th, 2026 > Notes" does not match target "Nov 5th, 2026 > Meeting > Agenda"';
+    syncHandler = () => Response.json({ error: refusal }, { status: 409 });
+    const result = await callTool("update_block", {
+      graph: "work",
+      "block-id": "b1",
+      "target-label": "Nov 5th, 2026 > Notes",
+      body: { title: "Renamed" },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(refusal);
+    expect(syncRequests).toHaveLength(1);
+    expect(new URL(syncRequests[0].url).searchParams.get("target-label")).toBe("Nov 5th, 2026 > Notes");
+    expect(JSON.parse(syncRequests[0].body)).toEqual({ title: "Renamed" });
+
+    syncRequests = [];
+    syncHandler = () => Response.json({ deleted: 1, "total-removed": 1, affected: [] });
+    const labels = ["Nov 5th, 2026 > Notes"];
+    await callTool("delete_blocks", { graph: "work", body: { "block-ids": ["b1"], labels } });
+    expect(JSON.parse(syncRequests[0].body)).toMatchObject({ "block-ids": ["b1"], labels });
+  });
+});
+
 describe("routing", () => {
   it("create_page on alias routes to /api/v1/graphs/<graph-id>/pages with that graph's PAT", async () => {
     syncHandler = () => Response.json({ id: "p1", title: "Standup [[Ann]]" }, { status: 201 });
@@ -972,6 +1032,11 @@ describe("hand-written tools", () => {
       "Give every write and delete a reason",
       "at most 200 characters",
       "never sent to or stored on the graph",
+      "target-label",
+      "Page > parent > ... > block",
+      "checked against the real target, never used to find it",
+      "a mismatch writes nothing",
+      "labels, parallel to block-ids",
     ]) {
       expect(result.text).toContain(phrase);
     }

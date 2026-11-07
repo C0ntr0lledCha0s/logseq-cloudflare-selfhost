@@ -46,7 +46,7 @@ const HINTS: Record<string, string> = {
   insert_block_tree:
     "Prefer this for whole notes such as meeting notes: one write call instead of many (writes are rate-limited). The response names the target (target) and each new top-level block (affected) by page, breadcrumb and snippet, even with verbose false.",
   delete_blocks:
-    "The response names each block (affected: page, breadcrumb, snippet and descendant count), read before the delete; a block still there afterwards is listed under not-removed.",
+    "The response names each block (affected: page, breadcrumb, snippet and descendant count), read before the delete; a block still there afterwards is listed under not-removed. labels, parallel to block-ids, gives each block's target-label.",
   move_blocks: "The response names each moved block with where it was (from) and is now (to): page and breadcrumb.",
   create_task: "Use this for every task or action item.",
   create_property:

@@ -1,26 +1,28 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index bb7c5be..af14f2f 100644
+index bb7c5be..f1f5c0c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -1184,7 +1184,8 @@
+@@ -1184,14 +1184,18 @@
  (defn- rejecting
    "Calls `write`, answering 400 when it is rejected: by `reject!`, or by the outliner refusing a change
    with a user-facing notification (such as editing a built-in node). A write that didn't store what
 -  it was asked to (verify-property-schema!) answers 500. Other errors propagate."
-+  it was asked to (verify-property-schema!) answers 500, and a delete that left blocks behind
-+  (confirm-removed!) answers 500 naming them. Other errors propagate."
++  it was asked to (verify-property-schema!) answers 500, a delete that left blocks behind
++  (confirm-removed!) answers 500 naming them, and a target-label that doesn't fit (check-labels!)
++  answers its refusal. Other errors propagate."
    [write]
    (try
      (write)
-@@ -1192,6 +1193,7 @@
+     (catch :default error
        (let [data (ex-data error)]
          (cond
++          (::label-refusal data) (label-refusal-response error)
            (::unverified data) (http/error-response (::unverified data) 500)
 +          (::not-removed data) (http/json-response nil {:error (ex-message error) :not-removed (::not-removed data)} 500)
            (or (::rejected data) (= :notification (:type data)))
            (http/bad-request (or (::rejected data) (get-in data [:payload :message])))
            :else (throw error))))))
-@@ -1347,6 +1349,185 @@
+@@ -1347,6 +1351,308 @@
                        holders)}
       409)))
  
@@ -170,6 +172,129 @@ index bb7c5be..af14f2f 100644
 +  (let [selected (resolve-page-selector db selector field {:e2ee? e2ee? :find find})]
 +    (if (:error selected) (selector-refusal selected) (f (:ok selected)))))
 +
++;; A target-label names a write's target for a reader, "Page > parent > ... > block", and the write
++;; checks it against the real target before it changes anything: a guard, never a way to find the
++;; target. The first segment is the page title, ignoring case. The rest match, from the last one
++;; back, the target's first line and then its nearest ancestors; ancestors above the topmost segment
++;; may be left out. Each is a case-insensitive prefix of at least 3 characters of the line it matches,
++;; or the whole line when that is shorter. A page target takes the page title alone. Every label in a
++;; call is checked against the snapshot the write runs on, and any mismatch refuses the whole call.
++
++(def ^:private label-separator " > ")
++(def ^:private label-min-length 3)
++
++(defn- code-point-count [text]
++  (.-length (js/Array.from text)))
++
++(defn- label-text [text]
++  (string/lower-case (string/trim (or text ""))))
++
++(defn- segment-matches?
++  "True when label `segment` fits `line`: a prefix of at least 3 characters, ignoring case, or all
++  of a line shorter than that."
++  [segment line]
++  (let [segment (label-text segment)
++        line (label-text line)]
++    (if (< (code-point-count line) label-min-length)
++      (= segment line)
++      (and (>= (code-point-count segment) label-min-length)
++           (string/starts-with? line segment)))))
++
++(defn- first-line [entity]
++  (or (first (string/split-lines (feed-text entity))) ""))
++
++(defn- label-matches?
++  "True when `label` names `entity` (a page or a block) as section 3.4 of the design says. `segments`
++  is the label split on \" > \"."
++  [entity segments]
++  (let [[page-segment & below] segments
++        block? (some? (:block/page entity))
++        page (if block? (:block/page entity) entity)]
++    (and (= (label-text page-segment) (label-text (:block/title page)))
++         (if-not block?
++           (empty? below)
++           (let [ancestors (feed-ancestors entity (dec (count below)))
++                 lines (map first-line (cons entity (reverse ancestors)))]
++             (and (seq below)
++                  (<= (count below) (count lines))
++                  (every? true? (map segment-matches? (reverse below) lines))))))))
++
++(defn- label-found
++  "How the target reads as a label, page title first: what a mismatch reports was found."
++  [entity]
++  (let [{:keys [page breadcrumb snippet]} (block-context entity {})]
++    (string/join label-separator (if (:block/page entity)
++                                   (concat [(:title page)] breadcrumb [snippet])
++                                   [(:title page)]))))
++
++(defn- label-error
++  "Why `label` doesn't name `target` (an entity, or {:page title} for a page the write will create),
++  or nil when it does."
++  [target label]
++  (let [segments (vec (.split label label-separator))
++        page-title (:page target)]
++    (cond
++      (some string/blank? segments) (str "target-label \"" label "\" has an empty segment")
++      (if page-title
++        (and (= 1 (count segments)) (= (label-text label) (label-text page-title)))
++        (label-matches? target segments))
++      nil
++      :else (str "target-label \"" label "\" does not match target \""
++                 (if page-title page-title (label-found target)) "\""))))
++
++(defn- check-target-labels
++  "nil when each check's label names its target in `db`, else the refusal of the whole call: 409
++  listing every failing entry with what was given and what was found (400 on an E2EE graph, whose
++  titles can't be compared). A check is {:entry index-or-nil :id db-id :label string}, or
++  {:entry :page title :label} for a page the write creates; a check without a label is skipped."
++  [db e2ee? checks]
++  (let [checks (filter :label checks)]
++    (cond
++      (empty? checks) nil
++      e2ee? {:status 400
++             :error "target-label: labels can't be checked on an E2EE graph, where titles are encrypted; leave it out"}
++      :else
++      (when-let [errors (seq (keep (fn [{:keys [entry id page label]}]
++                                     (when-let [error (label-error (if page {:page page} (d/entity db id)) label)]
++                                       (str (when entry (str "entry " entry ": ")) error)))
++                                   checks))]
++        {:status 409 :error (string/join "; " errors)}))))
++
++(defn- check-labels!
++  "Throws the refusal check-target-labels gives, so a write calling this first inside its
++  transaction changes nothing; `rejecting` and `refusing-labels` answer it."
++  [db e2ee? checks]
++  (when-let [refusal (check-target-labels db e2ee? checks)]
++    (throw (ex-info (:error refusal) {::label-refusal refusal}))))
++
++(defn- label-refusal-response [error]
++  (when-let [{:keys [status error]} (::label-refusal (ex-data error))]
++    (http/error-response error status)))
++
++(defn- refusing-labels
++  "Calls `write`, answering a label refusal from inside it; other errors propagate."
++  [write]
++  (try (write)
++       (catch :default error
++         (or (label-refusal-response error) (throw error)))))
++
++(defn- labels-error
++  "Why the labels a call gives are malformed, or nil: `labels`, when given, must be strings, one
++  per block-id; `entries` (batch entries or moves) may each give a string target-label."
++  ([entries]
++   (some (fn [[index entry]]
++           (when (and (map? entry) (contains? entry :target-label) (not (string? (:target-label entry))))
++             (str "entry " index ": target-label must be a string")))
++         (map-indexed vector (when (sequential? entries) entries))))
++  ([labels block-ids]
++   (cond
++     (nil? labels) nil
++     (not (sequential? labels)) "labels must be an array of strings, one per block-id"
++     (not= (count labels) (count block-ids))
++     (str "labels: " (count labels) (if (= 1 (count labels)) " label" " labels") " for " (count block-ids) " block-ids")
++     :else (some (fn [[index label]] (when-not (string? label) (str "labels[" index "]: must be a string")))
++                 (map-indexed vector labels)))))
++
 +(defn- target-context
 +  "{:target context} of `entity` as `db` now has it."
 +  [db entity e2ee?]
@@ -206,7 +331,7 @@ index bb7c5be..af14f2f 100644
  ;; deletePage, deleteTag and deleteProperty refuse to lose references, holders, child tags or
  ;; values unless the matching acknowledge-* query flag is true; dry-run=true reports the counts.
  (def ^:private loss-acknowledgements
-@@ -1412,38 +1593,41 @@
+@@ -1412,38 +1718,41 @@
  (defn- delete-node!
    "Deletes a page, tag or property through Logseq's page deletion rules once every loss it causes
    is acknowledged. Logseq clears today's journal instead of recycling it, so for a journal, today
@@ -280,7 +405,7 @@ index bb7c5be..af14f2f 100644
  
  (defn- atomic-write!
    "Runs (mutate conn) as one authored transaction and returns its result: all of its changes land,
-@@ -1474,50 +1658,63 @@
+@@ -1474,50 +1783,63 @@
            (http/json-response nil {:uuid (str page-id) :kind "page" :title title} 201))))
  
      :semantic/pages-blocks
@@ -378,7 +503,28 @@ index bb7c5be..af14f2f 100644
  
  (defn- move-destination
    "The outliner target and options that put `blocks` at `position` relative to `target`. The
-@@ -1554,7 +1751,10 @@
+@@ -1538,10 +1860,13 @@
+ 
+ (defn- insert-tree-response
+   "Inserts identity-checked `nodes` under `target` in one transaction: 400 for a property that
+-  doesn't resolve, else 201 with the inserted tree. `extra` joins the response body."
++  doesn't resolve, 409 when `label` (the call's target-label) doesn't name the target, else 201 with
++  the inserted tree. `extra` joins the response body."
+   ([context target nodes position]
+-   (insert-tree-response context target nodes position {}))
+-  ([{:keys [^js self ^js url conn db e2ee? creator]} target nodes position extra]
++   (insert-tree-response context target nodes position {} nil))
++  ([context target nodes position extra]
++   (insert-tree-response context target nodes position extra nil))
++  ([{:keys [^js self ^js url conn db e2ee? creator]} target nodes position extra label]
+    (let [verbose? (verbose-option url)
+          prepared (prepare-tree db nodes e2ee? "blocks")]
+      (cond
+@@ -1551,10 +1876,14 @@
+        (rejecting
+         #(let [inserted (atomic-write! conn creator false :insert-blocks
+                                        (fn [tx-conn]
++                                         (check-labels! @tx-conn e2ee? [{:id (:db/id target) :label label}])
                                           (insert-tree! tx-conn (d/entity @tx-conn (:db/id target))
                                                         (:nodes prepared) position e2ee?)))]
             (broadcast-change! self)
@@ -390,10 +536,30 @@ index bb7c5be..af14f2f 100644
  
  (defn- refresh-candidates
    "Body blocks (not pages or property values) of `page`, or of the whole graph, whose stored title
-@@ -1637,13 +1837,15 @@
-                                                                      (assoc @prepared :block/uuid (:block/uuid block))
-                                                                      :encrypted-title? e2ee? :encrypted-name (:name body))))
-           (broadcast-change! self)
+@@ -1617,7 +1946,12 @@
+     (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
+       truncated? (assoc :truncated true))))
+ 
+-(defn- handle-blocks [{:keys [^js self request conn db handler path-params e2ee? creator] :as context}]
++(defn- target-label-param
++  "The call's target-label query parameter, or nil."
++  [^js url]
++  (.get (.-searchParams url) "target-label"))
++
++(defn- handle-blocks [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+     :semantic/blocks-get
+@@ -1631,19 +1965,24 @@
+       (if (or (nil? block) (not (non-blank-string? (:title body))))
+         (http/bad-request "invalid block-id or title")
+         (let [prepared (volatile! nil)]
+-          (authored-write! conn creator (fn [actor-conn]
+-                                          (vreset! prepared (prepare-block-title! actor-conn e2ee? (:title body) block))
+-                                          (outliner-core/save-block! actor-conn
+-                                                                     (assoc @prepared :block/uuid (:block/uuid block))
+-                                                                     :encrypted-title? e2ee? :encrypted-name (:name body))))
+-          (broadcast-change! self)
 -          (http/json-response nil (with-escaped
 -                                    {:uuid (str (:block/uuid block)) :kind (block-kind block)
 -                                     ;; The stored title shows what was escaped; E2EE stores the input.
@@ -401,19 +567,28 @@ index bb7c5be..af14f2f 100644
 -                                              (:title body)
 -                                              (:block/title (d/entity @conn [:block/uuid (:block/uuid block)])))}
 -                                    @prepared)))))
-+          (http/json-response nil (with-context-or-unavailable
-+                                    (with-escaped
-+                                      {:uuid (str (:block/uuid block)) :kind (block-kind block)
-+                                       ;; The stored title shows what was escaped; E2EE stores the input.
-+                                       :title (if e2ee?
-+                                                (:title body)
-+                                                (:block/title (d/entity @conn [:block/uuid (:block/uuid block)])))}
-+                                      @prepared)
-+                                    #(target-context @conn block e2ee?))))))
++          (refusing-labels
++           #(do (authored-write! conn creator
++                                 (fn [actor-conn]
++                                   (check-labels! @actor-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                                   (vreset! prepared (prepare-block-title! actor-conn e2ee? (:title body) block))
++                                   (outliner-core/save-block! actor-conn
++                                                              (assoc @prepared :block/uuid (:block/uuid block))
++                                                              :encrypted-title? e2ee? :encrypted-name (:name body))))
++                (broadcast-change! self)
++                (http/json-response nil (with-context-or-unavailable
++                                          (with-escaped
++                                            {:uuid (str (:block/uuid block)) :kind (block-kind block)
++                                             ;; The stored title shows what was escaped; E2EE stores the input.
++                                             :title (if e2ee?
++                                                      (:title body)
++                                                      (:block/title (d/entity @conn [:block/uuid (:block/uuid block)])))}
++                                            @prepared)
++                                          (fn [] (target-context @conn block e2ee?)))))))))
  
      :semantic/refresh-refs
      (p/let [body (body-clj request)
-@@ -1663,30 +1865,40 @@
+@@ -1663,30 +2002,49 @@
          "page" (http/bad-request "block is a page: delete it with deletePage")
          "tag" (http/bad-request "block is a tag: delete it with deleteTag")
          "property" (http/bad-request "block is a property: delete it with deleteProperty")
@@ -425,7 +600,10 @@ index bb7c5be..af14f2f 100644
 +              affected [(block-context block {:e2ee? e2ee? :descendants (count descendants)})]
 +              removed (map #(:block/uuid (d/entity db %)) (cons (:db/id block) descendants))]
 +          (rejecting
-+           #(do (outliner-core/delete-blocks! conn [block] {})
++           #(do (atomic-write! conn creator false :delete-blocks
++                               (fn [tx-conn]
++                                 (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                                 (outliner-core/delete-blocks! tx-conn [(d/entity @tx-conn (:db/id block))] {})))
 +                (broadcast-change! self)
 +                (confirm-removed! @conn removed)
 +                (http/json-response nil {:deleted 1 :total-removed (count removed) :affected affected})))))
@@ -452,17 +630,30 @@ index bb7c5be..af14f2f 100644
            (if (and (contains? #{"before" "after"} position) (nil? (:block/parent target)))
              (http/bad-request "before and after need a block target, not a page")
 -            (let [[target' opts] (move-destination blocks target position)]
+-              (outliner-core/move-blocks! conn blocks target' opts)
+-              (broadcast-change! self)
+-              (http/json-response nil {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}))))))
 +            (let [[target' opts] (move-destination blocks target position)
 +                  before (mapv #(block-context % {:e2ee? e2ee?}) blocks)]
-               (outliner-core/move-blocks! conn blocks target' opts)
-               (broadcast-change! self)
--              (http/json-response nil {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}))))))
-+              (http/json-response nil (moved-response {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}
-+                                                      @conn before e2ee?)))))))
++              (refusing-labels
++               #(do (atomic-write! conn creator false :move-blocks
++                                   (fn [tx-conn]
++                                     (check-labels! @tx-conn e2ee? [{:id (:db/id target) :label (target-label-param url)}])
++                                     (outliner-core/move-blocks! tx-conn
++                                                                 (mapv (fn [b] (d/entity @tx-conn (:db/id b))) blocks)
++                                                                 (d/entity @tx-conn (:db/id target')) opts)))
++                    (broadcast-change! self)
++                    (http/json-response nil (moved-response {:uuids (mapv (fn [b] (str (:block/uuid b))) blocks) :moved true}
++                                                            @conn before e2ee?)))))))))
  
      :semantic/blocks-insert-children
      (p/let [body (body-clj request)
-@@ -1698,10 +1910,13 @@
+@@ -1694,14 +2052,18 @@
+       (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
+               (not (valid-tree-identities? db target (:blocks body))))
+         (http/bad-request "invalid target, position, or blocks")
+-        (insert-tree-response context target (:blocks body) (:position body))))
++        (insert-tree-response context target (:blocks body) (:position body) {} (target-label-param url))))
  
      :semantic/blocks-insert-tree
      (p/let [body (body-clj request)
@@ -475,49 +666,107 @@ index bb7c5be..af14f2f 100644
 +        (or (nil? target) (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target or blocks")
 -        (insert-tree-response context target (:blocks body) (or (:position body) "append"))))))
-+        :else (insert-tree-response context target (:blocks body) (or (:position body) "append"))))))
++        :else (insert-tree-response context target (:blocks body) (or (:position body) "append") {}
++                                    (target-label-param url))))))
  
  (defn- batch-entries-error
    "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
-@@ -1733,7 +1948,7 @@
+@@ -1716,7 +2078,14 @@
+               (str "entry " index ": " reason)))
+           (map-indexed vector resolved))))
+ 
+-(defn- handle-block-properties [{:keys [^js self request conn db handler path-params e2ee? creator]}]
++(defn- entry-label-checks
++  "One label check per batch entry that gives a target-label, against the entity `target` picks
++  from the entry's resolved form."
++  [entries resolved target]
++  (map-indexed (fn [index [entry item]] {:entry index :id (:db/id (target item)) :label (:target-label entry)})
++               (map vector entries resolved)))
++
++(defn- handle-block-properties [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
+   (case handler
+ 
+     :semantic/blocks-set-property
+@@ -1731,19 +2100,27 @@
+         (not (contains? body :value)) (http/bad-request "missing property value")
+         (:error prepared) (http/bad-request (:error prepared))
          :else
-         (do (authored-write! conn creator set-prepared-property! (:db/id block) property-ident (:value prepared) true)
-             (broadcast-change! self)
+-        (do (authored-write! conn creator set-prepared-property! (:db/id block) property-ident (:value prepared) true)
+-            (broadcast-change! self)
 -            (http/json-response nil {:updated true}))))
-+            (http/json-response nil (with-context-or-unavailable {:updated true} #(target-context @conn block e2ee?))))))
++        (refusing-labels
++         #(do (authored-write! conn creator
++                               (fn [actor-conn]
++                                 (check-labels! @actor-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                                 (set-prepared-property! actor-conn (:db/id block) property-ident (:value prepared) true)))
++              (broadcast-change! self)
++              (http/json-response nil (with-context-or-unavailable {:updated true} (fn [] (target-context @conn block e2ee?))))))))
  
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
-@@ -1743,7 +1958,7 @@
-         (do
-           (outliner-property/remove-block-property! conn (:db/id block) property-ident)
-           (broadcast-change! self)
+           property-ident (resolve-property-ident db (:property-id path-params))]
+       (if (or (nil? block) (nil? property-ident))
+         (http/bad-request "invalid block or property")
+-        (do
+-          (outliner-property/remove-block-property! conn (:db/id block) property-ident)
+-          (broadcast-change! self)
 -          (js/Response. nil #js {:status 204}))))
-+          (http/json-response nil (with-context-or-unavailable {:deleted true} #(target-context @conn block e2ee?))))))
++        (refusing-labels
++         #(do
++            (atomic-write! conn creator false :remove-block-property
++                           (fn [tx-conn]
++                             (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                             (outliner-property/remove-block-property! tx-conn (:db/id block) property-ident)))
++            (broadcast-change! self)
++            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?))))))))
  
      :semantic/blocks-batch-set-property
      (p/let [body (body-clj request)
-@@ -1782,7 +1997,8 @@
+@@ -1774,15 +2151,18 @@
+                                           (cond-> replace? (update :replaced conj (:db/id block)))))))
+                                 {:entries [] :added {} :replaced #{}}
+                                 entries)))]
+-      (if-let [error (batch-entries-error entries resolved)]
++      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
+         (http/bad-request error)
+-        (do (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
++        (refusing-labels
++         #(do (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
+              (fn [temp-conn]
++               (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
+                (doseq [{:keys [block property-ident prepared]} resolved]
                   (set-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)
                                           (true? (:isResetExistingValues body))))))
              (broadcast-change! self)
 -            (http/json-response nil {:updated (count resolved)}))))
 +            (http/json-response nil (with-context-or-unavailable {:updated (count resolved)}
-+                                      #(affected-context @conn (map :block resolved) e2ee?))))))
++                                      (fn [] (affected-context @conn (map :block resolved) e2ee?))))))))
  
      :semantic/blocks-batch-delete-property
      (p/let [body (body-clj request)
-@@ -1799,7 +2015,8 @@
+@@ -1791,15 +2171,18 @@
+                        (mapv (fn [{:keys [block-id property-id]}]
+                                {:block (find-entity db block-id)
+                                 :property-ident (resolve-property-ident db property-id)}) entries))]
+-      (if-let [error (batch-entries-error entries resolved)]
++      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
+         (http/bad-request error)
+-        (do
++        (refusing-labels
++         #(do
+           (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
+            (fn [temp-conn]
++             (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
               (doseq [{:keys [block property-ident]} resolved]
                 (outliner-property/remove-block-property! temp-conn (:db/id block) property-ident))))
            (broadcast-change! self)
 -          (http/json-response nil {:deleted (count resolved)}))))))
 +          (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
-+                                    #(affected-context @conn (map :block resolved) e2ee?))))))))
++                                    (fn [] (affected-context @conn (map :block resolved) e2ee?))))))))))
  
  (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
           unverified!)
-@@ -2007,7 +2224,8 @@
+@@ -2007,7 +2390,8 @@
      :semantic/pages-promote-to-tag
      (p/let [body (body-clj request)]
        (let [page-id (:page-id path-params)
@@ -527,7 +776,7 @@ index bb7c5be..af14f2f 100644
              dry-run? (flag-param url "dry-run")
              body-errors (cond-> (cond
                                    (nil? body) []
-@@ -2025,6 +2243,7 @@
+@@ -2025,6 +2409,7 @@
                         (:error promotion) (conj {:status 400 :error (:error promotion)}))]
          (cond
            e2ee? (http/bad-request "promote_page_to_tag isn't available on an E2EE graph")
@@ -535,7 +784,7 @@ index bb7c5be..af14f2f 100644
            (seq refusals)
            (http/json-response nil
                                (cond-> {:error (string/join "; " (map :error refusals))}
-@@ -2082,11 +2301,13 @@
+@@ -2082,11 +2467,13 @@
              priority-choice (when priority
                                (resolve-property-choice db :logseq.property/priority
                                                         task-priority-idents priority task-scope))
@@ -551,7 +800,7 @@ index bb7c5be..af14f2f 100644
            (nil? status-choice) (http/bad-request "invalid task status")
            (and priority (nil? priority-choice)) (http/bad-request "invalid task priority")
            (and (:page-id body) (not (page? target))) (http/bad-request "invalid task page-id")
-@@ -2115,8 +2336,9 @@
+@@ -2115,8 +2502,9 @@
                     (outliner-property/set-block-property! temp-conn (:db/id task) property-ident value)))))
              (broadcast-change! self)
              (let [task (d/entity @conn [:block/uuid @task-id])]
@@ -563,7 +812,7 @@ index bb7c5be..af14f2f 100644
                                    201))))))))
  
  (defn- handle-assets
-@@ -3124,18 +3346,22 @@
+@@ -3124,18 +3512,22 @@
          "before and after need a block target, not a page")))
  
  (defn- resolve-moves
@@ -591,7 +840,7 @@ index bb7c5be..af14f2f 100644
                    (-> result
                        (update :moves conj move)
                        (update :moved into (map :db/id (:blocks move)))))))
-@@ -3183,7 +3409,9 @@
+@@ -3183,7 +3575,9 @@
    maps an insert-entry-key to the tags earlier entries give that target."
    [db e2ee? added index entry]
    (let [prefix (str "entries[" index "]")
@@ -602,7 +851,7 @@ index bb7c5be..af14f2f 100644
          page (:page entry)
          existing-page (when (and (non-blank-string? page) (not e2ee?)) (ldb/get-page db page))
          scope (scope-with-tags db (or target existing-page {})
-@@ -3192,6 +3420,7 @@
+@@ -3192,6 +3586,7 @@
                       (prepare-properties db (:properties entry) e2ee? scope))
          error (cond
                  (and (contains? entry :target-id) (contains? entry :page)) "give target-id or page, not both"
@@ -610,7 +859,7 @@ index bb7c5be..af14f2f 100644
                  (contains? entry :target-id) (when (nil? target) "target not found")
                  (not (contains? entry :page)) "give target-id or page"
                  (not (non-blank-string? page)) "page must be a non-blank title"
-@@ -3211,7 +3440,8 @@
+@@ -3211,7 +3606,8 @@
          tree (when (and (nil? error) (contains? entry :blocks))
                 (prepare-tree db (:blocks entry) e2ee? (str prefix ".blocks")))]
      (cond
@@ -620,7 +869,7 @@ index bb7c5be..af14f2f 100644
        (:error tree) tree
        :else {:entry {:target target
                       :key (insert-entry-key target existing-page page)
-@@ -3233,7 +3463,7 @@
+@@ -3233,7 +3629,7 @@
                          {:keys [key properties]} (:entry resolved)
                          entry-uuids (tree-uuids (:blocks entry))]
                      (cond
@@ -629,7 +878,29 @@ index bb7c5be..af14f2f 100644
                        (some uuids entry-uuids)
                        (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
                        :else (-> result
-@@ -3292,42 +3522,59 @@
+@@ -3263,6 +3659,17 @@
+               (nil? existing) (assoc :created true))))
+         entries))
+ 
++(defn- insert-label-checks
++  "One label check per batch insert entry that gives a target-label: against its target, or the
++  page it names, or, for a page the batch creates, that page's title."
++  [db entries resolved]
++  (map-indexed (fn [index [entry {:keys [target page]}]]
++                 (let [existing (or target (ldb/get-page db page))]
++                   (cond-> {:entry index :label (:target-label entry)}
++                     existing (assoc :id (:db/id existing))
++                     (nil? existing) (assoc :page page))))
++               (map vector entries resolved)))
++
+ (defn- bulk-write-response
+   "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
+   [body dry-run? status]
+@@ -3289,45 +3696,71 @@
+             blocks (when (sequential? block-ids) (mapv #(find-entity db %) block-ids))
+             dry-run? (dry-run-option body)]
+         (if-let [error (or (delete-blocks-error block-ids blocks)
++                           (labels-error (:labels body) block-ids)
                             (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
            (http/bad-request error)
            (rejecting
@@ -643,6 +914,8 @@ index bb7c5be..af14f2f 100644
 +                                 blocks descendants)]
                (atomic-write! conn creator dry-run? :delete-blocks
                               (fn [tx-conn]
++                               (check-labels! @tx-conn e2ee? (map (fn [index block label] {:entry index :id (:db/id block) :label label})
++                                                                  (range) blocks (or (:labels body) (repeat nil))))
                                 (outliner-core/delete-blocks! tx-conn (mapv (fn [block] (d/entity @tx-conn (:db/id block))) blocks) {})))
 -              (when-not dry-run? (broadcast-change! self))
 -              (bulk-write-response {:deleted (count blocks) :total-removed (count removed)} dry-run? 200))))))
@@ -657,8 +930,9 @@ index bb7c5be..af14f2f 100644
 -      (let [{:keys [moves error]} (resolve-moves db (:moves body))
 +      (let [{:keys [moves error] :as resolved} (resolve-moves db e2ee? (:moves body))
              dry-run? (dry-run-option body)]
-         (if-let [error (or error (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
+-        (if-let [error (or error (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
 -          (http/bad-request error)
++        (if-let [error (or (labels-error (:moves body)) error (when (= ::invalid dry-run?) "dry-run must be a boolean"))]
 +          (selector-refusal (merge {:status 400} (select-keys resolved [:status :candidates]) {:error error}))
            (rejecting
 -           #(do (atomic-write! conn creator dry-run? :move-blocks (fn [tx-conn] (move-all! tx-conn moves)))
@@ -666,7 +940,10 @@ index bb7c5be..af14f2f 100644
 -                (bulk-write-response {:moved (reduce + (map (comp count :blocks) moves))} dry-run? 200))))))
 +           #(let [before (mapv (fn [block] (block-context block {:e2ee? e2ee?})) (mapcat :blocks moves))
 +                  response {:moved (reduce + (map (comp count :blocks) moves))}]
-+              (atomic-write! conn creator dry-run? :move-blocks (fn [tx-conn] (move-all! tx-conn moves)))
++              (atomic-write! conn creator dry-run? :move-blocks
++                             (fn [tx-conn]
++                               (check-labels! @tx-conn e2ee? (entry-label-checks (:moves body) moves :target))
++                               (move-all! tx-conn moves)))
 +              (when-not dry-run? (broadcast-change! self))
 +              (bulk-write-response (if dry-run? response (moved-response response @conn before e2ee?)) dry-run? 200))))))
  
@@ -676,14 +953,19 @@ index bb7c5be..af14f2f 100644
 +      (let [{:keys [entries error] :as resolved} (resolve-insert-entries db e2ee? (:entries body))
              dry-run? (dry-run-option body)
              verbose? (verbose-option url)]
-         (if-let [error (or error
+-        (if-let [error (or error
++        (if-let [error (or (labels-error (:entries body))
++                           error
                             (when (= ::invalid dry-run?) "dry-run must be a boolean")
                             (when (= ::invalid verbose?) "verbose must be true or false"))]
 -          (http/bad-request error)
 +          (selector-refusal (merge {:status 400} (select-keys resolved [:status :candidates]) {:error error}))
            (rejecting
             #(let [inserted (atomic-write! conn creator dry-run? :insert-blocks
-                                           (fn [tx-conn] (insert-entries! tx-conn e2ee? entries)))]
+-                                          (fn [tx-conn] (insert-entries! tx-conn e2ee? entries)))]
++                                          (fn [tx-conn]
++                                            (check-labels! @tx-conn e2ee? (insert-label-checks @tx-conn (:entries body) entries))
++                                            (insert-entries! tx-conn e2ee? entries)))]
                (when-not dry-run? (broadcast-change! self))
 -              (bulk-write-response {:entries (mapv (fn [entry] (update entry :blocks tree-response verbose?)) inserted)
 -                                    :count (reduce + (map (comp tree-count :blocks) inserted))}
@@ -704,7 +986,7 @@ index bb7c5be..af14f2f 100644
  
  ;; getPageBacklinks, getGraphHealth and listKnowledgeIndex read the whole graph through
  ;; graph-insights. They read titles and text, so they refuse E2EE graphs like getPageOutline.
-@@ -3451,10 +3698,11 @@
+@@ -3451,10 +3884,11 @@
        :else
        (case handler
          :semantic/pages-backlinks
@@ -720,7 +1002,7 @@ index bb7c5be..af14f2f 100644
  
          :semantic/graph-health
          (let [checks (or (comma-list url "checks") health-checks)
-@@ -3514,19 +3762,6 @@
+@@ -3514,19 +3948,6 @@
         (not (entity-util/hidden? entity))
         (not (string/blank? (:block/title entity)))))
  
@@ -741,7 +1023,7 @@ index bb7c5be..af14f2f 100644
    (let [page (:block/page block)
          above (feed-ancestors block)]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index cdf8ac9..27767ba 100644
+index cdf8ac9..0f9e32e 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -133,26 +133,26 @@
@@ -777,7 +1059,7 @@ index cdf8ac9..27767ba 100644
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
     "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
     "getTag" ["Get a tag" "Returns one tag by UUID, with the tags it extends and its tag properties."]
-@@ -200,11 +200,22 @@
+@@ -200,11 +200,38 @@
  (defn- openapi-path [path]
    (string/replace path #":([^/]+)" "{$1}"))
  
@@ -790,6 +1072,22 @@ index cdf8ac9..27767ba 100644
 +(def ^:private target-selector-description
 +  (str "A block UUID, or a page given as for page-id: " page-selector-description))
 +
++(def ^:private target-label-description
++  (str "Optional. How you name the target for a reader, \"Page > parent > ... > block\" (for a page target, "
++       "the page title alone), e.g. \"Nov 5th, 2026 > Meeting > Agenda\". It is checked against the real target "
++       "inside the write and never used to find it: the first segment must be the page title, ignoring case; the "
++       "others match, from the last one back, the target's first line and then its nearest parent blocks (upper "
++       "ones may be left out), each as a case-insensitive prefix of at least 3 characters, or the whole line when "
++       "that is shorter. A mismatch refuses the whole call with 409, naming what was given and what was found, "
++       "and writes nothing. Unavailable for E2EE graphs."))
++
++(def ^:private target-label-schema
++  {:type "string" :description target-label-description})
++
++(def ^:private label-checked-operations
++  #{"insertBlockChildren" "insertBlockTree" "updateBlock" "deleteBlock" "setBlockProperty"
++    "deleteBlockProperty" "moveBlocks"})
++
  (defn- path-parameters [path]
    (mapv (fn [[_ parameter]]
            (cond-> {:name parameter :in "path" :required true :schema {:type "string"}}
@@ -801,7 +1099,7 @@ index cdf8ac9..27767ba 100644
          (re-seq #":([^/]+)" path)))
  
  (def ^:private pagination-parameters
-@@ -292,14 +303,14 @@
+@@ -292,28 +319,35 @@
      "moveBlocks" {:required ["block-ids" "target-id" "position"]
                    :properties {:block-ids {:type "array" :minItems 1 :uniqueItems true
                                             :items {:type "string"}}
@@ -815,10 +1113,19 @@ index cdf8ac9..27767ba 100644
                                                                               :items {:type "string"}}
 -                                                                 :target-id {:type "string"}
 +                                                                 :target-id {:type "string" :description target-selector-description}
++                                                                 :target-label target-label-schema
                                                                   :position {:enum ["before" "after" "first-child" "last-child"]}}}}
                                      :dry-run dry-run-schema}}
      "deleteBlocks" {:required ["block-ids"]
-@@ -311,7 +322,7 @@
+                     :properties {:block-ids {:type "array" :minItems 1 :maxItems 100 :uniqueItems true
+                                              :items {:type "string"}}
++                                 :labels {:type "array" :items {:type "string"}
++                                          :description (str "Optional, parallel to block-ids: one target-label per block, checked as "
++                                                            "target-label is on the single-block writes. A different length is refused "
++                                                            "with 400. " target-label-description)}
+                                  :dry-run dry-run-schema}}
+     "batchInsertBlockTrees"
+     {:required ["entries"]
       :properties {:entries {:type "array" :minItems 1 :maxItems 100
                              :items {:type "object"
                                      :properties {:target-id {:type "string"
@@ -826,8 +1133,12 @@ index cdf8ac9..27767ba 100644
 +                                                             :description (str target-selector-description " Give this or page.")}
                                                   :page {:type "string"
                                                          :description "A page title: the page with that name, created when there is none. Give this or target-id. Unavailable for E2EE graphs."}
++                                                 :target-label (assoc target-label-schema :description
++                                                                      (str target-label-description " For an entry whose page the batch creates, give that page's title."))
                                                   :position {:enum ["append" "prepend"] :default "append"}
-@@ -322,7 +333,7 @@
+                                                  :properties {:$ref "#/components/schemas/PropertyValues"}
+                                                  :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}}
+@@ -322,7 +356,7 @@
                             :properties {:position {:enum ["append" "prepend"]}
                                          :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
      "insertBlockTree" {:required ["target-id" "blocks"]
@@ -836,7 +1147,22 @@ index cdf8ac9..27767ba 100644
                                      :position {:enum ["append" "prepend"] :default "append"}
                                      :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
      "setBlockProperty" {:required ["value"]
-@@ -346,7 +357,7 @@
+@@ -335,18 +369,20 @@
+                                                     :items {:type "object" :required ["block-id" "property-id" "value"]
+                                                             :properties {:block-id {:type "string"}
+                                                                          :property-id {:type "string"}
+-                                                                         :value {:$ref "#/components/schemas/PropertyValue"}}}}}}
++                                                                         :value {:$ref "#/components/schemas/PropertyValue"}
++                                                                         :target-label target-label-schema}}}}}
+     "batchDeleteBlockProperty" {:required ["entries"]
+                                 :properties {:entries {:type "array"
+                                                        :items {:type "object" :required ["block-id" "property-id"]
+                                                                :properties {:block-id {:type "string"}
+-                                                                            :property-id {:type "string"}}}}}}
++                                                                            :property-id {:type "string"}
++                                                                            :target-label target-label-schema}}}}}
+     "captureToToday" {:required ["blocks"]
+                       :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
      "createTask" {:required ["title"]
                    :properties {:title {:type "string"}
                                 :page-id {:type "string"
@@ -845,7 +1171,36 @@ index cdf8ac9..27767ba 100644
                                 :status {:$ref "#/components/schemas/TaskStatusSelector"}
                                 :priority {:$ref "#/components/schemas/TaskPrioritySelector"}
                                 :scheduled {:type "integer" :description "Scheduled date/time as a Unix timestamp in milliseconds."}
-@@ -523,9 +534,15 @@
+@@ -430,6 +466,8 @@
+     (into asset-upload-parameters)
+     (contains? delete-parameters operation-id)
+     (into (get delete-parameters operation-id))
++    (contains? label-checked-operations operation-id)
++    (conj {:name "target-label" :in "query" :schema {:type "string"} :description target-label-description})
+     (= "getPageBacklinks" operation-id)
+     (into [{:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
+             :description "Most items listed per relation. Counts are always complete."}])
+@@ -499,7 +537,19 @@
+   {:description description
+    :content {"application/json" {:schema {:$ref (str "#/components/schemas/" schema)}}}})
+ 
++(declare operation-responses*)
++
++(def ^:private label-refusal-response
++  {:description "A target-label does not match its target: the error names each failing entry with what was given and what was found, and nothing was written"})
++
+ (defn- operation-responses [operation-id]
++  (cond-> (operation-responses* operation-id)
++    (or (contains? label-checked-operations operation-id)
++        (contains? #{"batchInsertBlockTrees" "batchMoveBlocks" "batchSetBlockProperty" "batchDeleteBlockProperty"
++                     "deleteBlocks"} operation-id))
++    (assoc "409" label-refusal-response)))
++
++(defn- operation-responses* [operation-id]
+   (merge {"200" (case operation-id
+                   "listPages" (list-response :pages "PageResponse" "A cursor page of pages")
+                   "listPageBlocks"
+@@ -523,9 +573,15 @@
                    "updatePage" (entity-response "PageResponse" "The updated page")
                    "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
                    "getBlocks" (entity-response "BlocksResponse" "The blocks found, in request order, and the UUIDs not found")
@@ -864,7 +1219,7 @@ index cdf8ac9..27767ba 100644
                    "getTag" (entity-response "TagResponse" "A tag")
                    "updateTag" (entity-response "TagResponse" "The updated tag")
                    "promotePageToTag" (entity-response "PromotedTagResponse" "The page, now a tag, and what it kept")
-@@ -551,7 +568,15 @@
+@@ -551,7 +607,15 @@
                                 "409" {:description "The page is already a tag, or another tag uses its title (existing names it); nothing was changed"}}
             "createTag" {"201" (entity-response "TagResponse" "The created tag")
                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created. A page promote_page_to_tag can convert is named in the error and has promote: true")}
@@ -881,7 +1236,7 @@ index cdf8ac9..27767ba 100644
             {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
              "204" {:description "Deleted"}
              "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
-@@ -601,6 +626,62 @@
+@@ -601,6 +665,62 @@
                                                                 :holders {:type "integer"}
                                                                 :default {:type "boolean"}}}}}}))
  
@@ -944,7 +1299,7 @@ index cdf8ac9..27767ba 100644
  (def ^:private bulk-schemas
    "Schemas of block tree properties and of the bulk and insert operations' responses."
    (ordered-map
-@@ -612,7 +693,12 @@
+@@ -612,7 +732,12 @@
                                  :title {:type "string" :description "Omitted when verbose is false."}
                                  :children {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}
     :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
@@ -958,7 +1313,7 @@ index cdf8ac9..27767ba 100644
                                           :count {:type "integer" :description "Blocks inserted or reused, nested ones included."}
                                           :page-id {:type "string" :description "captureToToday only: today's journal page."}
                                           :page-title {:type "string" :description "captureToToday only: today's journal title, e.g. Nov 6th, 2026."}}}
-@@ -620,9 +706,13 @@
+@@ -620,9 +745,13 @@
                           :properties {:entries {:type "array"
                                                  :items {:type "object" :required ["target-id" "blocks"]
                                                          :properties {:target-id {:type "string"}
@@ -972,7 +1327,7 @@ index cdf8ac9..27767ba 100644
                                        :dry-run {:type "boolean"}}}
     :BlocksResponse {:type "object" :required ["blocks" "missing"]
                      :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockDetailResponse"}}
-@@ -630,9 +720,15 @@
+@@ -630,9 +759,15 @@
     :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
                            :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
                                         :total-removed {:type "integer" :description "Those blocks and all their descendants."}
@@ -988,7 +1343,7 @@ index cdf8ac9..27767ba 100644
                                       :dry-run {:type "boolean"}}}))
  
  (defn openapi-document [issuer]
-@@ -848,7 +944,9 @@
+@@ -848,7 +983,9 @@
                                                      :deadline {:type "integer"}}}]}
                 :CreatedTaskResponse {:allOf [{:$ref "#/components/schemas/TaskResponse"}
                                               {:type "object" :required ["page-id" "page-title"]
@@ -999,7 +1354,7 @@ index cdf8ac9..27767ba 100644
                 :CreatedAssetResponse {:allOf [{:$ref "#/components/schemas/AssetResponse"}
                                                {:type "object" :required ["page-id" "page-title"]
                                                 :properties {:page-id {:type "string"}
-@@ -858,7 +956,7 @@
+@@ -858,7 +995,7 @@
                  :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
                          {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
                write-guard-schemas)
@@ -1117,10 +1472,10 @@ index f011645..c759955 100644
              (is (= 200 (:status upper)) (str "an upper-case UUID " (pr-str upper)))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs
 new file mode 100644
-index 0000000..129f59c
+index 0000000..080f131
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,1042 @@
 +(ns logseq.db-sync.semantic-readable-writes-test
 +  "Readable write results (patch 0028). Deletes, moves, inserts and property writes answer the page
 +  title, breadcrumb (up to the five nearest ancestors below the page) and an 80-character snippet of
@@ -1825,6 +2180,344 @@ index 0000000..129f59c
 +          (is (= (ids :nov5) (get-in task [:body :page-id])))
 +          (is (= [200 (ids :notes2)] [(:status renamed) (get-in renamed [:body :uuid])]) (pr-str renamed))
 +          (is (= "Notes Two" (:block/title (d/entity @conn [:block/uuid (uuid (ids :notes2))])))))))))
++
++;; target-label (stage 5): a block-targeted write names its target as "Page > parent > ... > block",
++;; and the server checks it against the real target inside the write before changing anything. The
++;; label is a guard only; any mismatch refuses the whole call with 409 and writes nothing.
++
++(defn- labelled
++  "`path` with `label` as its target-label query parameter, URL-encoded."
++  [path label]
++  (str path (if (string/includes? path "?") "&" "?") "target-label=" (js/encodeURIComponent label)))
++
++(defn- datoms-of
++  "Every datom of `db` with its tx, to compare a graph before and after a call datom for datom."
++  [db]
++  (mapv (juxt :e :a :v :tx) (d/datoms db :eavt)))
++
++(defn- graph-diff
++  "What changed between two snapshots: the datoms only in `before` and only in `after` (empty when
++  the graph is unchanged datom for datom), kept short for a failure message."
++  [before after]
++  (let [a (set (datoms-of before)) b (set (datoms-of after))]
++    {:removed (count (remove b a)) :added (vec (take 5 (remove a b)))}))
++
++(def ^:private unchanged {:removed 0 :added []})
++
++(defn- mismatch
++  "The refusal text for a label that doesn't fit, as the spec words it."
++  ([given found] (str "target-label \"" given "\" does not match target \"" found "\""))
++  ([entry given found] (str "entry " entry ": " (mismatch given found))))
++
++(defn- refused [response] [(:status response) (get-in response [:body :error])])
++
++(defn- add-owner!
++  "An Owner text property, set to Ann on Agenda and Book flights; its UUID."
++  [self ids]
++  (p/let [property (request! self "POST" "/semantic/properties" {:title "Owner" :type "default"})
++          property-id (get-in property [:body :uuid])
++          _ (p/all (map #(request! self "PUT" (str "/semantic/blocks/" (ids %) "/properties/" property-id) {:value "Ann"})
++                        [:agenda :flights]))]
++    property-id))
++
++(def ^:private agenda-path (str journal-title " > Meeting > Agenda"))
++
++(deftest label-mismatch-single-target-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [property-id (add-owner! self ids)
++                before @conn
++                wrong (str journal-title " > Notes")
++                block (str "/semantic/blocks/" (ids :agenda))
++                calls [["insertBlockChildren" "POST" (str block "/children") {:position "append" :blocks [{:title "x"}]}]
++                       ["insertBlockTree" "POST" "/semantic/block-trees" {:target-id (ids :agenda) :blocks [{:title "x"}]}]
++                       ["updateBlock" "PATCH" block {:title "Renamed"}]
++                       ["deleteBlock" "DELETE" block nil]
++                       ["setBlockProperty" "PUT" (str block "/properties/" property-id) {:value "Bo"}]
++                       ["deleteBlockProperty" "DELETE" (str block "/properties/" property-id) nil]
++                       ["moveBlocks" "POST" "/semantic/block-moves"
++                        {:block-ids [(ids :flights)] :target-id (ids :agenda) :position "last-child"}]]
++                responses (p/all (map (fn [[_ method path body]] (request! self method (labelled path wrong) body)) calls))]
++          (doseq [[[operation] response] (map vector calls responses)]
++            (is (= [409 (mismatch wrong agenda-path)] (refused response)) operation))
++          (is (= unchanged (graph-diff before @conn)) "the graph is unchanged, datom for datom"))))))
++
++(deftest label-mismatch-batch-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [property-id (add-owner! self ids)
++                before @conn
++                notes (str journal-title " > Notes")
++                calls [["batchInsertBlockTrees" "POST" "/semantic/block-trees/batch"
++                        {:entries [{:target-id (ids :notes) :target-label notes :blocks [{:title "x"}]}
++                                   {:target-id (ids :agenda) :target-label notes :blocks [{:title "y"}]}]}]
++                       ["batchMoveBlocks" "POST" "/semantic/block-moves/batch"
++                        {:moves [{:block-ids [(ids :c1)] :target-id (ids :notes) :target-label notes :position "last-child"}
++                                 {:block-ids [(ids :c2)] :target-id (ids :agenda) :target-label notes :position "last-child"}]}]
++                       ["batchSetBlockProperty" "POST" "/semantic/block-properties/batch-set"
++                        {:entries [{:block-id (ids :notes) :property-id property-id :value "Bo" :target-label notes}
++                                   {:block-id (ids :agenda) :property-id property-id :value "Bo" :target-label notes}]}]
++                       ["batchDeleteBlockProperty" "POST" "/semantic/block-properties/batch-delete"
++                        {:entries [{:block-id (ids :flights) :property-id property-id
++                                    :target-label (str notes " > Book flights")}
++                                   {:block-id (ids :agenda) :property-id property-id :target-label notes}]}]
++                       ["deleteBlocks" "DELETE" "/semantic/blocks"
++                        {:block-ids [(ids :notes) (ids :agenda)] :labels [notes notes]}]]
++                responses (p/all (map (fn [[_ method path body]] (request! self method path body)) calls))]
++          (doseq [[[operation] response] (map vector calls responses)]
++            (is (= [409 (mismatch 1 notes agenda-path)] (refused response))
++                (str operation ": entry 1 alone is named")))
++          (is (= unchanged (graph-diff before @conn)) "entry 0 was not written either")
++          (p/let [both (request! self "DELETE" "/semantic/blocks"
++                                 {:block-ids [(ids :agenda) (ids :notes) (ids :ref)]
++                                  :labels [notes notes (str journal-title " > Meeting")]})]
++            (is (= [409 (str (mismatch 0 notes agenda-path) "; "
++                             (mismatch 2 (str journal-title " > Meeting") (str journal-title " > [[Meeting]]")))]
++                   (refused both))
++                "every failing entry is named, not only the first")
++            (is (= unchanged (graph-diff before @conn)))))))))
++
++(deftest labels-length-mismatch-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [before @conn
++                notes (str journal-title " > Notes")
++                ask (fn [labels] (request! self "DELETE" "/semantic/blocks" {:block-ids [(ids :notes) (ids :ref)] :labels labels}))
++                too-many (ask [notes notes notes])
++                too-few (ask [notes])
++                not-array (ask notes)
++                not-string (ask [notes 5])
++                batch-not-string (request! self "POST" "/semantic/block-trees/batch"
++                                           {:entries [{:target-id (ids :notes) :target-label ["Notes"] :blocks [{:title "x"}]}]})]
++          (is (= [400 "labels: 3 labels for 2 block-ids"] (refused too-many)))
++          (is (= [400 "labels: 1 label for 2 block-ids"] (refused too-few)))
++          (is (= [400 "labels must be an array of strings, one per block-id"] (refused not-array)))
++          (is (= [400 "labels[1]: must be a string"] (refused not-string)))
++          (is (= [400 "entry 0: target-label must be a string"] (refused batch-not-string)))
++          (is (= unchanged (graph-diff before @conn))))))))
++
++(defn- in-order
++  "Runs each of `calls` (functions answering a promise) after the one before has finished; their results."
++  [calls]
++  (reduce (fn [results call] (p/let [out results result (call)] (conj out result)))
++          (p/resolved [])
++          calls))
++
++(defn- parent-title [conn id]
++  (:block/title (:block/parent (d/entity @conn [:block/uuid (uuid id)]))))
++
++(deftest label-match-forms-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids journal]}]
++        (p/let [property-id (add-owner! self ids)
++                q4 (request! self "POST" "/semantic/block-trees" {:target-id journal :blocks [{:title "Q4"}]})
++                q4-id (get-in q4 [:body :blocks 0 :uuid])
++                prop (fn [k] (str "/semantic/blocks/" k "/properties/" property-id))
++                results
++                (in-order
++                 [;; the page-only form on a page target
++                  #(request! self "POST" (labelled "/semantic/block-trees" journal-title)
++                            {:target-id journal :blocks [{:title "Under the page"}]})
++                  ;; every level from the page down
++                  #(request! self "POST" (labelled (str "/semantic/blocks/" (ids :call) "/children")
++                                                  (str journal-title " > Meeting > Agenda > Call Sam"))
++                            {:position "append" :blocks [{:title "Agreed"}]})
++                  ;; upper ancestors left out
++                  #(request! self "PUT" (labelled (prop (ids :agenda)) (str journal-title " > Agenda")) {:value "Bo"})
++                  ;; a snippet under 3 characters, matched in full and ignoring case
++                  #(request! self "PUT" (labelled (prop q4-id) (str journal-title " > q4")) {:value "Cy"})
++                  ;; page and block segments ignore case, and the label is checked before the rename
++                  #(request! self "PATCH" (labelled (str "/semantic/blocks/" (ids :agenda)) "NOV 5TH, 2026 > meeting > AGENDA")
++                            {:title "Plan"})
++                  ;; a 3-character prefix, and spaces round segments are trimmed
++                  #(request! self "DELETE" (labelled (prop (ids :flights)) (str " " journal-title " >  Not  > Boo ")) nil)
++                  ;; deeper than the five ancestors a breadcrumb shows
++                  #(request! self "DELETE" (labelled (str "/semantic/blocks/" (ids :leaf))
++                                                    (str journal-title " > L1 > L2 > L3 > L4 > L5 > L6 > L7 > Deep leaf"))
++                            nil)
++                  ;; a page target of a move
++                  #(request! self "POST" (labelled "/semantic/block-moves" journal-title)
++                            {:block-ids [(ids :c1)] :target-id journal :position "first-child"})])
++                notes (str journal-title " > Notes")
++                batch-tree (request! self "POST" "/semantic/block-trees/batch"
++                                     {:entries [{:target-id (ids :notes) :target-label notes :blocks [{:title "Hotel"}]}
++                                                {:target-id "2026-11-05" :target-label journal-title :blocks [{:title "By date"}]}
++                                                ;; a page the entry creates takes the page-only form of its own title
++                                                {:page "Ideas" :target-label "ideas" :blocks [{:title "One"}]}]})
++                batch-move (request! self "POST" "/semantic/block-moves/batch"
++                                     {:moves [{:block-ids [(ids :flights)] :target-id (ids :meeting)
++                                               :target-label (str journal-title " > Meeting") :position "first-child"}
++                                              ;; checked before entry 0 moves Book flights out of Notes
++                                              {:block-ids [(ids :c2)] :target-id (ids :flights)
++                                               :target-label (str notes " > Book flights") :position "first-child"}]})
++                batch-set (request! self "POST" "/semantic/block-properties/batch-set"
++                                    {:entries [{:block-id (ids :notes) :property-id property-id :value "Di" :target-label notes}]})
++                batch-delete (request! self "POST" "/semantic/block-properties/batch-delete"
++                                       {:entries [{:block-id (ids :notes) :property-id property-id :target-label "nov 5th, 2026 > NOTES"}]})
++                deleted (request! self "DELETE" "/semantic/blocks"
++                                  {:block-ids [(ids :ref) (ids :c3)]
++                                   :labels [(str journal-title " > [[Meeting]]") (str journal-title " > Call Sam > Board pack")]})]
++          (is (= 201 (:status q4)) (pr-str q4))
++          (is (= [201 201 200 200 200 200 200 200] (map :status results)) (pr-str (remove #(< (:status %) 300) results)))
++          (is (= "Plan" (:block/title (d/entity @conn [:block/uuid (uuid (ids :agenda))]))))
++          (is (gone? conn (ids :leaf)))
++          (is (= journal-title (parent-title conn (ids :c1))))
++          (is (= [201 ["Notes" journal-title "Ideas"]]
++                 [(:status batch-tree) (map (comp :snippet :target) (get-in batch-tree [:body :entries]))])
++              (pr-str batch-tree))
++          (is (= [200 "Meeting" "Book flights"]
++                 [(:status batch-move) (parent-title conn (ids :flights)) (parent-title conn (ids :c2))])
++              (pr-str batch-move))
++          (is (= [200 200] (map :status [batch-set batch-delete])) (pr-str [batch-set batch-delete]))
++          (is (= 200 (:status deleted)) (pr-str deleted))
++          (is (every? #(gone? conn (ids %)) [:ref :c3])))))))
++
++(deftest label-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids journal]}]
++        (p/let [q4 (request! self "POST" "/semantic/block-trees" {:target-id journal :blocks [{:title "Q4"}]})
++                q4-id (get-in q4 [:body :blocks 0 :uuid])
++                before @conn
++                update! (fn [id label] (request! self "PATCH" (labelled (str "/semantic/blocks/" id) label) {:title "Changed"}))
++                empty-segment (update! (ids :agenda) (str journal-title " >  > Agenda"))
++                empty-label (update! (ids :agenda) "")
++                short-prefix (update! (ids :agenda) (str journal-title " > Ag"))
++                short-snippet (update! q4-id (str journal-title " > Q"))
++                longer (update! (ids :agenda) (str journal-title " > Agendas"))
++                extra (update! (ids :notes) (str journal-title " > Whatever > Notes"))
++                page-prefix (update! (ids :notes) "Nov 5th > Notes")
++                page-only (update! (ids :notes) journal-title)
++                out-of-place (update! (ids :call) agenda-path)
++                block-on-page (request! self "POST" (labelled "/semantic/block-trees" (str journal-title " > Notes"))
++                                        {:target-id journal :blocks [{:title "x"}]})
++                e2ee (request! self "POST" (labelled "/semantic/block-moves?graph-e2ee=true" journal-title)
++                               {:block-ids [(ids :c1)] :target-id journal :position "first-child"})
++                new-page (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "Ideas" :target-label "Idea" :blocks [{:title "One"}]}]})
++                with-entry (request! self "POST" "/semantic/block-moves/batch"
++                                     {:moves [{:block-ids [(ids :c1)] :target-id (ids :notes) :position "first-child"
++                                               :target-label (str journal-title " > No")}]})]
++          (is (= [409 (str "target-label \"" journal-title " >  > Agenda\" has an empty segment")] (refused empty-segment)))
++          (is (= [409 "target-label \"\" has an empty segment"] (refused empty-label)))
++          (is (= [409 (mismatch (str journal-title " > Ag") agenda-path)] (refused short-prefix))
++              "a prefix shorter than 3 characters")
++          (is (= [409 (mismatch (str journal-title " > Q") (str journal-title " > Q4"))] (refused short-snippet))
++              "a snippet under 3 characters must be given in full")
++          (is (= [409 (mismatch (str journal-title " > Agendas") agenda-path)] (refused longer)))
++          (is (= [409 (mismatch (str journal-title " > Whatever > Notes") (str journal-title " > Notes"))] (refused extra))
++              "more segments than the target has levels")
++          (is (= [409 (mismatch "Nov 5th > Notes" (str journal-title " > Notes"))] (refused page-prefix))
++              "the page segment is the whole title")
++          (is (= [409 (mismatch journal-title (str journal-title " > Notes"))] (refused page-only))
++              "a block target needs its own segment")
++          (is (= [409 (mismatch agenda-path (str agenda-path " > " long-snippet))] (refused out-of-place))
++              "the last segment is the target itself")
++          (is (= [409 (mismatch (str journal-title " > Notes") journal-title)] (refused block-on-page))
++              "a page target takes the page-only form")
++          (is (= [400 "target-label: labels can't be checked on an E2EE graph, where titles are encrypted; leave it out"]
++                 (refused e2ee)))
++          (is (= [409 (mismatch 0 "Idea" "Ideas")] (refused new-page))
++              "a page the batch would create takes its own title, in full")
++          (is (= [409 (mismatch 0 (str journal-title " > No") (str journal-title " > Notes"))] (refused with-entry))
++              "a 2-character prefix in a batch entry")
++          (is (= unchanged (graph-diff before @conn)) "no refused call wrote anything"))))))
++
++(deftest label-is-a-guard-only-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [notes (str journal-title " > Notes")
++                ;; A second block reading Notes, under Meeting, which the same label would also fit.
++                other (request! self "POST" "/semantic/block-trees" {:target-id (ids :meeting) :blocks [{:title "Notes"}]})
++                other-id (get-in other [:body :blocks 0 :uuid])
++                elsewhere (request! self "PATCH" (labelled (str "/semantic/blocks/" (ids :agenda)) notes) {:title "Notes moved"})
++                tree (request! self "POST" (labelled "/semantic/block-trees" notes)
++                               {:target-id (ids :agenda) :blocks [{:title "Lost"}]})
++                matched (request! self "PATCH" (labelled (str "/semantic/blocks/" other-id) notes) {:title "Meeting notes"})]
++          (is (= [409 (mismatch notes agenda-path)] (refused elsewhere)) "a label that fits another block never redirects")
++          (is (= [409 (mismatch notes agenda-path)] (refused tree)))
++          (is (= ["Agenda" "Notes"] (map #(:block/title (d/entity @conn [:block/uuid (uuid (ids %))])) [:agenda :notes])))
++          (is (= ["Sam's number" "Contract draft" "Board pack"]
++                 (map :block/title (sort-by :block/order (:block/_parent (d/entity @conn [:block/uuid (uuid (ids :call))]))))))
++          (is (= 200 (:status matched)) (pr-str matched))
++          (is (= ["Meeting notes" "Notes"]
++                 (map #(:block/title (d/entity @conn [:block/uuid (uuid %)])) [other-id (ids :notes)]))
++              "only the block the call names is written, though the label fits both"))))))
++
++(defn- transactions!
++  "Runs `call` and answers [its response, the number of transactions it made on `conn`]."
++  [conn call]
++  (let [count* (atom 0)
++        key (keyword (str "label-tx-" (random-uuid)))]
++    (d/listen! conn key (fn [{:keys [tx-data]}] (when (seq tx-data) (swap! count* inc))))
++    (-> (p/let [response (call)] [response @count*])
++        (p/finally #(d/unlisten! conn key)))))
++
++(deftest label-one-transaction-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids journal]}]
++        (p/let [property-id (add-owner! self ids)
++                notes (str journal-title " > Notes")
++                calls [["batchSetBlockProperty"
++                        #(request! self "POST" "/semantic/block-properties/batch-set"
++                                   {:entries [{:block-id (ids :notes) :property-id property-id :value "Bo" :target-label notes}
++                                              {:block-id (ids :agenda) :property-id property-id :value "Bo"
++                                               :target-label agenda-path}]})]
++                       ["batchMoveBlocks"
++                        #(request! self "POST" "/semantic/block-moves/batch"
++                                   {:moves [{:block-ids [(ids :c1)] :target-id (ids :notes) :target-label notes :position "last-child"}
++                                            {:block-ids [(ids :c2)] :target-id journal :target-label journal-title
++                                             :position "first-child"}]})]
++                       ["moveBlocks"
++                        #(request! self "POST" (labelled "/semantic/block-moves" notes)
++                                   {:block-ids [(ids :c3)] :target-id (ids :notes) :position "first-child"})]
++                       ["deleteBlockProperty"
++                        #(request! self "DELETE" (labelled (str "/semantic/blocks/" (ids :flights) "/properties/" property-id)
++                                                           (str notes " > Book flights"))
++                                   nil)]
++                       ["deleteBlock"
++                        #(request! self "DELETE" (labelled (str "/semantic/blocks/" (ids :c1)) (str notes " > Sam's")) nil)]
++                       ["deleteBlocks"
++                        #(request! self "DELETE" "/semantic/blocks"
++                                   {:block-ids [(ids :c2) (ids :ref)]
++                                    :labels [(str journal-title " > Contract") (str journal-title " > [[Meeting]]")]})]]
++                results (in-order (map (fn [[operation call]]
++                                         #(p/let [result (transactions! conn call)] [operation result]))
++                                       calls))]
++          (doseq [[operation [response transactions]] results]
++            (is (= 200 (:status response)) (str operation " " (pr-str response)))
++            (is (= 1 transactions) (str operation ": the label check and the write are one transaction"))))))))
++
++(deftest label-openapi-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        operations (into {} (for [[_ methods] (:paths document)
++                                  [_ operation] methods
++                                  :when (map? operation)]
++                              [(:operationId operation) operation]))
++        body (fn [operation-id] (get-in operations [operation-id :requestBody :content "application/json" :schema :properties]))]
++    (testing "the seven single-target writes take a target-label query parameter"
++      (doseq [operation-id ["insertBlockChildren" "insertBlockTree" "updateBlock" "deleteBlock"
++                            "setBlockProperty" "deleteBlockProperty" "moveBlocks"]]
++        (let [parameter (some #(when (= "target-label" (:name %)) %) (get-in operations [operation-id :parameters]))]
++          (is (= {:in "query" :schema {:type "string"}} (select-keys parameter [:in :schema])) operation-id)
++          (is (string/includes? (str (:description parameter)) "never") operation-id))))
++    (testing "each batch entry takes a target-label"
++      (doseq [[operation-id field] [["batchInsertBlockTrees" :entries] ["batchMoveBlocks" :moves]
++                                    ["batchSetBlockProperty" :entries] ["batchDeleteBlockProperty" :entries]]]
++        (is (= "string" (get-in (body operation-id) [field :items :properties :target-label :type])) operation-id)))
++    (testing "each of them documents the 409 a mismatch answers"
++      (doseq [operation-id ["insertBlockChildren" "insertBlockTree" "updateBlock" "deleteBlock" "setBlockProperty"
++                            "deleteBlockProperty" "moveBlocks" "batchInsertBlockTrees" "batchMoveBlocks"
++                            "batchSetBlockProperty" "batchDeleteBlockProperty" "deleteBlocks"]]
++        (is (string/includes? (get-in operations [operation-id :responses "409" :description]) "target-label") operation-id)))
++    (testing "deleteBlocks takes labels parallel to block-ids"
++      (is (= {:type "array" :items {:type "string"}} (select-keys (:labels (body "deleteBlocks")) [:type :items]))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 index c922306..5d6f576 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
