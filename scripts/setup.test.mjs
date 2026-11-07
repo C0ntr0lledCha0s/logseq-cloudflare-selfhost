@@ -24,11 +24,12 @@ const NOT_FOUND = "gh: Not Found (HTTP 404)\n";
 const FORBIDDEN = "gh: Resource not accessible by personal access token (HTTP 403)\n";
 
 // Stub scripts record `<name> <args>` in $SETUP_STUB_LOG. A fresh `init-env.sh` (no --push-only)
-// writes the .env.local that the later stages read.
+// writes the .env.local that the later stages read, and records INIT_ENV_CALLER in $SETUP_STUB_LOG.caller.
 const stubScript = (name, extra = "") => `#!/usr/bin/env bash
 echo "${name} $*" >> "$SETUP_STUB_LOG"
 ${extra}`;
 const initEnvWrites = `if [ "\${1:-}" != "--push-only" ]; then
+  echo "INIT_ENV_CALLER=\${INIT_ENV_CALLER:-}" >> "$SETUP_STUB_LOG.caller"
   umask 077
   {
     for n in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN; do
@@ -135,6 +136,7 @@ async function setup({ args = ["--yes"], input = "", rules = ghRules(), envLocal
       ...out,
       dir,
       scripts: existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [],
+      callers: existsSync(`${log}.caller`) ? readFileSync(`${log}.caller`, "utf8").split("\n").filter(Boolean) : [],
       ghCalls: gh.calls().map((c) => c.argv),
     };
   } finally {
@@ -153,7 +155,8 @@ test("a fresh run sets everything up, in order, and ends by claiming the owner",
     "init-env.sh ",
     "doctor.sh ",
     `init-env.sh --push-only ${SECRETS.join(" ")}`,
-    "run-deploy.sh --if-not-green",
+    // Stage 6 pushed, so the deploy runs whatever the last run's result.
+    "run-deploy.sh ",
     "allow-user.sh --owner",
   ]);
   assert.deepEqual(writes(out.ghCalls), [
@@ -202,6 +205,12 @@ test("a 303 for the main policy (it exists already) is not an error", async () =
   const out = await setup({ rules, envLocal: finishedEnv });
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.ok(out.stdout.includes("environment: added the main branch policy"), out.stdout);
+});
+
+test("init-env.sh is run as setup's, so it doesn't tell you to copy the values to GitHub (stage 6 does)", async () => {
+  const out = await setup({ rules: freshRules() });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.deepEqual(out.callers, ["INIT_ENV_CALLER=setup"]);
 });
 
 test("the repo is named, and a repo that isn't a fork gets bump-upstream and a warning", async () => {
@@ -312,16 +321,18 @@ test("--yes skips the repo prompt and the passphrase wait", async () => {
   assert.ok(!out.stdout.includes("Press Enter"), out.stdout);
 });
 
-test("partial push: only the missing names are pushed, and --repush pushes all seven", async () => {
+test("partial push: only the missing names are pushed, and --repush pushes all seven; either way the deploy runs", async () => {
   const five = SECRETS.slice(0, 5);
   const rules = ghRules({ over: [{ match: ["secret", "list"], stdout: JSON.stringify(five.map((name) => ({ name }))) }] });
   const partial = await setup({ rules, envLocal: finishedEnv });
   assert.equal(partial.status, 0, partial.stdout + partial.stderr);
   assert.deepEqual(pushes(partial.scripts), [`init-env.sh --push-only ${SECRETS.slice(5).join(" ")}`]);
+  assert.equal(partial.scripts.at(-1), "run-deploy.sh ");
 
+  // The last deploy was green, but the Worker still runs with the old values until a new one.
   const repush = await setup({ args: ["--yes", "--repush"], envLocal: finishedEnv });
   assert.equal(repush.status, 0, repush.stdout + repush.stderr);
-  assert.deepEqual(pushes(repush.scripts), [`init-env.sh --push-only ${SECRETS.join(" ")}`]);
+  assert.deepEqual(repush.scripts, ["doctor.sh ", `init-env.sh --push-only ${SECRETS.join(" ")}`, "run-deploy.sh "]);
 });
 
 test("a name outside the required seven is neither counted nor pushed", async () => {

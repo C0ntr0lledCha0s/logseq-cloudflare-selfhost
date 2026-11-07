@@ -26,6 +26,8 @@
 #   when missing, the four connector inputs and DB_SYNC_ALLOWED_USERS) are read from the environment when set, otherwise
 #   prompted for on the terminal (the token and the GitHub client secret silently). A fresh run
 #   takes DB_SYNC_ALLOWED_USERS from the template (`none`), never from the environment.
+# Env: INIT_ENV_CALLER=setup (set by setup.sh, which pushes the values itself) leaves out the "copy the
+#   values to GitHub" next step.
 # Env (TEST ONLY): INIT_ENV_REPO_ROOT overrides the repo root (where .env.local is written and
 #   .env.local.example is read); honoured only together with INIT_ENV_TEST=1.
 # Never prints secret values and never overwrites an existing .env.local (--add-missing only appends).
@@ -406,6 +408,6 @@ esac
 if [[ "$add_names " == *" $allowed_users_name "* && "${DB_SYNC_ALLOWED_USERS:-}" = "none" ]]; then
   echo "  - Your first sign-in will be refused. Sign in once, then run scripts/allow-user.sh --owner to add your ID to DB_SYNC_ALLOWED_USERS: README section 9.1."
 fi
-if [ "$push" != 1 ]; then
+if [ "$push" != 1 ] && [ "${INIT_ENV_CALLER:-}" != "setup" ]; then
   echo "  - Copy the values to the GitHub production environment (README 1.8)."
 fi

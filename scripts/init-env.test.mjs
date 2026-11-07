@@ -539,6 +539,23 @@ test("--add-missing accepts a 253-character lowercase CONNECTOR_HOSTNAME", { tim
   });
 });
 
+test("a fresh run says to copy the values to GitHub, unless setup.sh runs it (setup pushes them itself)", { timeout: 60000 }, async () => {
+  const copyLine = "Copy the values to the GitHub production environment (README 1.8)";
+  await withDir(async (dir) => {
+    const r = await run(dir);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(r.stdout.includes(copyLine), r.stdout);
+  });
+  await withDir(async (dir) => {
+    const r = await run(dir, [], { INIT_ENV_CALLER: "setup" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(!r.stdout.includes(copyLine), r.stdout);
+    // The other next steps stay.
+    assert.match(r.stdout, /TOFU_ENCRYPTION_PASSPHRASE/);
+    assert.match(r.stdout, /scripts\/allow-user\.sh --owner/);
+  });
+});
+
 // --- DB_SYNC_ALLOWED_USERS ---
 
 test("fresh run writes DB_SYNC_ALLOWED_USERS=none, whatever the environment holds, and says what to do next", { timeout: 60000 }, async () => {

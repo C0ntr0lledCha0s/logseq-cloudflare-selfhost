@@ -2,8 +2,8 @@
 # One command from a fresh fork to a deployed server whose owner is being claimed.
 # Usage: setup.sh [--yes] [--repush] [--deploy]   (run from inside your clone; needs gh, node 22+, openssl, git)
 #   --yes      don't ask: skip the repo question and the wait for you to save the passphrase
-#   --repush   push all seven secrets again, not just the missing ones (after editing .env.local)
-#   --deploy   run the deploy even when the latest one succeeded
+#   --repush   push all seven secrets again, not just the missing ones (after editing .env.local), and deploy
+#   --deploy   run the deploy even when the latest one succeeded (it always runs after stage 6 pushed anything)
 # Eight stages, in order. Each checks whether its work is already done and says `done` if so, so
 # re-running continues from the stage that failed, and a finished install is left as it is:
 #   1 prerequisites  2 which repo  3 values (.env.local)  4 checks (doctor)  5 GitHub settings
@@ -111,7 +111,8 @@ if [ ! -f "$env_file" ]; then
   fi
   echo "Create the Cloudflare API token with this link, then paste it below:"
   node "$scripts/token-link.mjs"
-  "$scripts/init-env.sh"
+  # Stage 6 pushes the values, so init-env.sh leaves out its "copy them to GitHub" step.
+  INIT_ENV_CALLER=setup "$scripts/init-env.sh"
   [ -f "$env_file" ] || fail "init-env.sh didn't write .env.local: fix what it reported, then re-run scripts/setup.sh"
 else
   echo "done"
@@ -219,16 +220,19 @@ missing=()
 for name in $required_secrets; do
   if [ "$repush" = 1 ] || ! has_line "$name" "$present"; then missing+=("$name"); fi
 done
+pushed=0
 if [ "${#missing[@]}" -eq 0 ]; then
   echo "done"
 else
   echo "pushing ${missing[*]}"
   "$scripts/init-env.sh" --push-only "${missing[@]}"
+  pushed=1
 fi
 
 # ---- 7. First deploy ----
 stage 7 "First deploy"
-if [ "$deploy" = 1 ]; then deploy_args=(); else deploy_args=(--if-not-green); fi
+# A pushed secret reaches the Workers only with a new deploy, so a green last run doesn't count then.
+if [ "$deploy" = 1 ] || [ "$pushed" = 1 ]; then deploy_args=(); else deploy_args=(--if-not-green); fi
 "$scripts/run-deploy.sh" ${deploy_args[@]+"${deploy_args[@]}"} || fail "the deploy didn't succeed: fix what it reported, then re-run scripts/setup.sh"
 
 # ---- 8. Next steps ----
