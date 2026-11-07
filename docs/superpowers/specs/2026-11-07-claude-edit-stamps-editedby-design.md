@@ -256,3 +256,31 @@ An entity is a target when, in the after-db, it has `:block/page` and no `:logse
 **Mutation check** (one line each, in a scratch copy): leaving out `:block/title`, `:block/parent`, `:block/order`, tag retractions, property attributes, property retractions, the `:block/page` check or the value-block exclusion, transacting the stamp outside the `tx-conn`, or removing the refusal from the single set, the single delete or the batch check each fails a test. `:block/parent` survived until a test moved a block whose new order key equals its old one.
 
 **Cost.** Two datoms per stamped block and one pass over the write's datoms, with an entity read for each distinct entity a qualifying datom names. No query per block, no Worker request, D1 row or neuron.
+
+### Stage 3: the Claude Activity page
+
+**What is created.** `ensure-activity-page!` runs in `authored-write!`'s `tx-conn` on a flagged write, after the stamps are transacted (so the page's own blocks are never stamped), and only when nothing holds the `:block/name` `claude activity`. It creates the page with `outliner-page/create!` and two blocks, "Edited by Claude since yesterday" and "Edited by Claude in the last 7 days", each made as the app's advanced-query command makes one: tagged Query, the query text in the `:logseq.property/query` value block shown as code (`display-type :code`, `lang clojure`), plus `table/sorting` `[{:id :user.property/claude-editedAt :asc? false}]`. The query block is the view the app's table reads its sorting from (`query/view.cljs` passes the block's UUID), so newest first comes from the view, not the query. The view is a table because that is View Type's default; setting it explicitly changed no outcome (a mutation removing it survived), so it was dropped. Everything shares the write's tx id; a second flagged write adds nothing.
+
+**The query text** (pinned in `semantic-edit-stamps-test`; the week view differs only in `:-7d-ms`):
+
+```clojure
+{:query [:find (pull ?b [*])
+         :in $ ?since
+         :where
+         [?b :user.property/claude-editedBy ?by]
+         [?by :block/uuid #uuid "3072a652-18e8-4dcb-bb37-e1aa38c8e3e9"]
+         [?b :user.property/claude-editedAt ?at]
+         [(>= ?at ?since)]]
+ :inputs [:-1d-ms]
+ :remove-block-children? false}
+```
+
+The choice is matched by its fixed UUID, never its title. `:remove-block-children?` is false so a stamped child of a stamped block is listed too. With the inputs Stage 1 recorded, the day view runs from local midnight yesterday and the week view from local midnight seven days back: a block stamped now, 23 hours or exactly 24 hours ago is in both, six days ago only in the week view, eight days ago in neither. The test runs the stored text as the app's `execute-custom-query` does (read, resolve inputs, `d/q`) and orders the rows with `logseq.db.common.view/get-view-data` over the query block, under UTC, Los Angeles and Auckland.
+
+**Order keys.** The two blocks are keyed with `db-order/gen-key` after the graph's max key (seeded by `handle`) and inserted with `:keep-block-order? true`; inserting into the empty page without it would key them `a0` and `a1`, below an existing high key.
+
+**A taken title.** Anything holding the `:block/name` (a page whose title differs only in case, a page, a tag, a property) skips the page step, and the write still stamps. A block titled Claude Activity doesn't hold a name and doesn't count. A Claude Activity page in the recycle bin still holds its name, so the page isn't recreated while it is there; the owner restores it or empties the bin (stage 4's `connector_help` text should say so).
+
+**Mutation check** (one line each, in a scratch copy): no title check, comparing `:block/title` instead of `:block/name`, no kept order, ascending sort, creating the page before the stamps, no Query tag, no code display, the week query using `:-1d-ms`, dropping the choice clause or the window clause, and creating the page on unflagged writes each fail a test.
+
+**Cost.** About 40 datoms once per graph (the page, two blocks and their two query value blocks with their properties); per flagged write, one `:block/name` index read. No Worker request, D1 row or neuron.

@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index f65a3a1..4c8427c 100644
+index f65a3a1..8937921 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -152,15 +152,19 @@
@@ -28,7 +28,7 @@ index f65a3a1..4c8427c 100644
  
  ;; A many value's entities are listed by :block/order, then by db id. Blocks, property entities and
  ;; pages under the Library or a namespace parent have an order key (a string); plain and journal
-@@ -1322,12 +1326,161 @@
+@@ -1322,12 +1326,211 @@
                     (and (contains? enabled (search-type entity))
                          (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))))
  
@@ -173,6 +173,56 @@ index f65a3a1..4c8427c 100644
 +                                 [:db/add e :user.property/claude-editedAt now]])))
 +          tx-data)))
 +
++;; The Claude Activity page (patch 0034, stage 3). The first flagged write also creates a page titled
++;; Claude Activity holding two advanced-query blocks, last day and last week, that list stamped blocks
++;; as a table (the View Type property's default) sorted by claudeEditedAt, newest first. The query text is pinned against UPSTREAM_REF
++;; in semantic-edit-stamps-test. :-1d-ms and :-7d-ms resolve, where the query runs, to local midnight
++;; one and seven days back in epoch milliseconds, which is what claudeEditedAt holds. A page, tag or
++;; property (anything holding the :block/name) already titled Claude Activity is left alone.
++
++(def ^:private activity-page-title "Claude Activity")
++
++(defn- activity-query-text
++  "An advanced query for blocks whose editedBy is the claude choice (by its fixed UUID) and whose
++  claudeEditedAt is at or after the time `input` resolves to."
++  [input]
++  (str "{:query [:find (pull ?b [*])\n"
++       "         :in $ ?since\n"
++       "         :where\n"
++       "         [?b " editedby-ident " ?by]\n"
++       "         [?by :block/uuid #uuid \"" editedby-choice-uuid "\"]\n"
++       "         [?b :user.property/claude-editedAt ?at]\n"
++       "         [(>= ?at ?since)]]\n"
++       " :inputs [" input "]\n"
++       " :remove-block-children? false}"))
++
++(def ^:private activity-queries
++  [{:title "Edited by Claude since yesterday" :text (activity-query-text :-1d-ms)}
++   {:title "Edited by Claude in the last 7 days" :text (activity-query-text :-7d-ms)}])
++
++(defn- ensure-activity-page!
++  "Creates the Claude Activity page on `conn` (the write's tx-conn) unless something already holds
++  its :block/name. The query blocks take order keys after the graph's max key (seeded by `handle`),
++  so they never share a key with an existing block."
++  [conn]
++  (when (empty? (d/datoms @conn :avet :block/name (common-util/page-name-sanity-lc activity-page-title)))
++    (let [[_ page-uuid] (outliner-page/create! conn activity-page-title {})
++          blocks (mapv (fn [{:keys [title]}]
++                         {:block/uuid (random-uuid) :block/title title :block/order (db-order/gen-key)})
++                       activity-queries)]
++      (outliner-core/insert-blocks! conn blocks (d/entity @conn [:block/uuid page-uuid])
++                                    {:sibling? false :bottom? true :keep-uuid? true :keep-block-order? true})
++      (doseq [[{:keys [text]} {:block/keys [uuid]}] (map vector activity-queries blocks)]
++        (let [id (:db/id (d/entity @conn [:block/uuid uuid]))]
++          ;; As the app's advanced-query command makes one: tagged Query, the text in a code block.
++          (outliner-property/set-block-property! conn id :block/tags :logseq.class/Query)
++          (outliner-property/set-block-property! conn id :logseq.property/query text)
++          (let [query-id (:db/id (:logseq.property/query (d/entity @conn id)))]
++            (outliner-property/set-block-property! conn query-id :logseq.property.node/display-type :code)
++            (outliner-property/set-block-property! conn query-id :logseq.property.code/lang "clojure"))
++          (ldb/transact! conn [[:db/add id :logseq.property.table/sorting
++                                [{:id :user.property/claude-editedAt :asc? false}]]]))))))
++
 +(defn- stamp-property-refusal
 +  "Why a property write naming `property-ident` is refused: the stamp properties are set by the
 +  server only, with or without the edit-stamp header. nil for any other property."
@@ -193,7 +243,7 @@ index f65a3a1..4c8427c 100644
  
  (defn- created-by-tx [before after datoms creator]
    (let [targets (into #{}
-@@ -1361,7 +1514,12 @@
+@@ -1361,7 +1564,12 @@
      (apply mutate conn args)
      (let [result (volatile! nil)
            metadata (volatile! nil)
@@ -206,7 +256,7 @@ index f65a3a1..4c8427c 100644
        ;; Keep identity scoped to synchronous work on an isolated connection.
        ;; The author and operation reach storage in the same transaction.
        (ldb/batch-transact-with-temp-conn!
-@@ -1369,9 +1527,19 @@
+@@ -1369,9 +1577,21 @@
         (fn [tx-conn tx-data]
           (vreset! result (apply mutate tx-conn args))
           (when-let [authorship (seq (created-by-tx before @tx-conn @tx-data creator))]
@@ -221,14 +271,16 @@ index f65a3a1..4c8427c 100644
 +           ;; Every block the write created or changed, in the same tx; the schema's own
 +           ;; entities are properties and a choice, so they never qualify.
 +           (when-let [stamps (seq (stamp-tx @tx-conn @tx-data (.now js/Date)))]
-+             (ldb/transact! tx-conn stamps))))
++             (ldb/transact! tx-conn stamps))
++           ;; After the stamps, so the page's own blocks are never stamped.
++           (ensure-activity-page! tx-conn)))
         :listen-db (fn [report]
 -                    (when (:outliner-op (:tx-meta report))
 +                    (when (and @capture? (:outliner-op (:tx-meta report)))
                        (vreset! metadata (:tx-meta report))))
         :transform-tx-meta (fn [_] @metadata))
        @result)))
-@@ -2221,7 +2389,7 @@
+@@ -2221,7 +2441,7 @@
              (when-let [reason (cond
                                  (nil? block) "block not found"
                                  (nil? property-ident) "property not found"
@@ -237,7 +289,7 @@ index f65a3a1..4c8427c 100644
                (str "entry " index ": " reason)))
            (map-indexed vector resolved))))
  
-@@ -2244,6 +2412,8 @@
+@@ -2244,6 +2464,8 @@
        (cond
          (nil? block) (http/bad-request "block not found")
          (nil? property-ident) (http/bad-request "property not found")
@@ -246,7 +298,7 @@ index f65a3a1..4c8427c 100644
          (not (contains? body :value)) (http/bad-request "missing property value")
          (:error prepared) (http/bad-request (:error prepared))
          :else
-@@ -2258,8 +2428,12 @@
+@@ -2258,8 +2480,12 @@
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
            property-ident (resolve-property-ident db (:property-id path-params))]
@@ -260,7 +312,7 @@ index f65a3a1..4c8427c 100644
          (refusing-labels
           #(do
              (atomic-write! conn creator false :remove-block-property
-@@ -2733,7 +2907,8 @@
+@@ -2733,7 +2959,8 @@
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
                (p/catch (fn [error]
@@ -270,7 +322,7 @@ index f65a3a1..4c8427c 100644
  
      :semantic/assets-get
      (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
-@@ -4437,6 +4612,17 @@
+@@ -4437,6 +4664,17 @@
      (= :semantic/block-changes handler) (handle-block-changes context)
      :else (http/not-found)))
  
@@ -288,7 +340,7 @@ index f65a3a1..4c8427c 100644
  (defn handle [{:keys [^js self route ^js url] :as context}]
    (let [conn (ensure-conn! self)
          handler (:handler route)
-@@ -4454,9 +4640,10 @@
+@@ -4454,9 +4692,10 @@
          context (assoc context :conn conn :db db :handler handler :e2ee? e2ee?
                         :path-params (:path-params route)
                         :creator (request-creator (:request context) e2ee?))]
@@ -307,10 +359,10 @@ index f65a3a1..4c8427c 100644
 +        (dispatch-handle context handler)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 new file mode 100644
-index 0000000..746164b
+index 0000000..5a890fa
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
-@@ -0,0 +1,1394 @@
+@@ -0,0 +1,1620 @@
 +(ns logseq.db-sync.semantic-edit-stamps-test
 +  "Claude edit stamps (patch 0034), stage 1: the flag and the schema. A write whose request carries
 +  x-logseq-edit-stamp: claude, from a real actor on a graph that isn't E2EE, creates two hidden
@@ -321,10 +373,13 @@ index 0000000..746164b
 +  409 before anything is stored. The probes at the top settle the spec's section 9 facts against
 +  UPSTREAM_REF. Stage 2 (at the end): a flagged write stamps each block it creates or changes with
 +  editedBy and claudeEditedAt in its own transaction, and the property tools refuse the two stamp
-+  properties. The graph has a page Notes with blocks A, B and C."
++  properties. Stage 3 (at the end): the first flagged write also creates a Claude Activity page with
++  a last-day and a last-week query block, unless a page, tag or property already holds that title.
++  The graph has a page Notes with blocks A, B and C."
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
++            [logseq.common.util :as common-util]
 +            [logseq.db :as ldb]
 +            [logseq.db-sync.common :as common]
 +            [logseq.db-sync.test-sql :as test-sql]
@@ -333,6 +388,8 @@ index 0000000..746164b
 +            [logseq.db-sync.worker.handler.index :as index-handler]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db.common.normalize :as db-normalize]
++            [logseq.db.common.order :as db-order]
++            [logseq.db.common.view :as db-view]
 +            [logseq.db.frontend.inputs :as db-inputs]
 +            [logseq.db.frontend.property :as db-property]
 +            [logseq.db.frontend.rules :as rules]
@@ -1019,6 +1076,22 @@ index 0000000..746164b
 +                  {:by (:v by) :by-tx (:tx by) :at (:v datom) :at-tx (:tx datom)}])))
 +        (holders-of db at-ident)))
 +
++(defn- activity-page
++  "The Claude Activity page the patch made: the page holding \"claude activity\" as :block/name whose
++  blocks are Query-tagged. nil when there is none."
++  [db]
++  (some (fn [datom]
++          (let [page (d/entity db (:e datom))]
++            (when (some #(= :logseq.class/Query (:db/ident %)) (mapcat :block/tags (:block/_page page)))
++              page)))
++        (d/datoms db :avet :block/name "claude activity")))
++
++(defn- activity-blocks
++  "The Activity page's top-level blocks, in page order."
++  [db]
++  (when-let [page (activity-page db)]
++    (sort-by :block/order (filter #(= (:db/id page) (:db/id (:block/parent %))) (:block/_page page)))))
++
 +(defn- traced!
 +  "Runs (write) and returns its response, the transactions it committed and the call's time window."
 +  [conn write]
@@ -1515,6 +1588,8 @@ index 0000000..746164b
 +                                      with (call flagged stamped)]
 +                                (p/recur more (conj acc [label without with])))))]
 +            (is (seq (stamps @(:conn flagged))) "the flagged graph was stamped")
++            (is (some? (activity-page @(:conn flagged))) "the flagged graph's first write made the page (stage 3)")
++            (is (nil? (activity-page @(:conn plain))))
 +            (is (empty? (holders-of @(:conn plain) at-ident)))
 +            (doseq [[label without with] results]
 +              (testing label
@@ -1705,6 +1780,209 @@ index 0000000..746164b
 +          (is (= #{a n d} (set (keys server))))
 +          (is (every? #(= choice-uuid (:by %)) (vals server)))
 +          (is (= server (view @client))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Stage 3: the Claude Activity page. The first flagged write also creates a page titled Claude
++;; Activity, unless a page, tag or property already holds the title (compared as :block/name), with
++;; two advanced-query blocks listing stamped blocks newest first as tables. The query text is pinned
++;; here: a change to it in the patch fails these tests and needs a fresh check in the app.
++
++(def ^:private pinned-day-query
++  (str "{:query [:find (pull ?b [*])\n"
++       "         :in $ ?since\n"
++       "         :where\n"
++       "         [?b :user.property/claude-editedBy ?by]\n"
++       "         [?by :block/uuid #uuid \"3072a652-18e8-4dcb-bb37-e1aa38c8e3e9\"]\n"
++       "         [?b :user.property/claude-editedAt ?at]\n"
++       "         [(>= ?at ?since)]]\n"
++       " :inputs [:-1d-ms]\n"
++       " :remove-block-children? false}"))
++
++(def ^:private pinned-week-query
++  (string/replace pinned-day-query ":-1d-ms" ":-7d-ms"))
++
++(def ^:private pinned-titles ["Edited by Claude since yesterday" "Edited by Claude in the last 7 days"])
++
++(defn- query-text [block] (:block/title (:logseq.property/query block)))
++
++(defn- run-pinned-query
++  "Runs `block`'s stored query as the app does (frontend.worker.handler.query/execute-custom-query:
++  read the text, resolve each input, d/q), then orders the rows as the app's table view does, with
++  the query block as the view (logseq.db.common.view/get-view-data). Returns UUIDs, in view order."
++  [db block]
++  (let [{:keys [query inputs]} (common-util/safe-read-string {:log-error? false} (query-text block))
++        resolved (mapv #(db-inputs/resolve-input db % {}) inputs)
++        ;; One pulled block per row, as the app's query-tuples reads them.
++        ids (map (comp :db/id first) (apply d/q query db resolved))
++        {:keys [data]} (db-view/get-view-data db (:db/id block) {:view-feature-type :query-result
++                                                                 :query-entity-ids ids})]
++    (mapv #(:block/uuid (d/entity db %)) data)))
++
++;; Before the fix the write made no page:
++;;   expected: (some? page)  actual: (not (some? nil))
++(deftest first-stamped-write-creates-the-activity-page-once-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a b c]}]
++        (p/let [unflagged (update-block! self c "C edited" signed)
++                _ (is (nil? (activity-page @conn)) "an unflagged write makes no page")
++                first-write (update-block! self a "A edited" stamped)
++                db @conn
++                page (activity-page db)
++                blocks (activity-blocks db)
++                write-tx (title-tx conn a)
++                second-db (p/let [_ (update-block! self b "B edited" stamped)] @conn)]
++          (is (= [200 200] [(:status unflagged) (:status first-write)]))
++          (is (some? page))
++          (is (= "Claude Activity" (:block/title page)))
++          (is (= 1 (count (d/datoms db :avet :block/name "claude activity"))) "one page")
++          (testing "two query blocks holding the pinned text"
++            (is (= pinned-titles (map :block/title blocks)))
++            (is (= [pinned-day-query pinned-week-query] (map query-text blocks)))
++            (doseq [block blocks]
++              (is (= #{:logseq.class/Query} (set (map :db/ident (:block/tags block)))))
++              (is (= :code (:logseq.property.node/display-type (:logseq.property/query block)))
++                  "an advanced query, shown as code")
++              (is (= "clojure" (:logseq.property.code/lang (:logseq.property/query block))))
++              (is (= :logseq.property.view/type.table (:db/ident (:logseq.property.view/type block)))
++                  "a table: View Type's default")
++              (is (= [{:id at-ident :asc? false}] (:logseq.property.table/sorting block))
++                  "newest claudeEditedAt first")))
++          (testing "in the write's own transaction"
++            (is (= #{write-tx} (set (map :tx (d/datoms db :eavt (:db/id page))))))
++            (is (= #{write-tx} (set (map :tx (mapcat #(d/datoms db :eavt (:db/id %)) blocks))))))
++          (testing "nothing on the page is stamped"
++            (is (= #{a} (set (keys (stamps db))))))
++          (testing "a second flagged write adds no page or block"
++            (is (= 1 (count (d/datoms second-db :avet :block/name "claude activity"))))
++            (is (= (map :block/uuid blocks) (map :block/uuid (activity-blocks second-db))))
++            (is (= #{a b} (set (keys (stamps second-db))))))
++          (is (empty? (validation-errors db (cons (:db/id page) (map :db/id blocks))))))))))
++
++;; Before the fix the write made no page, so there were no keys to compare:
++;;   expected: (= 2 (count orders))  actual: (not (= 2 0))
++(deftest activity-query-blocks-sort-after-the-seeded-max-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a notes]}]
++        ;; A key near the top of the range, so a key taken from the empty page ("a0") would fall
++        ;; below it.
++        (let [top "yzzzzzzzzzzzzzzzzzzzzzzzzz"]
++          (is (db-order/validate-order-key? top))
++          (d/transact! conn [{:block/uuid (random-uuid) :block/title "high" :block/order top
++                              :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                              :block/created-at 1 :block/updated-at 1}])
++          (p/let [existing (set (map :v (d/datoms @conn :avet :block/order)))
++                  response (update-block! self a "A edited" stamped)
++                  orders (map :block/order (activity-blocks @conn))]
++            (is (= 200 (:status response)))
++            (is (= 2 (count orders)))
++            (is (every? #(pos? (compare % top)) orders) (pr-str orders))
++            (is (every? (fn [order] (every? #(pos? (compare order %)) existing)) orders))
++            (is (= orders (sort orders)) "the day view first")
++            (is (every? #(= 1 (count (d/datoms @conn :avet :block/order %))) orders)
++                "no other entity holds either key")))))))
++
++;; Before the fix no case made a page, so the free-title case failed:
++;;   expected: (some? (activity-page @conn))  actual: (not (some? nil))
++(deftest a-taken-activity-title-is-left-alone-test
++  (async done
++    (-> (p/doseq [[label setup taken?]
++                  [["a page whose title differs only in case"
++                    (fn [{:keys [conn]}] (d/transact! conn [(raw-page (random-uuid) "claude activity")]) nil)
++                    true]
++                   ["a page with the same title"
++                    (fn [{:keys [self]}] (request! self "POST" "/semantic/pages" {:title "Claude Activity"}))
++                    true]
++                   ["a tag"
++                    (fn [{:keys [self]}] (request! self "POST" "/semantic/tags" {:title "Claude Activity"}))
++                    true]
++                   ["a property"
++                    (fn [{:keys [conn]}] (user-property! conn nil {} "Claude Activity") nil)
++                    true]
++                   ["a block (not a page) with the title"
++                    (fn [{:keys [self c]}] (update-block! self c "Claude Activity" signed))
++                    false]]]
++          (p/let [{:keys [conn self a] :as graph} (seed-graph)
++                  setup-response (setup graph)
++                  holders (set (map :e (d/datoms @conn :avet :block/name "claude activity")))
++                  before (set (map :e (d/datoms @conn :avet :block/page)))
++                  response (update-block! self a "A edited" stamped)]
++            (testing label
++              (when setup-response (is (<= 200 (:status setup-response) 299) (pr-str setup-response)))
++              (is (= 200 (:status response)) (pr-str response))
++              (is (= #{a} (set (keys (stamps @conn)))) "the write still stamps")
++              (if taken?
++                (do (is (= 1 (count holders)))
++                    (is (= holders (set (map :e (d/datoms @conn :avet :block/name "claude activity"))))
++                        "no second page")
++                    (is (nil? (activity-page @conn)))
++                    (is (empty? (->> (d/datoms @conn :avet :block/page)
++                                     (map :e)
++                                     (remove before)
++                                     ;; The stamp schema's claude choice lives on its property.
++                                     (remove #(:block/closed-value-property (d/entity @conn %)))))
++                        "no block was added anywhere"))
++                (is (some? (activity-page @conn)))))))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++;; Before the fix the write made no page, so there were no query blocks to run:
++;;   expected: (= 2 (count blocks))  actual: (not (= 2 0))
++(deftest pinned-activity-queries-return-the-right-rows-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a notes]}]
++        (p/let [response (update-block! self a "A edited" stamped)
++                db @conn
++                blocks (activity-blocks db)
++                _ (is (= 200 (:status response)))
++                _ (is (= 2 (count blocks)))
++                ;; A second editedBy choice, as an owner might add: blocks holding it aren't Claude's.
++                _ (outliner-property/upsert-closed-value! conn by-ident {:value "owner"})
++                decoy-choice (some #(when (= "owner" (db-property/closed-value-content %)) (:db/id %))
++                                   (closed-values @conn (d/entity @conn by-ident)))
++                choice-id (:db/id (d/entity @conn [:block/uuid choice-uuid]))
++                now (.now js/Date)
++                hour 3600000
++                ages {:now 60000 :h23 (* 23 hour) :h24 (* 24 hour) :d6 (* 6 24 hour) :d8 (* 8 24 hour)}
++                ids (into {} (map (fn [k] [k (random-uuid)])) (concat (keys ages) [:unstamped :decoy :no-time]))
++                block (fn [k text] {:block/uuid (ids k) :block/title text :block/order (db-order/gen-key)
++                                    :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                                    :block/created-at 1 :block/updated-at 1})
++                _ (d/transact! conn (map (fn [k] (block k (name k))) (keys ids)))
++                ;; A's own stamp is from the write; drop it so the rows are only the ones below.
++                _ (d/transact! conn [[:db/retract [:block/uuid a] by-ident]
++                                     [:db/retract [:block/uuid a] at-ident]])
++                _ (d/transact! conn (concat
++                                     (mapcat (fn [[k age]] [[:db/add [:block/uuid (ids k)] by-ident choice-id]
++                                                            [:db/add [:block/uuid (ids k)] at-ident (- now age)]])
++                                             ages)
++                                     [[:db/add [:block/uuid (ids :decoy)] by-ident decoy-choice]
++                                      [:db/add [:block/uuid (ids :decoy)] at-ident now]
++                                      ;; editedAt without editedBy, and editedBy without editedAt
++                                      [:db/add [:block/uuid (ids :unstamped)] at-ident now]
++                                      [:db/add [:block/uuid (ids :no-time)] by-ident choice-id]]))
++                db @conn
++                [day week] (map #(run-pinned-query db %) (activity-blocks db))
++                since-day (db-inputs/resolve-input db :-1d-ms {})
++                since-week (db-inputs/resolve-input db :-7d-ms {})
++                in-window (fn [since] (->> [:now :h23 :h24 :d6 :d8]
++                                           (filter #(>= (- now (ages %)) since))
++                                           (mapv ids)))]
++          (is (some? decoy-choice))
++          (testing "the recorded inputs: local midnight one and seven days back"
++            (is (<= (- now (* 48 hour)) since-day (- now (* 24 hour))))
++            (is (<= (- now (* 8 24 hour)) since-week (- now (* 7 24 hour)))))
++          (testing "the day view: now, 23 hours and exactly 24 hours ago, newest first"
++            (is (= (mapv ids [:now :h23 :h24]) (in-window since-day)) "what the recorded input includes")
++            (is (= (in-window since-day) day)))
++          (testing "the week view adds six days ago; eight days ago is in neither"
++            (is (= (mapv ids [:now :h23 :h24 :d6]) (in-window since-week)))
++            (is (= (in-window since-week) week)))
++          (testing "unstamped and decoy-valued blocks are absent"
++            (doseq [k [:unstamped :decoy :no-time]]
++              (is (not-any? #{(ids k)} (concat day week)) (name k)))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f2e1e92..07f3b43 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
