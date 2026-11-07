@@ -158,6 +158,8 @@ const ghRules = (extra = []) => [
   { match: ["api", `repos/${REPO}/environments/production`] },
   { match: ["secret", "set"] },
   { match: ["workflow", "run"] },
+  // run-deploy.sh reads the newest dispatched run before it dispatches: none yet.
+  { match: ["run", "list", "-R", REPO, "--workflow", "deploy.yml", "--event", "workflow_dispatch", "--limit", "1"], stdout: "[]\n" },
   {
     match: ["run", "list"],
     stdout: `${JSON.stringify([{ databaseId: 4242, createdAt: "2099-01-01T00:00:00Z", url: RUN_URL }])}\n`,

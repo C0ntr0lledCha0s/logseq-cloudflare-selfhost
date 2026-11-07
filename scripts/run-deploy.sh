@@ -52,16 +52,20 @@ if [ "$if_not_green" = 1 ]; then
   fi
 fi
 
-started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The new run is found by its ID, not its time: comparing createdAt with the local clock gave a false
+# "didn't start" when the clock ran ahead (WSL2 after sleep). Run IDs only grow, so the new run is the
+# first dispatched one with an ID above the newest before this dispatch (0 when there was none).
+previous_id="$(gh run list -R "$repo" --workflow deploy.yml --event workflow_dispatch --limit 1 --json databaseId |
+  node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8"))[0]?.databaseId ?? 0)')"
 gh workflow run deploy.yml -R "$repo" --ref main >/dev/null
 
-# The earliest dispatched run created at or after started_at, as `<id> <url>`; empty when none yet.
+# The oldest dispatched run newer than previous_id, as `<id> <url>`; empty when none yet.
 find_run() {
-  gh run list -R "$repo" --workflow deploy.yml --event workflow_dispatch --limit 5 --json databaseId,createdAt,url |
-    STARTED_AT="$started_at" node -e '
+  gh run list -R "$repo" --workflow deploy.yml --event workflow_dispatch --limit 5 --json databaseId,url |
+    PREVIOUS_ID="$previous_id" node -e '
       const runs = JSON.parse(require("fs").readFileSync(0, "utf8"))
-        .filter((run) => run.createdAt >= process.env.STARTED_AT)
-        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+        .filter((run) => run.databaseId > Number(process.env.PREVIOUS_ID))
+        .sort((a, b) => a.databaseId - b.databaseId);
       if (runs[0]) console.log(`${runs[0].databaseId} ${runs[0].url}`);
     '
 }

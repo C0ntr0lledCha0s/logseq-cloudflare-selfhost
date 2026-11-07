@@ -16,15 +16,19 @@ const PARENT = "upstream-owner/repo";
 const RUN_URL = "https://github.com/owner/repo/actions/runs/4242";
 const LIST = ["run", "list", "-R", REPO, "--workflow", "deploy.yml"];
 const json = (value) => `${JSON.stringify(value)}\n`;
-// A run created long after the script starts, and one created long before it.
-const NEW_RUN = [{ databaseId: 4242, createdAt: "2099-01-01T00:00:00Z", url: RUN_URL }];
-const OLD_RUN = [{ databaseId: 1, createdAt: "2000-01-01T00:00:00Z", url: "https://github.com/owner/repo/actions/runs/1" }];
+// The newest dispatched run before the script dispatches, and the one its dispatch starts. The new
+// run's createdAt is in the past, as when the local clock runs ahead of GitHub's (WSL2 after sleep).
+const PREVIOUS_RUN = [{ databaseId: 4000, createdAt: "2000-01-01T00:00:00Z", url: "https://github.com/owner/repo/actions/runs/4000" }];
+const NEW_RUN = [{ databaseId: 4242, createdAt: "2000-01-01T00:01:00Z", url: RUN_URL }];
 
-const rules = (...extra) => [
+/** Rules where `previous` is what the script reads before it dispatches (`--limit 1`). */
+const rulesAfter = (previous, ...extra) => [
   { match: ["repo", "view", ORIGIN, "--json", "nameWithOwner"], stdout: `${REPO}\n` },
   { match: ["repo", "view"], stdout: `${PARENT}\n` },
+  { match: [...LIST, "--event", "workflow_dispatch", "--limit", "1"], stdout: json(previous) },
   ...extra,
 ];
+const rules = (...extra) => rulesAfter(PREVIOUS_RUN, ...extra);
 const dispatched = (runs) => ({ match: [...LIST, "--event", "workflow_dispatch"], stdout: json(runs) });
 const latestOnMain = (runs) => ({ match: [...LIST, "--branch", "main"], stdout: json(runs) });
 
@@ -64,7 +68,10 @@ test("a successful run prints the URL and exits 0", { timeout: 30000 }, async ()
     const calls = argvs(gh);
     assert.ok(calls.includes(`workflow run deploy.yml -R ${REPO} --ref main`), calls.join("\n"));
     assert.ok(calls.includes(`run watch 4242 -R ${REPO} --exit-status`), calls.join("\n"));
-    assert.ok(calls.includes(`run list -R ${REPO} --workflow deploy.yml --event workflow_dispatch --limit 5 --json databaseId,createdAt,url`), calls.join("\n"));
+    const before = calls.indexOf(`run list -R ${REPO} --workflow deploy.yml --event workflow_dispatch --limit 1 --json databaseId`);
+    const dispatch = calls.indexOf(`workflow run deploy.yml -R ${REPO} --ref main`);
+    const poll = calls.indexOf(`run list -R ${REPO} --workflow deploy.yml --event workflow_dispatch --limit 5 --json databaseId,url`);
+    assert.ok(before >= 0 && before < dispatch && dispatch < poll, calls.join("\n"));
   });
 });
 
@@ -159,8 +166,27 @@ test("--if-not-green starts a run when the latest one is still in progress or th
   }
 });
 
-test("a run created before the start is ignored, and the script gives up with the Actions link", { timeout: 30000 }, async () => {
-  const ghRules = rules({ match: ["workflow", "run"] }, dispatched(OLD_RUN));
+test("the new run is the one with a newer ID than the last dispatched run, whatever the local clock says", { timeout: 30000 }, async () => {
+  const later = { databaseId: 4243, createdAt: "2000-01-01T00:02:00Z", url: "https://github.com/owner/repo/actions/runs/4243" };
+  const ghRules = rules({ match: ["workflow", "run"] }, dispatched([later, ...NEW_RUN, ...PREVIOUS_RUN]), { match: ["run", "watch"] });
+  await withGh(ghRules, async (run, gh) => {
+    const r = await run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, new RegExp(`deploy: succeeded \\(${RUN_URL}\\)`));
+    assert.ok(argvs(gh).includes(`run watch 4242 -R ${REPO} --exit-status`), argvs(gh).join("\n"));
+  });
+});
+
+test("with no dispatched run before, the first one listed is the new one", { timeout: 30000 }, async () => {
+  const ghRules = rulesAfter([], { match: ["workflow", "run"] }, dispatched(NEW_RUN), { match: ["run", "watch"] });
+  await withGh(ghRules, async (run) => {
+    const r = await run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+  });
+});
+
+test("only the run that was already there is ignored, and the script gives up with the Actions link", { timeout: 30000 }, async () => {
+  const ghRules = rules({ match: ["workflow", "run"] }, dispatched(PREVIOUS_RUN));
   await withGh(ghRules, async (run, gh) => {
     const began = Date.now();
     const r = await run();
