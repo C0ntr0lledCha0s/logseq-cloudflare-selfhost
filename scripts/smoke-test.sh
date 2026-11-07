@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Post-deploy smoke test. Usage: smoke-test.sh <base-url>
 # Env: SMOKE_PAT (optional personal access token).
+# A fresh deploy's certificate takes minutes to issue, so the first /health request
+# is retried: 10 attempts, 15 seconds apart. SMOKE_HEALTH_ATTEMPTS and
+# SMOKE_HEALTH_DELAY override that, and only when SMOKE_TEST=1 (the tests use 0 delay).
 set -euo pipefail
 
 usage() {
@@ -36,7 +39,23 @@ expect_status() { # name expected curl-args...
   if [ "$code" = "$expected" ]; then pass "$name"; else fail "$name" "$code"; fi
 }
 
-code="$(status "$base/health")"
+health_attempts=10
+health_delay=15
+if [ "${SMOKE_TEST:-}" = 1 ]; then
+  health_attempts="${SMOKE_HEALTH_ATTEMPTS:-10}"
+  health_delay="${SMOKE_HEALTH_DELAY:-15}"
+  [[ "$health_attempts" =~ ^[1-9][0-9]*$ ]] || { echo "SMOKE_HEALTH_ATTEMPTS must be a positive integer" >&2; exit 2; }
+  [[ "$health_delay" =~ ^[0-9]+$ ]] || { echo "SMOKE_HEALTH_DELAY must be a whole number of seconds" >&2; exit 2; }
+fi
+
+attempt=1
+while :; do
+  code="$(status "$base/health")"
+  [ "$code" != 200 ] && [ "$attempt" -lt "$health_attempts" ] || break
+  echo "health: $code (attempt $attempt of $health_attempts), retrying in ${health_delay}s" >&2
+  sleep "$health_delay"
+  attempt=$((attempt + 1))
+done
 if [ "$code" != 200 ]; then
   fail health "$code"
 elif [ "$(tr -d '[:space:]' <"$body")" != '{"ok":true}' ]; then

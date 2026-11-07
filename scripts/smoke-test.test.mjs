@@ -41,7 +41,14 @@ function spawnScript(args, env = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(script, args, {
       cwd: root,
-      env: { ...process.env, SMOKE_PAT: "", ...env },
+      env: {
+        ...process.env,
+        SMOKE_PAT: "",
+        SMOKE_TEST: "1",
+        SMOKE_HEALTH_ATTEMPTS: "1",
+        SMOKE_HEALTH_DELAY: "0",
+        ...env,
+      },
     });
     let stdout = "";
     let stderr = "";
@@ -172,4 +179,67 @@ test("notes when SMOKE_PAT is unset", { timeout: 120000 }, async () => {
     const withPat = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
     assert.doesNotMatch(withPat.stdout, /note: SMOKE_PAT/);
   });
+});
+
+/** A handler answering `/health` with 503 `failures` times, then as `healthy`. */
+function flaky(failures) {
+  let seen = 0;
+  const hits = () => seen;
+  const handler = (req, res) => {
+    if (req.url === "/health") {
+      seen += 1;
+      if (seen <= failures) return (res.writeHead(503), res.end("{}"));
+    }
+    return healthy(req, res);
+  };
+  return { handler, hits };
+}
+
+test("retries the first health check until it answers", { timeout: 120000 }, async () => {
+  const { handler, hits } = flaky(2);
+  await withStub(handler, async (base) => {
+    const r = await run(base, { SMOKE_HEALTH_ATTEMPTS: "3" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ok health$/m);
+    assert.equal(hits(), 3);
+  });
+});
+
+test("fails with the last status once the attempts run out", { timeout: 120000 }, async () => {
+  const { handler, hits } = flaky(2);
+  await withStub(handler, async (base) => {
+    const r = await run(base, { SMOKE_HEALTH_ATTEMPTS: "2" });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /^FAIL health: 503$/m);
+    assert.equal(hits(), 2);
+  });
+});
+
+test("does not retry a 200 with the wrong body", { timeout: 120000 }, async () => {
+  let seen = 0;
+  const h = (req, res) => {
+    if (req.url !== "/health") return healthy(req, res);
+    seen += 1;
+    res.writeHead(200);
+    res.end("{}");
+  };
+  await withStub(h, async (base) => {
+    const r = await run(base, { SMOKE_HEALTH_ATTEMPTS: "3" });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /^FAIL health: body$/m);
+    assert.equal(seen, 1);
+  });
+});
+
+test("the retry overrides are ignored without SMOKE_TEST=1", { timeout: 120000 }, async () => {
+  await withStub(healthy, async (base) => {
+    const r = await run(base, { SMOKE_TEST: "", SMOKE_HEALTH_ATTEMPTS: "0" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+  });
+});
+
+test("refuses a bad retry override", { timeout: 120000 }, async () => {
+  const r = await run("http://127.0.0.1:1", { SMOKE_HEALTH_ATTEMPTS: "0" });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /SMOKE_HEALTH_ATTEMPTS/);
 });

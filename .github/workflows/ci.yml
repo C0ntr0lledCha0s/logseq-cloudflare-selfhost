@@ -15,6 +15,16 @@ on:
         type: string
         required: false
         default: ""
+      repository:
+        description: Repository to check out; defaults to the calling repository
+        type: string
+        required: false
+        default: ""
+      ref:
+        description: Commit to check out; defaults to the triggering ref
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2

@@ -1,0 +1,125 @@
+name: sync-upstream
+
+# Forks only. The original repo moves UPSTREAM_REF and patches/ together through
+# bump-upstream; a fork takes both from its parent's main, never on its own.
+# The update PR's head is the parent's main itself: the default token can't push
+# workflow-file changes, and PRs it opens don't trigger pull_request CI. So CI runs
+# here against the parent's commit, and the result is reported as a `check` status.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: ${{ github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      parent: ${{ steps.resolve.outputs.parent }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      ahead: ${{ steps.resolve.outputs.ahead }}
+      behind: ${{ steps.resolve.outputs.behind }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Compare the parent's main with this fork's main
+        id: resolve
+        run: |
+          parent="$(gh api repos/${{ github.repository }} -q .parent.full_name)"
+          if ! printf '%s' "$parent" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "could not read the parent repository" >&2
+            exit 1
+          fi
+          parent_owner="${parent%%/*}"
+          sha="$(gh api "repos/$parent/commits/main" -q .sha)"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "could not resolve the parent's main" >&2
+            exit 1
+          fi
+          ahead="$(gh api "repos/${{ github.repository }}/compare/main...${parent_owner}:main" -q .ahead_by)"
+          if ! printf '%s' "$ahead" | grep -Eq '^[0-9]+$'; then
+            echo "could not compare with the parent's main" >&2
+            exit 1
+          fi
+          {
+            echo "parent=$parent"
+            echo "sha=$sha"
+            echo "ahead=$ahead"
+            if [ "$ahead" -gt 0 ]; then
+              echo "behind=true"
+            else
+              echo "behind=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: resolve
+    if: needs.resolve.outputs.behind == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      repository: ${{ needs.resolve.outputs.parent }}
+      ref: ${{ needs.resolve.outputs.sha }}
+
+  pr:
+    needs: [resolve, check]
+    if: always() && needs.resolve.outputs.behind == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    env:
+      PARENT: ${{ needs.resolve.outputs.parent }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      AHEAD: ${{ needs.resolve.outputs.ahead }}
+      CI_RESULT: ${{ needs.check.result }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Write PR body
+        run: |
+          {
+            echo "Brings in $AHEAD commits from $PARENT@${SHA:0:10}."
+            echo
+            echo "CI on the update: $CI_RESULT."
+            echo
+            echo "Merging deploys this server, as every merge to main does."
+          } > "$RUNNER_TEMP/pr-body.md"
+
+      - name: Create or update the update PR
+        run: |
+          parent_owner="${PARENT%%/*}"
+          number="$(gh pr list -R ${{ github.repository }} --base main --state open \
+            --json number,headRepositoryOwner,headRefName |
+            jq -r --arg owner "$parent_owner" \
+              '[.[] | select(.headRepositoryOwner.login == $owner and .headRefName == "main")][0].number // empty')"
+          title="chore: update from $PARENT"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" -R ${{ github.repository }} --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            gh pr create -R ${{ github.repository }} --base main --head "${parent_owner}:main" \
+              --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+          fi
+
+      # The PR's head is the parent's commit, so the required `check` status
+      # goes on that commit.
+      - name: Report the check status
+        run: |
+          if [ "$CI_RESULT" = success ]; then
+            state=success
+          else
+            state=failure
+          fi
+          gh api "repos/${{ github.repository }}/statuses/$SHA" \
+            -f state="$state" -f context=check -f description="CI on the update"
