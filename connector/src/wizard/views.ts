@@ -237,12 +237,16 @@ export function messagePage(status: number, title: string, message: string): Res
 }
 
 /** After a disconnect: the token still works in Logseq until the owner revokes it there. */
-export function disconnectedPage(alias: string): Response {
+export function disconnectedPage(alias: string, revokedTokens = 0): Response {
+  const tokens =
+    revokedTokens > 0
+      ? `\n<p>${revokedTokens} service ${revokedTokens === 1 ? "token that covered it was" : "tokens that covered it were"} revoked. If you reconnect this graph, create new ones on the <a href="/tokens">service tokens</a> page.</p>`
+      : "";
   return page(
     200,
     "Graph disconnected",
     `<h1>Disconnected <span class="alias">${escapeHtml(alias)}</span></h1>
-<p>Claude can no longer use this graph, and the stored token has been deleted.</p>
+<p>Claude can no longer use this graph, and the stored token has been deleted.</p>${tokens}
 <p class="callout"><strong>Also revoke the token in Logseq</strong> (Settings → Personal Access Tokens), so it stops working everywhere.</p>
 <p class="footer-links"><a href="/graphs">Back to connected graphs</a></p>`,
   );

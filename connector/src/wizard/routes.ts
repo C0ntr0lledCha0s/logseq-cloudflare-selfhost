@@ -293,11 +293,18 @@ async function replaceToken({ env, store, form }: FormCtx, alias: string): Promi
   }
 }
 
-/** POST /graphs/:alias/disconnect: deletes the graph and its stored token at once. */
-async function disconnectGraph({ store }: FormCtx, alias: string): Promise<Response> {
-  if (!(await store.get(alias))) return notFound();
+/**
+ * POST /graphs/:alias/disconnect: revokes the service tokens that cover the graph, then deletes the
+ * graph and its stored token. Tokens are scoped by graph id, so without the revoke, reconnecting the
+ * same graph would silently give old tokens their access back. Revoking first means a failure leaves
+ * the graph connected rather than the tokens live.
+ */
+async function disconnectGraph({ env, store }: FormCtx, alias: string): Promise<Response> {
+  const record = await store.get(alias);
+  if (!record) return notFound();
+  const revoked = await new ServiceTokenStore(env.DB).revokeForGraph(record.graphId, Date.now());
   await store.remove(alias);
-  return disconnectedPage(alias);
+  return disconnectedPage(alias, revoked);
 }
 
 /** GET /tokens: every token, revoked and expired ones included, with its graphs by current alias. */

@@ -176,6 +176,21 @@ export class ServiceTokenStore {
   }
 
   /**
+   * Revokes every unrevoked token whose scope includes `graphId`, and answers how many. Disconnecting
+   * a graph calls it, so reconnecting the same graph later restores no old token's access. It reads
+   * every row (json_each has no index), which is a handful: the owner's own tokens.
+   */
+  async revokeForGraph(graphId: string, now: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        "UPDATE service_tokens SET revoked_at = ? WHERE revoked_at IS NULL AND EXISTS (SELECT 1 FROM json_each(service_tokens.graph_ids) WHERE json_each.value = ?)",
+      )
+      .bind(now, graphId)
+      .run();
+    return result.meta.changes;
+  }
+
+  /**
    * Records use at most once per TOUCH_INTERVAL_MS. The condition is in the UPDATE, so two isolates
    * touching in the same hour write once. True when this call wrote.
    */

@@ -51,7 +51,21 @@ const clip = (text, token) => {
 /** The MCP endpoint: LOGSEQ_MCP_URL, else https://$LOGSEQ_MCP_HOST/mcp as .mcp.json builds it, else the default. */
 export function serverUrl(env) {
   const url = (env.LOGSEQ_MCP_URL ?? "").trim();
-  if (url) return url;
+  if (url) {
+    // The bearer goes with the first request, so a plain-http URL would send it in clear text.
+    // Only a loopback server (a local test or `wrangler dev`) may use http.
+    let parsed = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      // Refused below.
+    }
+    const loopback = parsed?.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+    if (parsed?.protocol !== "https:" && !loopback) {
+      throw new CliError(`LOGSEQ_MCP_URL must be an https:// URL (http only for localhost).\n${USAGE}`, 2);
+    }
+    return url;
+  }
   const host = (env.LOGSEQ_MCP_HOST ?? "").trim();
   return host ? `https://${host}/mcp` : DEFAULT_URL;
 }

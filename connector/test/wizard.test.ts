@@ -803,6 +803,30 @@ describe("service tokens", () => {
     return { db, measured };
   }
 
+  it("disconnecting a graph revokes every token that covers it, so reconnecting it restores no token", async () => {
+    const h = await twoGraphs();
+    const work = await create(h, { name: "nightly", access: "write" });
+    const both = await create(h, { name: "both", access: "read" }, [GRAPH_ID, OTHER_RECORD.graphId]);
+    const other = await create(h, { name: "other-only", access: "read" }, [OTHER_RECORD.graphId]);
+    expect((await mcp(h, work.token, "tools/list")).status).toBe(200);
+
+    const { res, html } = await h.page("/graphs/my-work-graph/disconnect", { csrf: h.csrf });
+    expect(res.status).toBe(200);
+    expect(html).toMatch(/2 service tokens? .*revoked/i);
+    await connect(h);
+
+    const byName = Object.fromEntries((await tokens().list()).map((t) => [t.name, t]));
+    expect(byName["nightly"]?.revokedAt).not.toBeNull();
+    expect(byName["both"]?.revokedAt).not.toBeNull();
+    expect(byName["other-only"]?.revokedAt).toBeNull();
+    const refused = await mcp(h, work.token, "tools/list");
+    expect(refused.status).toBe(401);
+    expect(JSON.stringify(refused.json)).toContain("service token 'nightly' was revoked");
+    expect((await mcp(h, both.token, "tools/list")).status).toBe(401);
+    expect((await mcp(h, other.token, "tools/list")).status).toBe(200);
+    assertNoToken();
+  });
+
   it("/tokens and /tokens/new need the owner's session; a service-token bearer alone is sent to /login", async () => {
     const h = await harness();
     const { id, token } = await tokens().create({

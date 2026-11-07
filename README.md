@@ -774,7 +774,7 @@ The token is stored encrypted and never shown again. The list shows each graph's
 
 - **Edit** its alias, mode or expiry, and whether Claude's edits are stamped (**Mark Claude's edits in the graph**, ticked by default; section 11.8);
 - **Replace token**: create a new token for the same graph in Logseq, paste it, then revoke the old one in Logseq. A read-write graph needs a `both` token;
-- **Disconnect**: Claude loses access at once and the stored token is deleted. **Also revoke the token in Logseq** (Settings → Personal Access Tokens), or it keeps working anywhere else it was copied.
+- **Disconnect**: Claude loses access at once and the stored token is deleted. Every service token that covers the graph is revoked too, so reconnecting the same graph later gives no old token its access back; create new ones on `/tokens`. **Also revoke the token in Logseq** (Settings → Personal Access Tokens), or it keeps working anywhere else it was copied.
 
 ### 11.8 What Claude can do
 
@@ -926,7 +926,7 @@ A Claude Code cloud session or scheduled task has no browser, so it can't comple
 2. **Add it to the cloud environment** as the secret `LOGSEQ_SERVICE_TOKEN`. If your connector isn't at `mcp.example.com`, add `LOGSEQ_MCP_HOST` with its hostname too.
 3. **Allow the connector in the network policy.** Unlike the claude.ai connector, this traffic goes from the session straight to your Worker, so add `mcp.example.com` to the environment's allowed domains.
 4. **Use it.** The checked-in `.mcp.json` defines a `logseq-service` server that reads `https://${LOGSEQ_MCP_HOST:-mcp.example.com}/mcp` and `${LOGSEQ_SERVICE_TOKEN}`, and `.claude/settings.json` enables it and allows its read tools without a prompt. Write tools still ask. In the session, `/mcp` should list `logseq-service` as connected, and its tools are named `mcp__logseq-service__<tool>` rather than `mcp__Logseq__<tool>`. The tools and arguments are the same.
-5. **CLI fallback.** If the MCP server isn't loaded, `node scripts/logseq-mcp.mjs list_graphs` calls a tool from bash. Pass arguments as one JSON object: `node scripts/logseq-mcp.mjs search_graph '{"graph":"notes","query":"pricing"}'`. It reads `LOGSEQ_SERVICE_TOKEN` and the server from `LOGSEQ_MCP_URL`, else `https://$LOGSEQ_MCP_HOST/mcp`, else `https://mcp.example.com/mcp`. It never takes the token as an argument and masks it in anything it prints. It exits 1 on an HTTP error, a JSON-RPC error or a tool error, and 2 on a usage error.
+5. **CLI fallback.** If the MCP server isn't loaded, `node scripts/logseq-mcp.mjs list_graphs` calls a tool from bash. Pass arguments as one JSON object: `node scripts/logseq-mcp.mjs search_graph '{"graph":"notes","query":"pricing"}'`. It reads `LOGSEQ_SERVICE_TOKEN` and the server from `LOGSEQ_MCP_URL`, else `https://$LOGSEQ_MCP_HOST/mcp`, else `https://mcp.example.com/mcp`. `LOGSEQ_MCP_URL` must be `https://` (plain `http://` only for `localhost` or `127.0.0.1`), because the token goes with the first request. It never takes the token as an argument and masks it in anything it prints. It exits 1 on an HTTP error, a JSON-RPC error or a tool error, and 2 on a usage error.
 6. **Revoke.** **Revoke** on the `/tokens` list stops a token at once. Revoked and expired tokens stay listed. To rotate, create a new token, replace the secret, then revoke the old one.
 
 What a service token can't do: manage tokens, reach a graph outside its scope, or write when it is read-only. The wizard shows each token's graphs, access, expiry and last use. Last use is updated at most once an hour per token.

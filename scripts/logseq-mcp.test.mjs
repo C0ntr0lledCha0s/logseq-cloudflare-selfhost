@@ -388,6 +388,27 @@ test("the server comes from LOGSEQ_MCP_URL, else https://$LOGSEQ_MCP_HOST/mcp as
   assert.equal(serverUrl({ LOGSEQ_MCP_HOST: "mcp.home.example" }), "https://mcp.home.example/mcp");
 });
 
+test("a non-https LOGSEQ_MCP_URL is refused before the token is sent, except on localhost", async () => {
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "ok")));
+  // 127.0.0.2 is not one of the allowed loopback names, so the stub would see the bearer if it went out.
+  const plain = s.url.replace("127.0.0.1", "127.0.0.2");
+  try {
+    for (const url of [plain, "ftp://127.0.0.2/mcp", "not a url"]) {
+      const out = await run(["list_graphs"], { LOGSEQ_SERVICE_TOKEN: TOKEN, LOGSEQ_MCP_URL: url });
+      assert.equal(out.status, 2, `${url}: ${out.stderr}`);
+      assert.match(out.stderr, /LOGSEQ_MCP_URL must be an https:\/\/ URL/, url);
+      assertNoToken(out, url);
+    }
+  } finally {
+    await s.close();
+  }
+  assert.equal(s.requests.length, 0, "nothing reached a server");
+  const { serverUrl } = await import("./logseq-mcp.mjs");
+  assert.equal(serverUrl({ LOGSEQ_MCP_URL: "http://127.0.0.1:8787/mcp" }), "http://127.0.0.1:8787/mcp", "localhost may use http");
+  assert.equal(serverUrl({ LOGSEQ_MCP_URL: "http://localhost:8787/mcp" }), "http://localhost:8787/mcp");
+  assert.equal(serverUrl({ LOGSEQ_MCP_URL: "https://mcp.example.com/mcp" }), "https://mcp.example.com/mcp");
+});
+
 test("a server that cannot be reached exits 1", async () => {
   const s = await stub(() => {});
   const url = s.url;
