@@ -1,0 +1,176 @@
+import { base64url } from "../crypto";
+
+/**
+ * Service tokens: `lsct_` bearers for unattended Claude Code cloud sessions (design
+ * docs/superpowers/specs/2026-11-07-service-token-cloud-sessions-design.md §3.2, §3.6). D1 holds only
+ * the SHA-256 of a token; the token itself is returned once, by `create`, and never stored.
+ */
+
+/** `lsct_` and the base64url of 32 random bytes: 48 characters, no colon (so OAuth KV never sees it). */
+export const TOKEN_PATTERN = /^lsct_[A-Za-z0-9_-]{43}$/;
+/** `last_used_at` is written at most once per token in this interval. */
+export const TOUCH_INTERVAL_MS = 3_600_000;
+export const MAX_EXPIRY_DAYS = 365;
+export const DEFAULT_EXPIRY_DAYS = 90;
+
+export type ServiceTokenAccess = "read" | "write";
+
+/** A token as the wizard sees it. Deliberately has no hash field. */
+export interface ServiceTokenRow {
+  id: string;
+  name: string;
+  ownerId: number;
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+}
+
+/** What verification needs from the row found by hash (§3.2 step 2). */
+export interface ServiceTokenMatch {
+  id: string;
+  name: string;
+  tokenHash: string;
+  ownerId: number;
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface NewServiceToken {
+  name: string;
+  ownerId: number;
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export function generateServiceToken(): string {
+  return `lsct_${base64url(crypto.getRandomValues(new Uint8Array(32)))}`;
+}
+
+/** SHA-256 of the whole token, as lower-case hex. A slow hash adds nothing for 256 random bits. */
+export async function hashServiceToken(token: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+interface Row {
+  id: string;
+  name: string;
+  token_hash?: string;
+  owner_id: number;
+  graph_ids: string;
+  access: ServiceTokenAccess;
+  created_at: number;
+  expires_at: number;
+  last_used_at: number | null;
+  revoked_at: number | null;
+}
+
+const PUBLIC_COLUMNS = "id, name, owner_id, graph_ids, access, created_at, expires_at, last_used_at, revoked_at";
+
+function toRow(row: Row): ServiceTokenRow {
+  return {
+    id: row.id,
+    name: row.name,
+    ownerId: row.owner_id,
+    graphIds: JSON.parse(row.graph_ids) as string[],
+    access: row.access,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    lastUsedAt: row.last_used_at,
+    revokedAt: row.revoked_at,
+  };
+}
+
+/**
+ * The service_tokens table. Every statement uses `run` or `all`, so its D1 cost can be read from
+ * `meta` (test/service-tokens.test.ts pins each: insert 4 written; hash lookup 1 read on a hit and 0
+ * on a miss; touch 1 read and at most 1 written; revoke 1 read and 1 written; list about one read a row).
+ */
+export class ServiceTokenStore {
+  constructor(private readonly db: D1Database) {}
+
+  /** Inserts a new token and returns it with its id. This is the only time the token exists outside its holder. */
+  async create(input: NewServiceToken): Promise<{ id: string; token: string }> {
+    const id = crypto.randomUUID();
+    const token = generateServiceToken();
+    await this.db
+      .prepare(
+        "INSERT INTO service_tokens (id, name, token_hash, owner_id, graph_ids, access, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        id,
+        input.name,
+        await hashServiceToken(token),
+        input.ownerId,
+        JSON.stringify(input.graphIds),
+        input.access,
+        input.createdAt,
+        input.expiresAt,
+      )
+      .run();
+    return { id, token };
+  }
+
+  async get(id: string): Promise<ServiceTokenRow | null> {
+    const { results } = await this.db.prepare(`SELECT ${PUBLIC_COLUMNS} FROM service_tokens WHERE id = ?`).bind(id).all<Row>();
+    return results[0] ? toRow(results[0]) : null;
+  }
+
+  /** Ordered by name, which the unique `name` index serves (an unindexed ORDER BY reads twice the rows). */
+  async list(): Promise<ServiceTokenRow[]> {
+    const { results } = await this.db.prepare(`SELECT ${PUBLIC_COLUMNS} FROM service_tokens ORDER BY name`).all<Row>();
+    return results.map(toRow);
+  }
+
+  /** The row whose hash matches, or null. Callers still compare the hash in constant time (§3.2 step 3). */
+  async findByHash(hash: string): Promise<ServiceTokenMatch | null> {
+    const { results } = await this.db
+      .prepare(
+        "SELECT id, name, token_hash, owner_id, graph_ids, access, expires_at, last_used_at, revoked_at FROM service_tokens WHERE token_hash = ?",
+      )
+      .bind(hash)
+      .all<Row>();
+    const row = results[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      tokenHash: row.token_hash!,
+      ownerId: row.owner_id,
+      graphIds: JSON.parse(row.graph_ids) as string[],
+      access: row.access,
+      expiresAt: row.expires_at,
+      lastUsedAt: row.last_used_at,
+      revokedAt: row.revoked_at,
+    };
+  }
+
+  /** Sets `revoked_at` once; a second revoke keeps the first time. True when this call revoked it. */
+  async revoke(id: string, now: number): Promise<boolean> {
+    const result = await this.db
+      .prepare("UPDATE service_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+      .bind(now, id)
+      .run();
+    return result.meta.changes > 0;
+  }
+
+  /**
+   * Records use at most once per TOUCH_INTERVAL_MS. The condition is in the UPDATE, so two isolates
+   * touching in the same hour write once. True when this call wrote.
+   */
+  async touch(id: string, now: number): Promise<boolean> {
+    const result = await this.db
+      .prepare("UPDATE service_tokens SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)")
+      .bind(now, id, now - TOUCH_INTERVAL_MS)
+      .run();
+    return result.meta.changes > 0;
+  }
+}
