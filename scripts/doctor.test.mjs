@@ -48,6 +48,10 @@ function greenRoutes(overrides = {}) {
   };
 }
 
+const POLICIES = `repos/${REPO}/environments/production/deployment-branch-policies`;
+const policies = (...list) => JSON.stringify({ total_count: list.length, branch_policies: list.map((p, i) => ({ id: i + 1, ...p })) });
+const MAIN_POLICY = { name: "main", type: "branch" };
+
 /** `gh variable list --json name,value` output holding CONNECTOR_ENABLED, or nothing when `value` is undefined. */
 const variableList = (value) => JSON.stringify(value === undefined ? [] : [{ name: "CONNECTOR_ENABLED", value }]);
 
@@ -63,6 +67,8 @@ function greenGh({ secrets = SECRETS, fork = false, envVariable, repoVariable, w
     [`repo view ${ORIGIN} --json nameWithOwner,isFork`, { status: 0, stdout: JSON.stringify({ nameWithOwner: REPO, isFork: fork }) }],
     ["repo view", { status: 0, stdout: JSON.stringify({ nameWithOwner: PARENT, isFork: false }) }],
     [`api repos/${REPO}/actions/permissions`, { status: 0, stdout: JSON.stringify({ enabled: true }) }],
+    // Before the environment's own rule, which is a prefix of it.
+    [`api ${POLICIES}?per_page=100`, { status: 0, stdout: policies(MAIN_POLICY) }],
     [
       `api repos/${REPO}/environments/production`,
       { status: 0, stdout: JSON.stringify({ deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }) },
@@ -582,6 +588,20 @@ test("an environment with no branch restriction is a FAIL, and so is a missing o
   assert.equal(levelOf(missing.results, "environment"), "FAIL");
 });
 
+test("a restricted environment with no main branch policy is a FAIL: every deploy of main would be refused", async () => {
+  for (const listed of [[], [{ name: "release", type: "branch" }], [{ name: "main", type: "tag" }]]) {
+    const gh = greenGh({ extra: [[`api ${POLICIES}?per_page=100`, { status: 0, stdout: policies(...listed) }]] });
+    const { results, exitCode } = await doctor({ gh });
+    const environment = only(results, "environment");
+    assert.equal(environment.level, "FAIL", JSON.stringify(listed));
+    assert.ok(environment.detail.includes("main"), environment.detail);
+    assert.ok(environment.detail.includes("scripts/setup.sh"), environment.detail);
+    assert.equal(exitCode, 1);
+  }
+  const unreadable = await doctor({ gh: greenGh({ extra: [[`api ${POLICIES}`, { status: 1, stdout: "" }]] }) });
+  assert.equal(levelOf(unreadable.results, "environment"), "FAIL");
+});
+
 test("gh not installed or not logged in is one FAIL, and no other GitHub check runs", async () => {
   const gh = { gh: () => ({ status: 127, stdout: "" }), calls: [] };
   const { results, exitCode } = await doctor({ gh });
@@ -696,6 +716,7 @@ async function runCli({ envLocal, env = {}, routes = greenRoutes(), mode = 0o600
     { match: ["repo", "view", ORIGIN], stdout: JSON.stringify({ nameWithOwner: REPO, isFork: false }) },
     { match: ["repo", "view"], stdout: JSON.stringify({ nameWithOwner: PARENT, isFork: false }) },
     { match: ["api", `repos/${REPO}/actions/permissions`], stdout: JSON.stringify({ enabled: true }) },
+    { match: ["api", `${POLICIES}?per_page=100`], stdout: policies(MAIN_POLICY) },
     {
       match: ["api", `repos/${REPO}/environments/production`],
       stdout: JSON.stringify({ deployment_branch_policy: { custom_branch_policies: true } }),

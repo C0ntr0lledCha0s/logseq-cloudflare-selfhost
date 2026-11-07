@@ -139,15 +139,32 @@ restricted=0
 if [ "$rc" -eq 0 ]; then
   printf '%s' "$gh_out" | node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).deployment_branch_policy?.custom_branch_policies === true ? 0 : 1)' && restricted=1
 fi
-if [ "$restricted" = 1 ]; then
-  echo "environment: done"
-else
+if [ "$restricted" = 0 ]; then
   # Missing, or present but open to every branch, which would let any branch read its secrets.
   gh_must gh api -X PUT "repos/$repo/environments/production" \
     -F 'deployment_branch_policy[protected_branches]=false' \
     -F 'deployment_branch_policy[custom_branch_policies]=true'
-  gh_must gh api -X POST "repos/$repo/environments/production/deployment-branch-policies" -f name=main -f type=branch
+fi
+# Restricted to named branches but with no `main` policy (an earlier run whose POST failed), every
+# deploy of main is refused, so the policy is checked on its own.
+gh_must gh api "repos/$repo/environments/production/deployment-branch-policies?per_page=100"
+has_main=0
+printf '%s' "$gh_out" | node -e '
+  const { branch_policies } = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  process.exit(branch_policies.some((p) => p.name === "main" && p.type === "branch") ? 0 : 1);
+' && has_main=1
+if [ "$has_main" = 0 ]; then
+  # GitHub answers 303 when the same policy already exists, so a repeated POST is harmless.
+  rc=0
+  gh_try gh api -X POST "repos/$repo/environments/production/deployment-branch-policies" -f name=main -f type=branch || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || fail "$gh_err"
+fi
+if [ "$restricted" = 0 ]; then
   echo "environment: created production, restricted to main"
+elif [ "$has_main" = 0 ]; then
+  echo "environment: added the main branch policy"
+else
+  echo "environment: done"
 fi
 
 gh_must gh api "repos/$repo/rulesets" --jq '.[].name'

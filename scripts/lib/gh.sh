@@ -18,8 +18,9 @@ origin_repo() {
 }
 
 # gh_try runs a gh command, keeping its output in gh_out and its error in gh_err. It returns 0 on
-# success and 4 for a 404 (the caller decides whether that means "missing"). A 403 stops with the admin
-# message, and any other failure stops with gh's own message.
+# success, 3 for a 303 (GitHub's answer when the thing being created already exists) and 4 for a 404
+# (the caller decides what each means). A 403 stops with the admin message, and any other failure
+# stops with gh's own message.
 gh_out=""
 gh_err=""
 gh_try() {
@@ -32,6 +33,7 @@ gh_try() {
   gh_err="$(cat "$errfile")"
   rm -f "$errfile"
   case "$gh_err" in
+    *"HTTP 303"*) return 3 ;;
     *"HTTP 404"*) return 4 ;;
     *"HTTP 403"*)
       local login
@@ -41,7 +43,7 @@ gh_try() {
     *) fail "$gh_err" ;;
   esac
 }
-# Like gh_try, but a 404 stops too.
+# Like gh_try, but a 303 or a 404 stops too.
 gh_must() {
   local rc=0
   gh_try "$@" || rc=$?

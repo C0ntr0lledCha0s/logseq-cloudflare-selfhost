@@ -63,6 +63,10 @@ function makeRoot({ envLocal = null, origin = ORIGIN, upstream = null } = {}) {
   return dir;
 }
 
+const POLICIES = `repos/${REPO}/environments/production/deployment-branch-policies`;
+const policies = (...list) => JSON.stringify({ total_count: list.length, branch_policies: list.map((p, i) => ({ id: i + 1, ...p })) });
+const MAIN_POLICY = { name: "main", type: "branch" };
+
 const finishedEnv = `${SECRETS.map((n) => (n === "DB_SYNC_ALLOWED_USERS" ? `${n}=${USER}` : n === "SYNC_HOSTNAME" ? `${n}=sync.example.com` : `${n}=placeholder`)).join("\n")}\n`;
 const workflowList = (state) =>
   JSON.stringify(["backup", "usage", "sync-upstream", "bump-upstream", "deploy"].map((n) => ({ path: `.github/workflows/${n}.yml`, state })));
@@ -85,6 +89,7 @@ function ghRules({ fork = true, over = [] } = {}) {
       match: ["api", `repos/${REPO}/environments/production`],
       stdout: JSON.stringify({ deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } }),
     },
+    { match: ["api", `${POLICIES}?per_page=100`], stdout: policies(MAIN_POLICY) },
     { match: ["api", `repos/${REPO}/rulesets`], stdout: "Protect main\n" },
     { match: ["api", `repos/${REPO}/actions/permissions/workflow`], stdout: "true\n" },
     { match: ["api", `repos/${REPO}/actions/permissions`], stdout: "true\n" },
@@ -102,6 +107,7 @@ const freshRules = (opts = {}) =>
       ...(opts.over ?? []),
       { match: ["secret", "list"], stdout: "[]" },
       { match: ["api", `repos/${REPO}/environments/production`], stderr: NOT_FOUND, exit: 1 },
+      { match: ["api", `${POLICIES}?per_page=100`], stdout: policies() },
       { match: ["api", `repos/${REPO}/rulesets`], stdout: "" },
       { match: ["api", `repos/${REPO}/actions/permissions/workflow`], stdout: "false\n" },
       { match: ["workflow", "list"], stdout: workflowList("disabled_fork") },
@@ -171,6 +177,31 @@ test("a fresh run sets everything up, in order, and ends by claiming the owner",
   assert.ok(out.stdout.includes("https://dash.cloudflare.com/?to=/:account/api-tokens"), out.stdout);
   assert.ok(out.stdout.includes("Your server is at https://sync.example.com."), out.stdout);
   assert.ok(!out.stdout.includes("placeholder"), "no secret value is printed");
+});
+
+test("a restricted environment with no main policy gets the policy, and nothing else is rewritten", async () => {
+  // The PUT succeeded on an earlier run and the POST of main didn't: every deploy of main would be refused.
+  for (const listed of [[], [{ name: "release", type: "branch" }], [{ name: "main", type: "tag" }]]) {
+    const rules = ghRules({ over: [{ match: ["api", `${POLICIES}?per_page=100`], stdout: policies(...listed) }] });
+    const out = await setup({ rules, envLocal: finishedEnv });
+    assert.equal(out.status, 0, out.stdout + out.stderr);
+    assert.deepEqual(writes(out.ghCalls), [`POST ${POLICIES}`], JSON.stringify(listed));
+    const post = out.ghCalls.find((a) => a[2] === "POST" && a[3] === POLICIES);
+    assert.deepEqual(post.slice(4), ["-f", "name=main", "-f", "type=branch"]);
+    assert.ok(out.stdout.includes("environment: added the main branch policy"), out.stdout);
+  }
+});
+
+test("a 303 for the main policy (it exists already) is not an error", async () => {
+  const rules = ghRules({
+    over: [
+      { match: ["api", `${POLICIES}?per_page=100`], stdout: policies() },
+      { match: ["api", "-X", "POST", POLICIES], stderr: "gh: See Other (HTTP 303)\n", exit: 1 },
+    ],
+  });
+  const out = await setup({ rules, envLocal: finishedEnv });
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.ok(out.stdout.includes("environment: added the main branch policy"), out.stdout);
 });
 
 test("the repo is named, and a repo that isn't a fork gets bump-upstream and a warning", async () => {

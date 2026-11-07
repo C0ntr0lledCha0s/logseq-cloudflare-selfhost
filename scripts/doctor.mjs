@@ -334,7 +334,15 @@ async function checkGithub({ env, gh, originUrl, add, connectorOn }) {
   } else if (environment.value.deployment_branch_policy?.custom_branch_policies !== true) {
     add("FAIL", "environment", "the production environment isn't restricted to named branches, so any branch could read its secrets: run scripts/setup.sh (README 1.8)");
   } else {
-    add("ok", "environment", "the production environment is restricted to named branches");
+    // Restricted with no `main` policy, every deploy of main is refused.
+    const policies = json(["api", `repos/${repo}/environments/production/deployment-branch-policies?per_page=100`]);
+    if (!policies.ok) {
+      add("FAIL", "environment", "couldn't read the production environment's branch policies: run gh auth status, and check you can administer the repo");
+    } else if (!policies.value.branch_policies?.some((p) => p?.name === "main" && p?.type === "branch")) {
+      add("FAIL", "environment", "the production environment has no main branch policy, so every deploy of main is refused: run scripts/setup.sh (README 1.8)");
+    } else {
+      add("ok", "environment", "the production environment is restricted to main");
+    }
   }
 
   const secrets = json(["secret", "list", "-R", repo, "--env", "production", "--json", "name"]);
