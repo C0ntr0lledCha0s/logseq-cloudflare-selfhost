@@ -26,15 +26,15 @@ fi
 ${fail ? "exit 1" : ""}
 `;
 
-/** A temp repo root: stub scripts, the real env-file.mjs, and a .env.local (or none). */
+/** A temp repo root: stub scripts, the real env-file.mjs and lib/gh.sh, and a .env.local (or none). */
 function makeRoot({ envLocal, failing = [] }) {
   const dir = mkdtempSync(join(tmpdir(), "enable-connector-"));
-  mkdirSync(join(dir, "scripts"));
+  mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
   for (const name of ["init-env.sh", "doctor.sh", "run-deploy.sh"]) {
     writeFileSync(join(dir, "scripts", name), stub(name, failing.includes(name)));
     chmodSync(join(dir, "scripts", name), 0o755);
   }
-  copyFileSync(join(root, "scripts", "env-file.mjs"), join(dir, "scripts", "env-file.mjs"));
+  for (const name of ["env-file.mjs", "lib/gh.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
   if (envLocal !== null) {
     writeFileSync(join(dir, ".env.local"), envLocal);
     chmodSync(join(dir, ".env.local"), 0o600);
@@ -132,16 +132,42 @@ test("a hostname that only ends with the domain's text, not a dot and the domain
   assert.deepEqual(out.scripts, []);
 });
 
-test("when the connector is already on in .env.local and on GitHub, nothing else runs", async () => {
-  const out = await enable({
-    envLocal: baseEnv("true"),
-    rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stdout: "true\n" }]),
-  });
+const alreadyOn = (extra = {}) => ({
+  envLocal: `${baseEnv("true")}CONNECTOR_HOSTNAME=mcp.example.com\n`,
+  rules: ghRules([{ match: ["variable", "get", "CONNECTOR_ENABLED"], stdout: "true\n" }]),
+  ...extra,
+});
+
+test("when the connector is already on in .env.local and on GitHub, it checks, deploys only if the last deploy isn't green, and prints the next steps", async () => {
+  const out = await enable(alreadyOn());
   assert.equal(out.status, 0, out.stdout + out.stderr);
   assert.ok(out.stdout.includes("the connector is already on"), out.stdout);
-  assert.deepEqual(out.scripts, []);
+  assert.deepEqual(out.scripts, ["doctor.sh ", "run-deploy.sh --if-not-green"]);
   assert.deepEqual(variableSets(out.ghCalls), []);
   assert.deepEqual(out.ghCalls.map((a) => a[0]), ["repo", "variable"]);
+  assert.ok(out.stdout.includes("https://mcp.example.com/mcp"), out.stdout);
+});
+
+test("already on with a failing doctor exits 1 without deploying, and says a re-run continues", async () => {
+  const out = await enable(alreadyOn({ failing: ["doctor.sh"] }));
+  assert.equal(out.status, 1);
+  assert.deepEqual(out.scripts, ["doctor.sh "]);
+  assert.ok(out.stderr.includes("fix the FAIL lines above, then re-run scripts/enable-connector.sh"), out.stderr);
+  assert.ok(!out.stderr.includes("already on"), out.stderr);
+});
+
+test("already on with a failing deploy exits 1 and prints no next steps", async () => {
+  const out = await enable(alreadyOn({ failing: ["run-deploy.sh"] }));
+  assert.equal(out.status, 1);
+  assert.deepEqual(out.scripts, ["doctor.sh ", "run-deploy.sh --if-not-green"]);
+  assert.ok(!out.stdout.includes("https://mcp.example.com/mcp"), out.stdout);
+});
+
+test("already on but no CONNECTOR_HOSTNAME in .env.local stops before any check", async () => {
+  const out = await enable(alreadyOn({ envLocal: baseEnv("true") }));
+  assert.equal(out.status, 1);
+  assert.ok(out.stderr.includes("CONNECTOR_HOSTNAME isn't set in .env.local"), out.stderr);
+  assert.deepEqual(out.scripts, []);
 });
 
 test("on in .env.local but unset on GitHub (a 404) carries on and sets the variable", async () => {
@@ -157,19 +183,19 @@ test("on on GitHub but off in .env.local carries on and corrects the file", asyn
   assert.ok(out.envLocal.endsWith("CONNECTOR_ENABLED=true\n"), out.envLocal);
 });
 
-test("a failing doctor stops before the deploy and names the way on", async () => {
+test("a failing doctor stops before the deploy and says a re-run continues", async () => {
   const out = await enable({ failing: ["doctor.sh"] });
   assert.equal(out.status, 1);
   assert.deepEqual(out.scripts, ["init-env.sh --add-missing --push", "doctor.sh "]);
-  assert.ok(out.stderr.includes("fix the FAIL lines above"), out.stderr);
-  assert.ok(out.stderr.includes("scripts/run-deploy.sh"), out.stderr);
+  assert.ok(out.stderr.includes("fix the FAIL lines above, then re-run scripts/enable-connector.sh"), out.stderr);
 });
 
-test("a failing deploy exits 1 and names the retry", async () => {
+test("a failing deploy exits 1 and says a re-run continues", async () => {
   const out = await enable({ failing: ["run-deploy.sh"] });
   assert.equal(out.status, 1);
   assert.deepEqual(out.scripts, ["init-env.sh --add-missing --push", "doctor.sh ", "run-deploy.sh "]);
   assert.ok(out.stderr.includes("the deploy didn't succeed"), out.stderr);
+  assert.ok(out.stderr.includes("re-run scripts/enable-connector.sh"), out.stderr);
   assert.ok(!out.stdout.includes("https://mcp.example.com/mcp"), "no next steps after a failed deploy");
 });
 

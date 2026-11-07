@@ -38,14 +38,14 @@ fi
 /** A temp repo root: stub scripts, the real helpers setup.sh calls, the ruleset, and a GitHub origin. */
 function makeRoot({ envLocal = null, origin = `https://github.com/${REPO}.git` } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "setup-"));
-  mkdirSync(join(dir, "scripts"));
+  mkdirSync(join(dir, "scripts", "lib"), { recursive: true });
   mkdirSync(join(dir, "config"));
   mkdirSync(join(dir, ".github", "rulesets"), { recursive: true });
   for (const [name, extra] of [["init-env.sh", initEnvWrites], ["doctor.sh", ""], ["run-deploy.sh", ""], ["allow-user.sh", ""]]) {
     writeFileSync(join(dir, "scripts", name), stubScript(name, extra));
     chmodSync(join(dir, "scripts", name), 0o755);
   }
-  for (const name of ["token-link.mjs", "env-file.mjs"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
+  for (const name of ["token-link.mjs", "env-file.mjs", "lib/gh.sh"]) copyFileSync(join(root, "scripts", name), join(dir, "scripts", name));
   copyFileSync(join(root, "config", "token-permissions.json"), join(dir, "config", "token-permissions.json"));
   copyFileSync(join(root, ".github", "rulesets", "protect-main.json"), join(dir, ".github", "rulesets", "protect-main.json"));
   if (envLocal !== null) {

@@ -4,7 +4,8 @@
 # Steps, in order: hostname, OAuth app details, your GitHub user ID, secrets (init-env.sh), the
 # CONNECTOR_ENABLED setting (.env.local and the GitHub variable), checks (doctor.sh), deploy.
 # It stops before the deploy if a check fails. A value already in .env.local is used as it is and not
-# asked for again, so re-running after a failure continues from where it stopped.
+# asked for again. Re-running when the connector is already on runs the checks, deploys if the latest
+# deploy isn't green, and prints the next steps, so a re-run after a failure continues.
 # CONNECTOR_HOSTNAME, GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET can be exported to skip their prompts.
 # Secrets never appear in arguments or output: init-env.sh reads them from the environment.
 # Prompts and handles secrets, so it refuses to run in GitHub Actions.
@@ -38,37 +39,9 @@ fail() {
   exit 1
 }
 
-# Every gh call has stdin closed, so none can prompt or take what the user types for this script's questions.
-# (Same helper as setup.sh.) Runs a gh command, keeping its output in gh_out and its error in gh_err.
-# Returns 0 on success and 4 for a 404 (the caller decides what that means). A 403 stops with the admin
-# message, and any other failure stops with gh's own message.
-gh_out=""
-gh_err=""
-gh_try() {
-  local errfile
-  errfile="$(mktemp)"
-  if gh_out="$("$@" 2>"$errfile" </dev/null)"; then
-    rm -f "$errfile"
-    return 0
-  fi
-  gh_err="$(cat "$errfile")"
-  rm -f "$errfile"
-  case "$gh_err" in
-    *"HTTP 404"*) return 4 ;;
-    *"HTTP 403"*)
-      local login
-      login="$(gh api user -q .login 2>/dev/null </dev/null || true)"
-      fail "gh is logged in as ${login:-unknown} (gh api user -q .login), which can't change settings on $repo: it needs admin on the repo."
-      ;;
-    *) fail "$gh_err" ;;
-  esac
-}
-# Like gh_try, but a 404 stops too.
-gh_must() {
-  local rc=0
-  gh_try "$@" || rc=$?
-  [ "$rc" -eq 0 ] || fail "$gh_err"
-}
+# gh_try and gh_must (stdin closed on every gh call, 404 and 403 told apart) live in lib/gh.sh.
+# shellcheck source=lib/gh.sh
+. "$scripts/lib/gh.sh"
 
 # Reads NAME from .env.local into env_val. Returns 3 when the name isn't in the file; any other
 # failure (such as a name that appears twice) stops with env-file.mjs's message.
@@ -88,6 +61,25 @@ env_get() {
   esac
 }
 
+doctor_failed="fix the FAIL lines above, then re-run scripts/enable-connector.sh"
+deploy_failed="the deploy didn't succeed: fix what it reported, then re-run scripts/enable-connector.sh"
+run_checks() {
+  "$scripts/doctor.sh" || fail "$doctor_failed"
+}
+next_steps() {
+  cat <<TEXT
+
+The connector is on. To add it to claude.ai:
+  1. Open Settings > Connectors > Add custom connector.
+  2. Name it Logseq and give the URL https://$connector_host/mcp
+     Leave the advanced OAuth client ID and secret empty.
+  3. Click Connect and sign in to GitHub with the account that owns this install.
+  4. Enable the connector in a conversation and ask "list my Logseq graphs".
+Then open https://$connector_host/graphs to connect your graphs (README 11.7).
+Claude Code on your own machine: claude mcp add --transport http logseq https://$connector_host/mcp
+TEXT
+}
+
 # ---- Prerequisites ----
 [ -f "$env_file" ] || fail "there is no .env.local here: run scripts/setup.sh first"
 command -v gh >/dev/null 2>&1 || fail "install gh (https://cli.github.com) and run gh auth login"
@@ -103,8 +95,16 @@ gh_try gh variable get CONNECTOR_ENABLED --env production -R "$repo" || rc=$?
 github_enabled=""
 [ "$rc" -ne 0 ] || github_enabled="$gh_out"
 if [ "$local_enabled" = "true" ] && [ "$github_enabled" = "true" ]; then
+  # Both switches are set before the checks run, so a failed check or deploy lands here on the
+  # re-run: carry on from the checks, and deploy only if the latest deploy isn't green.
   echo "the connector is already on"
-  echo "If its last deploy failed, run scripts/doctor.sh and then scripts/run-deploy.sh."
+  rc=0
+  env_get CONNECTOR_HOSTNAME || rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$env_val" ] || fail "CONNECTOR_HOSTNAME isn't set in .env.local: set it to the connector's hostname, then re-run"
+  connector_host="$env_val"
+  run_checks
+  "$scripts/run-deploy.sh" --if-not-green || fail "$deploy_failed"
+  next_steps
   exit 0
 fi
 
@@ -123,7 +123,7 @@ else
     read -rp "Connector hostname (e.g. mcp.example.com): " connector_host || true
   fi
 fi
-connector_host="${connector_host,,}"
+connector_host="$(printf '%s' "$connector_host" | tr '[:upper:]' '[:lower:]')"
 [ -n "$connector_host" ] || fail "the connector hostname is required"
 case "$sync_hostname" in
   *.*) zone="${sync_hostname#*.}" ;;
@@ -182,22 +182,10 @@ export CONNECTOR_HOSTNAME="$connector_host"
 # ---- 6. Settings and checks ----
 ENV_FILE_VALUE=true node "$scripts/env-file.mjs" set CONNECTOR_ENABLED --file "$env_file"
 gh_must gh variable set CONNECTOR_ENABLED --env production --body true -R "$repo"
-if ! "$scripts/doctor.sh"; then
-  fail "fix the FAIL lines above, then run scripts/doctor.sh again and, when it passes, scripts/run-deploy.sh (re-running this script would say the connector is already on)"
-fi
+run_checks
 
 # ---- 7. Deploy ----
-"$scripts/run-deploy.sh" || fail "the deploy didn't succeed: fix what it reported, then run scripts/run-deploy.sh"
+"$scripts/run-deploy.sh" || fail "$deploy_failed"
 
 # ---- 8. Next steps ----
-cat <<TEXT
-
-The connector is on. To add it to claude.ai:
-  1. Open Settings > Connectors > Add custom connector.
-  2. Name it Logseq and give the URL https://$connector_host/mcp
-     Leave the advanced OAuth client ID and secret empty.
-  3. Click Connect and sign in to GitHub with the account that owns this install.
-  4. Enable the connector in a conversation and ask "list my Logseq graphs".
-Then open https://$connector_host/graphs to connect your graphs (README 11.7).
-Claude Code on your own machine: claude mcp add --transport http logseq https://$connector_host/mcp
-TEXT
+next_steps
