@@ -656,3 +656,94 @@ test("--add-missing --push names DB_SYNC_ALLOWED_USERS when gh fails to set it",
     assert.match(r.stderr, /failed to set DB_SYNC_ALLOWED_USERS/);
   });
 });
+
+// --push-only NAME...: push the named values from an existing .env.local and write nothing.
+const secretCalls = (log) =>
+  (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [])
+    .filter((c) => c.argv[0] === "secret");
+
+test("--push-only pushes DB_SYNC_ALLOWED_USERS alone, with the file's value on stdin", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const body = `${SIX_ONLY}${ALLOWED}=${USER_A},${USER_B}\nSMOKE_PAT=\n`;
+    writeExisting(dir, body, 0o600);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push-only", ALLOWED], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const calls = secretCalls(log);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].argv, ["secret", "set", ALLOWED, "-R", "expected/repo", "--env", "production"]);
+    assert.equal(calls[0].stdin, `${USER_A},${USER_B}`);
+    assert.match(r.stdout, /Pushed 1 secrets to the GitHub production environment\./);
+    assert.equal(readFileSync(join(dir, ".env.local"), "utf8"), body, "the file is not rewritten");
+    assert.ok(!r.stdout.includes(USER_A) && !r.stderr.includes(USER_A), "the value is not printed");
+  });
+});
+
+test("--push-only maps GITHUB_CLIENT_ID to CONNECTOR_GITHUB_CLIENT_ID and pushes several names in order", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, `${SIX_ONLY}GITHUB_CLIENT_ID=${CONNECTOR_INPUTS.GITHUB_CLIENT_ID}\nSMOKE_PAT=tok\n`, 0o600);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push-only", "GITHUB_CLIENT_ID", "SMOKE_PAT"], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const calls = secretCalls(log);
+    assert.deepEqual(calls.map((c) => c.argv[2]), ["CONNECTOR_GITHUB_CLIENT_ID", "SMOKE_PAT"]);
+    assert.equal(calls[0].stdin, CONNECTOR_INPUTS.GITHUB_CLIENT_ID);
+    assert.equal(calls[1].stdin, "tok");
+    assert.match(r.stdout, /Pushed 2 secrets/);
+  });
+});
+
+test("--push-only rejects an unknown name with exit 2 and no gh secret call", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, `${SIX_ONLY}${ALLOWED}=none\n`, 0o600);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push-only", ALLOWED, "NOT_A_SECRET"], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /init-env: --push-only: unknown name NOT_A_SECRET/);
+    assert.equal(secretCalls(log).length, 0);
+  });
+});
+
+test("--push-only with one empty name among two exits 1 and pushes nothing", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, `${SIX_ONLY}${ALLOWED}=${USER_A}\nSMOKE_PAT=\n`, 0o600);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push-only", ALLOWED, "SMOKE_PAT"], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /SMOKE_PAT is missing or empty/);
+    assert.ok(!/DB_SYNC_ALLOWED_USERS is missing/.test(r.stderr));
+    assert.equal(secretCalls(log).length, 0);
+  });
+});
+
+test("--push-only with a name absent from .env.local exits 1 naming it", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    writeExisting(dir, SIX_ONLY, 0o600);
+    const { bin, log } = stubGh(dir);
+    const r = await run(dir, ["--push-only", "OWNER_GITHUB_USER_ID"], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /OWNER_GITHUB_USER_ID is missing or empty/);
+    assert.equal(secretCalls(log).length, 0);
+  });
+});
+
+for (const other of ["--push", "--add-missing"]) {
+  test(`--push-only with ${other} exits 2 and pushes nothing`, { timeout: 60000 }, async () => {
+    await withDir(async (dir) => {
+      writeExisting(dir, `${SIX_ONLY}${ALLOWED}=none\n`, 0o600);
+      const { bin, log } = stubGh(dir);
+      const r = await run(dir, ["--push-only", ALLOWED, other], { PATH: `${bin}:${process.env.PATH}` });
+      assert.equal(r.status, 2);
+      assert.match(r.stderr, /--push-only can't be combined/);
+      assert.equal(secretCalls(log).length, 0);
+    });
+  });
+}
+
+test("--push-only without a name exits 2 with the usage", { timeout: 60000 }, async () => {
+  await withDir(async (dir) => {
+    const r = await run(dir, ["--push-only"]);
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /usage: init-env.sh/);
+  });
+});

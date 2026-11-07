@@ -3,6 +3,7 @@
 # your sync hostname; the other three secrets are generated with `openssl rand -hex 32`.
 # DB_SYNC_ALLOWED_USERS (who may use the server) starts as `none`, which refuses everyone.
 # Usage: init-env.sh [--add-missing] [--push]   (run from anywhere)
+#        init-env.sh --push-only NAME...
 #   --push         also copy the values into the GitHub `production` environment with
 #                  `gh secret set` (value on stdin only).
 #   --add-missing  for an existing .env.local: append, in one marked block, only the names it
@@ -15,6 +16,12 @@
 #                  A name that is present but empty is an error: fill it by hand.
 #                  TOFU_ENCRYPTION_PASSPHRASE, ASSET_LINK_SECRET and DB_SYNC_ADMIN_TOKEN are never
 #                  generated in this mode: if one is missing, nothing is written or pushed (restore it).
+#   --push-only NAME...  push only the named values from the existing .env.local to the GitHub
+#                  `production` environment (same stdin-only `gh secret set`, same GITHUB_CLIENT_* ->
+#                  CONNECTOR_GITHUB_CLIENT_* mapping), and write nothing. NAME is one of the original
+#                  six, the six connector names, DB_SYNC_ALLOWED_USERS or SMOKE_PAT; any other name
+#                  exits 2. A name missing or empty in .env.local exits 1 before anything is pushed.
+#                  It can't be combined with --add-missing or --push.
 # Input: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, SYNC_HOSTNAME (and, with --add-missing and
 #   when missing, the four connector inputs and DB_SYNC_ALLOWED_USERS) are read from the environment when set, otherwise
 #   prompted for on the terminal (the token and the GitHub client secret silently). A fresh run
@@ -24,19 +31,40 @@
 # Never prints secret values and never overwrites an existing .env.local (--add-missing only appends).
 set -euo pipefail
 
-usage="usage: init-env.sh [--add-missing] [--push]"
+usage="usage: init-env.sh [--add-missing] [--push] | init-env.sh --push-only NAME..."
 push=0
 add_missing=0
+push_only=0
+only_names=""
 for arg in "$@"; do
   case "$arg" in
     --push) push=1 ;;
     --add-missing) add_missing=1 ;;
-    *)
+    --push-only) push_only=1 ;;
+    -*)
       echo "$usage" >&2
       exit 2
       ;;
+    *)
+      # Bare words are only valid as the names after --push-only.
+      [ "$push_only" = 1 ] || {
+        echo "$usage" >&2
+        exit 2
+      }
+      only_names="$only_names $arg"
+      ;;
   esac
 done
+if [ "$push_only" = 1 ]; then
+  if [ "$push" = 1 ] || [ "$add_missing" = 1 ]; then
+    echo "init-env: --push-only can't be combined with --add-missing or --push" >&2
+    exit 2
+  fi
+  [ -n "$only_names" ] || {
+    echo "$usage" >&2
+    exit 2
+  }
+fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(dirname "$script_dir")"
@@ -51,7 +79,12 @@ fi
 env_file="$repo_root/.env.local"
 template="$repo_root/.env.local.example"
 
-if [ "$add_missing" = 1 ]; then
+if [ "$push_only" = 1 ]; then
+  [ -f "$env_file" ] || {
+    echo "init-env: --push-only needs an existing $env_file" >&2
+    exit 1
+  }
+elif [ "$add_missing" = 1 ]; then
   [ -f "$env_file" ] || {
     echo "init-env: --add-missing needs an existing $env_file; run without it to create one" >&2
     exit 1
@@ -66,27 +99,95 @@ else
     exit 1
   }
 fi
-if [ "$push" = 1 ]; then
+if [ "$push" = 1 ] || [ "$push_only" = 1 ]; then
   command -v gh >/dev/null || {
-    echo "init-env: --push requires the GitHub CLI (gh)" >&2
+    echo "init-env: --push requires the GitHub CLI (gh) (as does --push-only)" >&2
     exit 1
   }
 fi
 
-command -v openssl >/dev/null || {
-  echo "init-env: openssl is required" >&2
-  exit 1
-}
+# --push-only generates nothing.
+if [ "$push_only" != 1 ]; then
+  command -v openssl >/dev/null || {
+    echo "init-env: openssl is required" >&2
+    exit 1
+  }
+fi
 
 original_names="CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TOFU_ENCRYPTION_PASSPHRASE ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN SYNC_HOSTNAME"
 connector_names="CONNECTOR_HOSTNAME GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET OWNER_GITHUB_USER_ID COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
 # Not a credential and never generated: who may use the server.
 allowed_users_name="DB_SYNC_ALLOWED_USERS"
 generated_names="ASSET_LINK_SECRET DB_SYNC_ADMIN_TOKEN TOFU_ENCRYPTION_PASSPHRASE COOKIE_ENCRYPTION_KEY GRAPH_TOKEN_KEY"
+# Pushes the values of $add_names to the production environment. $recovery says what to do on failure.
+push_secrets() {
+  # Target the repo that owns this checkout, whatever the current directory is.
+  target_repo="$(cd "$repo_root" && gh repo view --json nameWithOwner -q .nameWithOwner)" || {
+    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
+  [ -n "$target_repo" ] || {
+    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
+  echo "Pushing secrets to $target_repo (environment: production)"
+  gh api "repos/$target_repo/environments/production" >/dev/null || {
+    echo "init-env: environment 'production' not found in $target_repo; create it first (README 1.8)" >&2
+    echo "$recovery" >&2
+    exit 1
+  }
+  pushed=0
+  for name in $add_names; do
+    # GitHub rejects secret names starting with GITHUB_; .env.local keeps the GITHUB_* names.
+    secret_name="$name"
+    case "$name" in
+      GITHUB_CLIENT_ID | GITHUB_CLIENT_SECRET) secret_name="CONNECTOR_$name" ;;
+    esac
+    printf '%s' "${!name}" | gh secret set "$secret_name" -R "$target_repo" --env production || {
+      echo "init-env: failed to set $secret_name" >&2
+      echo "$recovery" >&2
+      exit 1
+    }
+    pushed=$((pushed + 1))
+  done
+  echo "Pushed $pushed secrets to the GitHub production environment."
+}
+
 # Names to write, in order. A fresh run writes the original six and DB_SYNC_ALLOWED_USERS;
 # --add-missing the absent ones.
 add_names=""
-if [ "$add_missing" = 1 ]; then
+if [ "$push_only" = 1 ]; then
+  # Check every name before pushing any. The file is parsed, never sourced.
+  problems=0
+  for name in $only_names; do
+    known=0
+    for allowed in $original_names $connector_names $allowed_users_name SMOKE_PAT; do
+      [ "$name" != "$allowed" ] || known=1
+    done
+    [ "$known" = 1 ] || {
+      echo "init-env: --push-only: unknown name $name" >&2
+      exit 2
+    }
+  done
+  for name in $only_names; do
+    value="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$name=//p" "$env_file" | tail -n 1)"
+    if [ -z "$value" ]; then
+      echo "init-env: --push-only: $name is missing or empty in $env_file" >&2
+      problems=1
+    fi
+    printf -v "$name" '%s' "$value"
+  done
+  [ "$problems" = 0 ] || {
+    echo "init-env: nothing was pushed" >&2
+    exit 1
+  }
+  add_names="$only_names"
+  recovery="init-env: nothing was written; fix the problem and re-run the same command"
+  push_secrets
+  exit 0
+elif [ "$add_missing" = 1 ]; then
   for name in $original_names $connector_names $allowed_users_name; do
     # `NAME=`, `export NAME=` and an indented `NAME=` all count as present.
     if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?$name=" "$env_file"; then
@@ -280,38 +381,7 @@ fi
 
 if [ "$push" = 1 ]; then
   recovery="init-env: .env.local was written; re-run the push with the README 1.8 loop"
-  # Target the repo that owns this checkout, whatever the current directory is.
-  target_repo="$(cd "$repo_root" && gh repo view --json nameWithOwner -q .nameWithOwner)" || {
-    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
-    echo "$recovery" >&2
-    exit 1
-  }
-  [ -n "$target_repo" ] || {
-    echo "init-env: could not determine the GitHub repo for $repo_root" >&2
-    echo "$recovery" >&2
-    exit 1
-  }
-  echo "Pushing secrets to $target_repo (environment: production)"
-  gh api "repos/$target_repo/environments/production" >/dev/null || {
-    echo "init-env: environment 'production' not found in $target_repo; create it first (README 1.8)" >&2
-    echo "$recovery" >&2
-    exit 1
-  }
-  pushed=0
-  for name in $add_names; do
-    # GitHub rejects secret names starting with GITHUB_; .env.local keeps the GITHUB_* names.
-    secret_name="$name"
-    case "$name" in
-      GITHUB_CLIENT_ID | GITHUB_CLIENT_SECRET) secret_name="CONNECTOR_$name" ;;
-    esac
-    printf '%s' "${!name}" | gh secret set "$secret_name" -R "$target_repo" --env production || {
-      echo "init-env: failed to set $secret_name" >&2
-      echo "$recovery" >&2
-      exit 1
-    }
-    pushed=$((pushed + 1))
-  done
-  echo "Pushed $pushed secrets to the GitHub production environment."
+  push_secrets
 fi
 
 echo
