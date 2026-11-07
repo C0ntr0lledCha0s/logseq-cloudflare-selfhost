@@ -208,6 +208,7 @@ if (brief.injected_instructions) log(`Warning: the issue text contains instructi
 if (/^(done|canceled)$/i.test(brief.task_status || '')) log(`Note: the Logseq task is already ${brief.task_status}.`)
 const needsVendor = brief.areas.some(a => ['connector', 'semantic', 'patch', 'migrations'].includes(a))
 if (needsVendor && !brief.env.vendor) log('Warning: connector/vendor is missing, so the connector suite will be skipped and regression tests there cannot be seen to fail. Build it first for a real proof (see /lane step 2).')
+if ((brief.env.behind_base || 0) > 10) log(`Warning: HEAD is ${brief.env.behind_base} commits behind ${BASE}. Patch numbers and README edits may clash at merge; merge ${BASE} into the branch before the fix or build stage if you can.`)
 log(`Brief: ${brief.title} [${brief.areas.join(', ')}]; ${brief.related_learnings.length} related learnings; on ${brief.env.branch}`)
 const BRIEF = J(brief)
 // Reviewers see only what this lane changed: commits before the lane started were reviewed by
@@ -281,7 +282,7 @@ if (!repro.ran) log('Warning: the regression test was not run here; its fail-bef
 // ---------- fix ----------
 phase('Fix')
 let change = await agent(
-  `Fix this bug with the smallest change that meets the acceptance criteria and makes the regression test(s) pass. Stay inside the issue's defect class. If you find a neighbouring class, don't fix it: list it in notes as out of scope, and the docs stage records it as a backlog item. A review finding widens the scope only when it is about this change's own behaviour. Update the tool's description, connector_help and manifest in the same change if behaviour visible to Claude changed.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate, then commit the test and the fix together as "fix(<scope>): <what changed>", with a body giving the cause, the fix and what the tests prove.${TRAILER}\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}\nRegression tests:\n${J(repro)}`,
+  `Fix this bug with the smallest change that meets the acceptance criteria and makes the regression test(s) pass. Stay inside the issue's defect class. If you find a neighbouring class, don't fix it: list it in notes as out of scope, and the docs stage records it as a backlog item. A review finding widens the scope only when it is about this change's own behaviour. Update the tool's description, connector_help and manifest in the same change if behaviour visible to Claude changed. Before the first review, write the negative and guard cases for every input kind the root cause and regression tests list (other display types, out-of-range inputs, the other write paths), not only the positive case. When you mirror a rule the upstream app applies, find the guard the app applies with it (for example a display-type check) and copy that too.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate, then commit the test and the fix together as "fix(<scope>): <what changed>", with a body giving the cause, the fix and what the tests prove.${TRAILER}\nBrief:\n${BRIEF}\nRoot cause:\n${J(cause)}\nRegression tests:\n${J(repro)}`,
   { ...M('implement'), label: 'fix', agentType: 'implementer', schema: CHANGE_SCHEMA },
 )
 if (!change) return { status: 'blocked', stage: 'fix', brief, cause, repro }
@@ -373,7 +374,7 @@ const docs = await agent(
 
 // ---------- compound + retro ----------
 phase('Compound')
-const stats = { investigate_rounds: refutations.length + 1, refuted_hypotheses: refutations.length, review_rounds: rounds, open_at_end: open.map(f => ({ id: f.id, severity: f.severity })), pre_existing_to_backlog: backlog.map(f => ({ id: f.id, severity: f.severity })), repro_ran: repro.ran, vendor: brief.env.vendor }
+const stats = { investigate_rounds: refutations.length + 1, refuted_hypotheses: refutations.length, review_rounds: rounds, open_at_end: open.map(f => ({ id: f.id, severity: f.severity, title: f.title })), pre_existing_to_backlog: backlog.map(f => ({ id: f.id, severity: f.severity, title: f.title })), repro_ran: repro.ran, vendor: brief.env.vendor }
 const compound = await agent(
   `Close the compound loop for this bug, then commit only your learning files (docs/solutions, REVIEW.md, CLAUDE.md) as "docs(learnings): …".${TRAILER}\nBrief:\n${BRIEF}\nRoot cause and evidence:\n${J(cause)}\nRefuted hypotheses:\n${J(refutations)}\nRegression tests:\n${J(repro.tests)}\nChange:\n${change.summary}\nReview: open ${J(open)}\nrefuted by skeptics (candidates for known false positives) ${J(review && review.refuted)}\nRun statistics for the retro:\n${J(stats)}`,
   { ...M('compound'), label: 'compound', agentType: 'compounder', schema: COMPOUND_SCHEMA },

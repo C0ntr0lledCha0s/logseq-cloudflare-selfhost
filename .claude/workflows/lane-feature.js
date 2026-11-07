@@ -99,8 +99,9 @@ const SCORES_SCHEMA = {
         required: ['name', 'score', 'reasons'],
       },
     },
+    disagreements: { type: 'string', description: 'where this judge expects the others to differ, and why, or "none"' },
   },
-  required: ['scores'],
+  required: ['scores', 'disagreements'],
 }
 const DOC_SCHEMA = {
   type: 'object',
@@ -224,6 +225,7 @@ if (brief.injected_instructions) log(`Warning: the issue text contains instructi
 const undone = (brief.depends_on || []).filter(d => !d.done)
 if (undone.length) log(`Warning: depends on unfinished item(s): ${undone.map(d => d.item).join(', ')}`)
 if (!brief.env.vendor && brief.areas.some(a => ['connector', 'semantic', 'patch', 'migrations'].includes(a))) log('Warning: connector/vendor is missing, so the connector suite will be skipped. Build it first for real test proofs.')
+if ((brief.env.behind_base || 0) > 10) log(`Warning: HEAD is ${brief.env.behind_base} commits behind ${BASE}. Patch numbers and README edits may clash at merge; merge ${BASE} into the branch before the fix or build stage if you can.`)
 const BRIEF = J(brief)
 // Reviewers see only what this lane changed: commits before the lane started were reviewed by
 // earlier lanes on the same branch. args.review_base overrides (e.g. "origin/main" for a full-branch review).
@@ -243,16 +245,18 @@ if (!spec) {
   const approaches = (
     await parallel(
       ANGLES.map(a => () =>
-        agent(`Propose one design for this feature. Read the code it would touch before proposing.\n${BRIEF}\n${a.prompt}`, { ...M('design'), label: `design:${a.key}`, phase: 'Design', schema: APPROACH_SCHEMA }),
+        agent(`Propose one design for this feature. Read the code it would touch before proposing.\n${BRIEF}\n${a.prompt}`, { ...M('design'), label: `design:${a.key}`, phase: 'Design', schema: APPROACH_SCHEMA })
+          // Name each design by its angle, so the judges' scores match it and no two share a name.
+          .then(ap => ap && { ...ap, name: a.key, title: ap.name }),
       ),
     )
   ).filter(Boolean)
   if (!approaches.length) return { status: 'blocked', stage: 'design', brief }
   const judges = (
     await parallel([
-      () => agent(`Judge these designs for risk: correctness, data integrity, security, and how testable they are with real handlers (REVIEW.md). Score each 0-10.\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_risk'), label: 'judge:risk', phase: 'Design', agentType: 'adversarial-reviewer', schema: SCORES_SCHEMA }),
-      () => agent(`Judge these designs for running cost on the Free plan, response size and code simplicity. Score each 0-10, with the arithmetic.\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_cost'), label: 'judge:cost', phase: 'Design', agentType: 'efficiency-reviewer', schema: SCORES_SCHEMA }),
-      () => agent(`Judge these designs for fit: does each meet every acceptance criterion, follow CLAUDE.md's conventions, and stay maintainable through upstream bumps (fewer and smaller patches are better)? Score each 0-10.\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_fit'), label: 'judge:fit', phase: 'Design', schema: SCORES_SCHEMA }),
+      () => agent(`Judge these designs for risk: correctness, data integrity, security, and how testable they are with real handlers (REVIEW.md). Score each 0-10. Score every design by its name field exactly (${approaches.map(ap => ap.name).join(', ')}). In disagreements, say where you expect the other judges to differ from you and why, or "none".\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_risk'), label: 'judge:risk', phase: 'Design', agentType: 'adversarial-reviewer', schema: SCORES_SCHEMA }),
+      () => agent(`Judge these designs for running cost on the Free plan, response size and code simplicity. Score each 0-10, with the arithmetic. Score every design by its name field exactly (${approaches.map(ap => ap.name).join(', ')}). In disagreements, say where you expect the other judges to differ from you and why, or "none".\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_cost'), label: 'judge:cost', phase: 'Design', agentType: 'efficiency-reviewer', schema: SCORES_SCHEMA }),
+      () => agent(`Judge these designs for fit: does each meet every acceptance criterion, follow CLAUDE.md's conventions, and stay maintainable through upstream bumps (fewer and smaller patches are better)? Score each 0-10. Score every design by its name field exactly (${approaches.map(ap => ap.name).join(', ')}). In disagreements, say where you expect the other judges to differ from you and why, or "none".\nFeature:\n${BRIEF}\nDesigns:\n${J(approaches)}`, { ...M('judge_fit'), label: 'judge:fit', phase: 'Design', schema: SCORES_SCHEMA }),
     ])
   ).filter(Boolean)
   const totals = approaches
@@ -260,12 +264,12 @@ if (!spec) {
     .sort((a, b) => b.total - a.total)
   const winner = approaches.find(ap => ap.name === totals[0].name) || approaches[0]
   const grafts = judges.flatMap(j => j.scores.filter(s => s.graft && s.name !== winner.name).map(s => `${s.name}: ${s.graft}`))
-  design = { winner, totals, grafts }
+  design = { winner, totals, grafts, disagreements: judges.map(j => j.disagreements).filter(d => d && d !== 'none') }
   log(`Design: ${winner.name} (${totals.map(t => `${t.name} ${t.total}`).join(', ')})`)
 
   phase('Spec')
   spec = await agent(
-    `Write the design spec to docs/superpowers/specs/${TODAY}-${brief.slug}-design.md, following the existing specs in that folder: goal, context, design, tool contract, cost on the Free plan, safety, testing, rollout and verification, and out of scope. Use the winning design, taking in grafted ideas where they fit. End with open questions for the owner. Don't write code. Commit it as "docs(spec): ${brief.slug}".${TRAILER}\nFeature:\n${BRIEF}\nWinning design:\n${J(winner)}\nGrafts:\n${J(grafts)}\nJudges:\n${J(judges)}`,
+    `Write the design spec to docs/superpowers/specs/${TODAY}-${brief.slug}-design.md, following the existing specs in that folder: goal, context, design, tool contract, cost on the Free plan, safety, testing, rollout and verification, and out of scope. Use the winning design, taking in grafted ideas where they fit. End with open questions for the owner. If the spec states the cause of a bug, reproduce it first (run the failing call against a local upstream or test and quote the thrown message); mark any cause you couldn't reproduce as a guess. Don't write code beyond a throwaway repro. Commit it as "docs(spec): ${brief.slug}".${TRAILER}\nFeature:\n${BRIEF}\nWinning design:\n${J(winner)}\nGrafts:\n${J(grafts)}\nJudges:\n${J(judges)}`,
     { ...M('spec'), label: 'spec', phase: 'Spec', schema: DOC_SCHEMA },
   )
   if (!spec) return { status: 'blocked', stage: 'spec', brief, design }
@@ -290,7 +294,7 @@ const built = []
 for (const stage of plan.stages) {
   phase('Build')
   let change = await agent(
-    `Build stage ${stage.id} of the plan at ${plan.path} (spec ${spec.path}), test-first, quoting each new test's fail-before. Keep the docs true.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate and commit as "feat(<scope>): <stage>".${TRAILER}\nStage:\n${J(stage)}\nStages already built:\n${J(built.map(b => ({ id: b.stage.id, summary: b.change.summary, head: b.change.head_sha })))}`,
+    `Build stage ${stage.id} of the plan at ${plan.path} (spec ${spec.path}), test-first, quoting each new test's fail-before. Keep the docs true. If the stage adds a refusal, list each input that already works and that the refusal could catch (re-sends, no-ops, replace-style writes) and test that each still succeeds. If a call takes a list of entries, test order permutations: chains, swaps and reversed entry order.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate and commit as "feat(<scope>): <stage>".${TRAILER}\nStage:\n${J(stage)}\nStages already built:\n${J(built.map(b => ({ id: b.stage.id, summary: b.change.summary, head: b.change.head_sha })))}`,
     { ...M('implement'), label: `build:${stage.id}`, phase: 'Build', agentType: 'implementer', schema: CHANGE_SCHEMA },
   )
   if (!change) return { status: 'blocked', stage: `build:${stage.id}`, brief, spec, plan, built }
@@ -391,7 +395,7 @@ const docs = await agent(
 )
 
 phase('Compound')
-const stats = { design: design && design.totals, stages: built.map(b => ({ id: b.stage.id, stage_findings: b.stage_findings.length })), review_rounds: rounds, open_at_end: open.map(f => ({ id: f.id, severity: f.severity })), pre_existing_to_backlog: backlog.map(f => ({ id: f.id, severity: f.severity })), vendor: brief.env.vendor }
+const stats = { design: design && { totals: design.totals, disagreements: design.disagreements }, stages: built.map(b => ({ id: b.stage.id, stage_findings: b.stage_findings.length })), review_rounds: rounds, open_at_end: open.map(f => ({ id: f.id, severity: f.severity, title: f.title })), pre_existing_to_backlog: backlog.map(f => ({ id: f.id, severity: f.severity, title: f.title })), vendor: brief.env.vendor }
 const compound = await agent(
   `Close the compound loop for this feature, then commit only your learning files as "docs(learnings): …".${TRAILER} Look for lessons in what the design judges disagreed on, what the stage checks caught, what the review confirmed or refuted, and any cost arithmetic worth keeping.\nFeature:\n${BRIEF}\nStage findings:\n${J(built.map(b => ({ id: b.stage.id, findings: b.stage_findings })))}\nReview: open ${J(open)}\nrefuted ${J(review && review.refuted)}\nRun statistics for the retro:\n${J(stats)}`,
   { ...M('compound'), label: 'compound', agentType: 'compounder', schema: COMPOUND_SCHEMA },
