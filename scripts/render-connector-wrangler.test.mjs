@@ -222,6 +222,20 @@ test("auditRetentionDays must be a whole number of days from 1 to 365", () => {
   }
 });
 
+test("the rendered retention range matches the one the connector's auditRetentionDays accepts", () => {
+  // connector/src/config.ts refuses AUDIT_RETENTION_DAYS outside 1..MAX_AUDIT_RETENTION_DAYS on every
+  // hourly purge, so a value the renderer accepts there would stop the purge.
+  const source = readFileSync(new URL("../connector/src/config.ts", import.meta.url), "utf8");
+  const max = Number(/const MAX_AUDIT_RETENTION_DAYS = (\d+);/.exec(source)?.[1]);
+  assert.ok(Number.isSafeInteger(max), "MAX_AUDIT_RETENTION_DAYS in config.ts");
+  assert.match(source, /const POSITIVE_INTEGER = \/\^\[1-9\]\[0-9\]\*\$\/;/, "config.ts's lower bound is 1");
+  const at = (auditRetentionDays) => () => render({ settings: { ...settings, connector: { ...settings.connector, auditRetentionDays } } });
+  assert.equal(at(1)().vars.AUDIT_RETENTION_DAYS, "1");
+  assert.equal(at(max)().vars.AUDIT_RETENTION_DAYS, String(max));
+  assert.throws(at(0), /auditRetentionDays/);
+  assert.throws(at(max + 1), /auditRetentionDays/);
+});
+
 test("refuses a template that sets AUDIT_RETENTION_DAYS", () => {
   assert.throws(
     () => render({ template: `{ "vars": { "AUDIT_RETENTION_DAYS": "7" } }` }),

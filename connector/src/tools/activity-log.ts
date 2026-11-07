@@ -292,17 +292,23 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           limit: args.limit ?? DEFAULT_LIMIT,
           cursor,
           includeSnapshot: args.include_snapshot === true,
+          snapshotChars: RESULT_CHAR_LIMIT - RESULT_RESERVE,
         });
         await log.recordRead(graphId, alias, [`${new Date(since).toISOString()}/${new Date(until).toISOString()}`], page.rowsRead);
 
         // Entries are kept, newest first, while the result fits; the rest follow from the last one kept.
-        const entryLines = page.entries.map((row) => `- ${entryLine(row, timeZone)}`);
-        const entryTexts = page.entries.map((row) => entryJson(row, args.include_snapshot === true));
+        // Each is built only when it is reached, so one that is cut is never parsed.
+        const entryLines: string[] = [];
+        const entryTexts: string[] = [];
         let kept = 0;
         let used = RESULT_RESERVE;
         while (kept < page.entries.length) {
-          const size = entryLines[kept].length + 1 + entryTexts[kept].length + 1;
+          const line = `- ${entryLine(page.entries[kept], timeZone)}`;
+          const text = entryJson(page.entries[kept], args.include_snapshot === true);
+          const size = line.length + 1 + text.length + 1;
           if (kept > 0 && used + size > RESULT_CHAR_LIMIT) break;
+          entryLines.push(line);
+          entryTexts.push(text);
           used += size;
           kept += 1;
         }
@@ -314,12 +320,12 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           `Activity log of graph '${alias}', ${formatWhen(since, timeZone)} to ${formatWhen(until, timeZone)} (${timeZone}), newest first: ` +
           (kept === 0 ? "No entries" : `${kept} ${kept === 1 ? "entry" : "entries"}`) +
           (cursor === undefined ? "." : " after the cursor.");
-        const lines = [header, ...entryLines.slice(0, kept)];
+        const lines = [header, ...entryLines];
         if (nextCursor !== null) lines.push(`Older entries in the window may follow: pass next-cursor as cursor (next-cursor: ${nextCursor}).`);
         return {
           content: [
             { type: "text", text: lines.join("\n") },
-            { type: "text", text: listingJson(entryTexts.slice(0, kept), nextCursor, page.scanned) },
+            { type: "text", text: listingJson(entryTexts, nextCursor, page.scanned) },
           ],
         };
       }),

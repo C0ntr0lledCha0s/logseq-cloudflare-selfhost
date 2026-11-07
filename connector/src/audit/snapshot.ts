@@ -8,7 +8,7 @@ import { type GraphAccess, graphFetch } from "../tools/semantic";
  * something, `audited()` reads it with one GET through the same graph token and stores the server's
  * JSON as the row's `before`: `{source, truncated?, e2ee?, error?, data}`. A block or page delete must
  * keep its whole subtree, so one that can't be read in full is refused, naming the entry; any other
- * write keeps a cut-down snapshot or the read's error and goes ahead. Dry runs read nothing.
+ * write keeps a cut-down snapshot or the read's error and goes ahead. Dry runs keep nothing, and only a delete's dry run reads (to be refused as the real call would be).
  */
 
 /**
@@ -301,6 +301,16 @@ export interface Snapshot {
   subject?: AffectedTarget;
 }
 
+/** A delete refused after its read, carrying what the read learnt (no `before`) for the log's page filter. */
+export class SnapshotRefusal extends ToolError {
+  constructor(
+    message: string,
+    readonly snapshot: Snapshot,
+  ) {
+    super(message, "refused");
+  }
+}
+
 /** The pages a read names: a page read's UUID and title, and each block's page-id. */
 function pagesRead(read: Read): string[] {
   if (read.request.source === "getBlocks") {
@@ -414,8 +424,13 @@ export async function takeSnapshot(access: GraphAccess, alias: string, tool: str
     } catch (error) {
       throw new ToolError(`audit snapshot failed: ${messageOf(error)}; nothing was deleted`, "refused");
     }
-    checkFound(read);
-    checkWhole(read);
+    try {
+      checkFound(read);
+      checkWhole(read);
+    } catch (error) {
+      // Refused after a read: the pages it read still find the refusal in the log.
+      throw new SnapshotRefusal(messageOf(error), snapshotOf(null, [read]));
+    }
     return snapshotOf(wrap(read.request.source, { truncated: read.request.cut, e2ee }, read.text), [read]);
   }
 
@@ -437,5 +452,19 @@ export function refreshRefsBefore(result: CallToolResult): string | null {
     const change = record(c) ?? {};
     return { uuid: change.uuid, "page-id": change["page-id"], before: change.before };
   });
-  return JSON.stringify({ source: "refresh_refs", ...(response.truncated === true ? { truncated: true } : {}), data });
+  const whole = JSON.stringify({ source: "refresh_refs", ...(response.truncated === true ? { truncated: true } : {}), data });
+  if (fits(whole)) return whole;
+  // Over the cap: every block's uuid and page-id, and its text while the texts, in order, still fit.
+  const encoder = new TextEncoder();
+  const ids = data.map(({ uuid, "page-id": pageId }) => ({ uuid, "page-id": pageId }));
+  const cut = (kept: unknown) => JSON.stringify({ source: "refresh_refs", truncated: true, data: kept });
+  let room = SNAPSHOT_MAX_BYTES - encoder.encode(cut(ids)).length;
+  if (room < 0) return cut(null);
+  let texts = 0;
+  for (; texts < data.length; texts += 1) {
+    const extra = encoder.encode(JSON.stringify(data[texts])).length - encoder.encode(JSON.stringify(ids[texts])).length;
+    if (extra > room) break;
+    room -= extra;
+  }
+  return cut([...data.slice(0, texts), ...ids.slice(texts)]);
 }

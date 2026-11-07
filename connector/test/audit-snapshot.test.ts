@@ -115,6 +115,8 @@ interface Row {
   error: string | null;
   dry_run: number;
   before: string | null;
+  pages: string | null;
+  targets: string | null;
 }
 
 /** Calls once and answers the result and the one audit row it left. */
@@ -499,7 +501,7 @@ describe("pre-reads", () => {
     expect((await audited("refresh_refs", { body: { "page-id": J5 } })).row.before).toBeNull();
   });
 
-  it("no pre-read for inserts, creates, asset saves, refresh_refs or dry runs", async () => {
+  it("no pre-read for inserts, creates, asset saves, refresh_refs or dry runs other than deletes'", async () => {
     for (const [name, args] of Object.entries(NO_PRE_READ)) {
       syncCalls = [];
       serve(fixtures, () => Response.json({ applied: false, changed: [] }));
@@ -515,7 +517,9 @@ describe("pre-reads", () => {
       serve(fixtures, () => Response.json({ "dry-run": true }));
       const { row } = await audited(name, dry);
       expect(row, name).toMatchObject({ status: "ok", dry_run: 1, before: null });
-      expect(gets(), name).toEqual([]);
+      // A delete's dry run reads what the real call would, to refuse it the same way; it stores nothing.
+      const deletes = (snapshotClassFor(name) as { delete?: unknown }).delete !== undefined;
+      expect(gets().length, name).toBe(deletes ? 1 : 0);
       expect(writes(), name).toHaveLength(1);
     }
     // save_document: its upload is the only request.
@@ -805,6 +809,108 @@ describe("delete snapshots", () => {
   });
 });
 
+describe("refusals keep the pages their read found", () => {
+  const big = (bytes: number) => JSON.stringify({ blocks: [outline.blocks[0], { ...outline.blocks[1], markdown: "x".repeat(bytes) }], missing: [] });
+  const J5_LOWER = J5.toLowerCase();
+
+  it("a block or page delete refused after its read, and an errored update_block, are found by the page they read", async () => {
+    const cases: [string, string, Record<string, unknown>, () => Response, () => Response][] = [
+      ["truncated", "delete_blocks", PRE_READS.delete_blocks.args, () => Response.json(outlineTruncated), () => Response.json({ ok: true })],
+      ["over 100 KB", "delete_blocks", PRE_READS.delete_blocks.args, () => new Response(big(SNAPSHOT_MAX_BYTES), { headers: { "Content-Type": "application/json" } }), () => Response.json({ ok: true })],
+      ["one block missing", "delete_blocks", { body: { "block-ids": [B1, B3] } }, () => Response.json({ blocks: [outline.blocks[0]], missing: [B3] }), () => Response.json({ ok: true })],
+      ["single truncated", "delete_block", { "block-id": B2 }, () => Response.json({ blocks: [outlineTruncated.blocks[1]], missing: [] }), () => Response.json({ ok: true })],
+      ["page truncated, by title", "delete_page", { "page-id": "Nov 5th, 2026" }, () => Response.json(pageOutlineTruncated), () => Response.json({ ok: true })],
+      ["sync 500 on the write", "update_block", PRE_READS.update_block.args, () => Response.json(summary), () => Response.json({ error: "boom" }, { status: 500 })],
+    ];
+    const ids: number[] = [];
+    for (const [label, name, args, read, write] of cases) {
+      syncCalls = [];
+      serve(read, write);
+      const { result, row } = await audited(name, args);
+      expect(result.isError, label).toBe(true);
+      expect(row.status, label).toBe(name === "update_block" ? "error" : "refused");
+      expect((row.pages ?? "").split("\n"), label).toContain(J5_LOWER);
+      ids.push(row.id);
+    }
+    // A refused page delete names the page its read returned, by title.
+    const pageRow = await new AuditLog(env.DB).get(WORK_ID, ids[4]);
+    expect(JSON.parse(pageRow!.targets!)[0]).toMatchObject({ uuid: J5, pageTitle: pageOutlineTruncated.title });
+    const listed = await call("get_activity_log", { page: J5 });
+    for (const id of ids) expect(listed.text, `entry ${id}`).toContain(`"id":${id},`);
+  });
+});
+
+describe("dry runs of deletes", () => {
+  it("a delete dry run is refused as the real call would be, and keeps no snapshot", async () => {
+    const truncated = `entry 1: ${B2} has more descendants than the 2,000-block snapshot budget; delete it in parts`;
+    const missing = `entry 1: ${B3} can't be read (hidden, in the Recycle bin or not found); nothing was deleted`;
+    const cases: [string, Record<string, unknown>, () => Response, RegExp | string][] = [
+      ["delete_blocks", { body: { "block-ids": [B1, B2], "dry-run": true } }, () => Response.json(outlineTruncated), truncated],
+      ["delete_blocks", { body: { "block-ids": [B1, B3], "dry-run": true } }, () => Response.json({ blocks: [outline.blocks[0]], missing: [B3] }), missing],
+      [
+        "delete_blocks",
+        { body: { "block-ids": [B1, B2], "dry-run": true } },
+        () => new Response(JSON.stringify({ blocks: [outline.blocks[0], { ...outline.blocks[1], markdown: "x".repeat(SNAPSHOT_MAX_BYTES) }], missing: [] }), { headers: { "Content-Type": "application/json" } }),
+        /^entry 1: .+ takes the snapshot over 100 KB/,
+      ],
+      ["delete_page", { "page-id": J5, "dry-run": true }, () => Response.json(pageOutlineTruncated), `entry 0: ${J5} has more descendants than the 2,000-block snapshot budget; delete it in parts`],
+      ["delete_tag", { "tag-id": TAG, "dry-run": true }, () => Response.json({ error: "boom" }, { status: 500 }), "audit snapshot failed: sync server error (HTTP 500): boom; nothing was deleted"],
+      ["delete_property", { "property-id": PROP, "dry-run": true }, () => Response.json({ error: "boom" }, { status: 500 }), "audit snapshot failed: sync server error (HTTP 500): boom; nothing was deleted"],
+    ];
+    for (const [name, args, read, error] of cases) {
+      syncCalls = [];
+      serve(read, () => Response.json({ "dry-run": true }));
+      const { result, row } = await audited(name, args);
+      expect(result.isError, name).toBe(true);
+      expect(result.text, name).toMatch(error);
+      expect(row, name).toMatchObject({ status: "refused", dry_run: 1, before: null });
+      expect(writes(), name).toEqual([]);
+    }
+    // The same dry run of a delete that fits goes ahead and stores nothing it read.
+    syncCalls = [];
+    serve(fixtures, () => Response.json({ "dry-run": true, deleted: 2 }));
+    const ok = await audited("delete_blocks", { body: { "block-ids": [B1, B2], "dry-run": true } });
+    expect(ok.row).toMatchObject({ status: "ok", dry_run: 1, before: null });
+    expect(gets()).toHaveLength(1);
+    expect(writes()).toHaveLength(1);
+  });
+});
+
+describe("refresh_refs snapshot size", () => {
+  const P = "00000001-2026-1105-0000-000000000000";
+  const changed = (n: number, chars: number, pageId = P) =>
+    Array.from({ length: n }, (_, i) => ({ uuid: `aaaaaaaa-0000-4000-8000-${String(i).padStart(12, "0")}`, "page-id": pageId, before: `${i} ${"b".repeat(chars)}`, after: "a" }));
+
+  it("over the cap keeps every block's uuid and page and the first texts whole, marked truncated, and reads back by id", async () => {
+    const response = { applied: true, changed: changed(200, 960) };
+    serve(fixtures, () => Response.json(response));
+    const { row } = await audited("refresh_refs", { body: { apply: true } });
+    expect(row.status).toBe("ok");
+    expect(new TextEncoder().encode(row.before!).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    const snap = before(row);
+    expect(snap).toMatchObject({ source: "refresh_refs", truncated: true });
+    expect(snap.data.map((d: any) => [d.uuid, d["page-id"]])).toEqual(response.changed.map((c) => [c.uuid, c["page-id"]]));
+    const kept = snap.data.filter((d: any) => d.before !== undefined);
+    expect(kept.length).toBeGreaterThan(50);
+    expect(kept.map((d: any) => d.before)).toEqual(response.changed.slice(0, kept.length).map((c) => c.before));
+    expect(snap.data.slice(kept.length).every((d: any) => d.before === undefined)).toBe(true);
+
+    const back = await call("get_activity_log", { id: row.id });
+    expect(back.isError).toBe(false);
+    const json = JSON.parse(back.text.slice(back.text.indexOf('{"entries"')));
+    expect(json.entries[0].before).toEqual(snap);
+
+    // At the cap's side: a response that fits is stored as given, not marked truncated.
+    serve(fixtures, () => Response.json({ applied: true, changed: changed(10, 100) }));
+    expect(before((await audited("refresh_refs", { body: { apply: true } })).row).truncated).toBeUndefined();
+    // Even the uuids and pages over the cap: data null.
+    serve(fixtures, () => Response.json({ applied: true, changed: changed(2000, 10, "p".repeat(100)) }));
+    const none = (await audited("refresh_refs", { body: { apply: true } })).row;
+    expect(new TextEncoder().encode(none.before!).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    expect(before(none)).toEqual({ source: "refresh_refs", truncated: true, data: null });
+  });
+});
+
 describe("contract", () => {
   it("connector_help says what the log keeps and that a delete too large to snapshot is refused", async () => {
     const help = (await call("connector_help", {})).text;
@@ -816,5 +922,6 @@ describe("contract", () => {
     expect(help).toContain("A tag or property delete keeps only the definition, not the values or tags it removes from each node");
     expect(help).toContain("A call refused for its input's shape (Input validation error) never reaches the graph and is not logged");
     expect(help).toContain("audit snapshot failed: …; nothing was deleted");
+    expect(help).toContain("a delete's dry run reads first and is refused exactly as the real call would be");
   });
 });

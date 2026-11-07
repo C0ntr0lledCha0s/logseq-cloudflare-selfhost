@@ -1480,7 +1480,8 @@ describe("audit log", () => {
       const where = DRY_RUN_IN[name];
       if (where !== undefined) {
         const dry = { ...CONTEXT_RESPONSE, "dry-run": true };
-        syncHandler = () => Response.json(dry);
+        // A delete's dry run reads first, as its real call does, so the read is answered too.
+        syncHandler = preReadsEmpty(() => Response.json(dry));
         const dryArgs =
           where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
         const preview = await callAudited(name, dryArgs);
@@ -1548,12 +1549,20 @@ describe("audit log", () => {
 
   it("UPDATE fails: the write stands, the row stays pending, and the result leads with the line", async () => {
     const e = testEnv({ DB: dbFailing(/^\s*UPDATE audit_log/, "D1_ERROR: network connection lost") });
-    syncHandler = () => Response.json(CONTEXT_RESPONSE);
+    // The before-read names the block's page (upper-cased, as a server might): the pending row is
+    // found by it, as begin stored it, since finish never ran.
+    syncHandler = (request) =>
+      request.method === "GET"
+        ? Response.json({ blocks: [{ uuid: B1, kind: "block", title: "Agenda", "page-id": PAGE_UUID.toUpperCase() }], missing: [] })
+        : Response.json(CONTEXT_RESPONSE);
     const before = await lastAuditId();
     const result = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "New title" }, reason: REASON }, connector(e));
     const rows = await auditRows(before);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ status: "pending", tool: "update_block", reason: REASON, targets: null });
+    expect(rows[0]).toMatchObject({ status: "pending", tool: "update_block", reason: REASON, targets: null, pages: PAGE_UUID });
+    const byPage = await callContent("get_activity_log", { graph: "work", page: PAGE_UUID }, connector(e));
+    expect(byPage.isError, byPage.content[0].text).toBe(false);
+    expect(JSON.parse(byPage.content[1].text).entries.map((x: { id: number; status: string }) => [x.id, x.status])).toContainEqual([rows[0].id, "pending"]);
     expect(syncRequests.map((r) => r.method)).toEqual(["GET", "PATCH"]);
     expect(result.isError).toBe(false);
     const lines = result.content[0].text.split("\n");
@@ -1564,7 +1573,7 @@ describe("audit log", () => {
     // A refused or failed write whose row can't be finished says so ahead of its own error.
     syncHandler = () => Response.json({ error: "entry 0: block not found" }, { status: 409 });
     const failed = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
-    const pending = (await auditRows(rows[0].id))[0];
+    const pending = (await auditRows(rows[0].id)).filter((r) => r.kind === "write")[0];
     expect(pending.status).toBe("pending");
     expect(failed).toEqual({
       isError: true,

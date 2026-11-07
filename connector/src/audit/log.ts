@@ -3,7 +3,7 @@ import { auditRetentionDays } from "../config";
 import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/common";
 import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
 import type { GraphAccess } from "../tools/semantic";
-import { type Snapshot, refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
+import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 
 /**
  * The owner-only write log (design 2026-11-07-connector-write-audit-log §3.2, §3.6). A write call
@@ -14,7 +14,9 @@ import { type Snapshot, refreshRefsBefore, snapshotClassFor, takeSnapshot } from
  *   finish  UPDATE by primary key 1 written, 1 read
  *   get     SELECT by primary key 1 read
  *   query   an aggregate over at most QUERY_SCAN_CAP - 1 - limit rows of the (graph_id, at) index,
- *           then at most `limit` rows by primary key: at most QUERY_SCAN_CAP read
+ *           then at most `limit` rows by primary key: at most QUERY_SCAN_CAP read. With
+ *           includeSnapshot the scan is `limit` rows shorter, and the snapshots that fit the result
+ *           are read by primary key after the page: still at most QUERY_SCAN_CAP
  *   recordRead INSERT of a kind = 'read' row, 2 written (READ_ROW_WRITES), 0 read
  *   probe   SELECT … LIMIT 0      0 read
  *   purge   oldest-row probe 1 read; with old rows, a DELETE over at most PURGE_BATCH ids
@@ -109,6 +111,11 @@ export interface AuditQuery {
   limit: number;
   cursor?: AuditCursor;
   includeSnapshot?: boolean;
+  /**
+   * With includeSnapshot, the most snapshot characters fetched: the page stops before the entry whose
+   * snapshot would pass it (the first entry is always returned), and the cursor resumes there.
+   */
+  snapshotChars?: number;
 }
 
 /** A page of entries, newest first, and the cursor to the rest of the window (null when it is exhausted). */
@@ -175,6 +182,11 @@ function toAuditRow(row: Row): AuditRow {
 function joinPages(pages: string[]): string | null {
   const lower = [...new Set(pages.map((p) => p.toLowerCase()))];
   return lower.length === 0 ? null : lower.join("\n");
+}
+
+/** Ids from a scan, as integers, inlined as a VALUES list since D1 binds at most 100 values. */
+function idList(ids: readonly (readonly number[])[]): string {
+  return ids.map(([id]) => `(${Math.trunc(id)})`).join(", ");
 }
 
 const NO_SUCH_TABLE = /no such table: audit_log(?![A-Za-z0-9_])/;
@@ -291,7 +303,9 @@ export class AuditLog {
    * D1 refuses a compound SELECT of more than a few terms, and a batch spends one of the invocation's
    * D1 queries per id.
    * Rows sharing the cursor's millisecond with a higher id are read and skipped, so a cursor inside a
-   * run of rows with the same `at` reads that many more. `before` is selected only with `includeSnapshot`.
+   * run of rows with the same `at` reads that many more. `before` is selected only with `includeSnapshot`,
+   * by a third statement after the page, and only for the entries whose snapshots fit `snapshotChars`
+   * (their lengths come with the page), so a page of large snapshots never fetches more than one result holds.
    */
   async query(graphId: string, q: AuditQuery): Promise<AuditPage> {
     // The FILTER clause comes first in the statement's text, so its values are bound first.
@@ -320,8 +334,9 @@ export class AuditLog {
     // One upper bound on `at`: given two (until and the cursor), the planner bounds the index range by one only.
     const from = q.cursor !== undefined && q.cursor.at < q.until ? q.cursor : { at: q.until - 1, id: Number.MAX_SAFE_INTEGER };
     binds.push(graphId, q.since, from.at, from.at, from.id);
-    // One row of the budget is the cursor's own row, which the scan reads and skips.
-    const scanCap = QUERY_SCAN_CAP - 1 - q.limit;
+    // One row of the budget is the cursor's own row, which the scan reads and skips; with
+    // includeSnapshot, another `limit` rows are kept for the snapshot fetch.
+    const scanCap = QUERY_SCAN_CAP - 1 - q.limit * (q.includeSnapshot ? 2 : 1);
     const scan = await this.db
       .prepare(
         `SELECT count(*) AS scanned, min(printf('%015d.%015d', at, id)) AS last,
@@ -337,7 +352,7 @@ export class AuditLog {
     const head = scan.results[0];
     const scanned = head?.scanned ?? 0;
     const hits = (JSON.parse(head?.hits ?? "[]") as [number, number][]).sort((a, b) => b[1] - a[1] || b[0] - a[0]);
-    const taken = hits.slice(0, q.limit);
+    let taken = hits.slice(0, q.limit);
     let nextCursor: AuditCursor | null = null;
     if (hits.length > q.limit) {
       const [id, at] = taken[taken.length - 1];
@@ -349,20 +364,47 @@ export class AuditLog {
     let rowsRead = scan.meta.rows_read;
     let entries: AuditRow[] = [];
     if (taken.length > 0) {
+      // The snapshot's length, not the snapshot: it is fetched below only for the entries that fit.
       const columns = `a.id, a.at, a.graph_id, a.alias, a.tool, a.kind, a.status, a.dry_run, a.reason, a.client, a.session, a.addressed, a.pages, a.targets, ${
-        q.includeSnapshot ? "a.before" : "NULL AS before"
-      }, a.error, a.rows_written, a.rows_read`;
-      // The ids come from the scan above, as integers, inlined since D1 binds at most 100 values.
-      const ids = taken.map(([id]) => `(${Math.trunc(id)})`).join(", ");
+        q.includeSnapshot ? "length(a.before) AS before_chars" : "NULL AS before_chars"
+      }, NULL AS before, a.error, a.rows_written, a.rows_read`;
       const fetched = await this.db
-        .prepare(`SELECT ${columns} FROM (VALUES ${ids}) AS ids CROSS JOIN audit_log AS a ON a.id = ids.column1`)
-        .all<Row>();
+        .prepare(`SELECT ${columns} FROM (VALUES ${idList(taken)}) AS ids CROSS JOIN audit_log AS a ON a.id = ids.column1`)
+        .all<Row & { before_chars: number | null }>();
       rowsRead += fetched.meta.rows_read;
       const byId = new Map(fetched.results.map((r) => [r.id, r]));
-      entries = taken.flatMap(([id]) => {
+      let rows = taken.flatMap(([id]) => {
         const r = byId.get(id);
-        return r === undefined ? [] : [toAuditRow(r)];
+        return r === undefined ? [] : [r];
       });
+      if (q.includeSnapshot) {
+        // Entries newest first while their snapshots fit the budget; the cursor resumes after the last.
+        const budget = q.snapshotChars ?? Number.POSITIVE_INFINITY;
+        let used = 0;
+        let kept = 0;
+        while (kept < rows.length) {
+          const chars = rows[kept].before_chars ?? 0;
+          if (kept > 0 && used + chars > budget) break;
+          used += chars;
+          kept += 1;
+        }
+        if (kept < rows.length) {
+          rows = rows.slice(0, kept);
+          taken = taken.slice(0, kept);
+          const last = rows[kept - 1];
+          nextCursor = { at: last.at, id: last.id };
+        }
+        const withBefore = rows.filter((r) => r.before_chars !== null);
+        if (withBefore.length > 0) {
+          const snapshots = await this.db
+            .prepare(`SELECT a.id, a.before FROM (VALUES ${idList(withBefore.map((r) => [r.id]))}) AS ids CROSS JOIN audit_log AS a ON a.id = ids.column1`)
+            .all<{ id: number; before: string | null }>();
+          rowsRead += snapshots.meta.rows_read;
+          const befores = new Map(snapshots.results.map((r) => [r.id, r.before]));
+          rows = rows.map((r) => ({ ...r, before: befores.get(r.id) ?? null }));
+        }
+      }
+      entries = rows.map(toAuditRow);
     }
     return { entries, nextCursor, scanned, rowsRead };
   }
@@ -525,7 +567,7 @@ function unfinished(id: number, error: unknown): string {
 
 /**
  * Runs one write call with its audit entry (design §3.3): the probe (once per isolate), the reason
- * and graph checks, the before-snapshot (§3.4, not for dry runs), a `pending` row holding it, the
+ * and graph checks, the before-snapshot (§3.4; a delete's dry run reads and checks it but keeps none), a `pending` row holding it, the
  * write, then the outcome on that row. A refusal before the write is logged too, including a delete
  * whose snapshot can't be taken in full. A pending row that can't be stored refuses the write before anything reaches
  * the sync server; an outcome that can't be stored leaves the write standing and leads the result
@@ -562,12 +604,16 @@ export function audited(
     }
 
     const dryRun = isDryRun(tool, args);
+    // A delete's dry run reads too, so it is refused as the real call would be; it keeps no snapshot.
+    const reads = !dryRun || ("delete" in plan && plan.delete !== undefined);
     let snapshot: Snapshot = { before: null, pages: [] };
-    if (refusal === undefined && !dryRun) {
+    if (refusal === undefined && reads) {
       try {
         snapshot = await takeSnapshot(ctx.access, alias, tool, rest);
+        if (dryRun) snapshot = { ...snapshot, before: null };
       } catch (error) {
         refusal = error;
+        if (error instanceof SnapshotRefusal) snapshot = error.snapshot;
       }
     }
     // Found by page whatever the outcome: the pages the call names and its snapshot read.

@@ -698,6 +698,76 @@ describe("large snapshots", () => {
   });
 });
 
+describe("snapshot cost", () => {
+  it("include_snapshot fetches only the snapshots that fit one result, not every entry's on the page", async () => {
+    const top = Date.now() - 1000;
+    // 200 deletes, each with a 95,000-character before: one fits a result, two don't.
+    await env.DB.prepare(
+      `WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 200)
+       INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, pages, before)
+       SELECT ?1 - i, ?2, 'work', 'delete_blocks', 'write', 'ok', 'notes',
+              '{"source":"getBlocks","data":"' || replace(hex(zeroblob(47500)), '0', 'x') || '"}' FROM k`,
+    )
+      .bind(top, WORK_ID)
+      .run();
+    const fetched: { rowsRead: number; chars: number }[] = [];
+    const db = {
+      prepare: (sql: string) => {
+        const wrap = (stmt: D1PreparedStatement): D1PreparedStatement =>
+          ({
+            bind: (...v: unknown[]) => wrap(stmt.bind(...v)),
+            all: async () => {
+              const r = await stmt.all<Record<string, unknown>>();
+              const chars = r.results.reduce((n, row) => n + (typeof row.before === "string" ? row.before.length : 0), 0);
+              fetched.push({ rowsRead: r.meta.rows_read, chars });
+              return r;
+            },
+          }) as unknown as D1PreparedStatement;
+        return wrap(env.DB.prepare(sql));
+      },
+    } as unknown as D1Database;
+    const budget = RESULT_CHAR_LIMIT - 2_000;
+    const page = await new AuditLog(db).query(WORK_ID, { since: top - DAY, until: top + 1, limit: 200, includeSnapshot: true, snapshotChars: budget });
+    expect(page.entries.map((e) => e.at)).toEqual([top]);
+    expect(page.entries[0].before).toHaveLength(95_000 + '{"source":"getBlocks","data":""}'.length);
+    expect(page.nextCursor).toEqual({ at: top, id: page.entries[0].id });
+    expect(fetched.reduce((n, f) => n + f.chars, 0)).toBeLessThanOrEqual(budget);
+    expect(page.rowsRead).toBeLessThanOrEqual(QUERY_SCAN_CAP);
+
+    // Through the tool: one entry per call, each call within the read budget, and the cursor reads on.
+    const first = await activity({ include_snapshot: true, limit: 200 });
+    expect(first.json.entries).toHaveLength(1);
+    // D1's own count: the scan, the page, and one snapshot (not one per entry on the page).
+    const scan = QUERY_SCAN_CAP - 1 - 2 * 200;
+    expect((await readRows())[0].rows_read).toBe(scan + scan + 1);
+    const second = await activity({ include_snapshot: true, limit: 200, cursor: first.json["next-cursor"] });
+    expect(second.json.entries.map((e) => new Date(e.at).getTime())).toEqual([top - 1]);
+    for (const r of await readRows()) expect(r.rows_read).toBeLessThanOrEqual(QUERY_SCAN_CAP);
+  });
+
+  it("with small snapshots, the largest page and its snapshot fetch still read at most 500 rows", async () => {
+    const top = Date.now() - 1000;
+    await env.DB.prepare(
+      `WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 600)
+       INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, pages, before)
+       SELECT ?1 - i, ?2, 'work', 'update_block', 'write', 'ok', 'notes', '{"source":"getBlocks","data":null}' FROM k`,
+    )
+      .bind(top, WORK_ID)
+      .run();
+    const page = await new AuditLog(env.DB).query(WORK_ID, { since: top - DAY, until: top + 1, limit: 200, includeSnapshot: true, snapshotChars: RESULT_CHAR_LIMIT });
+    // The scan is `limit` rows shorter with include_snapshot, keeping room for the snapshot fetch.
+    const scan = QUERY_SCAN_CAP - 1 - 2 * 200;
+    expect(page.entries).toHaveLength(scan);
+    expect(page.entries.every((e) => e.before === '{"source":"getBlocks","data":null}')).toBe(true);
+    expect(page.rowsRead).toBeLessThanOrEqual(QUERY_SCAN_CAP);
+    // Entries without a snapshot cost no snapshot read.
+    await env.DB.exec("UPDATE audit_log SET before = NULL");
+    const none = await new AuditLog(env.DB).query(WORK_ID, { since: top - DAY, until: top + 1, limit: 200, includeSnapshot: true, snapshotChars: RESULT_CHAR_LIMIT });
+    expect(none.entries).toHaveLength(scan);
+    expect(none.rowsRead).toBe(2 * scan);
+  });
+});
+
 describe("errors name the input", () => {
   it("dates, window, id, limit, cursor and graph", async () => {
     const other = await row({ at: Date.now() - 1000, graph_id: OTHER_ID });
