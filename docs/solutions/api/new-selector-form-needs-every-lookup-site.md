@@ -1,10 +1,11 @@
 ---
-title: A new way to name a page (journal date, title) must reach every lookup site, not just the resolver
+title: A new input form or refusal rule (journal date, reserved ident) must reach every site that takes that input, not just the first
 area: api
-tags: [selector, journal-date, ldb/get-page, target-label, dry-run, batch-insert]
+tags: [selector, journal-date, ldb/get-page, target-label, dry-run, batch-insert, reserved-ident, prepare-properties, every-route]
 seen:
   - 2026-11-07 – item 17, patch 0028, review round 2 (r2-correctness-1)
-promoted_to: []
+  - 2026-11-07 – item 29, patch 0034, review round 1 (r1-correctness-1): the stamp-property refusal covered the property tools but not the insert routes' properties
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
@@ -22,3 +23,5 @@ Page selectors by title or journal date were added to the shared resolver, but `
 ## How to catch it next time
 
 When an input form is added, `git grep` the lookups the old form went through (`ldb/get-page`, `get-page`) and test every consumer with the new form: the write, the dry run, the label check and the created flag. Test the same page named two ways in one batch.
+
+Same shape for refusals: a rule added to one route (refuse the reserved stamp idents in the property tools) missed the insert routes, which build properties through `prepare-properties`. List every route that accepts the input, flagged and unflagged, and test each with each form of it (title, ident, UUID). See `authorship-stamps-ride-the-write-transaction.md`.
