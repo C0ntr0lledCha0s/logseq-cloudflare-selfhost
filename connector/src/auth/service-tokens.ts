@@ -132,6 +132,17 @@ export class ServiceTokenStore {
     return results.map(toRow);
   }
 
+  /** Whether any token, revoked or not, has this name. A lookup on the unique name index: 0 rows read on a miss. */
+  async nameInUse(name: string): Promise<boolean> {
+    const { results } = await this.db.prepare("SELECT id FROM service_tokens WHERE name = ?").bind(name).all();
+    return results.length > 0;
+  }
+
+  /** Deletes one row. Only the wizard's failed read-back uses it; revoked and expired rows stay listed. */
+  async remove(id: string): Promise<void> {
+    await this.db.prepare("DELETE FROM service_tokens WHERE id = ?").bind(id).run();
+  }
+
   /** The row whose hash matches, or null. Callers still compare the hash in constant time (§3.2 step 3). */
   async findByHash(hash: string): Promise<ServiceTokenMatch | null> {
     const { results } = await this.db

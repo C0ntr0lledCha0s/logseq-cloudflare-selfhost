@@ -1,3 +1,4 @@
+import { MAX_EXPIRY_DAYS, type ServiceTokenRow } from "../auth/service-tokens";
 import { EXPIRY_WARN_DAYS, type GraphRecord, daysUntilExpiry } from "../graphs";
 import { escapeHtml, htmlPage } from "../html";
 
@@ -157,7 +158,8 @@ export function graphListPage(graphs: GraphRecord[], csrf: string, now: number):
     "Connected graphs",
     `<div class="page-head"><h1>Connected graphs</h1>${graphs.length === 0 ? "" : '<a class="button" href="/graphs/new">Connect a graph</a>'}</div>
 <p class="lede">Claude can use these graphs when you prompt it in claude.ai or Claude Code.</p>
-${list}`,
+${list}
+<p class="footer-links"><a href="/tokens">Service tokens</a> for unattended Claude Code sessions and scheduled tasks</p>`,
     signOut(csrf),
   );
 }
@@ -248,4 +250,131 @@ export function disconnectedPage(alias: string): Response {
 
 export function forbiddenPage(): Response {
   return messagePage(403, "Forbidden", "The form has expired. Reload the page and try again.");
+}
+
+// Service tokens (design docs/superpowers/specs/2026-11-07-service-token-cloud-sessions-design.md §3.7).
+// Only tokenCreatedPage ever receives a token, and it is the create response itself.
+
+/** Fields the create form shows again after a refusal. Never a token. */
+export interface TokenFormValues {
+  name: string;
+  graphIds: string[];
+  access: string;
+  expiresDays: string;
+}
+
+/** `ms` since the epoch as `YYYY-MM-DD HH:MM UTC`. */
+function utc(ms: number): string {
+  const iso = new Date(ms).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+}
+
+function tokenStatus(token: ServiceTokenRow, now: number): "active" | "expired" | "revoked" {
+  if (token.revokedAt !== null) return "revoked";
+  return token.expiresAt <= now ? "expired" : "active";
+}
+
+function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, string>, csrf: string, now: number): string {
+  const name = escapeHtml(token.name);
+  const status = tokenStatus(token, now);
+  const graphs = token.graphIds
+    .map((id) => {
+      const alias = aliases.get(id);
+      return alias === undefined ? `<span class="warning">${escapeHtml(id)} (not connected)</span>` : escapeHtml(alias);
+    })
+    .join(", ");
+  const write = token.access === "write";
+  const revoke =
+    status === "active"
+      ? `<form method="post" action="/tokens/${escapeHtml(token.id)}/revoke">
+  ${csrfField(csrf)}
+  <button class="danger">Revoke ${name}</button>
+</form>`
+      : "";
+  const ended = status === "revoked" ? ` on ${utc(token.revokedAt!)}` : "";
+  return `<section class="block" id="token-${name}">
+<div class="block-title"><h2>${name}</h2><span class="tag${write ? " write" : ""}">${write ? "read-write" : "read-only"}</span></div>
+<div class="children">
+<dl class="props">
+  <dt>Status</dt><dd>${status}${ended}</dd>
+  <dt>Graphs</dt><dd>${graphs}</dd>
+  <dt>Expires</dt><dd>${utc(token.expiresAt)}</dd>
+  <dt>Last used</dt><dd>${token.lastUsedAt === null ? "never" : utc(token.lastUsedAt)}</dd>
+</dl>
+${revoke}
+</div>
+</section>`;
+}
+
+/** GET /tokens. */
+export function tokenListPage(tokens: ServiceTokenRow[], graphs: GraphRecord[], csrf: string, now: number): Response {
+  const aliases = new Map(graphs.map((graph) => [graph.graphId, graph.alias]));
+  const list =
+    tokens.length === 0
+      ? `<div class="empty"><p>No service tokens yet.</p></div>`
+      : `<div class="outline">${tokens.map((token) => tokenSection(token, aliases, csrf, now)).join("\n")}</div>`;
+  return page(
+    200,
+    "Service tokens",
+    `<div class="page-head"><h1>Service tokens</h1><a class="button" href="/tokens/new">New token</a></div>
+<p class="lede">A service token lets an unattended Claude Code session or scheduled task use the chosen graphs without signing in.
+Revoked and expired tokens stay listed.</p>
+${list}
+<p class="footer-links"><a href="/graphs">Back to connected graphs</a></p>`,
+    signOut(csrf),
+  );
+}
+
+/** GET /tokens/new, and the same form again after a refusal. */
+export function newTokenPage(csrf: string, graphs: GraphRecord[], values: TokenFormValues, status = 200, error?: string): Response {
+  const boxes =
+    graphs.length === 0
+      ? `<p class="hint">No graphs are connected. <a href="/graphs/new">Connect a graph</a> first.</p>`
+      : graphs
+          .map((graph) => {
+            const mode = graph.mode === "write" ? "read-write" : "read-only";
+            return `<label class="check"><input type="checkbox" name="graph" value="${escapeHtml(graph.graphId)}"${checked(values.graphIds.includes(graph.graphId))}> ${escapeHtml(graph.alias)} <small>(${mode})</small></label>`;
+          })
+          .join("\n  ");
+  return page(
+    status,
+    "New service token",
+    `<h1>New service token</h1>
+${errorBox(error)}
+<form class="card" method="post" action="/tokens/new">
+  ${csrfField(csrf)}
+  <label class="field"><span>Name</span>
+  <input name="name" value="${escapeHtml(values.name)}" required maxlength="40" spellcheck="false">
+  <small>Shown in the audit log as service:name. Lowercase letters, digits and hyphens.</small></label>
+  <fieldset><legend>Graphs</legend>
+  ${boxes}
+  <small>A token's access never exceeds a graph's own mode.</small>
+  </fieldset>
+  <fieldset><legend>What the token may do</legend>
+  <div class="choices">
+  ${choice("access", "read", values.access, "Read only", "Search and read pages and blocks.", true)}
+  ${choice("access", "write", values.access, "Read and write", "Also write to graphs connected read-write.")}
+  </div>
+  </fieldset>
+  <label class="field"><span>Expires after (days)</span>
+  <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}" required>
+  <small>1 to ${MAX_EXPIRY_DAYS} days.</small></label>
+  <div class="actions"><button>Create token</button><a class="button quiet" href="/tokens">Cancel</a></div>
+</form>`,
+  );
+}
+
+/** The create response: the only page that ever holds the token, once, never cached. */
+export function tokenCreatedPage(name: string, token: string): Response {
+  return page(
+    200,
+    "Service token created",
+    `<h1>Created <span class="alias">${escapeHtml(name)}</span></h1>
+<p class="callout"><strong>Copy this token now.</strong> It is shown only on this page and can't be shown again.</p>
+<label class="field"><span>Token</span>
+<input readonly value="${escapeHtml(token)}" autocomplete="off" spellcheck="false"></label>
+<p>Select the token, copy it, and store it as the secret <code>LOGSEQ_SERVICE_TOKEN</code> in your Claude Code cloud environment.</p>
+<p class="hint">This page is not cached, but a screenshot, a restored browser tab or the clipboard can still hold the token. Close this tab when you're done. If it leaks, revoke it.</p>
+<p class="footer-links"><a href="/tokens">Back to service tokens</a></p>`,
+  );
 }
