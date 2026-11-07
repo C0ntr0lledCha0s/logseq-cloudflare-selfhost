@@ -1,4 +1,7 @@
 {
+  "enabledMcpjsonServers": [
+    "logseq-service"
+  ],
   "permissions": {
     "allow": [
       "Bash(scripts/check.sh)",
@@ -27,7 +30,16 @@
       "Bash(git blame:*)",
       "Bash(git fetch origin main)",
       "mcp__Logseq__list_graphs",
-      "Bash(git branch:*)"
+      "Bash(git branch:*)",
+      "mcp__logseq-service__search_graph",
+      "mcp__logseq-service__get_page_outline",
+      "mcp__logseq-service__get_page",
+      "mcp__logseq-service__get_block",
+      "mcp__logseq-service__get_blocks",
+      "mcp__logseq-service__list_tasks",
+      "mcp__logseq-service__kb_index",
+      "mcp__logseq-service__semantic_search",
+      "mcp__logseq-service__list_graphs"
     ],
     "deny": [
       "Read(./.env.local)",

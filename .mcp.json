@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "logseq-service": {
+      "type": "http",
+      "url": "https://${LOGSEQ_MCP_HOST:-mcp.example.com}/mcp",
+      "headers": { "Authorization": "Bearer ${LOGSEQ_SERVICE_TOKEN}" }
+    }
+  }
+}
