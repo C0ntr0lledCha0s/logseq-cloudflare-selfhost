@@ -22,6 +22,7 @@ A finding needs evidence you reproduced: a failing test, a command and its outpu
 - **Path parameters survive forwarding.** Anything decoded by the router and forwarded internally is encoded again. Test with an ident containing `/` through the public route. (`docs/solutions/api/qualified-ident-path-params-404.md`)
 - **Server writes keep order keys unique.** Any new path that creates blocks seeds the max order key and is tested against a page that already has blocks. (`docs/solutions/sync/order-key-not-seeded-for-server-writes.md`)
 - **Destructive operations keep their guards.** Deletes and resets refuse when references, holders or values exist unless they are acknowledged, and they offer a dry-run. A change can't widen what a call deletes beyond what the caller named.
+- **Refuse the whole family, keep the retry.** A guard that pre-empts an outliner throw covers every member that throws (all private tags, not only Tag), names the entry or path, and answers 4xx. It keeps what the caller can legitimately re-send: a value the target already holds, and what the outliner itself adds on create (a new journal's Journal). Test each refused value on a plain target and a held one, in a list with a valid value, and check nothing was written. (`docs/solutions/api/outliner-throws-on-private-tag-writes-answered-500.md`)
 - **Shipped patches are history.** A fix to shipped behaviour is a new numbered patch, not an edit to an old one. A patch that also belongs upstream says so in the PR.
 
 ## Sync
