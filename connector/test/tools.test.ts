@@ -573,6 +573,19 @@ describe("hand-written tools", () => {
     expect(syncRequests[0].body).toBe("");
   });
 
+  it("create_tag and connector_help point at promote_page_to_tag when a page holds the title", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_tag");
+    expect(create.description).toContain(
+      "If a page already has the title, the 409 names it; promote_page_to_tag converts that page.",
+    );
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "when create_tag is refused because a page has the title, promote_page_to_tag converts that page, keeping its blocks and references",
+    );
+    expect(help).toContain("Setting a page's tags to Tag is refused");
+  });
+
   it("connector_help returns the usage conventions", async () => {
     const result = await callTool("connector_help", {});
     expect(result.isError).toBe(false);

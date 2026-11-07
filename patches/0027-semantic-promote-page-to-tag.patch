@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d353090..851a37a 100644
+index d353090..2e60e72 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -954,6 +954,21 @@
@@ -70,7 +70,48 @@ index d353090..851a37a 100644
      (outliner-property/set-block-property! conn block-id property-ident value)))
  
  ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
-@@ -1754,7 +1791,130 @@
+@@ -1286,19 +1323,27 @@
+        (filter #(or (page? %) (tag? %) (property? %)))
+        (sort-by :db/id)))
+ 
+-(defn- title-taken-response [title holders]
+-  (http/json-response
+-   nil
+-   {:error (str "title \"" title "\" is already used by "
+-                (string/join ", " (map #(str (title-holder-kind %) " \"" (:block/title %) "\" ("
+-                                             (:block/uuid %) ")")
+-                                       holders))
+-                "; nothing was created. Use the existing one or choose another title.")
+-    :existing (mapv #(hash-map :uuid (uuid-string (:block/uuid %))
+-                               :kind (title-holder-kind %)
+-                               :title (:block/title %))
+-                    holders)}
+-   409))
++(defn- title-taken-response
++  "409 naming each holder of `title`. createTag passes `promotable?`: a holder it accepts gets a
++  pointer to promote_page_to_tag in the message and promote: true in its existing[] entry."
++  [title holders & [promotable?]]
++  (let [promotable? (or promotable? (constantly false))]
++    (http/json-response
++     nil
++     {:error (str "title \"" title "\" is already used by "
++                  (string/join ", " (map #(str (title-holder-kind %) " \"" (:block/title %) "\" ("
++                                               (:block/uuid %) ")")
++                                         holders))
++                  (apply str (map #(str "; to make page \"" (:block/title %) "\" a tag keeping its blocks and"
++                                        " references, call promote_page_to_tag with page-id " (:block/uuid %))
++                                  (filter promotable? holders)))
++                  "; nothing was created. Use the existing one or choose another title.")
++      :existing (mapv #(cond-> {:uuid (uuid-string (:block/uuid %))
++                                :kind (title-holder-kind %)
++                                :title (:block/title %)}
++                         (promotable? %) (assoc :promote true))
++                      holders)}
++     409)))
+ 
+ ;; deletePage, deleteTag and deleteProperty refuse to lose references, holders, child tags or
+ ;; values unless the matching acknowledge-* query flag is true; dry-run=true reports the counts.
+@@ -1754,7 +1799,130 @@
            (broadcast-change! self)
            (http/json-response nil {:deleted (count resolved)}))))))
  
@@ -202,7 +243,17 @@ index d353090..851a37a 100644
  
  (defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
    (case handler
-@@ -1833,6 +1993,40 @@
+@@ -1783,7 +1951,8 @@
+         (cond
+           (not (non-blank-string? (:title body))) (http/bad-request "missing title")
+           error (http/bad-request error)
+-          (seq holders) (title-taken-response (:title body) holders)
++          ;; A holder promotePageToTag would accept: a plain page no other tag's title blocks.
++          (seq holders) (title-taken-response (:title body) holders #(nil? (promotion-refusal db nil %)))
+           :else
+           (rejecting
+            #(let [tag-id (atomic-write! conn creator false :create-page
+@@ -1833,6 +2002,40 @@
                (broadcast-change! self)
                (http/json-response nil (tag-detail-response (d/entity @conn (:db/id tag)))))))))
  
@@ -243,7 +294,7 @@ index d353090..851a37a 100644
      :semantic/tags-delete
      (if-let [tag (find-entity db (:tag-id path-params))]
        (if-not (tag? tag)
-@@ -2492,29 +2686,31 @@
+@@ -2492,29 +2695,31 @@
    "Checks createTag's or updateTag's extends and properties for `tag` (nil when creating):
    {:parents [tag ...] :properties {:mode :properties}}, each key only when given, or {:error message}
    naming every refused entry. extends replaces the tags it extends and names at least one;
@@ -298,7 +349,7 @@ index d353090..851a37a 100644
  
  (defn- write-tag-schema!
    "Inside atomic-write!: replaces what the tag with db id `tag-id` extends with `parents`, and changes
-@@ -3458,7 +3654,7 @@
+@@ -3458,7 +3663,7 @@
  
  (def ^:private capture-and-tag-handlers
    #{:semantic/capture :semantic/tags-list :semantic/tags-create :semantic/tags-get :semantic/tags-objects
@@ -308,7 +359,7 @@ index d353090..851a37a 100644
  (def ^:private task-handlers
    #{:semantic/tasks-list :semantic/tasks-create})
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index c20b05b..ae8b7d0 100644
+index c20b05b..b8393cc 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -28,6 +28,8 @@
@@ -320,14 +371,17 @@ index c20b05b..ae8b7d0 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
      :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
-@@ -150,6 +152,7 @@
+@@ -150,8 +152,9 @@
     "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
 +   "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by UUID, into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (the ident the tag would get and the counts), with nothing written. Unavailable for E2EE graphs."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
-    "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
+-   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
++   "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
     "getTag" ["Get a tag" "Returns one tag by UUID, with the tags it extends and its tag properties."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+    "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
 @@ -250,7 +253,8 @@
     "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
                       dry-run-parameter]
@@ -367,16 +421,30 @@ index c20b05b..ae8b7d0 100644
                    "getProperty"
                    (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
                    "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
-@@ -537,6 +547,8 @@
+@@ -537,8 +547,10 @@
             "captureToToday" {"201" (entity-response "InsertedBlocksResponse" "Today's journal page and the inserted block trees")}
             "batchInsertBlockTrees"
             {"201" (entity-response "BatchInsertResponse" "Each entry's target and inserted block trees")}
 +           "promotePageToTag" {"404" {:description "No visible page has that page-id"}
 +                               "409" {:description "The page is already a tag, or another tag uses its title (existing names it); nothing was changed"}}
             "createTag" {"201" (entity-response "TagResponse" "The created tag")
-                         "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+-                        "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
++                        "409" (entity-response "TitleConflict" "The title is already used; nothing was created. A page promote_page_to_tag can convert is named in the error and has promote: true")}
             ("deletePage" "deleteTag" "deleteProperty")
-@@ -726,6 +738,12 @@
+            {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
+             "204" {:description "Deleted"}
+@@ -561,7 +573,9 @@
+                                            :items {:type "object" :required ["uuid" "kind" "title"]
+                                                    :properties {:uuid {:type "string"}
+                                                                 :kind {:enum ["page" "journal" "tag" "property"]}
+-                                                                :title {:type "string"}}}}}}
++                                                                :title {:type "string"}
++                                                                :promote {:type "boolean"
++                                                                          :description "createTag only: true on a page promotePageToTag can turn into this tag, keeping its blocks and references."}}}}}}
+    :DeleteImpact {:type "object" :required ["requires"]
+                   :properties {:dry-run {:type "boolean"}
+                                :uuid {:type "string"}
+@@ -726,6 +740,12 @@
                                                                 :properties {:uuid {:type "string"}
                                                                              :title {:type "string"}
                                                                              :ident {:type "string"}}}}}}
@@ -391,10 +459,10 @@ index c20b05b..ae8b7d0 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
 new file mode 100644
-index 0000000..2359fc4
+index 0000000..6193ce7
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
-@@ -0,0 +1,887 @@
+@@ -0,0 +1,1021 @@
 +(ns logseq.db-sync.semantic-promote-page-to-tag-test
 +  "Turning a page into a tag. Tag can't be set as a tags value, on any write path: the outliner
 +  refuses it (Can't set tag with built-in #Tag), which the handler answered as a 500. It is refused
@@ -409,6 +477,7 @@ index 0000000..2359fc4
 +            [datascript.core :as d]
 +            [logseq.db :as ldb]
 +            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.semantic :as semantic-handler]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
 +            [logseq.db.common.normalize :as db-normalize]
@@ -1282,6 +1351,139 @@ index 0000000..2359fc4
 +                (is (= [status error] [(:status dry) (get-in dry [:body :error])]) (pr-str dry))
 +                (is (= real dry) "the same refusal as the real call")
 +                (is (= before (snapshot conn)) "nothing is written")))))))))
++
++;; createTag's 409 when a page holds the title. The holders a promotion would accept get a pointer to
++;; promote_page_to_tag and promote: true; any other holder's entry and message are as before.
++
++(defn- create-tag! [self title]
++  (request! self "POST" "/semantic/tags" {:title title}))
++
++(defn- taken-message
++  "The 409 message createTag and createPage gave before the hint: each holder's kind, title and UUID."
++  [title holders]
++  (str "title \"" title "\" is already used by "
++       (string/join ", " (map (fn [[kind holder-title id]] (str kind " \"" holder-title "\" (" id ")")) holders))
++       "; nothing was created. Use the existing one or choose another title."))
++
++(defn- promote-hint [title id]
++  (str "; to make page \"" title "\" a tag keeping its blocks and references, call promote_page_to_tag with page-id " id))
++
++(defn- hinted-message
++  "taken-message with a hint for each [title id] in `promotable`, after the holders."
++  [title holders promotable]
++  (string/replace-first (taken-message title holders) "; nothing was created"
++                        (str (apply str (map (fn [[t id]] (promote-hint t id)) promotable)) "; nothing was created")))
++
++;; Before the hint: 409 with the message and existing entry, but no pointer and no promote flag, e.g.
++;;   expected: (string/includes? message "promote_page_to_tag")  actual: (not ...)
++(deftest create-tag-409-points-at-promotion-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant diner]}]
++        (p/do
++         (p/doseq [[kind title id holder-title] [["an empty page, other case" "restaurant" restaurant "Restaurant"]
++                                                ["a page with blocks, same case" "Diner" diner "Diner"]
++                                                ["upper case" "DINER" diner "Diner"]]]
++          (p/let [before (snapshot conn)
++                  response (create-tag! self title)]
++            (testing kind
++              (is (= 409 (:status response)) (pr-str response))
++              (is (= (hinted-message title [["page" holder-title id]] [[holder-title id]])
++                     (get-in response [:body :error])))
++              (is (string/includes? (get-in response [:body :error]) "promote_page_to_tag"))
++              (is (= [{:uuid (str id) :kind "page" :title holder-title :promote true}]
++                     (get-in response [:body :existing])))
++              (is (= before (snapshot conn)) "nothing is written"))))
++         (p/let [followed (promote! self restaurant)]
++           (is (= 200 (:status followed)) "the call the hint names succeeds")
++           (is (ldb/class? (entity conn restaurant)))))))))
++
++;; A holder promotion would refuse gets no pointer: a tag, a journal, a property, a built-in page, a
++;; namespaced page, and a page whose title a tag also has (promotion answers 409 for it). With a page
++;; and a property holding the title, only the page's entry is flagged; two pages both are.
++(deftest create-tag-409-no-hint-for-other-holders-test
++  (async done
++    (with-promotion-graph done
++      (fn [{:keys [conn self food cuisine servings-uuid]}]
++        (let [{:keys [journal lunch library]} (seed-refusal-kinds conn)
++              [food-page shelf-page kitchen kitchen-2] (repeatedly 4 random-uuid)
++              shelf (outliner-property/upsert-property!
++                     conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                     {:property-name "Shelf"})
++              shelf-uuid (:block/uuid (d/entity @conn (:db/ident shelf)))]
++          (d/transact! conn [(raw-page food-page "food") (raw-page shelf-page "shelf")
++                             (raw-page kitchen "Kitchen") (raw-page kitchen-2 "kitchen")])
++          (p/do
++            (p/doseq [[kind title holders] [["a tag" "cuisine" [["tag" "Cuisine" cuisine]]]
++                                            ["a journal" "Nov 6th, 2026" [["journal" "Nov 6th, 2026" journal]]]
++                                            ["a property" "servings" [["property" "servings" servings-uuid]]]
++                                            ["a built-in page" "Library" [["page" "Library" library]]]
++                                            ["a namespaced page" "Lunch" [["page" "Lunch" lunch]]]
++                                            ["a page whose title a tag has" "FOOD"
++                                             [["tag" "Food" food] ["page" "food" food-page]]]]]
++              (p/let [before (snapshot conn)
++                      response (create-tag! self title)]
++                (testing kind
++                  (is (= [409 (taken-message title holders)]
++                         [(:status response) (get-in response [:body :error])])
++                      (pr-str response))
++                  (is (= (mapv (fn [[k t id]] {:uuid (str id) :kind k :title t}) holders)
++                         (get-in response [:body :existing]))
++                      "no entry has promote")
++                  (is (= before (snapshot conn)) "nothing is written"))))
++            (p/let [mixed (create-tag! self "Shelf")
++                    shelf-holders (sort-by #(:db/id (entity conn %)) [shelf-uuid shelf-page])
++                    holder (fn [id] (if (= id shelf-page) ["page" "shelf" shelf-page] ["property" "Shelf" shelf-uuid]))]
++              (testing "a page and a property"
++                (is (= [409 (hinted-message "Shelf" (map holder shelf-holders) [["shelf" shelf-page]])]
++                       [(:status mixed) (get-in mixed [:body :error])])
++                    (pr-str mixed))
++                (is (= (set [{:uuid (str shelf-page) :kind "page" :title "shelf" :promote true}
++                             {:uuid (str shelf-uuid) :kind "property" :title "Shelf"}])
++                       (set (get-in mixed [:body :existing]))))))
++            (p/let [pages (create-tag! self "KITCHEN")]
++              (testing "two pages"
++                (is (= [409 (hinted-message "KITCHEN" [["page" "Kitchen" kitchen] ["page" "kitchen" kitchen-2]]
++                                            [["Kitchen" kitchen] ["kitchen" kitchen-2]])]
++                       [(:status pages) (get-in pages [:body :error])])
++                    (pr-str pages))
++                (is (= [true true] (map :promote (get-in pages [:body :existing]))))))))))))
++
++;; createPage's 409 is the body patch 0011 gave, with no pointer, for a page promotion would accept.
++(deftest create-page-409-unchanged-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant]}]
++        (p/let [before (snapshot conn)
++                response (request! self "POST" "/semantic/pages" {:title "restaurant"})]
++          (is (= {:status 409
++                  :body {:error (taken-message "restaurant" [["page" "Restaurant" restaurant]])
++                         :existing [{:uuid (str restaurant) :kind "page" :title "Restaurant"}]}}
++                 response))
++          (is (= before (snapshot conn)) "nothing is written"))))))
++
++(deftest openapi-documents-create-tag-hint-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        create-tag (get-in document [:paths "/api/v1/graphs/{graph-id}/tags" :post])
++        item (get-in document [:components :schemas :TitleConflict :properties :existing :items])]
++    (is (= {:type "boolean"} (select-keys (get-in item [:properties :promote]) [:type])))
++    (is (not (some #{"promote"} (:required item))))
++    (is (string/includes? (:description create-tag) "promote_page_to_tag"))
++    (is (string/includes? (get-in create-tag [:responses "409" :description]) "promote_page_to_tag"))))
++
++;; The graph's own validation refuses a write that leaves a promoted page without Tag or an ident, or
++;; with Page, before the read-back runs (promotion-read-back-wired-test), so these three checks are
++;; pinned here on a real page that was never converted: each must be named, and the call must throw.
++(deftest verify-promotion-names-what-is-missing-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn restaurant]}]
++        (let [page (entity conn restaurant)
++              counts (#'semantic-handler/promotion-counts @conn page)
++              error (try (#'semantic-handler/verify-promotion! @conn restaurant "Restaurant" counts) nil
++                         (catch :default e e))]
++          (is (= "the write did not store what was asked: Tag is missing; Page was not removed; the ident is missing"
++                 (ex-message error))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index e1c9ab9..75955cc 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
