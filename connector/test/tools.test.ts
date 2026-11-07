@@ -232,7 +232,7 @@ function specWithFakeOperation(): OpenApiSpec {
 }
 
 /** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
-const READ_HANDWRITTEN = ["connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file"];
+const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file"];
 const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",

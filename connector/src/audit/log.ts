@@ -13,6 +13,9 @@ import { refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
  *   begin   INSERT                2 written (row and index entry), 0 read
  *   finish  UPDATE by primary key 1 written, 1 read
  *   get     SELECT by primary key 1 read
+ *   query   an aggregate over at most QUERY_SCAN_CAP - 1 - limit rows of the (graph_id, at) index,
+ *           then at most `limit` rows by primary key: at most QUERY_SCAN_CAP read
+ *   recordRead INSERT of a kind = 'read' row, 2 written (READ_ROW_WRITES), 0 read
  *   probe   SELECT … LIMIT 0      0 read
  *   purge   oldest-row probe 1 read; with old rows, a DELETE over at most PURGE_BATCH ids
  *           (at most 501 more read, 1 written per row deleted)
@@ -22,6 +25,10 @@ import { refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 export const AUDIT_UPDATE_ROWS = 1;
 /** The most rows one purge run deletes. */
 export const PURGE_BATCH = 500;
+/** The most rows one `query` reads: it scans this many less its page size, then reads the page by id. */
+export const QUERY_SCAN_CAP = 500;
+/** Rows a `recordRead` INSERT writes (the row and its index entry), stored on the row it inserts. */
+export const READ_ROW_WRITES = 2;
 
 const DAY_MS = 86_400_000;
 
@@ -77,6 +84,39 @@ export interface AuditFinish {
   pages: string[];
   /** A snapshot known only after the write (refresh_refs' own before-text); when absent, `before` is kept. */
   before?: string | null;
+}
+
+/** A position in the log, newest first: rows strictly older than `(at, id)` come next. */
+export interface AuditCursor {
+  at: number;
+  id: number;
+}
+
+/** One `query` (design §3.5): a window, optional filters, a page size and where to resume. */
+export interface AuditQuery {
+  /** Inclusive, ms since the epoch. */
+  since: number;
+  /** Exclusive, ms since the epoch. */
+  until: number;
+  /** A page UUID or title, matched as one whole line of `pages`, ignoring case. */
+  page?: string;
+  tool?: string;
+  session?: string;
+  /** A status; `ok` leaves dry runs out, and `dry-run` is every dry run whatever its status. */
+  status?: AuditStatus | "dry-run";
+  limit: number;
+  cursor?: AuditCursor;
+  includeSnapshot?: boolean;
+}
+
+/** A page of entries, newest first, and the cursor to the rest of the window (null when it is exhausted). */
+export interface AuditPage {
+  entries: AuditRow[];
+  nextCursor: AuditCursor | null;
+  /** The rows the capped scan read from the window. */
+  scanned: number;
+  /** D1's own count of the rows both statements read. */
+  rowsRead: number;
 }
 
 export interface PurgeResult {
@@ -212,11 +252,125 @@ export class AuditLog {
 
   /** One row by id, or null when it doesn't exist or belongs to another graph. Reads 1 row. */
   async get(graphId: string, id: number): Promise<AuditRow | null> {
-    const { results } = await this.db
+    return (await this.lookup(graphId, id)).row;
+  }
+
+  /** `get`, with D1's count of the rows it read. */
+  async lookup(graphId: string, id: number): Promise<{ row: AuditRow | null; rowsRead: number }> {
+    const { results, meta } = await this.db
       .prepare("SELECT * FROM audit_log WHERE id = ? AND graph_id = ?")
       .bind(id, graphId)
       .all<Row>();
-    return results[0] === undefined ? null : toAuditRow(results[0]);
+    return { row: results[0] === undefined ? null : toAuditRow(results[0]), rowsRead: meta.rows_read };
+  }
+
+  /**
+   * One page of a graph's write entries, newest first (design §3.5), reading at most
+   * QUERY_SCAN_CAP rows. Two statements, each measured from D1's meta:
+   *
+   * 1. An aggregate over the window and cursor, scanned over the (graph_id, at) index with
+   *    `LIMIT QUERY_SCAN_CAP - 1 - limit`, newest first (the 1 is the cursor's own row, read and skipped). `kind` and the filters are applied outside the
+   *    scan, so a read row or a selective filter costs nothing extra. It answers how many rows it
+   *    scanned, the last one scanned, and the `(id, at)` of each match: one row read per row scanned.
+   * 2. The first `limit` matches by primary key, joined from a `VALUES` list: one row read per entry.
+   *
+   * When the matches fill the page, the next page resumes after its last entry; otherwise after the
+   * last row scanned, not the last row returned, so a match further down the window is never skipped.
+   * The cursor is null once a scan comes back short. A window function or a materialised CTE would
+   * do this in one statement, but each reads the scanned rows again from a temporary table (1,501
+   * and 1,500 rows for a 500-row scan, measured). An `IN` list or `json_each` reads two rows per id,
+   * D1 refuses a compound SELECT of more than a few terms, and a batch spends one of the invocation's
+   * D1 queries per id.
+   * Rows sharing the cursor's millisecond with a higher id are read and skipped, so a cursor inside a
+   * run of rows with the same `at` reads that many more. `before` is selected only with `includeSnapshot`.
+   */
+  async query(graphId: string, q: AuditQuery): Promise<AuditPage> {
+    // The FILTER clause comes first in the statement's text, so its values are bound first.
+    const filters: string[] = ["kind = 'write'"];
+    const binds: unknown[] = [];
+    if (q.page !== undefined) {
+      filters.push("instr(char(10) || pages || char(10), char(10) || ? || char(10)) > 0");
+      binds.push(q.page.toLowerCase());
+    }
+    if (q.tool !== undefined) {
+      filters.push("tool = ?");
+      binds.push(q.tool);
+    }
+    if (q.session !== undefined) {
+      filters.push("session = ?");
+      binds.push(q.session);
+    }
+    if (q.status === "dry-run") {
+      filters.push("dry_run = 1");
+    } else if (q.status === "ok") {
+      filters.push("status = 'ok' AND dry_run = 0");
+    } else if (q.status !== undefined) {
+      filters.push("status = ?");
+      binds.push(q.status);
+    }
+    // One upper bound on `at`: given two (until and the cursor), the planner bounds the index range by one only.
+    const from = q.cursor !== undefined && q.cursor.at < q.until ? q.cursor : { at: q.until - 1, id: Number.MAX_SAFE_INTEGER };
+    binds.push(graphId, q.since, from.at, from.at, from.id);
+    // One row of the budget is the cursor's own row, which the scan reads and skips.
+    const scanCap = QUERY_SCAN_CAP - 1 - q.limit;
+    const scan = await this.db
+      .prepare(
+        `SELECT count(*) AS scanned, min(printf('%015d.%015d', at, id)) AS last,
+                json_group_array(json_array(id, at)) FILTER (WHERE ${filters.join(" AND ")}) AS hits
+         FROM (
+           SELECT id, at, kind, tool, session, status, dry_run, pages FROM audit_log
+           WHERE graph_id = ? AND at >= ? AND at <= ? AND (at, id) < (?, ?)
+           ORDER BY at DESC, id DESC LIMIT ${scanCap}
+         )`,
+      )
+      .bind(...binds)
+      .all<{ scanned: number; last: string | null; hits: string | null }>();
+    const head = scan.results[0];
+    const scanned = head?.scanned ?? 0;
+    const hits = (JSON.parse(head?.hits ?? "[]") as [number, number][]).sort((a, b) => b[1] - a[1] || b[0] - a[0]);
+    const taken = hits.slice(0, q.limit);
+    let nextCursor: AuditCursor | null = null;
+    if (hits.length > q.limit) {
+      const [id, at] = taken[taken.length - 1];
+      nextCursor = { at, id };
+    } else if (scanned >= scanCap && head?.last) {
+      const [at, id] = head.last.split(".").map(Number);
+      nextCursor = { at, id };
+    }
+    let rowsRead = scan.meta.rows_read;
+    let entries: AuditRow[] = [];
+    if (taken.length > 0) {
+      const columns = `a.id, a.at, a.graph_id, a.alias, a.tool, a.kind, a.status, a.dry_run, a.reason, a.client, a.session, a.addressed, a.pages, a.targets, ${
+        q.includeSnapshot ? "a.before" : "NULL AS before"
+      }, a.error, a.rows_written, a.rows_read`;
+      // The ids come from the scan above, as integers, inlined since D1 binds at most 100 values.
+      const ids = taken.map(([id]) => `(${Math.trunc(id)})`).join(", ");
+      const fetched = await this.db
+        .prepare(`SELECT ${columns} FROM (VALUES ${ids}) AS ids CROSS JOIN audit_log AS a ON a.id = ids.column1`)
+        .all<Row>();
+      rowsRead += fetched.meta.rows_read;
+      const byId = new Map(fetched.results.map((r) => [r.id, r]));
+      entries = taken.flatMap(([id]) => {
+        const r = byId.get(id);
+        return r === undefined ? [] : [toAuditRow(r)];
+      });
+    }
+    return { entries, nextCursor, scanned, rowsRead };
+  }
+
+  /**
+   * Records one get_activity_log call as a `kind = 'read'` row: the graph, the window or id it
+   * read (`addressed`) and the rows its query read, so the usage report sees the log's read cost.
+   */
+  async recordRead(graphId: string, alias: string, addressed: string[], rowsRead: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, addressed, rows_written, rows_read)
+         VALUES (?, ?, ?, 'get_activity_log', 'read', 'ok', ?, ?, ?)`,
+      )
+      .bind(Date.now(), graphId, alias, JSON.stringify(addressed), READ_ROW_WRITES, rowsRead)
+      .run();
+    return result.meta.last_row_id;
   }
 
   /**

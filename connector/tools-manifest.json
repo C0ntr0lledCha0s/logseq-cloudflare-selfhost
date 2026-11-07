@@ -176,6 +176,17 @@
     }
   },
   {
+    "name": "get_activity_log",
+    "method": null,
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "get_block",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",

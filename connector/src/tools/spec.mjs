@@ -18,6 +18,7 @@ export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 /** Tools registered by hand rather than from the spec; listed here so the manifest covers them. */
 export const HANDWRITTEN_TOOLS = [
   "connector_help",
+  "get_activity_log",
   "kb_index",
   "list_graphs",
   "read_file",
@@ -69,6 +70,7 @@ export const ANNOTATIONS = Object.freeze({
   delete_page: DESTRUCTIVE_IDEMPOTENT,
   delete_property: DESTRUCTIVE_IDEMPOTENT,
   delete_tag: DESTRUCTIVE_IDEMPOTENT,
+  get_activity_log: READ,
   get_block: READ,
   get_blocks: READ,
   get_graph_health: READ,

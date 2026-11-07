@@ -1,10 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { type StatelessMcpHandler, createMcpHandler } from "agents/mcp/server";
+import settings from "../../config/settings.json";
 import openapi from "../vendor/openapi.json";
 import { type AuditContext, AuditLog, userAgentFamily } from "./audit/log";
 import { isOwner } from "./auth/github";
 import type { GrantProps } from "./auth/routes";
 import { GraphStore } from "./graphs";
+import { registerActivityLogTool } from "./tools/activity-log";
 import { registerAssetTools } from "./tools/assets";
 import { logTool } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
@@ -18,6 +20,11 @@ import type { OpenApiSpec } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
 const spec = openapi as unknown as OpenApiSpec;
+/**
+ * The owner's time zone, from the committed config/settings.json (bundled, as it holds no secret);
+ * get_activity_log reads and shows dates in it. UTC when unset, as on the sync server.
+ */
+const TIME_ZONE: string = (settings as { timeZone?: string }).timeZone ?? "UTC";
 
 interface IsolateTools {
   store: GraphStore;
@@ -95,6 +102,7 @@ export function mcpHandler(env: Env, ctx: ExecutionContext, caller: Caller = { c
     () => {
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
       registerHandwrittenTools(server, env, store, semantic !== null);
+      registerActivityLogTool(server, { log, access, timeZone: TIME_ZONE });
       registerGraphTools(server, graphTools, onSuccess, audit);
       registerAssetTools(server, access, onSuccess, audit);
       registerKbIndexTool(server, access, onSuccess);

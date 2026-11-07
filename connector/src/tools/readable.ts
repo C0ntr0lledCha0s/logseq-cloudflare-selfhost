@@ -250,7 +250,8 @@ function where(loc: TargetLocation | undefined): string {
   return path([shortTitle(loc.pageTitle), ...loc.breadcrumb]);
 }
 
-function line(t: AffectedTarget): string {
+/** One target as a summary line shows it: page > breadcrumb > "snippet" (counts), or a move's from and to. */
+export function targetLine(t: AffectedTarget): string {
   if (t.e2ee) return `${t.kind} ${t.uuid}${counts(t)}`;
   const quoted = `"${t.snippet ?? ""}"`;
   if (t.from !== undefined || t.to !== undefined) return `${quoted} from ${where(t.from)} to ${where(t.to)}`;
@@ -279,7 +280,7 @@ export function summarise(targets: AffectedTarget[], opts: SummaryOptions): stri
   const propertied = targets.filter((t) => t.propertiesOnly);
   // A long batch lists its first blocks only: the JSON result after the summary names every one.
   const list = (items: AffectedTarget[]) => {
-    for (const t of items.slice(0, SUMMARY_MAX_ITEMS)) lines.push(`- ${line(t)}`);
+    for (const t of items.slice(0, SUMMARY_MAX_ITEMS)) lines.push(`- ${targetLine(t)}`);
     if (items.length > SUMMARY_MAX_ITEMS) lines.push(`- … and ${items.length - SUMMARY_MAX_ITEMS} more, listed in the JSON result`);
   };
   const section = (items: AffectedTarget[], pastVerb: string, presentVerb: string, first: boolean) => {
