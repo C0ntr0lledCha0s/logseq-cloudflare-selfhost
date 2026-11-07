@@ -20,7 +20,7 @@ function repoCopy({ envLocal } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "list-users-"));
   mkdirSync(join(dir, "scripts"));
   mkdirSync(join(dir, "config"));
-  for (const f of ["list-users.sh", "allowed-users.mjs"]) copyFileSync(join(root, "scripts", f), join(dir, "scripts", f));
+  for (const f of ["list-users.sh", "allowed-users.mjs", "cloudflare-api.mjs"]) copyFileSync(join(root, "scripts", f), join(dir, "scripts", f));
   chmodSync(join(dir, "scripts", "list-users.sh"), 0o755);
   copyFileSync(join(root, "config", "settings.json"), join(dir, "config", "settings.json"));
   if (envLocal !== undefined) writeFileSync(join(dir, ".env.local"), envLocal);

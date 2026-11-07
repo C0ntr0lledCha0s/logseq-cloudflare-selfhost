@@ -102,6 +102,14 @@ jobs:
           fi
           echo "SEMANTIC_SEARCH_ENABLED=$enabled" >> "$GITHUB_ENV"
 
+      # Creates what a first deploy needs and OpenTofu can't: the R2 bucket for OpenTofu's state (the
+      # init below reads it) and the account's workers.dev subdomain. A re-run changes nothing.
+      - name: Ensure account prerequisites
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/ensure-account.mjs
+
       - name: Tofu init
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

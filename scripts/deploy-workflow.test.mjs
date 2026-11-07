@@ -197,3 +197,21 @@ test("the Deploy step passes DB_SYNC_ALLOWED_USERS and no other step does", () =
     .filter((line) => line.includes("DB_SYNC_ALLOWED_USERS"));
   assert.equal(others.length, 1, others.join("\n"));
 });
+
+test("the account prerequisites step runs before Tofu init, with the API token and account only", () => {
+  const name = "Ensure account prerequisites";
+  assert.ok(stepIndex(name) < stepIndex("Tofu init"));
+  const lines = step(name);
+  assert.ok(lines.includes("        run: node scripts/ensure-account.mjs"));
+  const at = lines.indexOf("        env:");
+  assert.notEqual(at, -1);
+  const env = [];
+  for (const line of lines.slice(at + 1)) {
+    if (!line.startsWith("          ")) break;
+    env.push(line.trim());
+  }
+  assert.deepEqual(env, [
+    "CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    "CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+  ]);
+});

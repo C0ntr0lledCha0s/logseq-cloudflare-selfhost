@@ -12,10 +12,10 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { DEFAULT_API_BASE, readEnvelope } from "./cloudflare-api.mjs";
 
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const NAME = "DB_SYNC_ALLOWED_USERS";
-const DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4";
 
 const USERS_SQL =
   "SELECT u.id AS id, u.email AS email, u.username AS username, " +
@@ -68,27 +68,12 @@ export function compareWithKnownUsers(ids, users) {
   return { error, warnings };
 }
 
-/** Parses a D1 API response. Throws the API's own error messages, never any rows. */
-async function readEnvelope(res) {
-  let body;
-  try {
-    body = await res.json();
-  } catch {
-    throw new Error(`D1 API ${res.status}: response is not JSON`);
-  }
-  if (!res.ok || body?.success !== true) {
-    const messages = Array.isArray(body?.errors) ? body.errors.map((e) => e?.message).filter(Boolean) : [];
-    throw new Error(`D1 API ${res.status}: ${messages.length > 0 ? messages.join("; ") : "no error message"}`);
-  }
-  return body;
-}
-
 /** Every user of the sync server's D1 database, with how many graphs each owns. */
 export async function fetchUsers({ accountId, apiToken, databaseName, apiBase = DEFAULT_API_BASE, fetchImpl = fetch }) {
   const headers = { Authorization: `Bearer ${apiToken}` };
   const dbUrl = `${apiBase}/accounts/${accountId}/d1/database`;
 
-  const list = await readEnvelope(await fetchImpl(`${dbUrl}?name=${encodeURIComponent(databaseName)}`, { headers }));
+  const list = await readEnvelope(await fetchImpl(`${dbUrl}?name=${encodeURIComponent(databaseName)}`, { headers }), "D1 API");
   // The name filter isn't guaranteed to be exact.
   const matches = (list.result ?? []).filter((db) => db?.name === databaseName);
   if (matches.length !== 1) {
@@ -101,6 +86,7 @@ export async function fetchUsers({ accountId, apiToken, databaseName, apiBase = 
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ sql: USERS_SQL }),
     }),
+    "D1 API",
   );
   const rows = query.result?.[0]?.results;
   if (!Array.isArray(rows)) throw new Error("D1 API: the users query returned no result set");
