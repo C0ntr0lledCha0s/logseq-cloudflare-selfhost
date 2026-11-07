@@ -903,6 +903,14 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("dry-run shows the mapping");
   });
 
+  it("update_property guards converted value blocks other blocks refer to behind acknowledge-references", async () => {
+    const tools = await listTools();
+    const update = tools.find((t) => t.name === "update_property");
+    expect(update.inputSchema.properties["acknowledge-references"].type).toBe("boolean");
+    expect(update.description).toContain("converted.referenced");
+    expect(update.description).toContain("unless acknowledge-references is true");
+  });
+
   it("create_tag and update_tag take extends and tag properties, and update_tag no longer needs a title", async () => {
     const tools = await listTools();
     const create = tools.find((t) => t.name === "create_tag");

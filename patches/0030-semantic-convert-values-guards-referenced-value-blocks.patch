@@ -1,0 +1,489 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index e5c4c90..5a6c355 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -3274,7 +3274,7 @@
+ ;; updateProperty's query flags. A retire whose choices have holders is refused with 409 unless
+ ;; acknowledge-holders=true; dry-run=true runs the whole update on a throwaway copy of the graph and
+ ;; answers what it would store, as the guarded deletes do.
+-(def ^:private property-update-flags ["acknowledge-holders" "dry-run"])
++(def ^:private property-update-flags ["acknowledge-holders" "acknowledge-references" "dry-run"])
+ 
+ (defn- retire-held-message
+   "The 409 refusal for retired choices (validate-choices' :retire entries) that blocks hold or that
+@@ -3317,11 +3317,42 @@
+     (or (some #(when (= text (:text %)) %) targets)
+         (some #(when (= (string/lower-case text) (string/lower-case (:text %))) %) targets))))
+ 
++(defn- value-references
++  "The value blocks of a conversion (validate-conversion's values) that something refers to besides
++  their holders, as {value-id #{referrer-id}}: a link or block ref, an embed, an alias or another
++  property's value (reference-attributes, through referrer-ids, which skips hidden referrers).
++  The converted property's own attribute is how holders hold their values, so it isn't counted, nor
++  are the other value blocks the conversion deletes."
++  [db property-ident values]
++  (let [attributes (remove #{property-ident} (reference-attributes db))
++        value-ids (set (map :id values))]
++    (into {}
++          (keep (fn [{:keys [id]}]
++                  (let [referrers (into #{} (remove value-ids) (referrer-ids db (d/entity db id) attributes))]
++                    (when (seq referrers) [id referrers]))))
++          values)))
++
++(defn- references-message
++  "The 409 refusal for a conversion that would delete value blocks other blocks or pages refer to:
++  the property, the counts and the first referrers by UUID."
++  [db title {:keys [values references]}]
++  (let [referenced (count references)
++        referrers (sort (map #(str (:block/uuid (d/entity db %))) (into #{} cat (vals references))))
++        shown 5]
++    (str "convert_values: " title ": " referenced (if (= 1 referenced) " value block" " value blocks")
++         " (of " (count values) " to delete) " (if (= 1 referenced) "is" "are") " referenced by "
++         (count referrers) (if (= 1 (count referrers)) " block or page: " " blocks or pages: ")
++         (string/join ", " (take shown referrers))
++         (when (> (count referrers) shown) (str " and " (- (count referrers) shown) " more"))
++         "; deleting them turns links to them into plain text and drops embeds and property values"
++         " that point at them; set acknowledge-references=true to convert anyway, or dry-run=true to preview")))
++
+ (defn- validate-conversion
+   "Checks updateProperty's convert_values for `property`, given the body and the call's choices
+   result. nil when the body doesn't ask for a conversion, else {:ok plan} or {:error message}. The
+   plan is {:values [{:id :text :choice {:uuid :text} :holders #{holder-id}}] :holders {holder-id
+-  #{choice-uuid}}}, values in the order they were made."
++  #{choice-uuid}} :references {value-id #{referrer-id}}}, values in the order they were made.
++  :references holds only the value blocks something other than their holders refers to."
+   [db property body choices e2ee?]
+   (let [convert (:convert_values body)
+         title (:block/title property)
+@@ -3381,6 +3412,7 @@
+                        "; add them under choices.add in the same call")}
+           :else
+           {:ok {:values values
++                :references (value-references db property-ident values)
+                 :holders (reduce (fn [holders {:keys [choice] :as value}]
+                                    (reduce #(update %1 %2 (fnil conj #{}) (:uuid choice)) holders (:holders value)))
+                                  {} values)}})))))
+@@ -3399,10 +3431,16 @@
+                                    [:db/add holder property-ident [:block/uuid uuid]]))))
+     (outliner-core/delete-blocks! tx-conn (mapv #(d/entity @tx-conn (:id %)) values) {})))
+ 
++(defn- conversion-counts
++  "converted: how many value blocks are converted (and deleted), how many blocks hold them, and how
++  many of the deleted ones other blocks or pages refer to."
++  [{:keys [values holders references]}]
++  {:values (count values) :holders (count holders) :deleted (count values) :referenced (count references)})
++
+ (defn- conversion-response
+-  "converted: {values holders}, and on a dry run the mapping: one row per distinct text."
+-  [{:keys [values holders]} dry-run?]
+-  (cond-> {:converted {:values (count values) :holders (count holders)}}
++  "converted (conversion-counts), and on a dry run the mapping: one row per distinct text."
++  [{:keys [values] :as conversion} dry-run?]
++  (cond-> {:converted (conversion-counts conversion)}
+     dry-run?
+     (assoc :mapping (mapv (fn [[text rows]]
+                             {:text text
+@@ -3517,19 +3555,28 @@
+             conversion (when (property? property) (validate-conversion db property body choices e2ee?))
+             flags (into {} (map (juxt identity #(flag-param url %))) property-update-flags)
+             invalid (some #(when (= ::invalid (get flags %)) %) property-update-flags)
+-            held (filter #(or (pos? (:holders %)) (:default %)) (get-in choices [:ok :retire]))]
++            held (filter #(or (pos? (:holders %)) (:default %)) (get-in choices [:ok :retire]))
++            refuse-held? (and (seq held) (not (get flags "acknowledge-holders")) (not (get flags "dry-run")))
++            refuse-references? (and (seq (get-in conversion [:ok :references]))
++                                    (not (get flags "acknowledge-references")) (not (get flags "dry-run")))]
+         (cond
+           invalid (http/bad-request (str invalid " must be true or false"))
+           (or (not (property? property)) (empty? body) (not (valid-property-schema? body)))
+           (http/bad-request "invalid property-id or update")
+           (or (:error classes) (:error choices) (:error conversion))
+           (http/bad-request (string/join "; " (keep :error [classes choices conversion])))
+-          (and (seq held) (not (get flags "acknowledge-holders")) (not (get flags "dry-run")))
+-          (http/json-response nil {:error (retire-held-message held)
+-                                   :retired (mapv (fn [{:keys [uuid text holders default]}]
+-                                                    (cond-> {:choice (uuid-string uuid) :title text :holders holders}
+-                                                      default (assoc :default true)))
+-                                                  held)}
++          (or refuse-held? refuse-references?)
++          (http/json-response nil (cond-> {:error (string/join "; " (cond-> []
++                                                                      refuse-held? (conj (retire-held-message held))
++                                                                      refuse-references?
++                                                                      (conj (references-message db (:block/title property) (:ok conversion)))))}
++                                    refuse-held?
++                                    (assoc :retired (mapv (fn [{:keys [uuid text holders default]}]
++                                                            (cond-> {:choice (uuid-string uuid) :title text :holders holders}
++                                                              default (assoc :default true)))
++                                                          held))
++                                    refuse-references?
++                                    (assoc :converted (conversion-counts (:ok conversion))))
+                               409)
+           :else
+           (rejecting
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 360a43f..6e1175e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -162,7 +162,7 @@
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+    "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+    "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
+-   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referrers, unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
+    "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+@@ -280,7 +280,8 @@
+    "deleteProperty" [(delete-flag-parameter "acknowledge-values" "Set true to delete even though nodes hold a value for the property; the values are removed. Omitted or false, a delete with values is refused.")
+                      dry-run-parameter]
+    "updateProperty" [(delete-flag-parameter "acknowledge-holders" "Set true to retire choices (choices.retire) that blocks hold or that are the property's default value; those blocks lose the value and the default is cleared. Omitted or false, such a retire is refused with 409 and nothing is changed.")
+-                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired, converted and the conversion mapping, and dry-run: true. A retire with holders is previewed without acknowledge-holders.")]
++                     (delete-flag-parameter "acknowledge-references" "Set true to convert values (convert_values) even though other blocks or pages refer to old text value blocks the conversion deletes: links and block refs to them become plain text, and embeds and other properties' values pointing at them are removed. Omitted or false, such a conversion is refused with 409 and nothing is changed.")
++                     (delete-flag-parameter "dry-run" "When true, change nothing and answer what the update would store: the property as it would read, with retired, converted (with the deleted and referenced counts) and the conversion mapping, and dry-run: true. A retire with holders and a conversion with referenced value blocks are previewed without their acknowledge-* flags.")]
+    "moveBlocks" [(delete-flag-parameter "dry-run" "When true, check and apply the move to a throwaway copy of the graph and answer the same body with dry-run: true, with each block's to as the move would leave it. Nothing is moved; refusals are the real call's.")]
+    "promotePageToTag" [(delete-flag-parameter "dry-run" "When true, check and convert a throwaway copy of the graph and answer the same body with dry-run: true: what the tag would extend and the promoted counts, without ident, which only the real call assigns (it carries a random suffix). A dry run writes nothing; refusals are the same as the real call's.")]})
+ 
+@@ -622,7 +623,7 @@
+             "204" {:description "Deleted"}
+             "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
+            "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
+-           "updateProperty" {"409" (entity-response "RetireRefusal" "Choices to retire are held by blocks or are the property's default value, and acknowledge-holders is not true; nothing was changed")}
++           "updateProperty" {"409" (entity-response "RetireRefusal" "Choices to retire are held by blocks or are the property's default value, and acknowledge-holders is not true, or convert_values would delete value blocks other blocks or pages refer to, and acknowledge-references is not true; nothing was changed")}
+            "createTask"
+            {"201" (entity-response "CreatedTaskResponse" "The created DB Task object and the page it is on")}
+            "createAsset"
+@@ -661,10 +662,16 @@
+    :DeleteRefusal {:allOf [{:$ref "#/components/schemas/DeleteImpact"}
+                            {:type "object" :required ["error"]
+                             :properties {:error {:type "string"}}}]}
+-   :RetireRefusal {:type "object" :required ["error" "retired"]
++   :RetireRefusal {:type "object" :required ["error"]
+                    :properties {:error {:type "string"}
++                                :converted {:type "object" :required ["values" "holders" "deleted" "referenced"]
++                                            :description "Present when convert_values was refused for referenced value blocks: the conversion's counts, as a dry run gives them."
++                                            :properties {:values {:type "integer"}
++                                                         :holders {:type "integer"}
++                                                         :deleted {:type "integer"}
++                                                         :referenced {:type "integer"}}}
+                                 :retired {:type "array"
+-                                          :description "Each retired choice that blocks hold, with how many, or that is the property's default value (default: true)."
++                                          :description "Present when held retired choices were refused: each retired choice that blocks hold, with how many, or that is the property's default value (default: true)."
+                                           :items {:type "object" :required ["choice" "title" "holders"]
+                                                   :properties {:choice {:type "string" :description "The choice's UUID."}
+                                                                :title {:type "string"}
+@@ -966,10 +973,12 @@
+                                                                               :title {:type "string"}
+                                                                               :holders {:type "integer"}
+                                                                               :default {:type "boolean"}}}}
+-                                               :converted {:type "object" :required ["values" "holders"]
+-                                                           :description "On updateProperty with convert_values: how many text value blocks were converted (and deleted), and how many blocks held them."
++                                               :converted {:type "object" :required ["values" "holders" "deleted" "referenced"]
++                                                           :description "On updateProperty with convert_values: how many text value blocks were converted, how many blocks held them, how many value blocks are deleted, and how many of those other blocks or pages refer to (a link, block ref, embed or another property's value; a holder's own value isn't counted)."
+                                                            :properties {:values {:type "integer"}
+-                                                                        :holders {:type "integer"}}}
++                                                                        :holders {:type "integer"}
++                                                                        :deleted {:type "integer"}
++                                                                        :referenced {:type "integer"}}}
+                                                :mapping {:type "array"
+                                                          :description "On updateProperty with convert_values and dry-run=true: each distinct text, the choice it would become, and how many blocks hold it."
+                                                          :items {:type "object" :required ["text" "choice" "holders"]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+index 1626fbf..d69de3f 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
+@@ -1482,7 +1482,7 @@
+                    (map (juxt :name (comp :type :schema)))
+                    (into {}))
+         choices (get-in operation [:requestBody :content "application/json" :schema :properties :choices :properties])]
+-    (is (= {"acknowledge-holders" "boolean" "dry-run" "boolean"} flags))
++    (is (= {"acknowledge-holders" "boolean" "acknowledge-references" "boolean" "dry-run" "boolean"} flags))
+     (is (= "string" (get-in choices [:retire :items :type])))
+     (is (= "#/components/schemas/RetireRefusal"
+            (get-in operation [:responses "409" :content "application/json" :schema :$ref])))
+@@ -1551,7 +1551,7 @@
+                   done-id (choice-uuid conn phase "Done")
+                   reads (p/all (map #(read-value self % phase) [b0 b1 b2 b3]))]
+             (is (= 200 (:status converted)) (str (:body converted)))
+-            (is (= {:values 4 :holders 4} (get-in converted [:body :converted])))
++            (is (= {:values 4 :holders 4 :deleted 4 :referenced 0} (get-in converted [:body :converted])))
+             (is (nil? (get-in converted [:body :mapping])) "the mapping is for dry runs")
+             (is (= [active active done-id done-id] (mapv #(stored conn % phase) [b0 b1 b2 b3]))
+                 "exact, ignoring case, and with spaces trimmed; Done is the choice added in the same call")
+@@ -1577,7 +1577,7 @@
+                   done-id (add-choice! conn phase "Done")
+                   converted (convert! self phase {:choices {:update [{:choice "Done" :title "Closed"}]}})]
+             (is (= 200 (:status converted)) (str (:body converted)))
+-            (is (= {:values 2 :holders 2} (get-in converted [:body :converted])))
++            (is (= {:values 2 :holders 2 :deleted 2 :referenced 0} (get-in converted [:body :converted])))
+             (is (= [done-id done-id] (mapv #(stored conn % phase) [b0 b1])))
+             (is (= ["Closed"] (choice-titles conn phase)))))))))
+ 
+@@ -1617,7 +1617,7 @@
+                   read (read-value self b0 labels)]
+             (is (= 5 (count old)) "five text value blocks before")
+             (is (= 200 (:status converted)) (str (:body converted)))
+-            (is (= {:values 5 :holders 3} (get-in converted [:body :converted])))
++            (is (= {:values 5 :holders 3 :deleted 5 :referenced 0} (get-in converted [:body :converted])))
+             (is (= #{active} (stored conn b0 labels)) "Active and active end as one ref")
+             (is (= 1 (count (d/datoms @conn :eavt (:db/id (entity conn b0)) labels))) "one datom, not two")
+             (is (= [{:uuid (str active) :title "Active"}] read))
+@@ -1691,7 +1691,7 @@
+                   done-id (choice-uuid conn phase "Done")]
+             (is (= 200 (:status dry)) (str (:body dry)))
+             (is (true? (get-in dry [:body :dry-run])))
+-            (is (= {:values 4 :holders 5} (get-in dry [:body :converted])))
++            (is (= {:values 4 :holders 5 :deleted 4 :referenced 0} (get-in dry [:body :converted])))
+             (let [mapping (get-in dry [:body :mapping])]
+               (is (= [["Active" "Active" 3] ["active" "Active" 1] ["Done" "Done" 1]]
+                      (mapv (juxt :text (comp :title :choice) :holders) mapping))
+@@ -1714,11 +1714,11 @@
+                   empty-property (convert! self phase {})
+                   off (request! self "PATCH" (property-path status) {:convert_values false :title "project-status"})]
+             (is (= 200 (:status held)) (str (:body held)))
+-            (is (= {:values 0 :holders 0} (get-in held [:body :converted]))
++            (is (= {:values 0 :holders 0 :deleted 0 :referenced 0} (get-in held [:body :converted]))
+                 "a holder that already holds a choice is left as it is")
+             (is (= active (stored conn b0 status)))
+             (is (= 200 (:status empty-property)) (str (:body empty-property)))
+-            (is (= {:values 0 :holders 0} (get-in empty-property [:body :converted])))
++            (is (= {:values 0 :holders 0 :deleted 0 :referenced 0} (get-in empty-property [:body :converted])))
+             (is (= 200 (:status off)) (str (:body off)))
+             (is (nil? (get-in off [:body :converted])) "convert_values false converts nothing")
+             (is (true? (= before (snapshot conn))) "nothing changed")))))))
+@@ -1880,7 +1880,7 @@
+         response (get-in (semantic-routes/openapi-document "https://issuer.example")
+                          [:components :schemas :PropertyResponse :properties])]
+     (is (= "boolean" (get-in request [:convert_values :type])))
+-    (is (= ["values" "holders"] (get-in response [:converted :required])))
++    (is (= ["values" "holders" "deleted" "referenced"] (get-in response [:converted :required])))
+     (is (= "array" (get-in response [:mapping :type])))
+     (is (string/includes? (:description operation) "convert_values"))))
+ 
+@@ -2091,7 +2091,7 @@
+                   active (add-choice! conn phase "Active")
+                   converted (convert! self phase {})]
+             (is (= 200 (:status converted)) (str (:body converted)))
+-            (is (= {:values 1 :holders 1} (get-in converted [:body :converted])))
++            (is (= {:values 1 :holders 1 :deleted 1 :referenced 0} (get-in converted [:body :converted])))
+             (is (= active (stored conn b0 phase)))
+             (is (= :logseq.property/empty-placeholder (:db/ident (get (entity conn b1) phase))))))))))
+ 
+@@ -2178,3 +2178,219 @@
+             (is (= [{:uuid (str backlog) :title "Backlog" :holders 0 :default true}] (get-in real [:body :retired])))
+             (is (nil? (entity conn backlog)) "the choice is gone")
+             (is (nil? (default)) "and the property has no default")))))))
++
++;; convert_values and value blocks referenced elsewhere. Deleting an old value block flattens a block
++;; ref to it into plain text, empties an embed of it and drops another property's value pointing at it
++;; (the outliner's delete hook and retractEntity), so the dry run counts the value blocks to delete and
++;; how many are referenced, and the real call is refused with 409 unless acknowledge-references=true.
++;; A holder's own value (the converted property's attribute) is not a reference.
++
++(defn- referenced-conversion!
++  "Holds Active on b0 and b1 for phase (two value blocks), lets `refer!` make b2 refer to b0's value
++  block, then converts: a dry run, a call without the flag and one with it."
++  [done kind refer!]
++  (with-choices done
++    (fn [{:keys [conn self phase blocks] :as graph}]
++      (let [[b0 b1 b2] blocks]
++        (p/let [_ (hold! self b0 phase "Active")
++                _ (hold! self b1 phase "Active")
++                v0 (stored conn b0 phase)
++                v1 (stored conn b1 phase)
++                referred (refer! graph b2 v0)
++                before (snapshot conn)
++                body {:choices {:add [{:title "Active"}]}}
++                dry (convert! self phase body "dry-run=true")
++                after-dry (snapshot conn)
++                refused (convert! self phase body)
++                after-refused (snapshot conn)
++                kept (some? (entity conn v0))
++                added (choice-uuid conn phase "Active")
++                acked (convert! self phase body "acknowledge-references=true")
++                active (choice-uuid conn phase "Active")
++                reads (p/all (map #(read-value self % phase) [b0 b1]))]
++          (testing kind
++            (is (= 200 (:status referred)) (str "the reference is written: " (:body referred)))
++            (is (not= v0 v1) "each holder has its own value block")
++            (is (= 200 (:status dry)) (str (:body dry)))
++            (is (= 2 (get-in dry [:body :converted :deleted])) "the dry run counts the value blocks to delete")
++            (is (= 1 (get-in dry [:body :converted :referenced])) "and the ones referenced elsewhere")
++            (is (true? (= before after-dry)) "a dry run stores nothing")
++            (is (= 409 (:status refused)) (str (:body refused)))
++            (let [error (str (get-in refused [:body :error]))]
++              (is (string/includes? error "convert_values") error)
++              (is (string/includes? error "phase") "the error names the property")
++              (is (string/includes? error "1 value block") "and the count")
++              (is (string/includes? error (str b2)) "and the referencing block")
++              (is (string/includes? error "acknowledge-references") "and the flag"))
++            (is (true? (= before after-refused)) "a refused call writes nothing")
++            (is (true? kept) "the referenced value block is kept")
++            (is (nil? added) "no choice was added")
++            (is (= 200 (:status acked)) (str (:body acked)))
++            (is (some? active) "the acknowledged call converts")
++            (is (= [{:uuid (str active) :title "Active"} {:uuid (str active) :title "Active"}] (vec reads))
++                "and every holder reads back its choice")
++            (is (nil? (entity conn v0)) "the old value blocks are gone")
++            (is (nil? (entity conn v1)))))))))
++
++(deftest convert-values-referenced-by-page-ref-test
++  (async done
++    (referenced-conversion! done "a [[ref]] in a block's title"
++                            (fn [{:keys [self]} referrer value]
++                              (request! self "PATCH" (str "/semantic/blocks/" referrer) {:title (str "See [[" value "]]")})))))
++
++(deftest convert-values-referenced-by-block-ref-test
++  (async done
++    (referenced-conversion! done "a ((ref)) in a block's title"
++                            ;; The app stores a ((ref)) as the title text and a :block/refs datom.
++                            (fn [{:keys [conn]} referrer value]
++                              (d/transact! conn [{:db/id (:db/id (entity conn referrer))
++                                                  :block/title (str "See ((" value "))")
++                                                  :block/refs [(:db/id (entity conn value))]}])
++                              {:status 200}))))
++
++(deftest convert-values-referenced-by-embed-test
++  ;; The app's embed command stores a block whose :block/link is the embedded block.
++  (async done
++    (referenced-conversion! done "an embed (:block/link)"
++                            (fn [{:keys [conn]} referrer value]
++                              (d/transact! conn [[:db/add (:db/id (entity conn referrer)) :block/link
++                                                  (:db/id (entity conn value))]])
++                              {:status 200}))))
++
++(deftest convert-values-referenced-by-node-property-test
++  ;; Another property's value pointing at the value block (for-client is a node property).
++  (async done
++    (referenced-conversion! done "another property's value"
++                            (fn [{:keys [conn for-client]} referrer value]
++                              (d/transact! conn [[:db/add (:db/id (entity conn referrer)) for-client
++                                                  (:db/id (entity conn value))]])
++                              {:status 200}))))
++
++(deftest convert-values-referenced-by-many-node-property-test
++  ;; The same through a cardinality-many node property (clients).
++  (async done
++    (referenced-conversion! done "a cardinality-many property's value"
++                            (fn [{:keys [conn clients]} referrer value]
++                              (d/transact! conn [[:db/add (:db/id (entity conn referrer)) clients
++                                                  (:db/id (entity conn value))]])
++                              {:status 200}))))
++
++(deftest convert-values-holders-are-not-references-test
++  ;; Two holders of one value block through phase itself, and a holder of its own value: nothing
++  ;; refers to a value block from outside, so the counts are 0 and no flag is needed.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1 b2] blocks]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (hold! self b1 phase "Done")
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn b2)) phase (:db/id (get (entity conn b0) phase))]])
++                  before (snapshot conn)
++                  body {:choices {:add [{:title "Active"} {:title "Done"}]}}
++                  dry (convert! self phase body "dry-run=true")
++                  after-dry (snapshot conn)
++                  real (convert! self phase body)
++                  active (choice-uuid conn phase "Active")
++                  done-id (choice-uuid conn phase "Done")]
++            (is (= 200 (:status dry)) (str (:body dry)))
++            (is (= 2 (get-in dry [:body :converted :deleted])))
++            (is (= 0 (get-in dry [:body :converted :referenced])) "a holder's own value is not a reference")
++            (is (true? (= before after-dry)))
++            (is (= 200 (:status real)) (str "no flag is needed: " (:body real)))
++            (is (= [active done-id active] (mapv #(stored conn % phase) [b0 b1 b2])))))))))
++
++(deftest convert-values-referenced-and-held-retire-names-both-flags-test
++  ;; A call that retires a held choice and deletes a referenced value block needs both flags; the
++  ;; refusal names both, and one flag alone is still refused.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1 b2] blocks]
++          (p/let [_ (hold! self b0 phase "Active")
++                  v0 (stored conn b0 phase)
++                  paused (add-choice! conn phase "Paused")
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn b1)) phase (:db/id (entity conn paused))]])
++                  _ (d/transact! conn [{:db/id (:db/id (entity conn b2))
++                                        :block/title (str "See ((" v0 "))")
++                                        :block/refs [(:db/id (entity conn v0))]}])
++                  before (snapshot conn)
++                  body {:choices {:add [{:title "Active"}] :retire ["Paused"]}}
++                  neither (convert! self phase body)
++                  holders-only (convert! self phase body "acknowledge-holders=true")
++                  references-only (convert! self phase body "acknowledge-references=true")
++                  after (snapshot conn)
++                  both (convert! self phase body "acknowledge-holders=true&acknowledge-references=true")]
++            (is (= 409 (:status neither)) (str (:body neither)))
++            (is (string/includes? (str (get-in neither [:body :error])) "acknowledge-holders"))
++            (is (string/includes? (str (get-in neither [:body :error])) "acknowledge-references"))
++            (is (= 409 (:status holders-only)) (str (:body holders-only)))
++            (is (string/includes? (str (get-in holders-only [:body :error])) "acknowledge-references"))
++            (is (= 409 (:status references-only)) (str (:body references-only)))
++            (is (string/includes? (str (get-in references-only [:body :error])) "acknowledge-holders"))
++            (is (true? (= before after)) "no refused call wrote anything")
++            (is (= 200 (:status both)) (str (:body both)))
++            (is (nil? (entity conn v0)))))))))
++
++(deftest convert-values-holder-linking-its-own-value-is-a-reference-test
++  ;; Only the converted property's own attribute is left out: a holder that also links to its value
++  ;; block in its title loses that link to the delete, so it counts.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0] blocks]
++          (p/let [_ (hold! self b0 phase "Active")
++                  v0 (stored conn b0 phase)
++                  _ (d/transact! conn [{:db/id (:db/id (entity conn b0))
++                                        :block/title (str "See [[" v0 "]]")
++                                        :block/refs [(:db/id (entity conn v0))]}])
++                  dry (convert! self phase {:choices {:add [{:title "Active"}]}} "dry-run=true")
++                  refused (convert! self phase {:choices {:add [{:title "Active"}]}})]
++            (is (= {:values 1 :holders 1 :deleted 1 :referenced 1} (get-in dry [:body :converted])))
++            (is (= 409 (:status refused)) (str (:body refused)))
++            (is (string/includes? (str (get-in refused [:body :error])) (str b0)))
++            (is (= {:values 1 :holders 1 :deleted 1 :referenced 1} (get-in refused [:body :converted]))
++                "the refusal carries the counts")
++            (is (some? (entity conn v0)))))))))
++
++(deftest convert-values-value-blocks-referring-to-each-other-test
++  ;; A reference from one deleted value block to another is lost with both, so it isn't counted.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1] blocks]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (hold! self b1 phase "Done")
++                  v0 (stored conn b0 phase)
++                  v1 (stored conn b1 phase)
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn v1)) :block/refs (:db/id (entity conn v0))]])
++                  body {:choices {:add [{:title "Active"} {:title "Done"}]}}
++                  dry (convert! self phase body "dry-run=true")
++                  real (convert! self phase body)]
++            (is (= 0 (get-in dry [:body :converted :referenced])) (str (:body dry)))
++            (is (= 200 (:status real)) (str (:body real)))
++            (is (nil? (entity conn v0)))
++            (is (nil? (entity conn v1)))))))))
++
++(deftest convert-values-referenced-message-counts-test
++  ;; Two referenced value blocks and six referrers: the plurals, and the first five referrers named
++  ;; with the rest counted.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1 & others] blocks
++              referrers (take 6 others)]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (hold! self b1 phase "Done")
++                  v0 (stored conn b0 phase)
++                  v1 (stored conn b1 phase)
++                  _ (d/transact! conn (map-indexed (fn [i referrer]
++                                                     [:db/add (:db/id (entity conn referrer)) :block/refs
++                                                      (:db/id (entity conn (if (even? i) v0 v1)))])
++                                                   referrers))
++                  refused (convert! self phase {:choices {:add [{:title "Active"} {:title "Done"}]}})
++                  error (str (get-in refused [:body :error]))
++                  named (filter #(string/includes? error (str %)) referrers)]
++            (is (= 409 (:status refused)) error)
++            (is (string/includes? error "phase: 2 value blocks (of 2 to delete) are referenced by 6 blocks or pages: ") error)
++            (is (= 5 (count named)) "five referrers are named")
++            (is (string/includes? error " and 1 more;") error)))))))
