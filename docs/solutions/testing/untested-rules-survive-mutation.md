@@ -6,6 +6,7 @@ seen:
   - 2026-11-06 – item 25, patch 0021, review round 3 (r3-tests-1, r3-tests-2)
   - 2026-11-06 – item 23, patch 0022, review round 3 (r3-tests-1): removing `(js/isFinite n)` from `number-text` left 312 tests green, so "NaN" was stored and read back as null
   - 2026-11-06 – item 26, patch 0026, review round 3 (r3-tests-1): weakening `own?` or `choice?` in convert_values left the suite green; fixed with a test that points a holder at another property's value block and at another property's choice
+  - 2026-11-07 – item 17, patch 0028, review rounds 1 to 3 (r1-tests-1, r2-tests-1, r2-tests-2, r3-tests-1): the batch-insert dry run's "fail when the context read fails" rule, the label segment floor and separator guards, and the journal-date lookup in batch insert each survived mutation until a test made them decide the outcome
 promoted_to: ["REVIEW.md"]
 ---
 
