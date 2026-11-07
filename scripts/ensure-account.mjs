@@ -11,8 +11,8 @@ import { apiBaseFromEnv, cf, CfError } from "./cloudflare-api.mjs";
 
 export const STATE_BUCKET = "logseq-selfhost-tofu-state";
 
-const R2_NOT_ENABLED = 10042;
-const R2_NOT_ENABLED_MESSAGE =
+export const R2_NOT_ENABLED = 10042;
+export const R2_NOT_ENABLED_MESSAGE =
   "R2 isn't enabled on this account. Enable it at dash.cloudflare.com → R2 (a payment method is required), then re-run.";
 
 const defaultRandomHex = (length) => randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length);
