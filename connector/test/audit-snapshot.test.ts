@@ -218,8 +218,8 @@ const NO_PRE_READ: Record<string, Record<string, unknown>> = {
   create_tag: { body: { title: "Meeting" } },
   create_property: { body: { title: "Venue" } },
   refresh_refs: { body: { "page-id": J5, apply: true } },
-  // An insert entry with properties on a page selector, or with blocks only, overwrites no block value the pre-read could name.
-  batch_insert_block_trees: { body: { entries: [{ page: "Meeting", properties: { Venue: "Library" } }, { "target-id": B1, blocks: [{ title: "Child" }] }] } },
+  // Entries with blocks only, on a block or a page, overwrite nothing.
+  batch_insert_block_trees: { body: { entries: [{ page: "Meeting", blocks: [{ title: "Agenda" }] }, { "target-id": B1, blocks: [{ title: "Child" }] }] } },
 };
 
 /** Each tool that has a dry run, and where it takes the flag. */
@@ -367,7 +367,7 @@ describe("pre-reads", () => {
     expect(before(row)).toMatchObject({ source: "getBlocks", truncated: true });
   });
 
-  it("a non-delete snapshot over 256 KB is cut down to the blocks' summaries, marked truncated", async () => {
+  it("a non-delete snapshot over the cap is cut down to the blocks' summaries, marked truncated", async () => {
     const big = structuredClone(summary);
     big.blocks[0].properties[0].value = "x".repeat(SNAPSHOT_MAX_BYTES);
     serve(() => Response.json(big));
@@ -384,6 +384,110 @@ describe("pre-reads", () => {
     serve(() => Response.json({ ...page, properties: [{ ident: "user.property/notes", title: "Notes", value: "x".repeat(SNAPSHOT_MAX_BYTES) }] }));
     const pageRow = (await audited("update_page", PRE_READS.update_page.args)).row;
     expect(before(pageRow)).toEqual({ source: "getPage", truncated: true, data: { uuid: J5, kind: "page", title: "Notes" } });
+  });
+
+  it("a cut-down snapshot still over the cap keeps only its source, with data null", async () => {
+    // One title over the cap, and two titles that are over it together: pick() keeps titles.
+    const one = structuredClone(summary);
+    one.blocks[0].title = "x".repeat(SNAPSHOT_MAX_BYTES);
+    const two = structuredClone(summary);
+    two.blocks[0].title = "x".repeat(SNAPSHOT_MAX_BYTES / 2);
+    two.blocks[1].title = "y".repeat(SNAPSHOT_MAX_BYTES / 2);
+    for (const response of [one, two]) {
+      serve(() => Response.json(response));
+      const { row } = await audited("update_block", PRE_READS.update_block.args);
+      expect(row.status).toBe("ok");
+      expect(before(row)).toEqual({ source: "getBlocks", truncated: true, data: null });
+      expect(new TextEncoder().encode(row.before!).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    }
+    // A page whose title alone is over the cap.
+    serve(() => Response.json({ ...page, title: "p".repeat(SNAPSHOT_MAX_BYTES) }));
+    const pageRow = (await audited("update_page", PRE_READS.update_page.args)).row;
+    expect(before(pageRow)).toEqual({ source: "getPage", truncated: true, data: null });
+  });
+
+  it("batch_insert_block_trees reads each page an entry sets properties on by title, date or page, once each", async () => {
+    // target-id takes a block UUID or a page selector; page takes a title or a date (and creates a
+    // missing page). Each entry with properties overwrites the values it sets on what it names.
+    const args = {
+      body: {
+        entries: [
+          { "target-id": "Meeting", properties: { Status: "Done" } },
+          { page: "2026-11-05", properties: { Venue: "Library" } },
+          { "target-id": B1, properties: { Venue: "Library" } },
+          // The same page again, in another case: read once.
+          { page: "meeting", properties: { Venue: "Library" } },
+          // Blocks only, and a page that doesn't exist yet: nothing overwritten, or nothing to read.
+          { page: "Agenda", blocks: [{ title: "Item" }] },
+          { page: "Brand new", properties: { Venue: "Library" } },
+          // A page UUID as target-id goes to getBlocks with the block UUIDs.
+          { "target-id": J5, properties: { Venue: "Library" } },
+        ],
+      },
+    };
+    serve((path, url) => (path === "/pages/Brand%20new" ? Response.json({ error: "page not found: Brand new" }, { status: 404 }) : fixtures(path, url)));
+    const { result, row } = await audited("batch_insert_block_trees", args);
+    expect(result.isError, result.text).toBe(false);
+    expect(row.status).toBe("ok");
+    expect(gets().map((c) => [c.path.slice(GRAPH.length), c.ids])).toEqual([
+      ["/blocks", `${B1},${J5}`],
+      ["/pages/Meeting", null],
+      ["/pages/2026-11-05", null],
+      ["/pages/Brand%20new", null],
+    ]);
+    expect(writes()).toHaveLength(1);
+    expect(before(row)).toEqual({
+      source: "getBlocks",
+      data: summary,
+      pages: [
+        { page: "Meeting", source: "getPage", data: page },
+        { page: "2026-11-05", source: "getPage", data: page },
+        { page: "Brand new", source: "getPage", error: "sync server error (HTTP 404): page not found: Brand new" },
+      ],
+    });
+
+    // Page selectors only: no getBlocks read.
+    syncCalls = [];
+    serve(fixtures);
+    const pagesOnly = await audited("batch_insert_block_trees", { body: { entries: [{ page: "2026-11-05", properties: { Venue: "Library" } }] } });
+    expect(gets().map((c) => c.path.slice(GRAPH.length))).toEqual(["/pages/2026-11-05"]);
+    expect(before(pagesOnly.row)).toEqual({ source: "getBlocks", data: null, pages: [{ page: "2026-11-05", source: "getPage", data: page }] });
+
+    // A dry run reads nothing.
+    syncCalls = [];
+    const dry = await audited("batch_insert_block_trees", { body: { ...args.body, "dry-run": true } });
+    expect(gets()).toEqual([]);
+    expect(dry.row).toMatchObject({ dry_run: 1, before: null });
+  });
+
+  it("batch_insert_block_trees reads at most 10 pages, marks the rest cut, and cuts down pages over the cap", async () => {
+    const entries = Array.from({ length: 12 }, (_, i) => ({ page: `Page ${i}`, properties: { Venue: "Library" } }));
+    serve(fixtures);
+    const { row } = await audited("batch_insert_block_trees", { body: { entries } });
+    expect(gets().map((c) => c.path.slice(GRAPH.length))).toEqual(entries.slice(0, 10).map((e) => `/pages/${encodeURIComponent(e.page)}`));
+    const snap = before(row);
+    expect(snap).toMatchObject({ source: "getBlocks", truncated: true, data: null });
+    expect(snap.pages).toHaveLength(10);
+
+    syncCalls = [];
+    serve((path, url) => (path.startsWith("/pages/") ? Response.json({ ...page, properties: [{ title: "Notes", value: "x".repeat(SNAPSHOT_MAX_BYTES) }] }) : fixtures(path, url)));
+    const big = await audited("batch_insert_block_trees", { body: { entries: [{ page: "Meeting", properties: { Venue: "Library" } }, { "target-id": B1, properties: { Venue: "Library" } }] } });
+    const cut = before(big.row);
+    expect(cut).toEqual({
+      source: "getBlocks",
+      truncated: true,
+      data: { blocks: summary.blocks.map((b) => ({ uuid: b.uuid, kind: b.kind, title: b.title, order: b.order, "parent-id": b["parent-id"], "page-id": b["page-id"] })), missing: [] },
+      pages: [{ page: "Meeting", source: "getPage", data: { uuid: J5, kind: "page", title: "Notes" } }],
+    });
+    expect(new TextEncoder().encode(big.row.before!).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+
+    // A page title over the cap: cut-down still doesn't fit, so every read keeps only its source.
+    syncCalls = [];
+    serve((path, url) => (path.startsWith("/pages/") ? Response.json({ ...page, title: "p".repeat(SNAPSHOT_MAX_BYTES) }) : fixtures(path, url)));
+    const huge = await audited("batch_insert_block_trees", { body: { entries: [{ page: "Meeting", properties: { Venue: "Library" } }, { "target-id": B1, properties: { Venue: "Library" } }] } });
+    expect(huge.row.status).toBe("ok");
+    expect(before(huge.row)).toEqual({ source: "getBlocks", truncated: true, data: null, pages: [{ page: "Meeting", source: "getPage", data: null }] });
+    expect(new TextEncoder().encode(huge.row.before!).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
   });
 
   it("refresh_refs stores its own response's before-text, and nothing when it only previews", async () => {
@@ -449,8 +553,8 @@ describe("delete snapshots", () => {
       [{ body: { "block-ids": [B1, B2] } }, outlineTruncated, message(1, B2)],
       // Reversed: the server reads B2 first and runs out on B1.
       [{ body: { "block-ids": [B2, B1] } }, { ...outlineTruncated, blocks: [{ ...outlineTruncated.blocks[1], truncated: false }, { ...outlineTruncated.blocks[0], truncated: true }] }, message(1, B1)],
-      // A missing UUID before it: the entry is counted in the call's block-ids, not the response's blocks.
-      [{ body: { "block-ids": [B3, B2] } }, { blocks: [outlineTruncated.blocks[1]], missing: [B3] }, message(1, B2)],
+      // A title before it, which getBlocks isn't asked for: the entry is counted in the call's block-ids, not the read's ids.
+      [{ body: { "block-ids": ["Meeting", B2] } }, { blocks: [outlineTruncated.blocks[1]], missing: [] }, message(1, B2)],
       // Given upper-cased, named as given.
       [{ body: { "block-ids": [B2.toUpperCase()] } }, { blocks: [outlineTruncated.blocks[1]], missing: [] }, message(0, B2.toUpperCase())],
     ];
@@ -469,14 +573,15 @@ describe("delete snapshots", () => {
     expect(writes()).toEqual([]);
   });
 
-  it("oversized (over 256 KB) delete refused naming the entry; exactly 256 KB goes ahead", async () => {
+  it("oversized (over 100 KB) delete refused naming the entry; exactly 100 KB goes ahead", async () => {
+    expect(SNAPSHOT_MAX_BYTES).toBe(100 * 1024);
     const block = { ...outline.blocks[1], markdown: "" };
     const empty = JSON.stringify({ blocks: [outline.blocks[0], block], missing: [] }).length;
     const sized = (bytes: number) => JSON.stringify({ blocks: [outline.blocks[0], { ...block, markdown: "x".repeat(bytes - empty) }], missing: [] });
     syncCalls = [];
     serve(() => new Response(sized(SNAPSHOT_MAX_BYTES + 1), { headers: { "Content-Type": "application/json" } }));
     const over = await audited("delete_blocks", PRE_READS.delete_blocks.args);
-    const error = `entry 1: ${B2} takes the snapshot over 256 KB (262,145 bytes); delete it in parts`;
+    const error = `entry 1: ${B2} takes the snapshot over 100 KB (102,401 bytes); delete it in parts`;
     expect(over.result).toEqual({ isError: true, text: error });
     expect(over.row).toMatchObject({ status: "refused", error });
     expect(writes()).toEqual([]);
@@ -494,8 +599,31 @@ describe("delete snapshots", () => {
     serve(() => new Response(wide, { headers: { "Content-Type": "application/json" } }));
     const page = await audited("delete_page", PRE_READS.delete_page.args);
     expect(page.row.status).toBe("refused");
-    expect(page.row.error).toMatch(new RegExp(`^entry 0: ${J5} takes the snapshot over 256 KB \\(\\d{3},\\d{3} bytes\\); delete it in parts$`));
+    expect(page.row.error).toMatch(new RegExp(`^entry 0: ${J5} takes the snapshot over 100 KB \\(\\d{3},\\d{3} bytes\\); delete it in parts$`));
     expect(writes()).toEqual([]);
+
+    // The entry whose subtree takes the running total over the cap is named, not the last one:
+    // entry 0 alone is over it, and entry 1 is small.
+    for (const [ids, blocks, named] of [
+      [[B1, B2], [{ ...outline.blocks[0], markdown: "x".repeat(SNAPSHOT_MAX_BYTES) }, outline.blocks[1]], `entry 0: ${B1}`],
+      // Neither alone is over the cap; together they are, at entry 1 of three.
+      [
+        [B1, B2, B3],
+        [
+          { ...outline.blocks[0], markdown: "x".repeat(SNAPSHOT_MAX_BYTES / 2) },
+          { ...outline.blocks[1], markdown: "y".repeat(SNAPSHOT_MAX_BYTES / 2) },
+          { ...outline.blocks[1], uuid: B3, markdown: "z" },
+        ],
+        `entry 1: ${B2}`,
+      ],
+    ] as const) {
+      syncCalls = [];
+      serve(() => Response.json({ blocks, missing: [] }));
+      const refused = await audited("delete_blocks", { body: { "block-ids": ids } });
+      expect(refused.row.status).toBe("refused");
+      expect(refused.row.error).toMatch(new RegExp(`^${named} takes the snapshot over 100 KB \\(\\d{3},\\d{3} bytes\\); delete it in parts$`));
+      expect(writes()).toEqual([]);
+    }
   });
 
   it("delete_page snapshot and its truncated refusal", async () => {
@@ -552,22 +680,63 @@ describe("delete snapshots", () => {
     expect(writes()).toEqual([]);
   });
 
-  it("a UUID under missing does not stop the call; the server's refusal is recorded", async () => {
-    serve(
-      () => Response.json({ blocks: [outline.blocks[0]], missing: [B3] }),
-      () => Response.json({ error: "block-ids[1]: block not found" }, { status: 409 }),
-    );
-    const { result, row } = await audited("delete_blocks", { body: { "block-ids": [B1, B3] } });
-    expect(result).toEqual({ isError: true, text: "block-ids[1]: block not found" });
-    expect(writes()).toHaveLength(1);
-    expect(row).toMatchObject({ status: "error", error: "block-ids[1]: block not found" });
-    expect(before(row).data.missing).toEqual([B3]);
+  it("a UUID the read lists as missing (hidden, in the Recycle bin or gone) refuses the delete, naming the entry", async () => {
+    // getBlocks hides a block under a deleted or hidden ancestor, but the delete still finds it, so
+    // a delete of what can't be read is refused, as a page's 404 is.
+    const message = (i: number, id: string) => `entry ${i}: ${id} can't be read (hidden, in the Recycle bin or not found); nothing was deleted`;
+    const cases: [string, Record<string, unknown>, unknown, string][] = [
+      ["delete_blocks", { body: { "block-ids": [B1, B3] } }, { blocks: [outline.blocks[0]], missing: [B3] }, message(1, B3)],
+      ["delete_block", { "block-id": B1 }, { blocks: [], missing: [B1] }, message(0, B1)],
+      // The same delete sent again: every block is gone. The first is named.
+      ["delete_blocks", PRE_READS.delete_blocks.args, { blocks: [], missing: [B1, B2] }, message(0, B1)],
+      // Given upper-cased and listed as given, or listed lower-cased: named as the call gave it.
+      ["delete_blocks", { body: { "block-ids": [B1, B3.toUpperCase()] } }, { blocks: [outline.blocks[0]], missing: [B3.toUpperCase()] }, message(1, B3.toUpperCase())],
+      ["delete_blocks", { body: { "block-ids": [B1, B3.toUpperCase()] } }, { blocks: [outline.blocks[0]], missing: [B3] }, message(1, B3.toUpperCase())],
+      // A title before it, which isn't read: the entry is counted in the call's block-ids.
+      ["delete_blocks", { body: { "block-ids": ["Meeting", B3] } }, { blocks: [], missing: [B3] }, message(1, B3)],
+    ];
+    for (const [name, args, response, error] of cases) {
+      syncCalls = [];
+      serve(() => Response.json(response));
+      const { result, row } = await audited(name, args);
+      expect(result, name).toEqual({ isError: true, text: error });
+      expect(row, name).toMatchObject({ status: "refused", error, before: null });
+      expect(writes(), name).toEqual([]);
+    }
+    // On an E2EE graph the summary read's missing refuses too.
+    syncCalls = [];
+    serve((path, url) => (url.searchParams.get("view") === "summary" ? Response.json({ blocks: [], missing: [B1] }) : Response.json(e2ee409, { status: 409 })));
+    const e2ee = await audited("delete_block", { "block-id": B1 });
+    expect(e2ee.row).toMatchObject({ status: "refused", error: message(0, B1) });
+    expect(writes()).toEqual([]);
   });
 
-  it("re-sends, leaf blocks, empty pages and a full 2,000-block budget still go ahead", async () => {
+  it("an outline read that fails with anything but 409 refuses the delete, even when the summary read would answer", async () => {
+    // Only E2EE's 409 falls back to summaries: any other failure means the subtree can't be read.
+    for (const [status, error] of [
+      [500, "boom"],
+      [404, "not found"],
+      [503, "unavailable"],
+    ] as const) {
+      for (const [name, args] of [
+        ["delete_block", PRE_READS.delete_block.args],
+        ["delete_blocks", PRE_READS.delete_blocks.args],
+        ["delete_page", PRE_READS.delete_page.args],
+      ] as const) {
+        syncCalls = [];
+        serve((path, url) => (url.searchParams.get("view") === "outline" || path.endsWith("/outline") ? Response.json({ error }, { status }) : fixtures(path, url)));
+        const { result, row } = await audited(name, args);
+        const text = `audit snapshot failed: sync server error (HTTP ${status}): ${error}; nothing was deleted`;
+        expect(result, `${name} ${status}`).toEqual({ isError: true, text });
+        expect(row, `${name} ${status}`).toMatchObject({ status: "refused", error: text, before: null });
+        expect(gets(), `${name} ${status}`).toHaveLength(1);
+        expect(writes(), `${name} ${status}`).toEqual([]);
+      }
+    }
+  });
+
+  it("leaf blocks, empty pages and a full 2,000-block budget still go ahead", async () => {
     const cases: [string, Record<string, unknown>, unknown][] = [
-      // The same delete sent again: every block is gone, and the server answers for itself.
-      ["delete_blocks", PRE_READS.delete_blocks.args, { blocks: [], missing: [B1, B2] }],
       // A leaf block: nothing under it.
       ["delete_block", { "block-id": B1 }, { blocks: [{ ...outline.blocks[0], markdown: "", "block-count": 0 }], missing: [] }],
       // Exactly the budget, not over it.
@@ -641,8 +810,11 @@ describe("contract", () => {
     const help = (await call("connector_help", {})).text;
     expect(help).toContain("Before an update, move, property change or delete, what it overwrote is kept in the log");
     expect(help).toContain(
-      "A block or page delete whose subtree is over 2,000 blocks or 256 KB is refused, naming the entry (entry 1: <uuid> has more descendants than the 2,000-block snapshot budget; delete it in parts); delete it in parts",
+      "A block or page delete whose subtree is over 2,000 blocks or 100 KB is refused, naming the entry (entry 1: <uuid> has more descendants than the 2,000-block snapshot budget; delete it in parts); delete it in parts",
     );
+    expect(help).toContain("or that it can't read (hidden, in the Recycle bin or not found)");
+    expect(help).toContain("A tag or property delete keeps only the definition, not the values or tags it removes from each node");
+    expect(help).toContain("A call refused for its input's shape (Input validation error) never reaches the graph and is not logged");
     expect(help).toContain("audit snapshot failed: …; nothing was deleted");
   });
 });

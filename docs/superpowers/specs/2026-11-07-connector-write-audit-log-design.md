@@ -68,7 +68,7 @@ Rejected:
 
 - **Server-side snapshot in a patch (0033).** Taking the snapshot from the pre-transaction db inside `atomic-write!` would be exact (no gap between snapshot and write) and restorable (UUIDs, order keys, hidden value blocks). It means an `audit` flag on every semantic write handler, stacked on unmerged 0028 to 0032, so `bump-upstream` conflicts are likely, and a write response that carries up to 1 MB of `before` for the connector to parse under the 10 ms CPU limit. It is the right path if the owner later wants `restore_from_log` (section 10).
 - **Log after the write.** Two rows per write and no extra request, but a Worker crash or the D1 daily cap between the commit and the insert leaves an applied, unlogged write with nothing reported, which acceptance 4 forbids.
-- **R2 for large snapshots.** Snapshots are capped at 256 KB (3.3), so D1 holds them all; a second store adds a binding, a second retention rule and a second failure mode.
+- **R2 for large snapshots.** Snapshots are capped at 100 KB (3.4), so D1 holds them all; a second store adds a binding, a second retention rule and a second failure mode.
 
 ### 3.1 Layout
 
@@ -145,7 +145,7 @@ A row left `pending` because the Worker died between steps 4 and 6 is shown by `
 | `update_page` | `getPage` | title, tags, properties |
 | `update_tag`, `delete_tag`, `promote_page_to_tag` | `getTag` (or `getPage` before a promote) | title, properties, extends, tag properties |
 | `update_property`, `delete_property` | `getProperty` | type, cardinality, choices, classes |
-| `batch_insert_block_trees` | `getBlocks` for entries with a `target-id` and properties, since those replace existing values | as for property writes |
+| `batch_insert_block_trees` | `getBlocks` for entries with a UUID `target-id` and properties, and `getPage` for each page an entry with properties names by title or date (`target-id` or `page`), since those replace existing values | as for property writes, and each page's title, tags and properties |
 | `refresh_refs` | none | its response already lists each block's text before and after; that is stored as `before` |
 | inserts, creates, `capture_to_today`, `create_task`, `save_document`, `save_file_from_url` | none | nothing is overwritten |
 
@@ -153,9 +153,9 @@ A guard test, like item 17's `contextClassFor`, fails when a non-read tool in `t
 
 Rules:
 
-- **Deletes that can't be snapshotted are refused (call).** A `delete_block` or `delete_blocks` whose outline comes back with `truncated: true` on any entry, or whose snapshot is over 256 KB, is refused before the delete is sent, naming the entry: `entry 3: <uuid> has more descendants than the 2,000-block snapshot budget; delete it in parts`. This keeps acceptance 2 true and follows the repo's "refuse up front" rule. Several blocks in one `delete_blocks` share the 2000-block budget, so a call may need splitting even when each block alone would fit. `delete_page` follows the same rule on `getPageOutline`'s `truncated`.
+- **Deletes that can't be snapshotted are refused (call).** A `delete_block` or `delete_blocks` whose outline comes back with `truncated: true` on any entry, or whose snapshot is over 100 KB, is refused before the delete is sent, naming the entry: `entry 3: <uuid> has more descendants than the 2,000-block snapshot budget; delete it in parts`. This keeps acceptance 2 true and follows the repo's "refuse up front" rule. Several blocks in one `delete_blocks` share the 2000-block budget, so a call may need splitting even when each block alone would fit. `delete_page` follows the same rule on `getPageOutline`'s `truncated`.
 - **Non-delete snapshots over the cap** are stored cut down to the addressed blocks' summaries, with `truncated: true`.
-- **Pre-read failures.** A UUID under `missing` doesn't stop the call, because the write refuses the same UUID itself and that refusal is logged. Any other pre-read failure on a delete refuses the delete (`audit snapshot failed: <reason>; nothing was deleted`). On other writes the failure is stored as `before: {error}` and the write proceeds.
+- **Pre-read failures.** A block delete whose read doesn't return a block it names (listed under `missing`) is refused, naming the entry by its index in the call: `entry 1: <uuid> can't be read (hidden, in the Recycle bin or not found); nothing was deleted`. `getBlocks` hides a block under a deleted (Recycle bin) or hidden ancestor, but the delete still finds it, so the write would not refuse it itself; this matches the page delete's 404 below (review round 1). Any other pre-read failure on a delete refuses the delete (`audit snapshot failed: <reason>; nothing was deleted`). On other writes the failure is stored as `before: {error}` and the write proceeds.
 - **E2EE graphs.** `view=outline` and `getPageOutline` answer 409, so deletes store the summary view of the addressed blocks (ciphertext titles) with `e2ee: true`. The subtree can't be read back on E2EE graphs; this is a documented exception to acceptance 2 (section 11, question 3).
 - **The snapshot is best-effort.** It is a separate read before the write, so a Logseq client edit between the two is missed. The docs say so.
 
@@ -164,7 +164,12 @@ Rules:
 - **Which deletes refuse.** Every tool named `delete_*` with a pre-read (`delete_block`, `delete_blocks`, `delete_page`, `delete_tag`, `delete_property`) refuses when its read fails, as "any other pre-read failure on a delete" says. Only the block and page deletes can be `truncated`. A 404 on the read (a page that is hidden or already in the Recycle bin, which `getPageOutline` doesn't show but `deletePage` still finds) refuses too: that page's subtree can't be read.
 - **Only UUIDs go to `getBlocks`.** It takes UUIDs only and refuses a duplicate, so the read takes each UUID-shaped id once (ignoring case), in call order, and leaves titles, dates and `..` to the write, which refuses what doesn't exist. A call that names no UUID reads nothing. More than 100 blocks (a `batch_move_blocks` can name more) reads the first 100 and marks the snapshot `truncated`. Page, tag and property selectors are passed to their read as given, encoded once; `.`, `..` and empty ids read nothing, since the handler refuses them before any request.
 - **E2EE fallback.** On the outline's 409 a block delete reads `getBlocks` summary and `delete_page` reads `getPage`, each with `e2ee: true`: two GETs, the only case over one. A failing fallback refuses the delete.
-- **The oversized refusal** names the entry whose JSON takes the running total over 256 KB, counted in UTF-8 bytes: `entry 1: <uuid> takes the snapshot over 256 KB (262,145 bytes); delete it in parts`. Exactly 256 KB is kept.
+- **The oversized refusal** names the entry whose JSON takes the running total over 100 KB, counted in UTF-8 bytes: `entry 1: <uuid> takes the snapshot over 100 KB (102,401 bytes); delete it in parts`. Exactly 100 KB is kept. The cap was 256 KB until review round 1: `get_activity_log` returns a snapshot whole in one result, which claude.ai cuts at 150,000 characters, so a larger one couldn't be read back. A UTF-8 byte count is never below the character count, so 100 KB leaves the entry's other fields about 47,000 characters.
+- **Only E2EE's 409 falls back to summaries.** Any other failure of a delete's outline read (500, 404, 503) refuses it, even when the summary read would answer.
+- **`batch_insert_block_trees` page reads** (review round 1). `target-id` takes a page title or date as well as a UUID, and `page` names an existing page (or creates one); an entry with properties overwrites the values it sets either way. Each distinct page selector (ignoring case) among entries with properties is read with `getPage`, at most 10 per call (the rest mark the snapshot `truncated`), after the `getBlocks` read of the UUIDs. The row's `before` is then `{source: getBlocks, truncated?, error?, data, pages: [{page, source: getPage, data | error}]}`, with `data` null when no UUID carries properties; a page that doesn't exist yet stores its 404 as `error`. Over the cap every read is cut down to its summary, and past that every `data` is null.
+- **Tag and property deletes** keep only the definition (`getTag`, `getProperty`), not the values or tags they remove from each holder. Snapshotting the holders is a backlog item; `connector_help` and README §11.8 say so.
+- **`refresh_refs` previews are dry runs.** A `refresh_refs` call without `apply: true` writes nothing, so it is logged with `dry_run = 1` and listed as `dry run` (review round 1).
+- **Calls refused for their input's shape** (the MCP SDK's `Input validation error`, such as an empty `block-ids` or a non-string `reason`) are refused before `audited()` runs, so they are not logged. Nothing reaches the graph; `connector_help` and README §11.8 say so.
 - **Cut-down snapshots** keep `uuid`, `kind`, `title`, `order`, `parent-id` and `page-id` of each block (or of the page, tag or property); if that is still over the cap, `data` is null.
 - **The read comes before `begin`** (step 3 before step 4), so when the INSERT fails the snapshot's GET has already reached the sync server; no write has.
 - **`refresh_refs`** stores `{source: "refresh_refs", data: [{uuid, page-id, before}]}` from its response through `finish` (`before = coalesce(?, before)`, still 1 row written), and nothing for a preview (`applied: false`).
@@ -195,6 +200,8 @@ A hand-written read tool in `connector/src/tools/activity-log.ts`, registered be
 - **Rejected, measured:** a window function (`row_number`, `count(*) OVER ()`) read 1,501 to 3,002 rows for a 500-row scan; a materialised CTE 1,500; `IN (…)` and `json_each` two rows per id; a compound `UNION ALL` of more than a few terms is refused by D1; a batch of lookups spends one of the invocation's 50 D1 queries per entry.
 - **Cost:** at most 500 rows read per listing (499 less `limit` scanned, the cursor's own row read and skipped, and `limit` by id), plus any rows sharing the cursor's millisecond with a higher id. A lookup by `id` reads 1. Each call that reads the log writes 2 (its `kind = 'read'` row, whose `addressed` holds the window as an ISO interval or `id:<n>`). An input refused before any query (a bad date, a window over 92 days, a bad cursor) reads and records nothing. An `id` naming a read row answers `no such entry`.
 - **The cursor** is `<at>.<id>`. When the matches fill the page it is the last entry returned; otherwise the last row scanned; null when the scan came back short.
+- **Pages and addressed** (review round 1). `pages` also holds the pages the call names (`page-id`, `page`, and a `target-id` that is a title or date) and those its snapshot read (a page read's UUID and title, each block's `page-id`), from `begin`, so refused, failed and pending entries are found by page too. A write whose response names no target (`update_page`, `promote_page_to_tag`) stores the page its `getPage` read returned as its target, and so does a refused or failed call whose page was read. The JSON gains `addressed`, and a line with no target shows the first UUID or selector the call named.
+- **Listings fit one result.** Entries are kept, newest first, while the text and JSON stay under 150,000 characters; when one is left out, `next-cursor` resumes after the last one kept, and the text part repeats it (`next-cursor: <cursor>`). An entry whose JSON alone wouldn't fit keeps only its first target, with `targets-omitted`.
 - **The summary line** is `<when> <tool> <outcome>: <first target> (+N more). Reason: <reason>`, with the first target as item 17's summaries show it (`targetLine`, so a delete's own count reads `(+3 children)`), and the outcome `ok`, `dry run`, `refused: <error>`, `error: <error>` (error text on one line, cut at 200 characters), `refused (dry run): …` or `outcome unknown`. `status: ok` leaves dry runs out; `dry-run` lists every dry run whatever its status.
 - **Dates:** a `YYYY-MM-DD` `until` covers that whole day (`until` is exclusive, so it is the next day's start). A window of 92 calendar days that spans the end of daylight saving is 92 days and an hour long, and is kept: the limit is 92 days plus one hour. The time zone is `timeZone` from `config/settings.json`, bundled into the connector (UTC when unset).
 
@@ -293,9 +300,9 @@ Daily totals at 300 writes a day: about 900 rows written for the log, about 600 
 
 Worst case at the sync write rate limit (20 a minute all day, 28,800 calls): about 86k log rows written plus the purge, which would breach 100k. The 100k Worker request cap is reached first, since each write is already at least two Worker invocations.
 
-Storage: about 1 to 3 KB per typical entry, up to 256 KB for a delete snapshot. At 300 a day for 90 days with a 2 KB average, about 55 MB of the 500 MB per-database limit, shown by the usage report.
+Storage: about 1 to 3 KB per typical entry, up to 100 KB for a delete snapshot. At 300 a day for 90 days with a 2 KB average, about 55 MB of the 500 MB per-database limit, shown by the usage report.
 
-CPU: the snapshot is JSON from the sync server, stored as text without re-parsing beyond the size check and the `truncated` flags. A 256 KB `JSON.parse` is the largest added cost on the 10 ms budget; the cap keeps it bounded.
+CPU: the snapshot is JSON from the sync server, stored as text without re-parsing beyond the size check and the `truncated` flags. A 100 KB `JSON.parse` is the largest added cost on the 10 ms budget; the cap keeps it bounded.
 
 ## 6. Safety
 
@@ -321,7 +328,7 @@ CPU: the snapshot is JSON from the sync server, stored as text without re-parsin
 All connector tests run in `@cloudflare/vitest-pool-workers` against real D1 with migrations applied by `test/apply-migrations.ts`, and against the real generated tools, with the `SYNC` binding faked at the HTTP level as `tools.test.ts` does. Each test is seen to fail before its code exists, and the failure is quoted in the PR.
 
 1. **Acceptance 1.** A table-driven test over `tools-manifest.json` calls every non-read tool once in each of: success, sync 409, refused reason, read-only graph, dry run (where the tool has one). It asserts exactly one `audit_log` row per call with the right `status` and `dry_run`. A guard test asserts every non-read tool has a `SNAPSHOT_PLAN` entry, mutation-checked by removing one.
-2. **Acceptance 2.** `delete_blocks` with a fake `getBlocks` outline response is read back through `get_activity_log(id, include_snapshot)` and contains the full outline. An outline with `truncated: true`, and one over 256 KB, are refused naming the entry, with nothing sent to the delete endpoint (asserted on the fake's request log). The `getBlocks` outline shape the fake returns is checked against `bulk-read-response` in a db-sync test run by CI's upstream suite, so the fake can't drift from the real handler.
+2. **Acceptance 2.** `delete_blocks` with a fake `getBlocks` outline response is read back through `get_activity_log(id, include_snapshot)` and contains the full outline. An outline with `truncated: true`, and one over 100 KB, are refused naming the entry, with nothing sent to the delete endpoint (asserted on the fake's request log). The `getBlocks` outline shape the fake returns is checked against `bulk-read-response` in a db-sync test run by CI's upstream suite, so the fake can't drift from the real handler.
 3. **Acceptance 3.** Seeded entries over a week: the summary carries page titles, breadcrumbs, snippets and reasons; the page, tool, session and status filters work; a selective filter pages through a window larger than 500 rows; the cursor ends on null; `pending` rows show as `outcome unknown`.
 4. **Acceptance 4.** A `DB` wrapper that throws on INSERT refuses the write with no request reaching the fake sync server. One that throws on UPDATE leaves the write applied and the result carrying the "could not be completed" line. A database without migration 0004 refuses writes with the migration message.
 5. **Cost.** Tests read `meta.rows_written` and `meta.rows_read` from the real statements and pin 3 rows written per write, at most 500 rows read per listing, and 1 row read for a purge with nothing old (the measured full-table read in section 2 is the mutant this test kills).
@@ -343,7 +350,7 @@ All connector tests run in `@cloudflare/vitest-pool-workers` against real D1 wit
 
 - `restore_from_log(entry-id, dry-run)`. It needs a restorable snapshot (UUIDs, order keys, hidden value blocks), which means the server-side snapshot from the pre-transaction db inside `atomic-write!` (patch). Revisit with that.
 - The daily digest cron that writes a "Claude activity" summary into the journal. It would make the connector write to the graph unprompted and add a cron; `get_activity_log` answers the same question on demand.
-- R2 storage for snapshots over 256 KB.
+- R2 storage for snapshots over 100 KB.
 - Logging read tools beyond `get_activity_log`'s own cost row.
 - Edits made in the Logseq app or by other API clients.
 - Reconciling `pending` rows after a crash.
@@ -351,7 +358,7 @@ All connector tests run in `@cloudflare/vitest-pool-workers` against real D1 wit
 ## 11. Open questions for the owner
 
 1. **Daily digest.** Leave it out (this design), or add a journal summary under a "Claude activity" heading later as its own item?
-2. **Large deletes.** Refuse deletes whose subtree can't be snapshotted in full (over 2,000 blocks or 256 KB), as designed, or allow them with a truncated snapshot and a warning in the result?
+2. **Large deletes.** Refuse deletes whose subtree can't be snapshotted in full (over 2,000 blocks or 256 KB, lowered to 100 KB in review round 1), as designed, or allow them with a truncated snapshot and a warning in the result?
 3. **E2EE graphs.** Accept that a deleted subtree can't be read back on E2EE graphs (only the addressed blocks' encrypted summaries are kept), or refuse block deletes on E2EE graphs?
 4. **Client id.** Is the User-Agent family enough for `client`, or should `GrantProps` carry the OAuth client id (new grants only, so a re-consent)?
 5. **Snapshot compression.** Store snapshots as plain JSON text (this design, about 55 MB at 300 writes a day), or gzip them into a BLOB to roughly halve storage at some CPU cost on the 10 ms budget?

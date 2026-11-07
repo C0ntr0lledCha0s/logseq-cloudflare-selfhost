@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { type AuditCursor, type AuditLog, type AuditRow } from "../audit/log";
-import { ToolError, resolveGraph, runTool } from "./common";
+import { RESULT_CHAR_LIMIT, ToolError, resolveGraph, runTool } from "./common";
 import { type AffectedTarget, targetLine } from "./readable";
 import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
@@ -25,6 +25,11 @@ const MAX_LIMIT = 200;
 /** The longest error text a summary line shows; the JSON holds all of it. */
 const ERROR_CHARS = 200;
 const STATUSES = ["ok", "error", "refused", "pending", "dry-run"] as const;
+/**
+ * Room kept in a result for its text part's header and cursor line and the JSON's own keys. An
+ * entry's JSON longer than RESULT_CHAR_LIMIT less this keeps only its first target.
+ */
+const RESULT_RESERVE = 2_000;
 
 export interface ActivityLogDeps {
   log: AuditLog;
@@ -149,6 +154,11 @@ function targetsOf(row: AuditRow): AffectedTarget[] {
   return Array.isArray(parsed) ? (parsed as AffectedTarget[]) : [];
 }
 
+function addressedOf(row: AuditRow): string[] {
+  const parsed = parseJson(row.addressed);
+  return Array.isArray(parsed) ? parsed.filter((a): a is string => typeof a === "string") : [];
+}
+
 /** The outcome as a summary line shows it. A pending row's write may or may not have been applied. */
 function outcome(row: AuditRow): string {
   if (row.status === "pending") return "outcome unknown";
@@ -160,33 +170,51 @@ function outcome(row: AuditRow): string {
 
 /**
  * One entry as a line: when (local time), tool, outcome, the first block or page it changed (or, when
- * it names none, wrote to) as item 17's summaries show it, how many more, and the reason.
+ * it names none, wrote to) as item 17's summaries show it, how many more, and the reason. An entry
+ * with no target shows the first UUID or selector the call named instead.
  */
 export function entryLine(row: AuditRow, timeZone: string): string {
   const targets = targetsOf(row);
   const affected = targets.filter((t) => t.role === "affected");
   const shown = affected.length > 0 ? affected : targets;
+  const addressed = addressedOf(row);
   let text = `${formatWhen(row.at, timeZone)} ${row.tool} ${outcome(row)}`;
   if (shown.length > 0) text += `: ${targetLine(shown[0])}${shown.length > 1 ? ` (+${shown.length - 1} more)` : ""}`;
+  else if (addressed.length > 0) text += `: ${addressed[0]}${addressed.length > 1 ? ` (+${addressed.length - 1} more)` : ""}`;
   if (row.reason !== null) text += `. Reason: ${row.reason}`;
   return text;
 }
 
-/** The entry as the JSON part shows it; `before` only when asked for. */
-function entryJson(row: AuditRow, withBefore: boolean): Record<string, unknown> {
-  return {
-    id: row.id,
-    at: new Date(row.at).toISOString(),
-    tool: row.tool,
-    status: row.status,
-    dry_run: row.dryRun,
-    reason: row.reason,
-    client: row.client,
-    session: row.session,
-    targets: targetsOf(row),
-    error: row.error,
-    ...(withBefore ? { before: parseJson(row.before) } : {}),
-  };
+/**
+ * The entry as the JSON part shows it, as text; `before` only when asked for. One that wouldn't fit a
+ * result keeps only its first target, with `targets-omitted` the count left out: a snapshot is at most
+ * SNAPSHOT_MAX_BYTES, so the snapshot itself always fits whole.
+ */
+function entryJson(row: AuditRow, withBefore: boolean): string {
+  const targets = targetsOf(row);
+  const json = (shown: AffectedTarget[]) =>
+    JSON.stringify({
+      id: row.id,
+      at: new Date(row.at).toISOString(),
+      tool: row.tool,
+      status: row.status,
+      dry_run: row.dryRun,
+      reason: row.reason,
+      client: row.client,
+      session: row.session,
+      addressed: addressedOf(row),
+      targets: shown,
+      ...(shown.length < targets.length ? { "targets-omitted": targets.length - shown.length } : {}),
+      error: row.error,
+      ...(withBefore ? { before: parseJson(row.before) } : {}),
+    });
+  const whole = json(targets);
+  return whole.length <= RESULT_CHAR_LIMIT - RESULT_RESERVE ? whole : json(targets.slice(0, 1));
+}
+
+/** The JSON part: the entries' JSON texts, the cursor and the rows scanned. */
+function listingJson(entries: string[], nextCursor: string | null, scanned: number): string {
+  return `{"entries":[${entries.join(",")}],"next-cursor":${JSON.stringify(nextCursor)},"scanned":${scanned}}`;
 }
 
 export function registerActivityLogTool(server: McpServer, { log, access, timeZone }: ActivityLogDeps): void {
@@ -212,7 +240,7 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
         page: z
           .string()
           .optional()
-          .describe("Only entries that touched this page: its UUID or its exact title, ignoring case (not a prefix)."),
+          .describe("Only entries that touched or named this page, refused and failed calls included: its UUID or its exact title, ignoring case (not a prefix)."),
         tool: z.string().optional().describe("Only entries for this tool, e.g. delete_blocks."),
         session: z.string().optional().describe("Only entries from this MCP session id."),
         status: z
@@ -247,7 +275,7 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           return {
             content: [
               { type: "text", text },
-              { type: "text", text: JSON.stringify({ entries: [entryJson(row, true)], "next-cursor": null, scanned: 1 }) },
+              { type: "text", text: listingJson([entryJson(row, true)], null, 1) },
             ],
           };
         }
@@ -267,18 +295,33 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
         });
         await log.recordRead(graphId, alias, [`${new Date(since).toISOString()}/${new Date(until).toISOString()}`], page.rowsRead);
 
+        // Entries are kept, newest first, while the result fits; the rest follow from the last one kept.
+        const entryLines = page.entries.map((row) => `- ${entryLine(row, timeZone)}`);
+        const entryTexts = page.entries.map((row) => entryJson(row, args.include_snapshot === true));
+        let kept = 0;
+        let used = RESULT_RESERVE;
+        while (kept < page.entries.length) {
+          const size = entryLines[kept].length + 1 + entryTexts[kept].length + 1;
+          if (kept > 0 && used + size > RESULT_CHAR_LIMIT) break;
+          used += size;
+          kept += 1;
+        }
+        const last = page.entries[kept - 1];
+        const next = kept < page.entries.length ? { at: last.at, id: last.id } : page.nextCursor;
+        const nextCursor = next === null ? null : encodeCursor(next);
+
         const header =
           `Activity log of graph '${alias}', ${formatWhen(since, timeZone)} to ${formatWhen(until, timeZone)} (${timeZone}), newest first: ` +
-          (page.entries.length === 0 ? "No entries" : `${page.entries.length} ${page.entries.length === 1 ? "entry" : "entries"}`) +
+          (kept === 0 ? "No entries" : `${kept} ${kept === 1 ? "entry" : "entries"}`) +
           (cursor === undefined ? "." : " after the cursor.");
-        const lines = [header, ...page.entries.map((row) => `- ${entryLine(row, timeZone)}`)];
-        if (page.nextCursor !== null) lines.push("Older entries in the window may follow: pass next-cursor as cursor.");
-        const json = {
-          entries: page.entries.map((row) => entryJson(row, args.include_snapshot === true)),
-          "next-cursor": page.nextCursor === null ? null : encodeCursor(page.nextCursor),
-          scanned: page.scanned,
+        const lines = [header, ...entryLines.slice(0, kept)];
+        if (nextCursor !== null) lines.push(`Older entries in the window may follow: pass next-cursor as cursor (next-cursor: ${nextCursor}).`);
+        return {
+          content: [
+            { type: "text", text: lines.join("\n") },
+            { type: "text", text: listingJson(entryTexts.slice(0, kept), nextCursor, page.scanned) },
+          ],
         };
-        return { content: [{ type: "text", text: lines.join("\n") }, { type: "text", text: JSON.stringify(json) }] };
       }),
   );
 }

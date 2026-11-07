@@ -407,6 +407,16 @@ describe("capWriteResult", () => {
     expect(summary).toMatch(/^s+\n\n\[summary cut: the write was applied; the JSON result below is complete\]$/);
   });
 
+  it("a cut summary keeps its last line, the audit entry Claude cites", () => {
+    const json = JSON.stringify({ moved: 1, pad: "j".repeat(140_000) });
+    const last = "Logged as audit entry 4242";
+    const capped = capWriteResult({ content: [{ type: "text", text: `${"s".repeat(20_000)}\nReason: tidy\n${last}` }, { type: "text", text: json }] });
+    const [summary, kept] = texts(capped);
+    expect(kept).toBe(json);
+    expect(summary.length + kept.length).toBe(RESULT_CHAR_LIMIT);
+    expect(summary).toMatch(new RegExp(`^s+\\n\\n\\[summary cut: the write was applied; the JSON result below is complete\\]\\n${last}$`));
+  });
+
   it("when the JSON alone is over the cap, keeps the summary and cuts the JSON with a write's notice", () => {
     const capped = capWriteResult({ content: [{ type: "text", text: "Moved 1 block:" }, { type: "text", text: "j".repeat(200_000) }] });
     const [summary, json] = texts(capped);

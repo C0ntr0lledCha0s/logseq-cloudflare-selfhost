@@ -394,14 +394,18 @@ function acceptEverything(): void {
 
 /**
  * `handler` for writes, with each before-snapshot GET (audit stage 3) answered by a valid, empty
- * snapshot: getBlocks lists the ids as missing, and a page, tag or property read finds an empty
- * entity. test/audit-snapshot.test.ts covers the snapshots themselves.
+ * snapshot: getBlocks finds each id as an empty block (a delete of a block the read lists as missing
+ * is refused), and a page, tag or property read finds an empty entity. test/audit-snapshot.test.ts
+ * covers the snapshots themselves.
  */
 function preReadsEmpty(handler: SyncHandler): SyncHandler {
   return (request) => {
     if (request.method !== "GET") return handler(request);
     const url = new URL(request.url);
-    if (url.pathname.endsWith("/blocks")) return Response.json({ blocks: [], missing: (url.searchParams.get("ids") ?? "").split(",") });
+    if (url.pathname.endsWith("/blocks")) {
+      const ids = (url.searchParams.get("ids") ?? "").split(",");
+      return Response.json({ blocks: ids.map((uuid) => ({ uuid, kind: "block", title: "", markdown: "", "block-count": 0, truncated: false })), missing: [] });
+    }
     return Response.json({ uuid: PAGE_UUID, kind: "page", title: "Notes", markdown: "", "block-count": 0, truncated: false });
   };
 }
@@ -1252,7 +1256,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   update_page: { "page-id": PAGE_UUID, body: { title: "Notes" } },
   promote_page_to_tag: { "page-id": PAGE_UUID },
   delete_blocks: { body: { "block-ids": [B1, B2] } },
-  refresh_refs: { body: { "page-id": PAGE_UUID } },
+  refresh_refs: { body: { "page-id": PAGE_UUID, apply: true } },
   update_block: { "block-id": B1, body: { title: "New title" } },
   delete_block: { "block-id": B1 },
   move_blocks: { body: { "block-ids": [B1], "target-id": B2, position: "after" } },
@@ -1428,14 +1432,21 @@ describe("audit log", () => {
       });
       expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
       expect(JSON.parse(ok.row.targets!), name).toEqual(toAffectedTargets(CONTEXT_RESPONSE));
-      expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID].sort());
+      // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
+      const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
+      expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID, ...named].sort());
 
       // Sync 409: an error row carrying the server's message, not ok and not two rows.
       syncRequests = [];
       syncHandler = preReadsEmpty(() => Response.json({ error: "entry 0: block not found" }, { status: 409 }));
       const conflict = await callAudited(name, args);
       expect(conflict.result.isError, name).toBe(true);
-      expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, targets: null, pages: null, graph_id: WORK_ID });
+      expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, graph_id: WORK_ID });
+      // Only what the call and its snapshot named (activity-log.test.ts covers finding it by page):
+      // the page a page read returned, never a target the response would have named.
+      for (const page of conflict.row.pages?.split("\n") ?? []) expect(ok.row.pages!.split("\n"), name).toContain(page);
+      const known = conflict.row.targets === null ? [] : JSON.parse(conflict.row.targets);
+      expect(known.map((t: { uuid: string; kind: string }) => [t.uuid, t.kind]), name).toEqual(known.length === 0 ? [] : [[PAGE_UUID, "page"]]);
 
       // Refusals before the handler: nothing reaches the sync server.
       syncRequests = [];
@@ -1721,12 +1732,12 @@ describe("audit log", () => {
       // A move names only where each block was and is now; both pages count.
       ["move_blocks", await fixture("move-blocks"), ["nov 5th, 2026", J5]],
       ["batch_move_blocks", { affected: [{ uuid: B1, kind: "block", snippet: "x", from: { page: { uuid: J5, title: "Nov 5th, 2026" }, breadcrumb: [] }, to: { page: { uuid: NOTES_PAGE, title: "Notes" }, breadcrumb: [] } }] }, ["nov 5th, 2026", J5, "notes", NOTES_PAGE]],
-      // A page or journal target names itself as its page.
-      ["delete_page", await fixture("delete-page-today"), ["nov 6th, 2026", J6]],
+      // A page or journal target names itself as its page; the call's page-id and the page its snapshot read count too.
+      ["delete_page", await fixture("delete-page-today"), ["nov 6th, 2026", J6, PAGE_UUID, "notes"]],
       // E2EE: the page's UUID only, its title is encrypted.
       ["delete_blocks", await fixture("delete-blocks-e2ee"), [J5]],
-      // Batch entries: each entry's target and affected blocks.
-      ["batch_insert_block_trees", await fixture("batch-insert-block-trees"), ["nov 5th, 2026", J5, "ideas", "5d0f4c7a-2222-4b4e-8c1e-000000000003"]],
+      // Batch entries: each entry's target and affected blocks, and the page the call names by title.
+      ["batch_insert_block_trees", await fixture("batch-insert-block-trees"), ["nov 5th, 2026", J5, "ideas", "5d0f4c7a-2222-4b4e-8c1e-000000000003", "meeting"]],
       // A response with no context names no page.
       ["create_page", { id: "p1", title: "Standup" }, null],
     ];

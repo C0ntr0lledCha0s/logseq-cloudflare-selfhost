@@ -1,6 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { ToolError, resolveGraph } from "../tools/common";
-import { resultJson } from "../tools/readable";
+import { type AffectedTarget, resultJson } from "../tools/readable";
 import { type GraphAccess, graphFetch } from "../tools/semantic";
 
 /**
@@ -11,10 +11,18 @@ import { type GraphAccess, graphFetch } from "../tools/semantic";
  * write keeps a cut-down snapshot or the read's error and goes ahead. Dry runs read nothing.
  */
 
-/** The largest snapshot stored, in UTF-8 bytes of the server's JSON. */
-export const SNAPSHOT_MAX_BYTES = 256 * 1024;
+/**
+ * The largest snapshot stored, in UTF-8 bytes of the server's JSON. get_activity_log returns a
+ * snapshot whole in one result, which claude.ai cuts at RESULT_CHAR_LIMIT (150,000) characters; a
+ * UTF-8 byte count is never below the character count, so 100 KB leaves the entry's other fields
+ * about 47,000 characters.
+ */
+export const SNAPSHOT_MAX_BYTES = 100 * 1024;
+const SNAPSHOT_MAX_LABEL = `${SNAPSHOT_MAX_BYTES / 1024} KB`;
 /** getBlocks takes at most this many ids. */
 const GET_BLOCKS_MAX_IDS = 100;
+/** batch_insert_block_trees: the most pages named by title or date read with getPage, one GET each. */
+export const PAGE_READS_MAX = 10;
 
 export type SnapshotSource = "getBlocks" | "getPageOutline" | "getPage" | "getTag" | "getProperty" | "refresh_refs";
 
@@ -27,6 +35,8 @@ export interface SnapshotRequest {
   cut?: boolean;
   /** For a getBlocks read, the UUIDs as the call gave them, in the order read (to name an entry). */
   ids?: string[];
+  /** For a getBlocks read, each of `ids`' index in the call's list. */
+  indexes?: number[];
 }
 
 export type SnapshotPlanEntry =
@@ -36,6 +46,8 @@ export type SnapshotPlanEntry =
       read(args: Record<string, unknown>): SnapshotRequest | null;
       /** A delete: refused unless its snapshot is read in full. */
       delete?: { e2ee(args: Record<string, unknown>): SnapshotRequest | null };
+      /** Pages the call names by title or date whose values it overwrites, each read with getPage. */
+      pages?(args: Record<string, unknown>): unknown[];
       keep: string;
     }
   | { source: "refresh_refs"; keep: string }
@@ -64,14 +76,28 @@ function entries(args: Record<string, unknown>, key: string): Record<string, unk
 function blocksRead(given: unknown[], view: "summary" | "outline"): SnapshotRequest | null {
   const seen = new Set<string>();
   const ids: string[] = [];
-  for (const id of given) {
-    if (typeof id !== "string" || !UUID.test(id) || seen.has(id.toLowerCase())) continue;
+  const indexes: number[] = [];
+  given.forEach((id, index) => {
+    if (typeof id !== "string" || !UUID.test(id) || seen.has(id.toLowerCase())) return;
     seen.add(id.toLowerCase());
     ids.push(id);
-  }
+    indexes.push(index);
+  });
   if (ids.length === 0) return null;
   const read = ids.slice(0, GET_BLOCKS_MAX_IDS);
-  return { source: "getBlocks", path: "/blocks", query: { ids: read.join(","), view }, ids: read, cut: ids.length > read.length };
+  return {
+    source: "getBlocks",
+    path: "/blocks",
+    query: { ids: read.join(","), view },
+    ids: read,
+    indexes: indexes.slice(0, GET_BLOCKS_MAX_IDS),
+    cut: ids.length > read.length,
+  };
+}
+
+/** A string that names a page by title or date rather than by UUID (UUIDs go to getBlocks). */
+function pageSelector(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && value !== "." && value !== ".." && !UUID.test(value);
 }
 
 /** A read of `/<kind>/<id><suffix>`, or null for an id the handler itself refuses before any request. */
@@ -108,12 +134,20 @@ export const SNAPSHOT_PLAN: Readonly<Record<string, SnapshotPlanEntry>> = Object
   batch_delete_block_property: blockSummary((a) => entries(a, "entries").map((e) => e["block-id"])),
   move_blocks: blockSummary((a) => list(record(a.body)?.["block-ids"])),
   batch_move_blocks: blockSummary((a) => entries(a, "moves").flatMap((m) => list(m["block-ids"]))),
-  // Only entries that set properties on an existing block replace values; page selectors and plain inserts don't.
-  batch_insert_block_trees: blockSummary((a) =>
-    entries(a, "entries")
-      .filter((e) => e.properties !== undefined)
-      .map((e) => e["target-id"]),
-  ),
+  // Entries that set properties replace the values of the block or page they name: by UUID through
+  // getBlocks, by title or date (target-id or page) through getPage. Plain inserts overwrite nothing.
+  batch_insert_block_trees: {
+    ...blockSummary((a) =>
+      entries(a, "entries")
+        .filter((e) => e.properties !== undefined)
+        .map((e) => e["target-id"]),
+    ),
+    pages: (a) =>
+      entries(a, "entries")
+        .filter((e) => e.properties !== undefined)
+        .flatMap((e) => [e["target-id"], e.page]),
+    keep: "title, tags, properties, parent-id, order and page-id of each addressed block, and each page named by title or date",
+  },
   delete_block: blockDelete((a) => [a["block-id"]]),
   delete_blocks: blockDelete((a) => list(record(a.body)?.["block-ids"])),
   delete_page: {
@@ -167,12 +201,20 @@ function pick(value: unknown): Record<string, unknown> {
   return Object.fromEntries(SUMMARY_KEYS.filter((k) => from[k] !== undefined).map((k) => [k, from[k]]));
 }
 
+/** A read's data cut down to each addressed block's (or the entity's) summary. */
+function cutData(parsed: unknown): unknown {
+  const blocks = record(parsed)?.blocks;
+  return Array.isArray(blocks) ? { blocks: blocks.map(pick), missing: record(parsed)?.missing } : pick(parsed);
+}
+
+function fits(text: string): boolean {
+  return new TextEncoder().encode(text).length <= SNAPSHOT_MAX_BYTES;
+}
+
 /** A non-delete snapshot over the cap, cut down to each addressed block's (or the entity's) summary. */
 function cutDown(source: string, parsed: unknown, e2ee: boolean): string {
-  const blocks = record(parsed)?.blocks;
-  const data = Array.isArray(blocks) ? { blocks: blocks.map(pick), missing: record(parsed)?.missing } : pick(parsed);
-  const text = wrap(source, { truncated: true, e2ee }, JSON.stringify(data));
-  return new TextEncoder().encode(text).length <= SNAPSHOT_MAX_BYTES ? text : wrap(source, { truncated: true, e2ee }, "null");
+  const text = wrap(source, { truncated: true, e2ee }, JSON.stringify(cutData(parsed)));
+  return fits(text) ? text : wrap(source, { truncated: true, e2ee }, "null");
 }
 
 interface Read {
@@ -208,8 +250,22 @@ function readEntries(read: Read): { index: number; id: string; entry: Record<str
     const entry = record(block);
     const uuid = typeof entry?.uuid === "string" ? entry.uuid.toLowerCase() : undefined;
     const index = given.findIndex((id) => id.toLowerCase() === uuid);
-    return entry && index >= 0 ? [{ index, id: given[index], entry }] : [];
+    return entry && index >= 0 ? [{ index: read.request.indexes?.[index] ?? index, id: given[index], entry }] : [];
   });
+}
+
+/**
+ * Refuses a block delete when the read didn't return a block it names: getBlocks hides blocks under a
+ * deleted (Recycle bin) or hidden ancestor, which the delete still finds and removes.
+ */
+function checkFound(read: Read): void {
+  if (read.request.source !== "getBlocks") return;
+  const found = new Set(readEntries(read).map((f) => f.id.toLowerCase()));
+  const ids = read.request.ids ?? [];
+  const i = ids.findIndex((id) => !found.has(id.toLowerCase()));
+  if (i >= 0) {
+    throw new ToolError(`entry ${read.request.indexes?.[i] ?? i}: ${ids[i]} can't be read (hidden, in the Recycle bin or not found); nothing was deleted`, "refused");
+  }
 }
 
 /** Refuses a delete whose snapshot isn't whole: an entry the budget cut short, or over the size cap. */
@@ -232,21 +288,116 @@ function checkWhole(read: Read): void {
       }
     }
     const named = over ? `entry ${over.index}: ${over.id}` : "the snapshot";
-    throw new ToolError(`${named} takes the snapshot over 256 KB (${bytes(read.size)} bytes); delete it in parts`, "refused");
+    throw new ToolError(`${named} takes the snapshot over ${SNAPSHOT_MAX_LABEL} (${bytes(read.size)} bytes); delete it in parts`, "refused");
   }
+}
+
+/** What a pre-read learnt: the row's `before`, and the pages it names (for the log's page filter). */
+export interface Snapshot {
+  before: string | null;
+  /** Page UUIDs and titles the reads returned. */
+  pages: string[];
+  /** The page a getPage or getPageOutline read returned, as a target, for a write whose response names none. */
+  subject?: AffectedTarget;
+}
+
+/** The pages a read names: a page read's UUID and title, and each block's page-id. */
+function pagesRead(read: Read): string[] {
+  if (read.request.source === "getBlocks") {
+    return list(record(read.parsed)?.blocks).flatMap((b) => {
+      const page = record(b)?.["page-id"];
+      return typeof page === "string" ? [page] : [];
+    });
+  }
+  if (read.request.source !== "getPage" && read.request.source !== "getPageOutline") return [];
+  const entity = record(read.parsed)!;
+  return [entity.uuid, entity.title].filter((v): v is string => typeof v === "string" && v !== "");
+}
+
+function subjectOf(read: Read): AffectedTarget | undefined {
+  if (read.request.source !== "getPage" && read.request.source !== "getPageOutline") return undefined;
+  const entity = record(read.parsed)!;
+  if (typeof entity.uuid !== "string") return undefined;
+  const title = typeof entity.title === "string" ? entity.title : undefined;
+  const kind = typeof entity.kind === "string" ? entity.kind : "page";
+  return { uuid: entity.uuid, kind, role: "target", pageUuid: entity.uuid, pageTitle: title, breadcrumb: [], snippet: title };
+}
+
+function snapshotOf(before: string | null, reads: Read[]): Snapshot {
+  const pages = [...new Set(reads.flatMap(pagesRead))];
+  const subject = reads.length === 1 ? subjectOf(reads[0]) : undefined;
+  return { before, pages, ...(subject ? { subject } : {}) };
+}
+
+/** Each distinct page selector (ignoring case), in call order. */
+function distinctSelectors(given: unknown[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of given) {
+    if (!pageSelector(value) || seen.has(value.toLowerCase())) continue;
+    seen.add(value.toLowerCase());
+    out.push(value);
+  }
+  return out;
+}
+
+/**
+ * batch_insert_block_trees with pages named by title or date: the getBlocks read (or null when no
+ * block UUID carries properties) and one getPage read per page, the first PAGE_READS_MAX of them,
+ * stored as `{source: getBlocks, truncated?, error?, data, pages: [{page, source: getPage, data | error}]}`.
+ * Over the cap, each read is cut down to its summary, and past that every data is null.
+ */
+async function batchInsertSnapshot(access: GraphAccess, alias: string, request: SnapshotRequest | null, selectors: string[]): Promise<Snapshot> {
+  const reads: Read[] = [];
+  let blocks: Read | undefined;
+  let blocksError: string | undefined;
+  if (request !== null) {
+    try {
+      blocks = await get(access, alias, request);
+      reads.push(blocks);
+    } catch (error) {
+      blocksError = messageOf(error);
+    }
+  }
+  const pages: { page: string; read?: Read; error?: string }[] = [];
+  for (const page of selectors.slice(0, PAGE_READS_MAX)) {
+    try {
+      const read = await get(access, alias, entityRead("getPage", "pages", page)!);
+      pages.push({ page, read });
+      reads.push(read);
+    } catch (error) {
+      pages.push({ page, error: messageOf(error) });
+    }
+  }
+  const truncated = request?.cut === true || selectors.length > PAGE_READS_MAX;
+  const build = (data: (read: Read) => string, cut: boolean): string => {
+    const head = JSON.stringify({ source: "getBlocks", ...(cut ? { truncated: true } : {}), ...(blocksError !== undefined ? { error: blocksError } : {}) });
+    const parts = pages.map((p) =>
+      p.read ? `{"page":${JSON.stringify(p.page)},"source":"getPage","data":${data(p.read)}}` : JSON.stringify({ page: p.page, source: "getPage", error: p.error }),
+    );
+    return `${head.slice(0, -1)},"data":${blocks ? data(blocks) : "null"},"pages":[${parts.join(",")}]}`;
+  };
+  let text = build((r) => r.text, truncated);
+  if (!fits(text)) text = build((r) => JSON.stringify(cutData(r.parsed)), true);
+  if (!fits(text)) text = build(() => "null", true);
+  return snapshotOf(text, reads);
 }
 
 /**
  * Reads what `tool` will overwrite, for the row's `before`: null when the tool reads nothing or the
- * call names nothing readable. A delete whose snapshot isn't whole, or whose read fails, throws a
- * refusal (`ToolError` "refused") naming the entry; any other write keeps the error or a cut-down
- * snapshot. On an E2EE graph (an outline read answers 409) a delete keeps the summaries, with e2ee.
+ * call names nothing readable. A delete whose snapshot isn't whole, whose read fails or doesn't
+ * return a block it names, throws a refusal (`ToolError` "refused") naming the entry; any other write
+ * keeps the error or a cut-down snapshot. On an E2EE graph (an outline read answers 409) a delete
+ * keeps the summaries, with e2ee.
  */
-export async function takeSnapshot(access: GraphAccess, alias: string, tool: string, args: Record<string, unknown>): Promise<string | null> {
+export async function takeSnapshot(access: GraphAccess, alias: string, tool: string, args: Record<string, unknown>): Promise<Snapshot> {
+  const none: Snapshot = { before: null, pages: [] };
   const plan = snapshotClassFor(tool);
-  if (plan.source === "none" || plan.source === "refresh_refs") return null;
+  if (plan.source === "none" || plan.source === "refresh_refs") return none;
   const request = plan.read(args);
-  if (request === null) return null;
+  const selectors = distinctSelectors(plan.pages?.(args) ?? []);
+  if (selectors.length > 0) return batchInsertSnapshot(access, alias, request, selectors);
+  if (request === null) return none;
 
   if (plan.delete) {
     let read: Read;
@@ -263,18 +414,19 @@ export async function takeSnapshot(access: GraphAccess, alias: string, tool: str
     } catch (error) {
       throw new ToolError(`audit snapshot failed: ${messageOf(error)}; nothing was deleted`, "refused");
     }
+    checkFound(read);
     checkWhole(read);
-    return wrap(read.request.source, { truncated: read.request.cut, e2ee }, read.text);
+    return snapshotOf(wrap(read.request.source, { truncated: read.request.cut, e2ee }, read.text), [read]);
   }
 
   let read: Read;
   try {
     read = await get(access, alias, request);
   } catch (error) {
-    return JSON.stringify({ source: request.source, error: messageOf(error) });
+    return { before: JSON.stringify({ source: request.source, error: messageOf(error) }), pages: [] };
   }
-  if (read.size > SNAPSHOT_MAX_BYTES) return cutDown(read.request.source, read.parsed, false);
-  return wrap(read.request.source, { truncated: read.request.cut }, read.text);
+  if (read.size > SNAPSHOT_MAX_BYTES) return snapshotOf(cutDown(read.request.source, read.parsed, false), [read]);
+  return snapshotOf(wrap(read.request.source, { truncated: read.request.cut }, read.text), [read]);
 }
 
 /** refresh_refs' snapshot, from its own response: each changed block's text before the refresh. Null for a preview. */

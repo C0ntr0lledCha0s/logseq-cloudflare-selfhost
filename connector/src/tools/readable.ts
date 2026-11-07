@@ -354,7 +354,7 @@ function compact(text: string): string {
 /**
  * A write's result (summary first, then the server's JSON) cut to `RESULT_CHAR_LIMIT` characters.
  * Over the cap, the JSON is first written without indentation. The write was applied, so the read path's "request less" never applies: when the JSON alone fits,
- * the summary is cut and the JSON kept whole; otherwise the summary is kept and the JSON cut with a
+ * the summary is cut before its last line (the audit entry line) and the JSON kept whole; otherwise the summary is kept and the JSON cut with a
  * notice that says the write was applied.
  */
 export function capWriteResult(given: CallToolResult): CallToolResult {
@@ -367,7 +367,13 @@ export function capWriteResult(given: CallToolResult): CallToolResult {
   const [first, ...rest] = result.content;
   const cut = "\n\n[summary cut: the write was applied; the JSON result below is complete]";
   const budget = RESULT_CHAR_LIMIT - (total - (first?.type === "text" ? first.text.length : 0)) - cut.length;
-  if (first?.type === "text" && budget >= 0) return { ...result, content: [{ ...first, text: first.text.slice(0, budget) + cut }, ...rest] };
+  if (first?.type === "text" && budget >= 0) {
+    // The summary's last line (Logged as audit entry <id>) is kept: the middle is cut, not the end.
+    const end = first.text.lastIndexOf("\n");
+    const last = end >= 0 ? first.text.slice(end) : "";
+    const keep = last.length <= budget ? last : "";
+    return { ...result, content: [{ ...first, text: first.text.slice(0, budget - keep.length) + cut + keep }, ...rest] };
+  }
   return capResult(
     result,
     (n) => `\n\n[truncated: the write was applied; its result had ${n} characters and the limit is ${RESULT_CHAR_LIMIT}, so the JSON is cut. Read the pages it names to see the outcome.]`,

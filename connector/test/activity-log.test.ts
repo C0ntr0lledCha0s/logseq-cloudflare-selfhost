@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import committedManifest from "../tools-manifest.json";
 import settings from "../../config/settings.json";
 import { AuditLog, QUERY_SCAN_CAP, READ_ROW_WRITES } from "../src/audit/log";
-import { snapshotClassFor } from "../src/audit/snapshot";
+import { SNAPSHOT_MAX_BYTES, snapshotClassFor } from "../src/audit/snapshot";
+import { RESULT_CHAR_LIMIT } from "../src/tools/common";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
@@ -28,6 +29,8 @@ const REASON = "tidy duplicate notes";
 
 let syncCalls: { method: string; path: string }[];
 let writeResponse: () => Response;
+/** Answers a GET the default fake doesn't, by path under the graph; undefined falls through. */
+let readResponse: (path: string) => Response | undefined;
 let consoleSpies: MockInstance[];
 
 function testEnv(): Env {
@@ -36,6 +39,8 @@ function testEnv(): Env {
       const request = new Request(input, init);
       const url = new URL(request.url);
       syncCalls.push({ method: request.method, path: url.pathname });
+      const read = request.method === "GET" ? readResponse(url.pathname.slice(`/api/v1/graphs/${WORK_ID}`.length)) : undefined;
+      if (read !== undefined) return read;
       if (request.method === "GET" && url.pathname.endsWith("/blocks")) {
         return Response.json(url.searchParams.get("view") === "outline" ? outline : summary);
       }
@@ -58,6 +63,7 @@ beforeEach(async () => {
   }
   syncCalls = [];
   writeResponse = () => Response.json({ error: "unexpected write" }, { status: 500 });
+  readResponse = () => undefined;
   consoleSpies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m));
 });
 
@@ -242,7 +248,8 @@ describe("listing", () => {
     expect(first.lines[4]).toMatch(new RegExp(`^${when} delete_blocks error: .*block not found.*\\. Reason: ${REASON}$`));
     expect(first.lines).toHaveLength(5);
     const entry = first.json.entries[0];
-    expect(Object.keys(entry).sort()).toEqual(["at", "client", "dry_run", "error", "id", "reason", "session", "status", "targets", "tool"]);
+    expect(Object.keys(entry).sort()).toEqual(["addressed", "at", "client", "dry_run", "error", "id", "reason", "session", "status", "targets", "tool"]);
+    expect(entry.addressed).toEqual([B1, B2]);
     expect(entry).toMatchObject({ tool: "delete_blocks", status: "ok", dry_run: false, reason: REASON, error: null });
     expect(entry.targets[0]).toMatchObject({ uuid: B1, pageTitle: "Notes", breadcrumb: ["Meeting"], snippet: "Call Sam about the contract" });
     expect(new Date(entry.at).getTime()).toBeGreaterThan(now - DAY);
@@ -365,6 +372,95 @@ describe("filters", () => {
     expect(byId.get(ok)).toMatch(/ update_block ok\. Reason: fix typo$/);
     expect(all.json.entries.find((e) => e.id === pending).status).toBe("pending");
     expect(all.json.entries.find((e) => e.id === dry)).toMatchObject({ status: "ok", dry_run: true });
+  });
+
+  it("a refresh_refs preview (apply omitted or false) is a dry run; with apply true it is an applied write", async () => {
+    const changed = { changed: [{ uuid: B1, "page-id": NOTES, before: "Call Sam #Followup", after: "Call Sam #[[Followup]]" }] };
+    const ids: Record<string, number> = {};
+    for (const [label, body, applied] of [
+      ["omitted", { "page-id": NOTES }, false],
+      ["false", { "page-id": NOTES, apply: false }, false],
+      ["whole graph", {}, false],
+      ["true", { "page-id": NOTES, apply: true }, true],
+    ] as const) {
+      writeResponse = () => Response.json({ applied, ...changed });
+      const result = await call("refresh_refs", { reason: "check links", body });
+      expect(result.isError, result.text).toBe(false);
+      ids[label] = Number(/Logged as audit entry (\d+)/.exec(result.text)![1]);
+    }
+    const all = await activity();
+    const line = (id: number) => all.lines[all.json.entries.findIndex((e) => e.id === id)];
+    for (const label of ["omitted", "false", "whole graph"]) {
+      expect(line(ids[label]), label).toMatch(/ refresh_refs dry run(:|\.)/);
+      expect(all.json.entries.find((e) => e.id === ids[label]), label).toMatchObject({ status: "ok", dry_run: true });
+    }
+    expect(line(ids.true)).toMatch(/ refresh_refs ok(:|\.)/);
+    expect((await activity({ status: "ok" })).json.entries.map((e) => e.id)).toEqual([ids.true]);
+    expect((await activity({ status: "dry-run" })).json.entries.map((e) => e.id)).toEqual([ids["whole graph"], ids.false, ids.omitted]);
+  });
+
+  it("entries whose response names no target are found by page and name what they addressed", async () => {
+    const PAGE = { uuid: NOTES, kind: "page", title: "Notes", tags: [], properties: [] };
+    readResponse = (path) => (path === `/pages/${NOTES}` || path === "/pages/Notes" ? Response.json(PAGE) : undefined);
+    const write = async (name: string, args: Record<string, unknown>, response: () => Response) => {
+      writeResponse = response;
+      const result = await call(name, args);
+      return { result, id: (await env.DB.prepare("SELECT max(id) AS id FROM audit_log WHERE kind = 'write'").first<{ id: number }>())!.id };
+    };
+    // update_page and promote_page_to_tag name no target; the page is known from the call and its snapshot.
+    const renamed = await write("update_page", { "page-id": NOTES, body: { title: "Notes 2" }, reason: "rename" }, () => Response.json({ uuid: NOTES, title: "Notes 2" }));
+    expect(renamed.result.isError, renamed.result.text).toBe(false);
+    const promoted = await write("promote_page_to_tag", { "page-id": "Notes" }, () => Response.json({ uuid: NOTES, title: "Notes" }));
+    // refresh_refs on one page, by its UUID.
+    const refreshed = await write("refresh_refs", { body: { "page-id": NOTES, apply: true } }, () => Response.json({ applied: true, changed: [] }));
+    // A delete_page the sync server refuses, and one refused before anything is read (the reason is too long).
+    const refusedDelete = await write("delete_page", { "page-id": MEETING }, () => Response.json({ error: "x" }, { status: 500 }));
+    const tooLong = await write("delete_page", { "page-id": "Meeting", reason: "r".repeat(201) }, () => Response.json({}));
+    expect(tooLong.result.isError).toBe(true);
+    // A tag write names no page; its tag is shown as addressed.
+    const tagged = await write("update_tag", { "tag-id": "Followup", body: { title: "Follow-up" } }, () => Response.json({ uuid: "t", title: "Follow-up" }));
+
+    const byPage = async (page: string) => (await activity({ page })).json.entries.map((e) => e.id);
+    expect(await byPage(NOTES)).toEqual([refreshed.id, promoted.id, renamed.id]);
+    expect(await byPage("notes")).toEqual([promoted.id, renamed.id]);
+    expect(await byPage(MEETING)).toEqual([refusedDelete.id]);
+    expect(await byPage("Meeting")).toEqual([tooLong.id]);
+
+    const all = await activity();
+    const line = (id: number) => all.lines[all.json.entries.findIndex((e) => e.id === id)];
+    const json = (id: number) => all.json.entries.find((e) => e.id === id);
+    expect(line(renamed.id)).toMatch(/ update_page ok: page "Notes"\. Reason: rename$/);
+    expect(line(promoted.id)).toMatch(/ promote_page_to_tag ok: page "Notes"$/);
+    expect(line(refreshed.id)).toMatch(new RegExp(` refresh_refs ok: ${NOTES}$`));
+    expect(line(refusedDelete.id)).toMatch(new RegExp(` delete_page refused: audit snapshot failed: .*: ${MEETING}$`));
+    expect(line(tooLong.id)).toMatch(/ delete_page refused: reason is 201 characters.*: Meeting$/);
+    expect(line(tagged.id)).toMatch(/ update_tag ok: Followup$/);
+    expect(json(renamed.id).addressed).toEqual([NOTES]);
+    expect(json(tagged.id).addressed).toEqual(["Followup"]);
+  });
+
+  it("a call refused before any read is found by each page it names: page-id, page, and a target-id given as a title or date", async () => {
+    // A reason over 200 characters refuses every call before anything is read or written.
+    const long = "r".repeat(201);
+    const cases: [string, Record<string, unknown>, string[]][] = [
+      ["delete_page", { "page-id": "Meeting" }, ["meeting"]],
+      ["refresh_refs", { body: { "page-id": NOTES, apply: true } }, [NOTES]],
+      ["batch_insert_block_trees", { body: { entries: [{ page: "2026-11-05", properties: { Venue: "Library" } }, { "target-id": "Ideas", blocks: [{ title: "x" }] }] } }, ["2026-11-05", "ideas"]],
+      ["insert_block_tree", { body: { "target-id": "2026-11-06", blocks: [{ title: "x" }] } }, ["2026-11-06"]],
+      ["batch_move_blocks", { body: { moves: [{ "block-ids": [B1], "target-id": "Archive", position: "last-child" }] } }, ["archive"]],
+      // A UUID target-id may be a block, so it isn't taken as a page; nor is a block-id.
+      ["move_blocks", { body: { "block-ids": [B1], "target-id": B2, position: "after" } }, []],
+      ["update_block", { "block-id": B1, body: { title: "x" } }, []],
+    ];
+    for (const [name, args, pages] of cases) {
+      const result = await call(name, { ...args, reason: long });
+      expect(result.isError, name).toBe(true);
+      const stored = await env.DB.prepare("SELECT status, pages FROM audit_log WHERE kind = 'write' ORDER BY id DESC LIMIT 1").first<{ status: string; pages: string | null }>();
+      expect(stored!.status, name).toBe("refused");
+      expect(stored!.pages === null ? [] : stored!.pages.split("\n").sort(), name).toEqual([...pages].sort());
+    }
+    expect(syncCalls).toEqual([]);
+    expect((await activity({ page: "Archive" })).json.entries.map((e) => e.tool)).toEqual(["batch_move_blocks"]);
   });
 
   it("other graphs' entries and read rows never appear", async () => {
@@ -533,6 +629,72 @@ describe("snapshots", () => {
       [B2, "- Call Sam about [[Notes]]"],
     ]);
     expect(one.lines[0]).toMatch(/ delete_blocks ok: Notes > "Agenda" \(\+1 more\)\. Reason: tidy duplicate notes$/);
+  });
+});
+
+describe("large snapshots", () => {
+  const delete100 = (i: number, size: number) => ({
+    source: "getBlocks",
+    data: { blocks: [{ uuid: B1, markdown: String(i).repeat(size) }], missing: [] },
+  });
+  const many = Array.from({ length: 100 }, (_, i) => target(`Page ${i} ${"t".repeat(80)}`, NOTES, ["Parent", "Child"], "s".repeat(80), `aaaaaaaa-0000-4000-8000-${String(i).padStart(12, "0")}`));
+
+  it("a snapshot at the cap, with 100 targets, reads back whole by id", async () => {
+    const now = Date.now() - 1000;
+    // At the cap in UTF-8 bytes, less the wrapper.
+    const snap = delete100(7, SNAPSHOT_MAX_BYTES - JSON.stringify(delete100(7, 0)).length);
+    expect(new TextEncoder().encode(JSON.stringify(snap)).length).toBe(SNAPSHOT_MAX_BYTES);
+    const id = await row({ at: now, tool: "delete_blocks", before: snap, targets: many, reason: "r".repeat(200), error: null });
+    const { content, isError } = await call("get_activity_log", { id });
+    expect(isError).toBe(false);
+    expect(content.join("").length).toBeLessThanOrEqual(RESULT_CHAR_LIMIT);
+    const entry = JSON.parse(content[1]).entries[0];
+    expect(entry.before).toEqual(snap);
+    expect(entry.id).toBe(id);
+  });
+
+  it("an entry whose targets alone are over the result cap keeps its first target and its whole snapshot", async () => {
+    const now = Date.now() - 1000;
+    const snap = delete100(3, 50_000);
+    const huge = Array.from({ length: 400 }, (_, i) => target(`Page ${i} ${"t".repeat(200)}`, NOTES, ["Parent"], "s".repeat(200), `aaaaaaaa-0000-4000-8000-${String(i).padStart(12, "0")}`));
+    expect(JSON.stringify(huge).length).toBeGreaterThan(RESULT_CHAR_LIMIT);
+    const id = await row({ at: now, tool: "delete_blocks", before: snap, targets: huge });
+    const { content, isError } = await call("get_activity_log", { id });
+    expect(isError).toBe(false);
+    expect(content.join("").length).toBeLessThanOrEqual(RESULT_CHAR_LIMIT);
+    const entry = JSON.parse(content[1]).entries[0];
+    expect(entry.before).toEqual(snap);
+    expect(entry.targets).toEqual([huge[0]]);
+    expect(entry["targets-omitted"]).toBe(399);
+    // A listing shows it too, and a small entry keeps all its targets.
+    await row({ at: now - 1, tool: "update_block", targets: many.slice(0, 3) });
+    const listed = await activity({ include_snapshot: true });
+    expect(listed.json.entries.map((e) => [e.targets.length, e["targets-omitted"]])).toEqual([
+      [1, 399],
+      [3, undefined],
+    ]);
+  });
+
+  it("include_snapshot listings stop before the result cap; next-cursor, in both parts, reads the rest", async () => {
+    const now = Date.now() - 1000;
+    const size = 40_000;
+    const ids: number[] = [];
+    for (let i = 0; i < 6; i++) ids.unshift(await row({ at: now - 10 + i, tool: "delete_blocks", before: delete100(i, size), targets: many }));
+    const seen: number[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 6; page++) {
+      const { content, isError } = await call("get_activity_log", { include_snapshot: true, ...(cursor ? { cursor } : {}) });
+      expect(isError).toBe(false);
+      expect(content.join("").length).toBeLessThanOrEqual(RESULT_CHAR_LIMIT);
+      const json = JSON.parse(content[1]);
+      expect(json.entries.length).toBeGreaterThan(0);
+      for (const e of json.entries) expect(e.before.data.blocks[0].markdown).toHaveLength(size);
+      seen.push(...json.entries.map((e: { id: number }) => e.id));
+      cursor = json["next-cursor"] ?? undefined;
+      if (cursor === undefined) break;
+      expect(content[0]).toContain(`next-cursor: ${cursor}`);
+    }
+    expect(seen).toEqual(ids);
   });
 });
 

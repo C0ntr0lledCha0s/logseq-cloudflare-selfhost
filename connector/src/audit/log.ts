@@ -3,7 +3,7 @@ import { auditRetentionDays } from "../config";
 import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/common";
 import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
 import type { GraphAccess } from "../tools/semantic";
-import { refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
+import { type Snapshot, refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 
 /**
  * The owner-only write log (design 2026-11-07-connector-write-audit-log §3.2, §3.6). A write call
@@ -71,6 +71,8 @@ export interface AuditBegin {
   client: string | null;
   session: string | null;
   addressed: string[];
+  /** Page titles and UUIDs known before the write (from the call and its snapshot), so a pending row is found by page. */
+  pages?: string[];
   /** The before-snapshot as JSON text, stored without re-parsing; null when there is none. */
   before: string | null;
 }
@@ -169,6 +171,12 @@ function toAuditRow(row: Row): AuditRow {
   };
 }
 
+/** The `pages` column: lower-cased, '\n'-joined, each once; null when there are none. */
+function joinPages(pages: string[]): string | null {
+  const lower = [...new Set(pages.map((p) => p.toLowerCase()))];
+  return lower.length === 0 ? null : lower.join("\n");
+}
+
 const NO_SUCH_TABLE = /no such table: audit_log(?![A-Za-z0-9_])/;
 
 /**
@@ -206,8 +214,8 @@ export class AuditLog {
   async begin(entry: AuditBegin): Promise<number> {
     const result = await this.db
       .prepare(
-        `INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, dry_run, reason, client, session, addressed, before)
-         VALUES (?, ?, ?, ?, 'write', 'pending', ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, dry_run, reason, client, session, addressed, pages, before)
+         VALUES (?, ?, ?, ?, 'write', 'pending', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         entry.at,
@@ -219,6 +227,7 @@ export class AuditLog {
         entry.client,
         entry.session,
         JSON.stringify(entry.addressed),
+        joinPages(entry.pages ?? []),
         entry.before,
       )
       .run();
@@ -230,7 +239,7 @@ export class AuditLog {
   /** Records the outcome on the row `begin` inserted, with the row's own D1 cost. Throws when no row has that id. */
   async finish(id: number, outcome: AuditFinish): Promise<void> {
     const insert = this.insertCost.get(id);
-    const pages = outcome.pages.length === 0 ? null : outcome.pages.map((p) => p.toLowerCase()).join("\n");
+    const pages = joinPages(outcome.pages);
     const result = await this.db
       .prepare(
         `UPDATE audit_log SET status = ?, error = ?, targets = ?, pages = ?, before = coalesce(?, before), rows_written = ?, rows_read = ? WHERE id = ?`,
@@ -460,9 +469,36 @@ export function addressedBy(args: Record<string, unknown>): string[] {
   return [...out];
 }
 
-/** A dry run takes `dry-run: true` as a query argument or in its body. */
-function isDryRun(args: Record<string, unknown>): boolean {
+/**
+ * A dry run takes `dry-run: true` as a query argument or in its body. refresh_refs previews, writing
+ * nothing, unless its body has `apply: true`.
+ */
+function isDryRun(tool: string, args: Record<string, unknown>): boolean {
+  if (tool === "refresh_refs" && record(args.body)?.apply !== true) return true;
   return args["dry-run"] === true || record(args.body)?.["dry-run"] === true;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The pages a call names, as given: each `page-id` and `page`, and each `target-id` that is a title
+ * or date (a UUID there may be a block), at the top level, in `body` and in its entries and moves.
+ */
+export function pagesAddressed(args: Record<string, unknown>): string[] {
+  const out = new Set<string>();
+  const take = (holder: Record<string, unknown> | undefined) => {
+    if (!holder) return;
+    for (const key of ["page-id", "page"]) if (typeof holder[key] === "string" && holder[key] !== "") out.add(holder[key]);
+    const target = holder["target-id"];
+    if (typeof target === "string" && target !== "" && !UUID.test(target)) out.add(target);
+  };
+  take(args);
+  const body = record(args.body);
+  take(body);
+  for (const list of [body?.entries, body?.moves]) {
+    if (Array.isArray(list)) for (const item of list) take(record(item));
+  }
+  return [...out];
 }
 
 /** Each page a write's targets name, by title and UUID, including where a move came from and went to. */
@@ -525,15 +561,17 @@ export function audited(
       refusal = error;
     }
 
-    const dryRun = isDryRun(args);
-    let before: string | null = null;
+    const dryRun = isDryRun(tool, args);
+    let snapshot: Snapshot = { before: null, pages: [] };
     if (refusal === undefined && !dryRun) {
       try {
-        before = await takeSnapshot(ctx.access, alias, tool, rest);
+        snapshot = await takeSnapshot(ctx.access, alias, tool, rest);
       } catch (error) {
         refusal = error;
       }
     }
+    // Found by page whatever the outcome: the pages the call names and its snapshot read.
+    const known = [...pagesAddressed(args), ...snapshot.pages, ...pagesOf(snapshot.subject ? [snapshot.subject] : [])];
 
     let id: number;
     try {
@@ -547,7 +585,8 @@ export function audited(
         client: ctx.client,
         session: ctx.session,
         addressed: addressedBy(args),
-        before,
+        pages: known,
+        before: snapshot.before,
       });
     } catch (error) {
       throw new ToolError(`audit log unavailable: ${messageOf(error)}; nothing was written`, "audit-unavailable");
@@ -556,7 +595,7 @@ export function audited(
     const fail = async (error: unknown): Promise<unknown> => {
       const status = error instanceof ToolError && REFUSALS.has(error.status) ? "refused" : "error";
       try {
-        await ctx.log.finish(id, { status, error: messageOf(error), targets: null, pages: [] });
+        await ctx.log.finish(id, { status, error: messageOf(error), targets: snapshot.subject ? [snapshot.subject] : null, pages: known });
       } catch (finishError) {
         if (error instanceof ToolError) return new ToolError(`${unfinished(id, finishError)}\n${error.message}`, error.status);
       }
@@ -572,10 +611,12 @@ export function audited(
     }
 
     const { targets, summary } = describeWrite(tool, result, reason);
+    // A response that names nothing (update_page, promote_page_to_tag) is logged with the page its snapshot read.
+    const logged = targets.length === 0 && snapshot.subject ? [snapshot.subject] : targets;
     const lines: string[] = [];
     try {
       const after = plan.source === "refresh_refs" ? refreshRefsBefore(result) : null;
-      await ctx.log.finish(id, { status: "ok", error: null, targets, pages: pagesOf(targets), before: after });
+      await ctx.log.finish(id, { status: "ok", error: null, targets: logged, pages: [...known, ...pagesOf(logged)], before: after });
     } catch (error) {
       lines.push(unfinished(id, error));
     }
