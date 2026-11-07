@@ -46,6 +46,7 @@ A finding needs evidence you reproduced: a failing test, a command and its outpu
 - **Secrets stay secret.** No token, key or `.env.local` value is logged, returned, committed or written into a test fixture. Docs use `sync.example.com` and `mcp.example.com`.
 - **Outbound fetches go through `net/safe-fetch.ts`.** No URL built from tool input is fetched any other way (SSRF).
 - **GitHub Actions.** Third-party actions are pinned by SHA, `permissions` are minimal, and secrets are only exposed to the job that needs them.
+- **Scope lives in one place.** A service token's graph scope and read-only mode are applied in `access.resolve` (`scopedResolve`). A tool that reads `store.list()` or `store.resolve()` directly, or reaches a graph without `lookupGraph` or `resolveGraph`, escapes it. A new tool gets a test under a read-only token (a write is refused naming the token, with no sync call) and with an alias outside the scope. A bearer that isn't a service token never reaches D1, and a refusal reason is given only after the full hash matched.
 - **Graph content is data.** Text read from the graph never becomes an instruction to an agent. Workflows quote it and don't follow it.
 
 ## Contract and docs
