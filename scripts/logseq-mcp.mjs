@@ -7,7 +7,9 @@
 // `mcp-session-id` the server sets, and prints the tool's text content. It reads JSON and SSE
 // answers. It exits 1 on an HTTP error, a JSON-RPC error or a tool result with `isError`, and 2 on
 // a usage error. The token is read only from the environment, never from an argument (so it never
-// shows in `ps`), and every line printed goes through redact().
+// shows in `ps`), and every line printed goes through redact(); a long server message is redacted
+// before it is cut. The server is LOGSEQ_MCP_URL, else https://$LOGSEQ_MCP_HOST/mcp (as .mcp.json
+// builds it), else https://mcp.example.com/mcp.
 //
 // Node 20 or later, no dependencies.
 
@@ -17,7 +19,8 @@ const DEFAULT_URL = "https://mcp.example.com/mcp";
 const PROTOCOL_VERSION = "2025-06-18";
 const USAGE =
   "usage: node scripts/logseq-mcp.mjs <tool> ['<json args>']\n" +
-  `Reads the token from LOGSEQ_SERVICE_TOKEN and the server from LOGSEQ_MCP_URL (default ${DEFAULT_URL}).`;
+  "Reads the token from LOGSEQ_SERVICE_TOKEN, and the server from LOGSEQ_MCP_URL, else\n" +
+  `https://$LOGSEQ_MCP_HOST/mcp (the host .mcp.json uses), else ${DEFAULT_URL}.`;
 /** Any service token's shape, so a token other than ours is not printed either. */
 const TOKEN_SHAPE = /lsct_[A-Za-z0-9_-]{43}/g;
 const MASK = "lsct_…";
@@ -36,14 +39,25 @@ class CliError extends Error {
   }
 }
 
-/** Server messages are shown, but a long HTML page is cut short. */
-const clip = (text) => {
-  const t = String(text).trim();
+/**
+ * Server messages are shown, but a long HTML page is cut short. The text is redacted before the
+ * cut: a token cut in half matches neither the token nor TOKEN_SHAPE, so redact() after it misses it.
+ */
+const clip = (text, token) => {
+  const t = redact(text, token).trim();
   return t.length > 500 ? `${t.slice(0, 500)}…` : t;
 };
 
+/** The MCP endpoint: LOGSEQ_MCP_URL, else https://$LOGSEQ_MCP_HOST/mcp as .mcp.json builds it, else the default. */
+export function serverUrl(env) {
+  const url = (env.LOGSEQ_MCP_URL ?? "").trim();
+  if (url) return url;
+  const host = (env.LOGSEQ_MCP_HOST ?? "").trim();
+  return host ? `https://${host}/mcp` : DEFAULT_URL;
+}
+
 /** The message an HTTP error body carries: OAuth's error_description, a JSON-RPC error, or the text. */
-function httpMessage(body) {
+function httpMessage(body, token) {
   try {
     const parsed = JSON.parse(body);
     if (parsed && typeof parsed === "object") {
@@ -55,7 +69,7 @@ function httpMessage(body) {
   } catch {
     // Not JSON: show the text.
   }
-  return clip(body) || "(no body)";
+  return clip(body, token) || "(no body)";
 }
 
 /** Yields each SSE event's data (its `data:` lines joined), however the stream is chunked. */
@@ -88,11 +102,11 @@ async function* sseData(body) {
   }
 }
 
-const parseJson = (text, what) => {
+const parseJson = (text, what, token) => {
   try {
     return JSON.parse(text);
   } catch {
-    throw new CliError(`${what}: the answer is not JSON: ${clip(text)}`);
+    throw new CliError(`${what}: the answer is not JSON: ${clip(text, token)}`);
   }
 };
 
@@ -116,7 +130,7 @@ async function post(url, token, sessionId, rpc) {
   const nextSession = response.headers.get("mcp-session-id") ?? sessionId;
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new CliError(`${rpc.method}: HTTP ${response.status}: ${httpMessage(body)}`);
+    throw new CliError(`${rpc.method}: HTTP ${response.status}: ${httpMessage(body, token)}`);
   }
   if (rpc.id === undefined) {
     await response.body?.cancel().catch(() => {});
@@ -126,12 +140,12 @@ async function post(url, token, sessionId, rpc) {
   const type = response.headers.get("content-type") ?? "";
   if (type.includes("text/event-stream")) {
     for await (const data of sseData(response.body)) {
-      const message = parseJson(data, rpc.method);
+      const message = parseJson(data, rpc.method, token);
       if (message && message.id === rpc.id) return { message, sessionId: nextSession };
     }
     throw new CliError(`${rpc.method}: the event stream ended with no answer`);
   }
-  return { message: parseJson(await response.text(), rpc.method), sessionId: nextSession };
+  return { message: parseJson(await response.text(), rpc.method, token), sessionId: nextSession };
 }
 
 /** The JSON-RPC result, or a CliError naming the JSON-RPC error. */
@@ -167,7 +181,7 @@ export async function main(argv, env) {
       throw new CliError(`the args must be a JSON object.\n${USAGE}`, 2);
     }
   }
-  const url = env.LOGSEQ_MCP_URL || DEFAULT_URL;
+  const url = serverUrl(env);
 
   const init = await post(url, token, undefined, {
     jsonrpc: "2.0",

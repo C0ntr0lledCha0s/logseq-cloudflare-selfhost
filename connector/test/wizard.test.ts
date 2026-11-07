@@ -5,6 +5,7 @@ import { createSession } from "../src/auth/session";
 import { GraphStore } from "../src/graphs";
 import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
+import { tokenListPage } from "../src/wizard/views";
 import { SyncError, inspectToken, syncFetch } from "../src/sync";
 
 const ORIGIN = "https://mcp.example.com";
@@ -1003,6 +1004,27 @@ describe("service tokens", () => {
     for (const t of [active, revoked, gone]) expect(html).not.toContain(t.token.slice(5));
   });
 
+  it("the list shows a token as expired at exactly its expires_at, as verification refuses it, and active a millisecond before", async () => {
+    const now = 1_800_000_000_000;
+    const row = (name: string, expiresAt: number) => ({
+      id: `id-${name}`,
+      name,
+      ownerId: OWNER_ID,
+      graphIds: [GRAPH_ID],
+      access: "read" as const,
+      createdAt: now - DAY,
+      expiresAt,
+      lastUsedAt: null,
+      revokedAt: null,
+    });
+    const html = await tokenListPage([row("at-now", now), row("just-before", now + 1)], [], "csrf", now).text();
+    const section = (name: string) => html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
+    expect(section("at-now")).toMatch(/expired/);
+    expect(section("at-now")).not.toContain("/revoke");
+    expect(section("just-before")).not.toMatch(/expired/);
+    expect(section("just-before")).toContain("/tokens/id-just-before/revoke");
+  });
+
   it("revoke sets revoked_at, redirects to /tokens, and the token then gets the revoked 401; a second revoke keeps the first time", async () => {
     const h = await twoGraphs();
     const { token } = await create(h, { name: "ci" });
@@ -1054,14 +1076,19 @@ describe("service tokens", () => {
   });
 
   it("read-back: a stored row that differs from the form (test DB wrapper) is deleted and the create refused naming the field", async () => {
-    const tamperings: [string, (row: Record<string, unknown>) => Record<string, unknown> | null][] = [
-      ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([GRAPH_ID]) })],
-      ["name", (r) => ({ ...r, name: "other-name" })],
-      ["access", (r) => ({ ...r, access: "write" })],
-      ["expires_days", (r) => ({ ...r, expires_at: (r.expires_at as number) + DAY })],
-      ["token", () => null],
+    const BOTH = [GRAPH_ID, OTHER_GRAPH_ID];
+    // Graph tamperings that keep the length, as well as one that drops a graph.
+    const tamperings: [string, (row: Record<string, unknown>) => Record<string, unknown> | null, string[]][] = [
+      ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([GRAPH_ID]) }), BOTH],
+      ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([OTHER_GRAPH_ID, GRAPH_ID]) }), BOTH],
+      ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([GRAPH_ID, GRAPH_ID]) }), BOTH],
+      ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([OTHER_GRAPH_ID]) }), [GRAPH_ID]],
+      ["name", (r) => ({ ...r, name: "other-name" }), BOTH],
+      ["access", (r) => ({ ...r, access: "write" }), BOTH],
+      ["expires_days", (r) => ({ ...r, expires_at: (r.expires_at as number) + DAY }), BOTH],
+      ["token", () => null, BOTH],
     ];
-    for (const [field, tamper] of tamperings) {
+    for (const [field, tamper, graphIds] of tamperings) {
       const alter = (sql: string, result: D1Result) =>
         /FROM service_tokens WHERE id = \?/.test(sql)
           ? ({
@@ -1071,7 +1098,7 @@ describe("service tokens", () => {
           : result;
       const m = meterTokens(alter);
       const h = await twoGraphs({ DB: m.db });
-      const { res, html } = await h.page("/tokens/new", createForm(h, { name: "ci" }, [GRAPH_ID, OTHER_GRAPH_ID]));
+      const { res, html } = await h.page("/tokens/new", createForm(h, { name: "ci" }, graphIds));
       expect(res.status, field).toBe(500);
       const error = /<p class="error" role="alert">([^<]*)<\/p>/.exec(html)?.[1] ?? "";
       expect(error, field).toMatch(new RegExp(`^${field}: `));

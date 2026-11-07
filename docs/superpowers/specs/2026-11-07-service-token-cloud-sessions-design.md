@@ -214,11 +214,11 @@ Revoked and expired rows stay listed so the owner can see what existed; deleting
 
 ### 3.9 CLI fallback
 
-`scripts/logseq-mcp.mjs <tool> ['<json args>']` is a Node 20 script with no dependencies, for sessions where the MCP server is not loaded. It reads `LOGSEQ_SERVICE_TOKEN` and `LOGSEQ_MCP_URL` (default `https://mcp.example.com/mcp`), sends `initialize` then `tools/call` (passing back `mcp-session-id` when the server sets one, and parsing a JSON or SSE response), and prints the tool's text content. It exits 1 on an HTTP error, a JSON-RPC error or a tool result with `isError`, printing the status and the server's message. Every line it prints goes through one `redact()` that replaces the token's value with `lsct_…`. It never takes the token as an argument, so it never appears in `ps`.
+`scripts/logseq-mcp.mjs <tool> ['<json args>']` is a Node 20 script with no dependencies, for sessions where the MCP server is not loaded. It reads `LOGSEQ_SERVICE_TOKEN`, and takes the server from `LOGSEQ_MCP_URL`, else `https://$LOGSEQ_MCP_HOST/mcp` (the host `.mcp.json` uses, so one secret serves both), else `https://mcp.example.com/mcp`. It sends `initialize` then `tools/call` (passing back `mcp-session-id` when the server sets one, and parsing a JSON or SSE response), and prints the tool's text content. It exits 1 on an HTTP error, a JSON-RPC error or a tool result with `isError`, printing the status and the server's message. Every line it prints goes through one `redact()` that replaces the token's value with `lsct_…`, and a long server message is redacted before it is cut to 500 characters, so a token at the cut is not printed in part. It never takes the token as an argument, so it never appears in `ps`.
 
 ### 3.10 Docs
 
-- README: a new section "Service tokens for cloud sessions" in §11: create a token in the wizard; add `LOGSEQ_SERVICE_TOKEN` (and `LOGSEQ_MCP_HOST` when not `mcp.example.com`) as a cloud environment secret; allow `mcp.example.com` in the environment's network policy; how `.mcp.json` picks them up; the CLI fallback; revoke and expiry.
+- README: a new section "Service tokens for cloud sessions" in §11: create a token in the wizard; add `LOGSEQ_SERVICE_TOKEN` (and `LOGSEQ_MCP_HOST` when not `mcp.example.com`) as a cloud environment secret; allow `mcp.example.com` in the environment's network policy; how `.mcp.json` picks them up; the CLI fallback (which reads the same `LOGSEQ_MCP_HOST`, or `LOGSEQ_MCP_URL` when set); revoke and expiry.
 - README §11.6: one line pointing unattended sessions and scheduled tasks at the new section.
 - README §11.8 and `connector_help`: one sentence (section 4).
 - README §11.9 (security model): service tokens are hashed, scoped, expiring and owner-bound, and cannot manage tokens.
@@ -239,7 +239,7 @@ No MCP tool is added, removed or renamed, and `tools-manifest.json` is unchanged
 
 New HTTP surface, wizard only (owner cookie session and CSRF): `GET /tokens`, `GET` and `POST /tokens/new` (fields `name`, repeated `graph`, `access`, `expires_days`, `csrf`), `POST /tokens/:id/revoke`.
 
-CLI: `node scripts/logseq-mcp.mjs <tool> ['<json args>']`, env `LOGSEQ_SERVICE_TOKEN` and `LOGSEQ_MCP_URL`.
+CLI: `node scripts/logseq-mcp.mjs <tool> ['<json args>']`, env `LOGSEQ_SERVICE_TOKEN`, `LOGSEQ_MCP_HOST` and `LOGSEQ_MCP_URL`.
 
 ## 5. Cost on the Free plan
 
