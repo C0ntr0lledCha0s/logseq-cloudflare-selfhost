@@ -64,6 +64,13 @@ function expiryFields(expires: string, unknown: boolean): string {
 </fieldset>`;
 }
 
+function editStampsField(on: boolean): string {
+  return `<fieldset><legend>Edit stamps</legend>
+  <label class="check"><input type="checkbox" name="edit_stamps" value="1"${checked(on)}> Mark Claude's edits in the graph</label>
+  <small>Blocks Claude creates or changes get the hidden properties editedBy and claudeEditedAt, listed on the Claude Activity page. Unticking stops new stamps; existing ones stay.</small>
+</fieldset>`;
+}
+
 function tokenField(): string {
   return `<label class="field"><span>Personal access token</span>
   <input type="password" name="token" autocomplete="off" spellcheck="false" required></label>`;
@@ -113,6 +120,7 @@ function graphSection(graph: GraphRecord, csrf: string, now: number): string {
   ${aliasField(alias)}
   ${modeFields(graph.mode)}
   ${expiryFields(expires, graph.expiresAt === null)}
+  ${editStampsField(graph.editStamps)}
   <button>Save changes</button>
 </form>
 </details>

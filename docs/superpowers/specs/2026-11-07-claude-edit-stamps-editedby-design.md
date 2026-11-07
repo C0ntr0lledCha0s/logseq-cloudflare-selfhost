@@ -294,3 +294,13 @@ The choice is matched by its fixed UUID, never its title. `:remove-block-childre
 **Measured, per write tool, stamps on against off** (`edit stamps header` in `test/tools.test.ts`): the same sync requests in the same order (so the same Worker requests and rate-limited writes), the same D1 statements with the same `rows_read` and `rows_written`, and the same audit row apart from `id` and `at`. `resolve()` is one statement reading one row. No neurons: nothing here calls Workers AI.
 
 **Contract.** Spec §4's sentence is on the 13 generated stamping tools (through `STAMPING_TOOLS` in `semantic.ts`) and on `save_document` and `save_file_from_url`, and on no other tool. `CONNECTOR_HELP` holds the section, with Stage 2's refusal sentence folded into its end. Question 4 (section 11) is still open; if the owner answers "help only", `STAMPING_TOOLS` and `STAMP_HINT` go.
+
+### Stage 5: the owner's switch
+
+**The form.** The wizard's per-graph **Edit** form at `/graphs` has a checkbox, "Mark Claude's edits in the graph" (`name="edit_stamps" value="1"`), ticked from `GraphRecord.editStamps`. `editGraph` saves it through `Graphs.update` with the alias, mode and expiry, after the same checks; a refused save (a taken alias, write mode on a read token, a bad expiry) changes nothing, the box included. A browser doesn't post an unticked box, so a missing field saves 0, and any value other than `1` does too, as the expiry's "I don't know" box already reads its field. The connect form doesn't show the box: a new graph starts with the column default, 1.
+
+**Who can change it.** Only a POST with the owner's session and the session's CSRF token, like every other wizard form. No MCP tool's input schema names the setting (checked over `tools/list` with semantic search off and on), so Claude can't turn its own stamps off.
+
+**Effect.** The next tool call reads the new value through `resolve()`, so no call after the save sends the old header (`posting the form unticked stops the header…` in `test/wizard.test.ts`, which also follows a rename in the same save). Existing stamps, the properties and the Activity page are untouched. Cost: no extra D1 read per tool call; one row written per form save, as before.
+
+**Mutation check** (one line each): a missing field kept as "unchanged" instead of 0, the setting left out of the `update` call, the box always rendered ticked, and any non-empty value read as ticked. Each failed at least one test in `test/wizard.test.ts`.

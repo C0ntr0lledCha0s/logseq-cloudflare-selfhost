@@ -236,7 +236,7 @@ async function confirmGraph({ env, session, csrf, store, form }: FormCtx): Promi
   }
 }
 
-/** POST /graphs/:alias/edit: alias, mode and expiry. */
+/** POST /graphs/:alias/edit: alias, mode, expiry and edit stamps (an unticked box is not posted, so it saves off). */
 async function editGraph({ store, form }: FormCtx, alias: string): Promise<Response> {
   const graph = await store.get(alias);
   if (!graph) return notFound();
@@ -246,7 +246,8 @@ async function editGraph({ store, form }: FormCtx, alias: string): Promise<Respo
     checkModeFits(mode, graph.permission);
     const expiresAt = parseExpiry(form);
     if (next !== alias && (await store.get(next))) throw new FormError(`The alias “${next}” is already in use.`, 409);
-    await store.update(alias, { alias: next, mode, expiresAt });
+    const editStamps = text(form, "edit_stamps") === "1";
+    await store.update(alias, { alias: next, mode, expiresAt, editStamps });
     return toList();
   } catch (error) {
     if (error instanceof FormError) return messagePage(error.status, "Not saved", error.message);

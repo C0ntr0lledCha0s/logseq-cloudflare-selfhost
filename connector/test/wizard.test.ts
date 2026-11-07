@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { createSession } from "../src/auth/session";
 import { GraphStore } from "../src/graphs";
 import { createConnector } from "../src/index";
+import { mcpHandler } from "../src/mcp";
 import { SyncError, inspectToken, syncFetch } from "../src/sync";
 
 const ORIGIN = "https://mcp.example.com";
@@ -522,6 +523,164 @@ describe("manage connected graphs", () => {
     syncHandler = () => Response.json({ error: "rate limit exceeded" }, { status: 429, headers: { "Retry-After": "60" } });
     await submitToken(h);
     expect(transcript.length).toBeGreaterThan(20);
+    assertNoToken();
+  });
+});
+
+describe("edit stamps switch", () => {
+  const LABEL = "Mark Claude's edits in the graph";
+  const BLOCK = "33333333-3333-3333-3333-333333333333";
+
+  /** The edit form of one graph's section on /graphs. */
+  async function editForm(h: Harness, alias: string): Promise<string> {
+    const { html } = await h.page("/graphs");
+    const section = html.slice(html.indexOf(`id="graph-${alias}"`)).split("</section>")[0];
+    return section.slice(section.indexOf(`action="/graphs/${alias}/edit"`)).split("</form>")[0];
+  }
+
+  function stampBox(form: string): string | undefined {
+    return /<input type="checkbox" name="edit_stamps"[^>]*>/.exec(form)?.[0];
+  }
+
+  /** The edit form's fields as the browser would post them, keeping alias, mode and expiry. */
+  function sameFields(alias: string, expires: string, stamps: boolean): Record<string, string> {
+    return { alias, mode: "write", expires, ...(stamps ? { edit_stamps: "1" } : {}) };
+  }
+
+  /** One MCP JSON-RPC call through the connector's own handler, with the wizard tests' sync fake. */
+  async function rpc(testEnv: Env, method: string, params: unknown): Promise<any> {
+    const request = new Request(`${ORIGIN}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const ctx = createExecutionContext();
+    const res = await mcpHandler(testEnv, ctx)(request, testEnv, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    const json = res.headers.get("Content-Type")?.includes("text/event-stream")
+      ? text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6))).find((m) => m.id === 1)
+      : JSON.parse(text);
+    expect(json.error).toBeUndefined();
+    return json.result;
+  }
+
+  /** Calls update_block and returns the edit-stamp header of each non-GET request it sent. */
+  async function updateBlockStamps(h: Harness, alias: string): Promise<(string | null)[]> {
+    const tokens = syncForTokens({ [TOKEN]: [WORK], [OTHER_TOKEN]: [OTHER] });
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/v1/graphs") return tokens(request);
+      if (request.method === "GET") {
+        return Response.json({ uuid: BLOCK, kind: "block", title: "Old", markdown: "Old", "block-count": 0, truncated: false });
+      }
+      return Response.json({ uuid: BLOCK, kind: "block", title: "New title" });
+    };
+    syncRequests = [];
+    const result = await rpc(h.testEnv, "tools/call", {
+      name: "update_block",
+      arguments: { graph: alias, "block-id": BLOCK, body: { title: "New title" } },
+    });
+    expect(result.isError ?? false, JSON.stringify(result.content)).toBe(false);
+    const writes = syncRequests.filter((r) => r.method !== "GET");
+    expect(writes.length).toBeGreaterThan(0);
+    return writes.map((r) => r.headers.get("x-logseq-edit-stamp"));
+  }
+
+  it("edit form shows the checkbox ticked by default and unticked after saving 0", async () => {
+    const h = await harness();
+    await connect(h);
+    const form = await editForm(h, "my-work-graph");
+    expect(form).toContain(LABEL);
+    expect(stampBox(form)).toBe('<input type="checkbox" name="edit_stamps" value="1" checked>');
+    expect(await store().get("my-work-graph")).toMatchObject({ editStamps: true });
+
+    const expires = (await store().get("my-work-graph"))!.expiresAt!;
+    const saved = await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("my-work-graph", expires, false) });
+    expect(saved.res.status).toBe(303);
+    expect(await store().get("my-work-graph")).toMatchObject({ editStamps: false });
+    expect(stampBox(await editForm(h, "my-work-graph"))).toBe('<input type="checkbox" name="edit_stamps" value="1">');
+
+    // Any value other than the box's own "1" is unticked, as the expiry's "unknown" box is.
+    for (const [value, on] of [["1", true], ["0", false], ["1", true], ["on", false]] as const) {
+      const res = await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("my-work-graph", expires, false), edit_stamps: value });
+      expect(res.res.status, value).toBe(303);
+      expect((await store().get("my-work-graph"))!.editStamps, value).toBe(on);
+    }
+  });
+
+  it("posting the form unticked stops the header on the next update_block; ticking it brings it back", async () => {
+    const h = await harness();
+    await connect(h);
+    const expires = (await store().get("my-work-graph"))!.expiresAt!;
+    expect(await updateBlockStamps(h, "my-work-graph")).toEqual(["claude"]);
+
+    const off = await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("my-work-graph", expires, false) });
+    expect(off.res.status).toBe(303);
+    expect(await updateBlockStamps(h, "my-work-graph")).toEqual([null]);
+
+    const on = await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("my-work-graph", expires, true) });
+    expect(on.res.status).toBe(303);
+    expect(await updateBlockStamps(h, "my-work-graph")).toEqual(["claude"]);
+
+    // The switch follows the graph through a rename in the same save.
+    await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("work", expires, false) });
+    expect(await updateBlockStamps(h, "work")).toEqual([null]);
+  });
+
+  it("the form needs the owner session and CSRF token; no MCP tool's input schema names edit_stamps or editStamps", async () => {
+    const h = await harness();
+    await connect(h);
+    const expires = (await store().get("my-work-graph"))!.expiresAt!;
+    const other = await harness();
+    const unticked = sameFields("my-work-graph", expires, false);
+    expect((await h.page("/graphs/my-work-graph/edit", unticked)).res.status).toBe(403);
+    expect((await h.page("/graphs/my-work-graph/edit", { csrf: other.csrf, ...unticked })).res.status).toBe(403);
+    const worker = createConnector({ githubFetch: async () => new Response(null, { status: 500 }) });
+    const intruder = (await createSession(env, 2002)).split(";")[0];
+    for (const cookie of [intruder, ""]) {
+      const request = new Request(`${ORIGIN}/graphs/my-work-graph/edit`, {
+        method: "POST",
+        headers: { Cookie: cookie },
+        body: new URLSearchParams({ csrf: h.csrf, ...unticked }),
+        redirect: "manual",
+      });
+      const ctx = createExecutionContext();
+      const res = await worker.fetch!(request as Request<unknown, IncomingRequestCfProperties>, h.testEnv, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(res.status).toBe(302);
+    }
+    // A refused save (taken alias) changes nothing, the box included.
+    await store().add({ ...OTHER_RECORD });
+    expect((await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...unticked, alias: "other" })).res.status).toBe(409);
+    expect(await store().get("my-work-graph")).toMatchObject({ editStamps: true });
+
+    // No tool, with semantic search off or on, takes the setting as an input.
+    const semanticOn = { AI: {} as Ai, VECTORIZE: {} as Vectorize, SEMANTIC_MAX_VECTORS: "10000" };
+    for (const extra of [{}, semanticOn]) {
+      const { tools } = await rpc({ ...h.testEnv, ...extra } as Env, "tools/list", {});
+      expect(tools.length).toBeGreaterThan(20);
+      for (const tool of tools) expect(JSON.stringify(tool.inputSchema), tool.name).not.toMatch(/edit_?stamps?/i);
+    }
+  });
+
+  it("a save that only flips the box leaves the other fields unchanged", async () => {
+    const h = await harness();
+    await connect(h);
+    const before = (await store().get("my-work-graph"))!;
+    const fields = sameFields("my-work-graph", before.expiresAt!, false);
+    await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...fields });
+    expect(await store().get("my-work-graph")).toEqual({ ...before, editStamps: false });
+    // Re-sending the same unticked save is a no-op that still succeeds.
+    expect((await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...fields })).res.status).toBe(303);
+    expect(await store().get("my-work-graph")).toEqual({ ...before, editStamps: false });
+    await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, ...sameFields("my-work-graph", before.expiresAt!, true) });
+    expect(await store().get("my-work-graph")).toEqual(before);
+    expect(await store().token("my-work-graph")).toBe(TOKEN);
+    // A save that changes the other fields with the box ticked keeps stamping on.
+    await h.page("/graphs/my-work-graph/edit", { csrf: h.csrf, alias: "my-work-graph", mode: "read", expires_unknown: "1", edit_stamps: "1" });
+    expect(await store().get("my-work-graph")).toEqual({ ...before, mode: "read", expiresAt: null, editStamps: true });
     assertNoToken();
   });
 });
