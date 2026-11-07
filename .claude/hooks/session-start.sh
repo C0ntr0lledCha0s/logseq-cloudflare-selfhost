@@ -23,6 +23,12 @@ else
   log "  scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream"
 fi
 
+if ! command -v clojure >/dev/null 2>&1; then
+  log "WARNING: the clojure command is missing. scripts/build.sh and the upstream db-sync tests"
+  log "  (scripts/check.sh --upstream) can't run. Install the Clojure CLI in the environment's"
+  log "  setup script and allow repo.clojars.org (docs/lanes/README.md, Setting up)."
+fi
+
 [ -f .claude/lanes.local.json ] || log "no .claude/lanes.local.json: /lane will look up the issues graph with list_graphs"
 log "ready"
 exit 0

@@ -10,7 +10,8 @@ import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION } from "./spec.mjs";
 // The file tools replace the generated createAsset/getAsset (design §7). createAsset takes the raw
 // bytes as `application/octet-stream` with their exact `size` and SHA-256 `checksum` as query
 // parameters, and attaches the asset block to the page in its `page-id` parameter (a page UUID; when
-// omitted the server appends it to today's journal). A page given by title is looked up by exact,
+// omitted the server appends it to today's journal, in the server's TIMEZONE, and answers with the
+// page it used as page-id and page-title). A page given by title is looked up by exact,
 // case-insensitive title through searchGraph first. getAsset returns a five-minute signed URL whose
 // origin is the request's, so read_file fetches its path and query over the SYNC binding.
 
@@ -67,7 +68,9 @@ const pageArg = z
   .string()
   .min(1)
   .optional()
-  .describe("Title or UUID of an existing page to attach the file to. Omit to add it to today's journal.");
+  .describe(
+    "Title or UUID of an existing page to attach the file to. Omit to add it to today's journal (today in the owner's time zone, see connector_help).",
+  );
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
@@ -162,9 +165,17 @@ async function upload(
     body: file.bytes,
     headers: { "Content-Type": "application/octet-stream" },
   });
-  const asset = (await response.json()) as { uuid?: unknown };
+  const asset = (await response.json()) as { uuid?: unknown; "page-id"?: unknown; "page-title"?: unknown };
   if (typeof asset.uuid !== "string") throw new Error("createAsset answered without an asset uuid");
-  return textResult(JSON.stringify({ assetUuid: asset.uuid, fileName: file.fileName, size: file.bytes.byteLength }));
+  return textResult(
+    JSON.stringify({
+      assetUuid: asset.uuid,
+      fileName: file.fileName,
+      size: file.bytes.byteLength,
+      pageId: asset["page-id"],
+      pageTitle: asset["page-title"],
+    }),
+  );
 }
 
 /** The decoded last path segment of `url` when it is a file name with an extension. */
@@ -269,7 +280,7 @@ export function registerAssetTools(
     "save_document",
     {
       description:
-        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID.",
+        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
       inputSchema: z.object({
         graph: graphArg,
         fileName: z.string().min(1).describe("File name with an extension, e.g. meeting-notes.md"),
@@ -301,7 +312,7 @@ export function registerAssetTools(
     "save_file_from_url",
     {
       description:
-        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID.",
+        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
       inputSchema: z.object({
         graph: graphArg,
         url: z.string().describe("Public https URL of the file"),

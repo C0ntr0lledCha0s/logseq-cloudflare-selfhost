@@ -1,6 +1,7 @@
 ---
 name: efficiency-reviewer
-description: Reviews a change for cost on the Cloudflare Free plan, CPU time, response size, and duplicated or needless code. Use as the efficiency lens of lane-review, as the cost judge in the feature design panel, and on any change that touches D1, KV, Vectorize, Workers AI, crons or tool responses. Read-only.
+description: Reviews a change for cost on the Cloudflare Free plan, CPU time, response size, and duplicated or needless code. Use as the cost judge in the feature design panel (lane-review's light lens uses its budget table), and on any change that touches D1, KV, Vectorize, Workers AI, crons or tool responses. Read-only.
+model: sonnet
 tools: Read, Grep, Glob, Bash
 ---
 

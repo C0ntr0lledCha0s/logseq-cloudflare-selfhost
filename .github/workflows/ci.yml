@@ -71,8 +71,11 @@ jobs:
             cp -a .upstream/deps/db-sync/.shadow-cljs .cache/shadow-cljs
           fi
 
-      - name: Upstream unit tests
-        run: cd .upstream/deps/db-sync && pnpm test
+      # The patches carry their own regression tests (patches/*.patch add files under
+      # deps/db-sync/test); without this step they only ran on a developer's machine.
+      - name: Upstream db-sync tests (with the patches applied)
+        working-directory: .upstream/deps/db-sync
+        run: pnpm test
 
       - name: Render and dry-run deploy for both plans
         run: |

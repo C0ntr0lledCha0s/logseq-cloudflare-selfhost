@@ -461,9 +461,17 @@ describe("hand-written tools", () => {
       "batch_move_blocks",
       "verbose",
       "dry-run",
+      "owner's time zone",
+      "page-title",
+      "capture_to_today always writes to today",
+      "insert_block_tree with that journal's UUID as target-id",
+      "create_task with page-id",
+      "delete_page on today's journal",
     ]) {
       expect(result.text).toContain(phrase);
     }
+    // capture_to_today takes no page, so the help must not tell Claude to pass one.
+    expect(result.text).not.toContain("pass that journal page");
   });
 });
 

@@ -24,7 +24,7 @@ This repo self-hosts Logseq's DB sync server on Cloudflare, plus `logseq-connect
 
 - `scripts/check.sh` is the gate every lane uses. It runs the scripts' unit tests, the connector tests, typecheck and tools-manifest check (when `connector/vendor/` exists), and `tofu fmt`. It names each check it skipped and why. Add `--upstream` when `patches/` changed.
 - `npm test` runs the scripts' unit tests only (fast, needs nothing built).
-- Connector checks need the vendored upstream API: `scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream`. The build needs mise's toolchain (Java, Clojure, pnpm) and takes a while; CI runs it on every PR.
+- Connector checks need the vendored upstream API: `scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream`. The build needs mise's toolchain (Java, the Clojure CLI, pnpm) and takes a while. CI builds it on every push and PR, and also runs upstream's own db-sync suite, which includes the tests the patches add.
 - `npm --prefix connector run update:manifest` rewrites `tools-manifest.json` after a tool is added, removed or renamed.
 
 ## Recipes
@@ -57,6 +57,7 @@ Traps anyone changing the code would hit. The compound step adds an entry when a
 - Path parameters are decoded by the router. Re-encode them when forwarding, because qualified idents contain `/` (`docs/solutions/api/qualified-ident-path-params-404.md`).
 - A batch must replay as one transaction with one tx id. Mixed tx ids make clients replay retract and add in the wrong order (`docs/solutions/sync/batch-replayed-with-mixed-tx-ids.md`).
 - "It doesn't reproduce" and "the read hid it" are common outcomes. Check the read path before you blame the write (`docs/solutions/api/read-hid-built-in-properties.md`).
+- The outliner does not check closed values (choices) or a property's classes on server writes (`*closed-values-validate?*` defaults to false), so the semantic handler must resolve a title inside the property's allowed values itself (`docs/solutions/api/title-resolves-outside-allowed-values.md`).
 - Feeds end with a null next-cursor, and `count(*)` scans rows on D1. Both have cost the Free plan before (`docs/solutions/cost/d1-reads-from-indexer-scans.md`).
 
 ## Lanes
@@ -68,7 +69,7 @@ Staged work runs as a lane. Start one with `/lane` (it routes to the right workf
 | Bug | `lane-bug` | A defect: preconditions → investigate (the root cause is challenged by skeptics) → failing test → fix → review rounds → docs → compound and retro → closeout |
 | Feature | `lane-feature` | An enhancement: preconditions → design panel → spec (stops for approval) → plan → staged build → review rounds → docs → compound and retro → closeout |
 | Spike | `lane-spike` | A question: multi-angle research → write-up in `docs/spikes/` → challenge → compound |
-| Review | `lane-review` | Correctness, integrity, tests, efficiency, security (and contract) lenses. Skeptics verify each serious finding, and open findings are re-checked by id. The other lanes call it every round. |
+| Review | `lane-review` | Tests, correctness, integrity and light (efficiency, security and contract) lenses, over the lane's own commits. Skeptics verify each serious finding and send pre-existing ones to the backlog, and open findings are re-checked by id. The other lanes call it every round. |
 
 Lane agents commit as they go, one commit per stage. `/lane` pushes, and opens a PR only when asked.
 

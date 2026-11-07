@@ -83,7 +83,22 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
     delete cfg.vars.OPENAI_APPS_CHALLENGE;
   }
 
+  // 'Today' (capture, tasks and assets with no page) is the date in this zone. Workers run in
+  // UTC, so without it a New Zealand morning lands on yesterday's journal (patch 0025).
+  if (settings.timeZone !== undefined) {
+    cfg.vars = { ...(cfg.vars ?? {}), TIMEZONE: timeZone(settings.timeZone) };
+  }
+
   return stringify(cfg);
+}
+
+function timeZone(value) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+  } catch {
+    throw new Error(`settings.timeZone is not an IANA time zone: ${JSON.stringify(value)}`);
+  }
+  return value;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
