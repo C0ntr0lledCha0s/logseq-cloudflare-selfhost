@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index e5c4c90..5a6c355 100644
+index e5c4c90..a8de8df 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -3274,7 +3274,7 @@
@@ -11,22 +11,35 @@ index e5c4c90..5a6c355 100644
  
  (defn- retire-held-message
    "The 409 refusal for retired choices (validate-choices' :retire entries) that blocks hold or that
-@@ -3317,11 +3317,42 @@
+@@ -3317,11 +3317,55 @@
      (or (some #(when (= text (:text %)) %) targets)
          (some #(when (= (string/lower-case text) (string/lower-case (:text %))) %) targets))))
  
++(defn- value-holder-ids
++  "The blocks or pages the owner sees a referrer as: for another property's value block (whose
++  text holds the link), every entity that holds it, else its parent; any other referrer is itself."
++  [db referrer-id]
++  (let [referrer (d/entity db referrer-id)]
++    (if-let [from (:db/ident (:logseq.property/created-from-property referrer))]
++      (let [holders (into #{} (map :e) (d/datoms db :avet from referrer-id))]
++        (if (seq holders) holders (some-> (:db/id (:block/parent referrer)) hash-set)))
++      #{referrer-id})))
++
 +(defn- value-references
 +  "The value blocks of a conversion (validate-conversion's values) that something refers to besides
 +  their holders, as {value-id #{referrer-id}}: a link or block ref, an embed, an alias or another
-+  property's value (reference-attributes, through referrer-ids, which skips hidden referrers).
-+  The converted property's own attribute is how holders hold their values, so it isn't counted, nor
-+  are the other value blocks the conversion deletes."
++  property's value (reference-attributes, through referrer-ids, which skips hidden referrers). A
++  referrer that is another property's value block is counted as the blocks that hold it
++  (value-holder-ids). The converted property's own attribute is how holders hold their values, so it
++  isn't counted, nor are the other value blocks the conversion deletes."
 +  [db property-ident values]
 +  (let [attributes (remove #{property-ident} (reference-attributes db))
 +        value-ids (set (map :id values))]
 +    (into {}
 +          (keep (fn [{:keys [id]}]
-+                  (let [referrers (into #{} (remove value-ids) (referrer-ids db (d/entity db id) attributes))]
++                  (let [referrers (into #{}
++                                        (comp (remove value-ids) (mapcat #(value-holder-ids db %)))
++                                        (referrer-ids db (d/entity db id) attributes))]
 +                    (when (seq referrers) [id referrers]))))
 +          values)))
 +
@@ -55,7 +68,7 @@ index e5c4c90..5a6c355 100644
    [db property body choices e2ee?]
    (let [convert (:convert_values body)
          title (:block/title property)
-@@ -3381,6 +3412,7 @@
+@@ -3381,6 +3425,7 @@
                         "; add them under choices.add in the same call")}
            :else
            {:ok {:values values
@@ -63,7 +76,7 @@ index e5c4c90..5a6c355 100644
                  :holders (reduce (fn [holders {:keys [choice] :as value}]
                                     (reduce #(update %1 %2 (fnil conj #{}) (:uuid choice)) holders (:holders value)))
                                   {} values)}})))))
-@@ -3399,10 +3431,16 @@
+@@ -3399,10 +3444,16 @@
                                     [:db/add holder property-ident [:block/uuid uuid]]))))
      (outliner-core/delete-blocks! tx-conn (mapv #(d/entity @tx-conn (:id %)) values) {})))
  
@@ -83,7 +96,7 @@ index e5c4c90..5a6c355 100644
      dry-run?
      (assoc :mapping (mapv (fn [[text rows]]
                              {:text text
-@@ -3517,19 +3555,28 @@
+@@ -3517,19 +3568,28 @@
              conversion (when (property? property) (validate-conversion db property body choices e2ee?))
              flags (into {} (map (juxt identity #(flag-param url %))) property-update-flags)
              invalid (some #(when (= ::invalid (get flags %)) %) property-update-flags)
@@ -120,7 +133,7 @@ index e5c4c90..5a6c355 100644
            :else
            (rejecting
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 360a43f..6e1175e 100644
+index 360a43f..2fd626d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -162,7 +162,7 @@
@@ -128,7 +141,7 @@ index 360a43f..6e1175e 100644
     "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
     "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
 -   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks and holders), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
-+   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referrers, unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
     "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
@@ -187,10 +200,18 @@ index 360a43f..6e1175e 100644
                                                           :description "On updateProperty with convert_values and dry-run=true: each distinct text, the choice it would become, and how many blocks hold it."
                                                           :items {:type "object" :required ["text" "choice" "holders"]
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-index 1626fbf..d69de3f 100644
+index 1626fbf..8e05d32 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_property_schema_test.cljs
-@@ -1482,7 +1482,7 @@
+@@ -1269,6 +1269,7 @@
+                         "to remove it from them, or dry-run=true to preview")
+                    (get-in refused [:body :error])))
+             (is (= [{:choice (str backlog) :title "Backlog" :holders 2}] (get-in refused [:body :retired])))
++            (is (not (contains? (:body refused) :converted)) "a retire-only refusal carries no conversion counts")
+             (is (= 409 (:status both)) (str (:body both)))
+             (is (= (str "choices.retire 0: \"Backlog\" is held by 2 blocks; choices.retire 1: \"Done\" is held by 1 block; "
+                         "set acknowledge-holders=true to remove them from their holders, or dry-run=true to preview")
+@@ -1482,7 +1483,7 @@
                     (map (juxt :name (comp :type :schema)))
                     (into {}))
          choices (get-in operation [:requestBody :content "application/json" :schema :properties :choices :properties])]
@@ -199,7 +220,7 @@ index 1626fbf..d69de3f 100644
      (is (= "string" (get-in choices [:retire :items :type])))
      (is (= "#/components/schemas/RetireRefusal"
             (get-in operation [:responses "409" :content "application/json" :schema :$ref])))
-@@ -1551,7 +1551,7 @@
+@@ -1551,7 +1552,7 @@
                    done-id (choice-uuid conn phase "Done")
                    reads (p/all (map #(read-value self % phase) [b0 b1 b2 b3]))]
              (is (= 200 (:status converted)) (str (:body converted)))
@@ -208,7 +229,7 @@ index 1626fbf..d69de3f 100644
              (is (nil? (get-in converted [:body :mapping])) "the mapping is for dry runs")
              (is (= [active active done-id done-id] (mapv #(stored conn % phase) [b0 b1 b2 b3]))
                  "exact, ignoring case, and with spaces trimmed; Done is the choice added in the same call")
-@@ -1577,7 +1577,7 @@
+@@ -1577,7 +1578,7 @@
                    done-id (add-choice! conn phase "Done")
                    converted (convert! self phase {:choices {:update [{:choice "Done" :title "Closed"}]}})]
              (is (= 200 (:status converted)) (str (:body converted)))
@@ -217,7 +238,7 @@ index 1626fbf..d69de3f 100644
              (is (= [done-id done-id] (mapv #(stored conn % phase) [b0 b1])))
              (is (= ["Closed"] (choice-titles conn phase)))))))))
  
-@@ -1617,7 +1617,7 @@
+@@ -1617,7 +1618,7 @@
                    read (read-value self b0 labels)]
              (is (= 5 (count old)) "five text value blocks before")
              (is (= 200 (:status converted)) (str (:body converted)))
@@ -226,7 +247,7 @@ index 1626fbf..d69de3f 100644
              (is (= #{active} (stored conn b0 labels)) "Active and active end as one ref")
              (is (= 1 (count (d/datoms @conn :eavt (:db/id (entity conn b0)) labels))) "one datom, not two")
              (is (= [{:uuid (str active) :title "Active"}] read))
-@@ -1691,7 +1691,7 @@
+@@ -1691,7 +1692,7 @@
                    done-id (choice-uuid conn phase "Done")]
              (is (= 200 (:status dry)) (str (:body dry)))
              (is (true? (get-in dry [:body :dry-run])))
@@ -235,7 +256,7 @@ index 1626fbf..d69de3f 100644
              (let [mapping (get-in dry [:body :mapping])]
                (is (= [["Active" "Active" 3] ["active" "Active" 1] ["Done" "Done" 1]]
                       (mapv (juxt :text (comp :title :choice) :holders) mapping))
-@@ -1714,11 +1714,11 @@
+@@ -1714,11 +1715,11 @@
                    empty-property (convert! self phase {})
                    off (request! self "PATCH" (property-path status) {:convert_values false :title "project-status"})]
              (is (= 200 (:status held)) (str (:body held)))
@@ -249,7 +270,7 @@ index 1626fbf..d69de3f 100644
              (is (= 200 (:status off)) (str (:body off)))
              (is (nil? (get-in off [:body :converted])) "convert_values false converts nothing")
              (is (true? (= before (snapshot conn))) "nothing changed")))))))
-@@ -1880,7 +1880,7 @@
+@@ -1880,7 +1881,7 @@
          response (get-in (semantic-routes/openapi-document "https://issuer.example")
                           [:components :schemas :PropertyResponse :properties])]
      (is (= "boolean" (get-in request [:convert_values :type])))
@@ -258,7 +279,7 @@ index 1626fbf..d69de3f 100644
      (is (= "array" (get-in response [:mapping :type])))
      (is (string/includes? (:description operation) "convert_values"))))
  
-@@ -2091,7 +2091,7 @@
+@@ -2091,7 +2092,7 @@
                    active (add-choice! conn phase "Active")
                    converted (convert! self phase {})]
              (is (= 200 (:status converted)) (str (:body converted)))
@@ -267,7 +288,15 @@ index 1626fbf..d69de3f 100644
              (is (= active (stored conn b0 phase)))
              (is (= :logseq.property/empty-placeholder (:db/ident (get (entity conn b1) phase))))))))))
  
-@@ -2178,3 +2178,219 @@
+@@ -2156,6 +2157,7 @@
+                         "to clear the default, or dry-run=true to preview")
+                    (get-in refused [:body :error])))
+             (is (= [{:choice (str backlog) :title "Backlog" :holders 0 :default true}] (get-in refused [:body :retired])))
++            (is (not (contains? (:body refused) :converted)) "a retire-only refusal carries no conversion counts")
+             (is (= 409 (:status with-held)) (str (:body with-held)))
+             (is (= (str "choices.retire 0: \"Done\" is held by 1 block; choices.retire 1: \"Backlog\" is the property's "
+                         "default value; set acknowledge-holders=true to remove them from their holders and clear the "
+@@ -2178,3 +2180,285 @@
              (is (= [{:uuid (str backlog) :title "Backlog" :holders 0 :default true}] (get-in real [:body :retired])))
              (is (nil? (entity conn backlog)) "the choice is gone")
              (is (nil? (default)) "and the property has no default")))))))
@@ -312,9 +341,12 @@ index 1626fbf..d69de3f 100644
 +            (let [error (str (get-in refused [:body :error]))]
 +              (is (string/includes? error "convert_values") error)
 +              (is (string/includes? error "phase") "the error names the property")
-+              (is (string/includes? error "1 value block") "and the count")
++              (is (string/includes? error "phase: 1 value block (of 2 to delete) is referenced by 1 block or page: ")
++                  "and the count, in the singular")
 +              (is (string/includes? error (str b2)) "and the referencing block")
 +              (is (string/includes? error "acknowledge-references") "and the flag"))
++            (is (not (contains? (:body refused) :retired)) "a references-only refusal lists no retired choices")
++            (is (= {:values 2 :holders 2 :deleted 2 :referenced 1} (get-in refused [:body :converted])))
 +            (is (true? (= before after-refused)) "a refused call writes nothing")
 +            (is (true? kept) "the referenced value block is kept")
 +            (is (nil? added) "no choice was added")
@@ -487,3 +519,66 @@ index 1626fbf..d69de3f 100644
 +            (is (string/includes? error "phase: 2 value blocks (of 2 to delete) are referenced by 6 blocks or pages: ") error)
 +            (is (= 5 (count named)) "five referrers are named")
 +            (is (string/includes? error " and 1 more;") error)))))))
++
++(deftest convert-values-referenced-by-text-property-value-names-its-holder-test
++  ;; A link in another text property's value is stored on that property's hidden value block. The
++  ;; refusal names (and counts) the block that holds the value, which the owner can find, not the
++  ;; value block; a holder that also links directly is one referrer, and a value block two blocks
++  ;; hold names both.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1 b2 b3 b4] blocks
++              grade (:db/ident (outliner-property/upsert-property!
++                                conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                {:property-name "grade"}))]
++          (p/let [_ (hold! self b0 phase "Active")
++                  _ (hold! self b1 phase "Active")
++                  v0 (stored conn b0 phase)
++                  v1 (stored conn b1 phase)
++                  _ (hold! self b2 grade (str "See [[" v0 "]]"))
++                  gv (stored conn b2 grade)
++                  _ (hold! self b3 grade (str "note ((" v1 "))"))
++                  gv3 (stored conn b3 grade)
++                  _ (d/transact! conn [[:db/add (:db/id (entity conn gv)) :block/refs (:db/id (entity conn v0))]
++                                       [:db/add (:db/id (entity conn gv3)) :block/refs (:db/id (entity conn v1))]
++                                       ;; b3 also links directly, and b4 holds b3's grade value block too.
++                                       [:db/add (:db/id (entity conn b3)) :block/refs (:db/id (entity conn v1))]
++                                       [:db/add (:db/id (entity conn b4)) grade (:db/id (entity conn gv3))]])
++                  body {:choices {:add [{:title "Active"}]}}
++                  dry (convert! self phase body "dry-run=true")
++                  refused (convert! self phase body)
++                  error (str (get-in refused [:body :error]))]
++            (is (some? gv))
++            (is (= 2 (get-in dry [:body :converted :referenced])) (str (:body dry)))
++            (is (= 409 (:status refused)) error)
++            (is (string/includes? error "phase: 2 value blocks (of 2 to delete) are referenced by 3 blocks or pages: ") error)
++            (is (string/includes? error (str b2)) "the holder of the referring value is named")
++            (is (string/includes? error (str b3)))
++            (is (string/includes? error (str b4)) "every holder of a shared value block is named")
++            (is (not (string/includes? error (str gv))) "the hidden value block is not named")
++            (is (not (string/includes? error (str gv3))))
++            (is (some? (entity conn v0)) "nothing was deleted")))))))
++
++(deftest convert-values-referenced-by-unheld-text-property-value-names-its-parent-test
++  ;; A value block nothing holds any more (its holder's datom retracted, the block kept) is still
++  ;; shown under the block it was made on, so that block is named.
++  (async done
++    (with-choices done
++      (fn [{:keys [conn self phase blocks]}]
++        (let [[b0 b1] blocks
++              grade (:db/ident (outliner-property/upsert-property!
++                                conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                {:property-name "grade"}))]
++          (p/let [_ (hold! self b0 phase "Active")
++                  v0 (stored conn b0 phase)
++                  _ (hold! self b1 grade (str "See [[" v0 "]]"))
++                  gv (stored conn b1 grade)
++                  _ (d/transact! conn [[:db/retract (:db/id (entity conn b1)) grade (:db/id (entity conn gv))]
++                                       [:db/add (:db/id (entity conn gv)) :block/refs (:db/id (entity conn v0))]])
++                  refused (convert! self phase {:choices {:add [{:title "Active"}]}})
++                  error (str (get-in refused [:body :error]))]
++            (is (= (:db/id (entity conn b1)) (:db/id (:block/parent (entity conn gv)))) "the value block sits under b1")
++            (is (= 409 (:status refused)) error)
++            (is (string/includes? error (str "is referenced by 1 block or page: " b1 ";")) error)
++            (is (not (string/includes? error (str gv))))))))))
