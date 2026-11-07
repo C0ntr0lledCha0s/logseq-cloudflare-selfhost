@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/server";
-import { type StatelessMcpHandler, createMcpHandler } from "agents/mcp/server";
+import { createMcpHandler } from "agents/mcp/server";
 import settings from "../../config/settings.json";
 import openapi from "../vendor/openapi.json";
 import { type AuditContext, AuditLog, userAgentFamily } from "./audit/log";
@@ -8,7 +8,7 @@ import type { GrantProps } from "./auth/routes";
 import { GraphStore } from "./graphs";
 import { registerActivityLogTool } from "./tools/activity-log";
 import { registerAssetTools } from "./tools/assets";
-import { logTool } from "./tools/common";
+import { type RequestScope, logTool, requestScope, scopedResolve } from "./tools/common";
 import { registerHandwrittenTools } from "./tools/handwritten";
 import type { OnSuccess } from "./tools/readable";
 import { KB_INDEX_WRITE_TOOLS, markKbIndexDirty, registerKbIndexTool } from "./tools/kb-index";
@@ -42,11 +42,15 @@ interface IsolateTools {
  */
 const isolates = new WeakMap<Env, IsolateTools>();
 
-function isolateTools(env: Env): IsolateTools {
+/**
+ * The isolate's tools. `access.resolve` applies the request's scope (`scopedResolve`), so it only
+ * works inside `requestScope.run`; exported for the fail-closed test.
+ */
+export function isolateTools(env: Env): IsolateTools {
   let tools = isolates.get(env);
   if (!tools) {
     const store = new GraphStore(env.DB, env.GRAPH_TOKEN_KEY);
-    const access: GraphAccess = { env, resolve: (alias) => store.resolve(alias) };
+    const access: GraphAccess = { env, resolve: (alias) => scopedResolve(store, alias) };
     const bindings = semanticBindings(env);
     const semantic = bindings ? { store: new SemanticStore(env.DB), bindings } : null;
     tools = { store, access, graphTools: buildGraphTools(spec, access), audit: new AuditLog(env.DB), semantic };
@@ -87,10 +91,23 @@ export function callerOf(request: Request): Caller {
 }
 
 /**
+ * One request's MCP handler. Only the call form is exposed: the SDK handler's `fetch` and `notify`
+ * would run outside `requestScope.run`.
+ */
+export type McpRequestHandler = (request: Request, env: unknown, ctx: ExecutionContext) => Promise<Response>;
+
+/**
  * The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are
  * now. Every write is logged to audit_log with `caller`'s client and session (null when not given).
+ * The request runs inside `requestScope.run(scope, …)`: OAuth by default; a service token's scope
+ * limits every graph tool and list_graphs to its graphs and mode.
  */
-export function mcpHandler(env: Env, ctx: ExecutionContext, caller: Caller = { client: null, session: null }): StatelessMcpHandler {
+export function mcpHandler(
+  env: Env,
+  ctx: ExecutionContext,
+  caller: Caller = { client: null, session: null },
+  scope: RequestScope = { kind: "oauth" },
+): McpRequestHandler {
   const { store, access, graphTools, audit: log, semantic } = isolateTools(env);
   const audit: AuditContext = { log, access, ...caller };
   // audited() logs each write's reason and targets; onSuccess only records the use.
@@ -98,7 +115,7 @@ export function mcpHandler(env: Env, ctx: ExecutionContext, caller: Caller = { c
     ctx.waitUntil(touch(store, tool, alias));
     if (KB_INDEX_WRITE_TOOLS.has(tool)) ctx.waitUntil(markDirty(env, tool, alias));
   };
-  return createMcpHandler(
+  const handler = createMcpHandler(
     () => {
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
       registerHandwrittenTools(server, env, store, semantic !== null);
@@ -112,6 +129,7 @@ export function mcpHandler(env: Env, ctx: ExecutionContext, caller: Caller = { c
     // The Worker already answers 421 for any host but CONNECTOR_HOSTNAME (src/index.ts).
     { route: "/mcp" },
   );
+  return (request, handlerEnv, handlerCtx) => requestScope.run(scope, () => handler(request, handlerEnv, handlerCtx));
 }
 
 /**

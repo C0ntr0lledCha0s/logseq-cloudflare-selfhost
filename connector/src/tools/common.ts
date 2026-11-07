@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "@modelcontextprotocol/server";
-import type { ResolvedGraph } from "../graphs";
+import type { GraphStore, ResolvedGraph } from "../graphs";
 import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN } from "./spec.mjs";
 
@@ -102,6 +102,48 @@ export function withCallGraphs<T>(fn: () => Promise<T>): Promise<T> {
   return callGraphs.run(new Map(), fn);
 }
 
+/**
+ * Who a request acts for. OAuth reaches every connected graph at its own mode; a service token
+ * reaches only the graphs whose ids it lists, and `access: "read"` lowers each to read-only.
+ */
+export type RequestScope =
+  | { kind: "oauth" }
+  | { kind: "service"; name: string; graphIds: ReadonlySet<string>; access: "read" | "write" };
+
+/** The scope of the MCP request being served; `mcpHandler` runs every request inside `requestScope.run`. */
+export const requestScope = new AsyncLocalStorage<RequestScope>();
+
+/**
+ * The current request's scope. Throws when none is visible, so a tool callback that ran outside the
+ * request's context fails closed instead of reaching every graph (an unset scope never means OAuth).
+ */
+export function currentScope(): RequestScope {
+  const scope = requestScope.getStore();
+  if (scope === undefined) throw new Error("no request scope: refusing to resolve a graph outside an MCP request");
+  return scope;
+}
+
+/**
+ * `store.resolve(alias)` under the current request's scope. A service scope refuses a graph whose id
+ * it doesn't list (`out-of-scope`, naming the aliases it covers, read only on this refusal) and, when
+ * read-only, returns the graph as read-only with `readOnlyBy` set. Null stays null (unknown alias).
+ * It throws rather than returning, so `lookupGraph` never caches a graph the scope refused.
+ */
+export async function scopedResolve(store: GraphStore, alias: string): Promise<ResolvedGraph | null> {
+  const scope = currentScope();
+  const graph = await store.resolve(alias);
+  if (graph === null || scope.kind === "oauth") return graph;
+  if (!scope.graphIds.has(graph.graphId)) {
+    const covered = await store.aliasesFor([...scope.graphIds]);
+    throw new ToolError(
+      `graph '${alias}' is outside service token '${scope.name}''s scope (it covers: ${covered.length > 0 ? covered.join(", ") : "none"})`,
+      "out-of-scope",
+    );
+  }
+  if (scope.access === "read") return { ...graph, mode: "read", readOnlyBy: `service token '${scope.name}'` };
+  return graph;
+}
+
 /** The graph behind `alias`, or null for an unknown alias; read once per tool call (`withCallGraphs`). */
 export async function lookupGraph(access: GraphAccess, alias: string): Promise<ResolvedGraph | null> {
   const seen = callGraphs.getStore();
@@ -112,8 +154,9 @@ export async function lookupGraph(access: GraphAccess, alias: string): Promise<R
 }
 
 /**
- * The graph behind `alias` for one tool call. Throws `ToolError` for an unknown alias, and for a
- * write on a read-only graph, before anything reaches the sync server.
+ * The graph behind `alias` for one tool call. Throws `ToolError` for an unknown alias, an alias
+ * outside a service token's scope, and a write on a read-only graph (naming the token when a
+ * read-only token made it so), before anything reaches the sync server.
  */
 export async function resolveGraph(access: GraphAccess, alias: string, write: boolean): Promise<ResolvedGraph> {
   const graph = await lookupGraph(access, alias);
@@ -121,6 +164,9 @@ export async function resolveGraph(access: GraphAccess, alias: string, write: bo
     throw new ToolError(`unknown graph '${alias}' — call list_graphs for the connected aliases`, "unknown-graph");
   }
   if (graph.mode !== "read" && graph.mode !== "write") throw new Error(`graph '${alias}' has an invalid mode`);
-  if (graph.mode === "read" && write) throw new ToolError(`graph '${alias}' is read-only`, "read-only");
+  if (graph.mode === "read" && write) {
+    const by = graph.readOnlyBy === undefined ? "" : ` (${graph.readOnlyBy} is read-only)`;
+    throw new ToolError(`graph '${alias}' is read-only${by}`, "read-only");
+  }
   return graph;
 }

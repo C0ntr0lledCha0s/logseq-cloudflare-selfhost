@@ -273,3 +273,37 @@ describe("edit stamps setting", () => {
     expect((await s.resolve("work"))!.editStamps).toBe(true);
   });
 });
+
+describe("aliasesFor (service token scope)", () => {
+  const HOME = "22222222-2222-2222-2222-222222222222";
+  const ARCHIVE = "33333333-3333-3333-3333-333333333333";
+  const GONE = "44444444-4444-4444-4444-444444444444";
+
+  it("names the connected graphs among the ids, ordered by alias, in one statement; unknown ids drop out", async () => {
+    await store().add(BASE);
+    await store().add({ ...BASE, alias: "home", graphId: HOME });
+    await store().add({ ...BASE, alias: "archive", graphId: ARCHIVE });
+    const { db, measured } = metered();
+    const s = new GraphStore(db, env.GRAPH_TOKEN_KEY);
+    // Order of the ids given never matters; a deleted graph's id (GONE) is ignored.
+    expect(await s.aliasesFor([BASE.graphId, GONE, HOME])).toEqual(["home", "work"]);
+    expect(await s.aliasesFor([HOME, BASE.graphId])).toEqual(["home", "work"]);
+    expect(await s.aliasesFor([GONE])).toEqual([]);
+    expect(measured).toHaveLength(3);
+    for (const m of measured) expect(m.rowsWritten).toBe(0);
+    // Searched through the graph_id index: a few rows per id given (index, row and the sort), never
+    // a scan of the table. One id reads one row.
+    expect(measured[0].rowsRead).toBeLessThanOrEqual(3 * 3);
+    expect(measured[2].rowsRead).toBeLessThanOrEqual(3);
+  });
+
+  it("follows a renamed alias, since it reads by graph id; an empty list reads nothing", async () => {
+    await store().add(BASE);
+    await store().update("work", { alias: "work2" });
+    const { db, measured } = metered();
+    const s = new GraphStore(db, env.GRAPH_TOKEN_KEY);
+    expect(await s.aliasesFor([BASE.graphId])).toEqual(["work2"]);
+    expect(await s.aliasesFor([])).toEqual([]);
+    expect(measured).toHaveLength(1);
+  });
+});

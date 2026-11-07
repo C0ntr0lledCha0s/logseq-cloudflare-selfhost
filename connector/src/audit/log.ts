@@ -474,7 +474,7 @@ export interface AuditedWrite {
 export const AUDIT_MIGRATION_MISSING = "audit log unavailable: migration 0004 has not been applied; nothing was written";
 
 /** ToolError statuses that are refusals rather than failures: the call was turned down as given. */
-const REFUSALS = new Set(["refused", "unknown-graph", "read-only"]);
+const REFUSALS = new Set(["refused", "unknown-graph", "read-only", "out-of-scope"]);
 
 /** The argument names whose string values name what a call addresses (UUIDs, titles, dates or idents). */
 const ADDRESS_KEYS = ["block-id", "block-ids", "page-id", "target-id", "tag-id", "property-id", "page"];

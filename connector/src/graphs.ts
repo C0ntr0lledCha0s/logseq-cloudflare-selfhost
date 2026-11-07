@@ -25,6 +25,8 @@ export interface ResolvedGraph {
   pat: string;
   /** Whether writes send `x-logseq-edit-stamp: claude` (migration 0005; on unless the owner turned it off). */
   editStamps: boolean;
+  /** Set when a read-only service token lowered `mode` to read (e.g. `service token 'ci'`); the write refusal names it. */
+  readOnlyBy?: string;
 }
 
 /** A new graph starts with edit stamps on (the column's default). */
@@ -110,6 +112,19 @@ export class GraphStore {
   async get(alias: string): Promise<GraphRecord | null> {
     const row = await this.db.prepare(`SELECT ${RECORD_COLUMNS} FROM graphs WHERE alias = ?`).bind(alias).first<Row>();
     return row ? toRecord(row) : null;
+  }
+
+  /**
+   * The current aliases of the connected graphs among `graphIds`, ordered by alias; an id no longer
+   * connected drops out. One statement reading at most the graphs listed; none for an empty list.
+   */
+  async aliasesFor(graphIds: readonly string[]): Promise<string[]> {
+    if (graphIds.length === 0) return [];
+    const { results } = await this.db
+      .prepare(`SELECT alias FROM graphs WHERE graph_id IN (${graphIds.map(() => "?").join(", ")}) ORDER BY alias`)
+      .bind(...graphIds)
+      .all<{ alias: string }>();
+    return results.map((row) => row.alias);
   }
 
   /** The decrypted PAT. Throws if the alias is unknown or the ciphertext does not authenticate. */

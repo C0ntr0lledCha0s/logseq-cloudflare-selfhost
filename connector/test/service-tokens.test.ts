@@ -1,5 +1,7 @@
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { type MockInstance, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import committedManifest from "../tools-manifest.json";
 import {
   generateServiceToken,
   hashServiceToken,
@@ -8,6 +10,9 @@ import {
   TOUCH_INTERVAL_MS,
 } from "../src/auth/service-tokens";
 import { timingSafeEqual } from "../src/crypto";
+import { GraphStore } from "../src/graphs";
+import { isolateTools, mcpHandler } from "../src/mcp";
+import { type RequestScope, lookupGraph, requestScope, withCallGraphs } from "../src/tools/common";
 
 interface Measured {
   sql: string;
@@ -319,3 +324,360 @@ describe("ServiceTokenStore", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Scope: a service token's graph ids and access, applied where every tool resolves its graph.
+// ---------------------------------------------------------------------------------------------
+
+const ARCHIVE = "33333333-3333-3333-3333-333333333333";
+const GONE = "44444444-4444-4444-4444-444444444444";
+const B1 = "55555555-5555-4555-8555-555555555555";
+const PAGE = "66666666-6666-4666-8666-666666666666";
+
+/** A read-only token covering `work`; and a read-write one covering `work` and `archive` (connected read-only). */
+const READ_CI: RequestScope = { kind: "service", name: "ci", graphIds: new Set([WORK]), access: "read" };
+const WRITE_NIGHTLY: RequestScope = { kind: "service", name: "nightly", graphIds: new Set([WORK, ARCHIVE]), access: "write" };
+const SERVICE_CALLER = { client: "service:ci", session: "session-ci" };
+
+let syncCalls: { method: string; url: string }[];
+/** save_file_from_url's public fetch: answered with a small text file, and counted. */
+let publicFetch: MockInstance;
+
+function graphStore(db: D1Database = env.DB): GraphStore {
+  return new GraphStore(db, env.GRAPH_TOKEN_KEY);
+}
+
+/** The test env with a SYNC stub that counts calls (answering an empty page or block), and semantic search on. */
+function scopeEnv(overrides: Partial<Env> = {}): Env {
+  const sync = {
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      syncCalls.push({ method: request.method, url: request.url });
+      return Response.json({ uuid: PAGE, kind: "page", title: "Notes", markdown: "", "block-count": 0, truncated: false, blocks: [], missing: [] });
+    },
+  } as unknown as Fetcher;
+  // AI and VECTORIZE only need to exist for semantic_search and semantic_index_status to be registered.
+  return { ...env, SYNC: sync, AI: {} as Ai, VECTORIZE: {} as Vectorize, SEMANTIC_MAX_VECTORS: "10000", ...overrides } as Env;
+}
+
+/** One JSON-RPC call through `mcpHandler`, with the scope given or (undefined) the default. */
+async function rpc(method: string, params: unknown, scope?: RequestScope, e: Env = scopeEnv()): Promise<any> {
+  const request = new Request("https://mcp.example.com/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const ctx = createExecutionContext();
+  const handler = scope === undefined ? mcpHandler(e, ctx) : mcpHandler(e, ctx, SERVICE_CALLER, scope);
+  const res = await handler(request, e, ctx);
+  await waitOnExecutionContext(ctx);
+  expect(res.status).toBe(200);
+  const text = await res.text();
+  const json = res.headers.get("Content-Type")?.includes("text/event-stream")
+    ? text
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice(6)))
+        .find((msg) => msg.id === 1)
+    : JSON.parse(text);
+  expect(json.error).toBeUndefined();
+  return json.result;
+}
+
+async function call(name: string, args: Record<string, unknown>, scope?: RequestScope, e?: Env): Promise<{ isError: boolean; text: string }> {
+  const result = await rpc("tools/call", { name, arguments: args }, scope, e);
+  return { isError: result.isError === true, text: result.content.map((c: { text: string }) => c.text).join("\n") };
+}
+
+async function tools(scope?: RequestScope): Promise<any[]> {
+  return (await rpc("tools/list", {}, scope)).tools;
+}
+
+/**
+ * The smallest arguments a JSON schema accepts: required members only, the first enum value, one
+ * item for an array. Strings are a UUID, so they are accepted as ids, titles and selectors alike.
+ */
+function sample(schema: any, key = ""): unknown {
+  if (schema === undefined || schema === null) return B1;
+  if ("const" in schema) return schema.const;
+  if (Array.isArray(schema.enum)) return schema.enum[0];
+  for (const union of ["anyOf", "oneOf"]) if (Array.isArray(schema[union])) return sample(schema[union][0], key);
+  if (Array.isArray(schema.allOf)) return sample(schema.allOf[0], key);
+  const type = Array.isArray(schema.type) ? schema.type.find((t: string) => t !== "null") : schema.type;
+  if (type === "object" || (type === undefined && schema.properties)) {
+    const out: Record<string, unknown> = {};
+    for (const k of schema.required ?? []) out[k] = sample(schema.properties?.[k], k);
+    return out;
+  }
+  if (type === "array") return [sample(schema.items, key)];
+  if (type === "integer" || type === "number") return Math.max(1, schema.minimum ?? 1);
+  if (type === "boolean") return true;
+  if (schema.format === "uri" || key === "url") return "https://files.example.com/a.pdf";
+  if (key === "fileName") return "a.md";
+  if (key === "title") return "Standup";
+  return B1;
+}
+
+function argsFor(tool: any, graph: string): Record<string, unknown> {
+  return { ...(sample(tool.inputSchema, "") as Record<string, unknown>), graph };
+}
+
+async function auditRows(): Promise<{ tool: string; alias: string; status: string; client: string | null; error: string | null }[]> {
+  return (await env.DB.prepare("SELECT tool, alias, status, client, error FROM audit_log ORDER BY id").all<any>()).results;
+}
+
+const WRITES_IN_MANIFEST = committedManifest.filter((e) => !e.annotations.readOnlyHint).map((e) => e.name).sort();
+
+describe("scope", () => {
+  beforeEach(async () => {
+    await env.DB.exec("DELETE FROM graphs");
+    await env.DB.exec("DELETE FROM audit_log");
+    const base = { permission: "both" as const, expiresAt: null };
+    await graphStore().add({ ...base, alias: "work", graphId: WORK, graphName: "Work", mode: "write", token: "logseq_pat_Work1" });
+    await graphStore().add({ ...base, alias: "notes", graphId: NOTES, graphName: "Notes", mode: "write", token: "logseq_pat_Notes2" });
+    await graphStore().add({ ...base, alias: "archive", graphId: ARCHIVE, graphName: "Archive", mode: "read", token: "logseq_pat_Archive3" });
+    syncCalls = [];
+    publicFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("a", { headers: { "Content-Type": "text/plain" } }));
+  });
+
+  afterEach(() => {
+    publicFetch.mockRestore();
+  });
+
+  it("read-only scope refuses every write tool the server registers, naming the token, with 0 sync calls and a refused audit row", async () => {
+    const writes = (await tools(READ_CI)).filter((t) => t.annotations?.readOnlyHint !== true);
+    // Walked from the server mcpHandler builds, so a new write tool is covered without listing it here.
+    expect(writes.map((t) => t.name).sort()).toEqual(WRITES_IN_MANIFEST);
+    for (const tool of writes) {
+      const result = await call(tool.name, argsFor(tool, "work"), READ_CI);
+      expect(result, tool.name).toEqual({ isError: true, text: "graph 'work' is read-only (service token 'ci' is read-only)" });
+    }
+    expect(syncCalls).toEqual([]);
+    expect(publicFetch).not.toHaveBeenCalled();
+    const rows = await auditRows();
+    expect(rows.map((r) => r.tool).sort()).toEqual(WRITES_IN_MANIFEST);
+    for (const row of rows) {
+      expect(row, row.tool).toEqual({
+        tool: row.tool,
+        alias: "work",
+        status: "refused",
+        client: "service:ci",
+        error: "graph 'work' is read-only (service token 'ci' is read-only)",
+      });
+    }
+  });
+
+  it("read-only scope still reads its graph: a read tool reaches the sync server and answers", async () => {
+    const result = await call("get_page", { graph: "work", "page-id": PAGE }, READ_CI);
+    expect(result.isError, result.text).toBe(false);
+    expect(syncCalls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("out of scope: a read and a write tool are refused listing the covered aliases; the write's audit row is refused", async () => {
+    const message = "graph 'notes' is outside service token 'ci''s scope (it covers: work)";
+    expect(await call("get_page", { graph: "notes", "page-id": PAGE }, READ_CI)).toEqual({ isError: true, text: message });
+    expect(await call("update_block", { graph: "notes", "block-id": B1, body: { title: "x" } }, READ_CI)).toEqual({ isError: true, text: message });
+    // A read-write token is refused the same way: scope comes before mode.
+    expect(await call("update_block", { graph: "notes", "block-id": B1, body: { title: "x" } }, WRITE_NIGHTLY)).toEqual({
+      isError: true,
+      text: "graph 'notes' is outside service token 'nightly''s scope (it covers: archive, work)",
+    });
+    expect(syncCalls).toEqual([]);
+    expect(await auditRows()).toEqual([
+      { tool: "update_block", alias: "notes", status: "refused", client: "service:ci", error: message },
+      {
+        tool: "update_block",
+        alias: "notes",
+        status: "refused",
+        client: "service:ci",
+        error: "graph 'notes' is outside service token 'nightly''s scope (it covers: archive, work)",
+      },
+    ]);
+  });
+
+  it("a second lookup of an out-of-scope alias in the same call refuses too: nothing unscoped is cached (review focus 4)", async () => {
+    const { access } = isolateTools(scopeEnv());
+    const seen: string[] = [];
+    await requestScope.run(READ_CI, () =>
+      withCallGraphs(async () => {
+        for (let i = 0; i < 2; i += 1) {
+          try {
+            await lookupGraph(access, "notes");
+            seen.push("resolved");
+          } catch (error) {
+            seen.push((error as Error).message);
+          }
+        }
+      }),
+    );
+    expect(seen).toEqual([
+      "graph 'notes' is outside service token 'ci''s scope (it covers: work)",
+      "graph 'notes' is outside service token 'ci''s scope (it covers: work)",
+    ]);
+  });
+
+  it("every tool that takes a graph honours the scope: an out-of-scope alias reaches no sync call", async () => {
+    const graphTools = (await tools(WRITE_NIGHTLY)).filter((t) => t.inputSchema.properties?.graph !== undefined);
+    expect(graphTools.length).toBeGreaterThanOrEqual(committedManifest.length - 2);
+    for (const tool of graphTools) {
+      const result = await call(tool.name, argsFor(tool, "notes"), WRITE_NIGHTLY);
+      expect(result, tool.name).toEqual({ isError: true, text: "graph 'notes' is outside service token 'nightly''s scope (it covers: archive, work)" });
+    }
+    expect(syncCalls).toEqual([]);
+    expect(publicFetch).not.toHaveBeenCalled();
+  });
+
+  it("effective mode: a read-write token on a graph connected read-only gets the plain message (review focus 6), and writes to a read-write graph", async () => {
+    const update = (graph: string) => ({ graph, "block-id": B1, body: { title: "x" } });
+    expect(await call("update_block", update("archive"), WRITE_NIGHTLY)).toEqual({ isError: true, text: "graph 'archive' is read-only" });
+    expect(syncCalls).toEqual([]);
+    // A read-only token on the same graph names itself: it lowers the mode too.
+    const readArchive: RequestScope = { kind: "service", name: "ci", graphIds: new Set([ARCHIVE]), access: "read" };
+    expect(await call("update_block", update("archive"), readArchive)).toEqual({
+      isError: true,
+      text: "graph 'archive' is read-only (service token 'ci' is read-only)",
+    });
+    expect(syncCalls).toEqual([]);
+    const written = await call("update_block", update("work"), WRITE_NIGHTLY);
+    expect(written.isError, written.text).toBe(false);
+    expect(syncCalls.filter((c) => c.method !== "GET").map((c) => c.method)).toEqual(["PATCH"]);
+  });
+
+  it("scope is held by graph id: after a rename the new alias is in scope and the old one unknown (review focus 5)", async () => {
+    await graphStore().update("work", { alias: "work2" });
+    const read = await call("get_page", { graph: "work2", "page-id": PAGE }, READ_CI);
+    expect(read.isError, read.text).toBe(false);
+    expect(await call("get_page", { graph: "work", "page-id": PAGE }, READ_CI)).toEqual({
+      isError: true,
+      text: "unknown graph 'work' — call list_graphs for the connected aliases",
+    });
+    expect(await call("get_page", { graph: "notes", "page-id": PAGE }, READ_CI)).toEqual({
+      isError: true,
+      text: "graph 'notes' is outside service token 'ci''s scope (it covers: work2)",
+    });
+  });
+
+  it("list_graphs returns only the scoped graphs with their effective mode; a deleted graph's id is ignored (review focus 7)", async () => {
+    const listed = async (scope?: RequestScope) =>
+      JSON.parse((await call("list_graphs", {}, scope)).text).map((g: { alias: string; mode: string }) => [g.alias, g.mode]);
+    const withGone: RequestScope = { kind: "service", name: "ci", graphIds: new Set([GONE, WORK]), access: "read" };
+    expect(await listed(withGone)).toEqual([["work", "read"]]);
+    expect(await listed(WRITE_NIGHTLY)).toEqual([
+      ["archive", "read"],
+      ["work", "write"],
+    ]);
+    // The out-of-scope message lists only aliases that still exist.
+    expect(await call("get_page", { graph: "notes", "page-id": PAGE }, withGone)).toEqual({
+      isError: true,
+      text: "graph 'notes' is outside service token 'ci''s scope (it covers: work)",
+    });
+    // Every id gone: nothing listed, and the message says so.
+    const allGone: RequestScope = { kind: "service", name: "ci", graphIds: new Set([GONE]), access: "read" };
+    expect(await listed(allGone)).toEqual([]);
+    expect(await call("get_page", { graph: "work", "page-id": PAGE }, allGone)).toEqual({
+      isError: true,
+      text: "graph 'work' is outside service token 'ci''s scope (it covers: none)",
+    });
+    expect(syncCalls).toEqual([]);
+  });
+
+  it("what already works still works in scope: every read tool under a read-only token, every write and a re-send under a read-write one", async () => {
+    const SCOPE_REFUSAL = /is read-only|outside service token|unknown graph|no request scope/;
+    const listed = await tools(READ_CI);
+    const reads = listed.filter((t) => t.annotations?.readOnlyHint === true && t.inputSchema.properties?.graph !== undefined);
+    expect(reads.length).toBeGreaterThan(15);
+    for (const tool of reads) {
+      // The stub's answers don't fit every read (and AI is a stub), so a read may still fail; never for its scope.
+      const result = await call(tool.name, argsFor(tool, "work"), READ_CI);
+      expect(result.text, tool.name).not.toMatch(SCOPE_REFUSAL);
+    }
+    const writes = (await tools(WRITE_NIGHTLY)).filter((t) => t.annotations?.readOnlyHint !== true);
+    expect(writes.map((t) => t.name).sort()).toEqual(WRITES_IN_MANIFEST);
+    for (const tool of writes) {
+      const result = await call(tool.name, argsFor(tool, "work"), WRITE_NIGHTLY);
+      expect(result.text, tool.name).not.toMatch(SCOPE_REFUSAL);
+    }
+    // The same write sent twice in a row, under the same token, is written twice.
+    syncCalls = [];
+    for (let i = 0; i < 2; i += 1) {
+      const again = await call("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, WRITE_NIGHTLY);
+      expect(again.isError, again.text).toBe(false);
+    }
+    expect(syncCalls.filter((c) => c.method !== "GET").map((c) => c.method)).toEqual(["PATCH", "PATCH"]);
+  });
+
+  it("the order of a token's graph ids never matters: list_graphs and the covered list are ordered by alias", async () => {
+    const forward: RequestScope = { kind: "service", name: "nightly", graphIds: new Set([WORK, ARCHIVE]), access: "write" };
+    const reversed: RequestScope = { kind: "service", name: "nightly", graphIds: new Set([ARCHIVE, WORK]), access: "write" };
+    for (const scope of [forward, reversed]) {
+      const graphs = JSON.parse((await call("list_graphs", {}, scope)).text).map((g: { alias: string }) => g.alias);
+      expect(graphs).toEqual(["archive", "work"]);
+      expect((await call("get_page", { graph: "notes", "page-id": PAGE }, scope)).text).toBe(
+        "graph 'notes' is outside service token 'nightly''s scope (it covers: archive, work)",
+      );
+    }
+  });
+
+  it("OAuth unchanged: mcpHandler with no scope lists every graph with its own mode and writes to any read-write graph", async () => {
+    const graphs = JSON.parse((await call("list_graphs", {})).text).map((g: { alias: string; mode: string }) => [g.alias, g.mode]);
+    expect(graphs).toEqual([
+      ["archive", "read"],
+      ["notes", "write"],
+      ["work", "write"],
+    ]);
+    const written = await call("update_block", { graph: "notes", "block-id": B1, body: { title: "x" } });
+    expect(written.isError, written.text).toBe(false);
+    expect(await call("update_block", { graph: "archive", "block-id": B1, body: { title: "x" } })).toEqual({
+      isError: true,
+      text: "graph 'archive' is read-only",
+    });
+    // The explicit OAuth scope is the default.
+    const explicit = await call("get_page", { graph: "notes", "page-id": PAGE }, { kind: "oauth" });
+    expect(explicit.isError, explicit.text).toBe(false);
+  });
+
+  it("fail closed: the isolate's access.resolve outside requestScope.run throws rather than resolving unscoped", async () => {
+    const { access } = isolateTools(scopeEnv());
+    await expect(access.resolve("work")).rejects.toThrow("no request scope");
+    await expect(requestScope.run({ kind: "oauth" }, () => access.resolve("work"))).resolves.toMatchObject({ graphId: WORK, mode: "write" });
+  });
+
+  it("cost: an in-scope call reads the same D1 rows as under OAuth; only the refusal adds the alias read", async () => {
+    const run = async (args: Record<string, unknown>, scope?: RequestScope) => {
+      const { db, measured } = meteredFirst();
+      await call("get_page", args, scope, scopeEnv({ DB: db }));
+      return measured.map((m) => [m.sql.replace(/\s+/g, " ").trim(), m.rowsRead, m.rowsWritten]);
+    };
+    const inScope = { graph: "work", "page-id": PAGE };
+    expect(await run(inScope, READ_CI)).toEqual(await run(inScope));
+    const outOfScope = { graph: "notes", "page-id": PAGE };
+    const oauth = await run(outOfScope);
+    const refused = await run(outOfScope, READ_CI);
+    // OAuth reads the graph row once (a read records no use).
+    expect(oauth.map(([sql]) => sql)).toEqual([expect.stringMatching(/^SELECT graph_id, mode, token_ct/)]);
+    expect(refused).toEqual([oauth[0], [expect.stringMatching(/^SELECT alias FROM graphs WHERE graph_id IN \(\?\) ORDER BY alias$/), 1, 0]]);
+  });
+});
+
+/** `metered`, also answering `first` from `all` so `GraphStore.resolve` is counted from the same meta. */
+function meteredFirst(): { db: D1Database; measured: Measured[] } {
+  const measured: Measured[] = [];
+  const statement = (stmt: D1PreparedStatement, sql: string): D1PreparedStatement =>
+    ({
+      bind: (...values: unknown[]) => statement(stmt.bind(...values), sql),
+      run: async () => record(sql, await stmt.run()),
+      all: async () => record(sql, await stmt.all()),
+      first: async (column?: string) => {
+        const row = (record(sql, await stmt.all()).results[0] ?? null) as Record<string, unknown> | null;
+        return column === undefined ? row : (row?.[column] ?? null);
+      },
+      raw: () => {
+        throw new Error("raw() has no meta");
+      },
+    }) as unknown as D1PreparedStatement;
+  const record = <T extends D1Result>(sql: string, result: T): T => {
+    measured.push({ sql, rowsRead: result.meta.rows_read, rowsWritten: result.meta.rows_written });
+    return result;
+  };
+  return { db: { prepare: (sql: string) => statement(env.DB.prepare(sql), sql) } as unknown as D1Database, measured };
+}

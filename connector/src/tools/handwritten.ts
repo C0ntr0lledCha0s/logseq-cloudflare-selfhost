@@ -2,13 +2,14 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { connectorHostname } from "../config";
 import { EXPIRY_WARN_DAYS, type GraphRecord, type GraphStore, daysUntilExpiry } from "../graphs";
-import { runTool, textResult } from "./common";
+import { currentScope, runTool, textResult } from "./common";
 import { annotationsFor } from "./spec.mjs";
 import { SEMANTIC_HELP } from "./semantic-search";
 
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
   "Address a graph by its alias from list_graphs; graphs marked read-only refuse every write.",
+  "Under a service token, list_graphs shows only the token's graphs, other aliases are refused as outside its scope, and a read-only token refuses every write.",
   "For a broad topic, an overview or 'what do I know about X', call kb_index first: one call lists the graph's pages grouped by class with their summaries and UUIDs, so you can pick the pages to read instead of searching keyword by keyword. Use search_graph for specific words.",
   "To see how a page is used, call get_page_backlinks: links in text, tagged objects and property values that point at it, with counts. For a periodic review, get_graph_health lists unused tags and properties, duplicate titles, pages without a summary or a tag, and property values that are not one of their property's own choices (mismatched-choice-values: another property's choice, also on a node property, or a choice the holder's tags don't allow).",
   "Start a new page with a first block that begins with **Summary:** and one or two sentences; kb_index shows it as the page's summary.",
@@ -65,10 +66,14 @@ export function registerHandwrittenTools(server: McpServer, env: Env, store: Gra
       runTool("list_graphs", undefined, async () => {
         const now = Date.now();
         const host = connectorHostname(env);
-        const graphs = (await store.list()).map((graph) => ({
+        // Under a service token: only its graphs, each at the lower of its own and the token's mode.
+        const scope = currentScope();
+        const listed = (await store.list()).filter((graph) => scope.kind === "oauth" || scope.graphIds.has(graph.graphId));
+        const readOnly = scope.kind === "service" && scope.access === "read";
+        const graphs = listed.map((graph) => ({
           alias: graph.alias,
           graphName: graph.graphName,
-          mode: graph.mode,
+          mode: readOnly ? "read" : graph.mode,
           expiresAt: graph.expiresAt,
           expiryWarning: expiryWarning(graph, now, host),
         }));
