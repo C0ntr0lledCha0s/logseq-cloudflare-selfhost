@@ -577,6 +577,22 @@ describe("routing", () => {
     expect(syncRequests[0].auth).toBe(`Bearer ${NOTES_TOKEN}`);
   });
 
+  it("forwards a page title with / and % whole, so the server's page selector gets it back intact", async () => {
+    syncHandler = (request) => {
+      const segment = new URL(request.url).pathname.split("/")[6];
+      return Response.json({ uuid: "33333333-3333-3333-3333-333333333333", title: decodeURIComponent(segment) });
+    };
+    for (const [title, encoded] of [
+      ["Projects/Alpha", "Projects%2FAlpha"],
+      ["100% Done", "100%25%20Done"],
+    ]) {
+      const result = await callTool("get_page", { graph: "notes", "page-id": title });
+      expect(result.isError).toBe(false);
+      expect(syncRequests.at(-1)?.url).toBe(`https://sync.internal/api/v1/graphs/${NOTES_ID}/pages/${encoded}`);
+      expect(JSON.parse(result.text).title).toBe(title);
+    }
+  });
+
   it("unknown alias fails without any sync call", async () => {
     const unknown = await callTool("get_page", { graph: "nope", "page-id": "p1" });
     expect(unknown.isError).toBe(true);
@@ -937,7 +953,13 @@ describe("hand-written tools", () => {
       "owner's time zone",
       "page-title",
       "capture_to_today always writes to today",
-      "insert_block_tree with that journal's UUID as target-id",
+      "insert_block_tree with that journal's date (YYYY-MM-DD) or UUID as target-id",
+      "journal date",
+      "every page-id, every target-id and create_task's page-id",
+      "candidates",
+      "never creates a page",
+      "Titles and dates are refused on E2EE graphs",
+      "dry-run any delete you name by title",
       "create_task with page-id",
       "delete_page on today's journal",
       "restricted to classes",
