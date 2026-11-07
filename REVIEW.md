@@ -36,7 +36,7 @@ A finding needs evidence you reproduced: a failing test, a command and its outpu
 - **Do the arithmetic.** For each query a change adds to a request path or cron, work out rows read and written per call times calls per day, against 5M D1 rows read and 100k written per day. The same applies to KV operations, Workers AI neurons and subrequests. Going over stops sign-ins and graph tokens until 00:00 UTC. (`docs/solutions/cost/d1-reads-from-indexer-scans.md`)
 - **No scans on hot paths.** No `count(*)` or unindexed scans per request or per cron tick. Use the stored counts in `semantic_state`.
 - **Pagination ends.** Loops handle the last page (a null next-cursor) and are tested on it.
-- **Responses stay small.** Writes return IDs and counts by default (`verbose=false`). Claude pays tokens for every byte returned.
+- **Responses stay small.** Writes return IDs and counts by default (`verbose=false`). Claude pays tokens for every byte returned. Anything stored to be read back (audit snapshots) has a size cap below the 150,000-character result limit, and a listing that includes stored blobs stops before the budget and resumes by cursor. (`docs/solutions/connector/per-item-summary-blows-result-cap.md`)
 
 ## Security
 

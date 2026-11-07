@@ -9,6 +9,7 @@ seen:
   - 2026-11-07 – item 17, patch 0028, review rounds 1 to 3 (r1-tests-1, r2-tests-1, r2-tests-2, r3-tests-1): the batch-insert dry run's "fail when the context read fails" rule, the label segment floor and separator guards, and the journal-date lookup in batch insert each survived mutation until a test made them decide the outcome
   - 2026-11-07 – item 26 defect 4, patch 0030, round 1 (r1-tests-1): four convert_values reference rules survived mutation until tests pinned the 409 body shape (references-only has no `retired`, retire-only has no `converted`) and the singular wording
   - 2026-11-07 – item 26 defects 1 and 2, patch 0031, round 1 (r1-tests-1): the isResetExistingValues rule (a single tag adds, only a list replaces) in the final-tags overlay left the namespace green when mutated; a test where that rule alone decides the outcome killed it
+  - 2026-11-07 – item 28, rounds 1 to 3 (r1-tests-1 to 3, r3-tests-1): the snapshot cap, the first-entry-returned-whole rule and the audit page filters needed tests where that rule alone decided the outcome; each new rule was then mutated in a scratch copy
 promoted_to: ["REVIEW.md"]
 ---
 

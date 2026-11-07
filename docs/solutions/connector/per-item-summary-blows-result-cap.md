@@ -4,7 +4,8 @@ area: connector
 tags: [result-cap, summary, batch, verbose, tokens]
 seen:
   - 2026-11-07 – item 17, patch 0028, review round 3 (r3-light-1)
-promoted_to: []
+  - 2026-11-07 – item 28, review rounds 1 and 2: a stored snapshot cap of 256 KB could not be read back whole under the 150,000-character result limit, and `get_activity_log` with `include_snapshot` fetched and re-serialised every snapshot on a page of which one result holds about one
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
@@ -22,3 +23,5 @@ The summary lists at most 20 blocks a section ("... and 80 more, listed in the J
 ## How to catch it next time
 
 Any tool that adds human-readable text to a bulk result needs a test at the batch limit (100 entries) with long titles, and the cap notice for a write must say the write happened.
+
+Second sighting (item 28): anything stored for later read-back needs a size cap below the result limit (the audit snapshot cap is 100 KB), and a listing that includes stored blobs stops before the budget and resumes by cursor. Pick the cap from the result limit, not from storage.
