@@ -1,0 +1,242 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 4666738..6752ed4 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -2776,9 +2776,9 @@
+ 
+ (defn- validate-classes
+   "Resolves the tag `selectors` of `field` (classes, classes.add, ...): {:ok [tag ...]}, or
+-  {:error message} naming each entry that isn't a tag."
+-  [db field selectors]
+-  (validate-selectors db field selectors resolve-tag-selector "tag"))
++  {:error message} naming each entry that isn't a tag or that `check` refuses."
++  [db field selectors check]
++  (validate-selectors db field selectors resolve-tag-selector "tag" check))
+ 
+ (defn- mode-change
+   "A {set | add | remove: [...]} field (updateProperty's classes, updateTag's properties) as
+@@ -2795,7 +2795,13 @@
+   [db title type mode selectors]
+   (if (not= :node type)
+     {:error (str "classes: " title " is not a node property")}
+-    (let [resolved (validate-classes db (cond-> "classes" mode (str "." (name mode))) selectors)]
++    ;; Root can't be a class restriction: the app's tag picker for a property hides it
++    ;; (:except-root-class? true) and treats a Root-only restriction as none, while these write
++    ;; checks would enforce it as 'tagged nodes only'. classes.remove still takes a stored Root off.
++    (let [root-check (fn [tag]
++                       (when (and (not= :remove mode) (= :logseq.class/Root (:db/ident tag)))
++                         (str (:block/title tag) " is not a valid class restriction (it would allow any node; leave classes empty instead)")))
++          resolved (validate-classes db (cond-> "classes" mode (str "." (name mode))) selectors root-check)]
+       (if (:error resolved) resolved {:ok {:mode (or mode :set) :tags (:ok resolved)}}))))
+ 
+ (defn- class-tx
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 2fd626d..2a09cbb 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -160,9 +160,9 @@
+    "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
+    "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+-   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title) is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
++   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title), and Root Tag (logseq.class/Root, which would allow any node; leave classes out instead), is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+    "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
+-   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles; set and add refuse Root Tag (logseq.class/Root), and remove takes it off a property that holds it. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
+    "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+@@ -414,14 +414,14 @@
+                                    :type {:$ref "#/components/schemas/PropertyType"}
+                                    :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}
+                                    :classes (assoc tag-selectors-schema
+-                                                   :description "For a node property only: the tags whose objects it takes, each by UUID, ident or title.")
++                                                   :description "For a node property only: the tags whose objects it takes, each by UUID, ident or title. Root Tag is refused (leave classes out for no limit).")
+                                    :choices (assoc new-choices-schema
+                                                    :description "For a default (text), number or url property only: its choices, in the order the editor lists them. Titles must differ ignoring case.")}}
+     "updateProperty" {:properties {:title {:type "string"} :name encrypted-name-schema
+                                    :type {:$ref "#/components/schemas/PropertyType"}
+                                    :cardinality {:enum ["db.cardinality/one" "db.cardinality/many"]}
+                                    :classes {:type "object"
+-                                             :description "For a node property only: give exactly one of set (replace the classes; [] removes the limit), add or remove."
++                                             :description "For a node property only: give exactly one of set (replace the classes; [] removes the limit), add or remove. set and add refuse Root Tag."
+                                              :properties {:set tag-selectors-schema
+                                                           :add tag-selectors-schema
+                                                           :remove tag-selectors-schema}}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_property_classes_root_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_property_classes_root_test.cljs
+new file mode 100644
+index 0000000..5f85f22
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_property_classes_root_test.cljs
+@@ -0,0 +1,159 @@
++(ns logseq.db-sync.semantic-property-classes-root-test
++  "A property's classes can't be Root (:logseq.class/Root). The app's tag picker for a property
++  never offers Root (`:except-root-class? true`), and its value picker treats a Root-only
++  restriction as no restriction, while the server's write checks would enforce it as 'tagged nodes
++  only'. So createProperty classes and updateProperty classes.set and classes.add refuse Root up
++  front, by any form that names it (title, title in another case, UUID, ident), naming the entry,
++  and write nothing (not even the other classes in the same list). classes.remove still takes Root
++  off a property that holds it, and the other built-in classes (Page, Task) are still accepted."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- property-path [ident] (str "/semantic/properties/" (js/encodeURIComponent ident)))
++
++(defn- class-idents [conn ident]
++  (set (map :db/ident (:logseq.property/classes (d/entity @conn (keyword ident))))))
++
++(defn- titled [conn title]
++  (seq (d/datoms @conn :avet :block/title title)))
++
++(defn- graph!
++  "A fresh graph with the tag Client, and Root's selector forms."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          client (request! self "POST" "/semantic/tags" {:title "Client"})
++          root (d/entity @conn :logseq.class/Root)]
++    (is (= "Root Tag" (:block/title root)) "Root's title")
++    {:conn conn :self self
++     :client (get-in client [:body :uuid])
++     :client-ident (keyword (get-in client [:body :ident]))
++     :forms {"title" (:block/title root)
++             "title in lower case" (string/lower-case (:block/title root))
++             "uuid" (str (:block/uuid root))
++             "ident" "logseq.class/Root"}}))
++
++(defn- run [done f]
++  (-> (p/let [g (graph!)] (f g))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- property! [self title]
++  (p/let [r (request! self "POST" "/semantic/properties" {:title title :type "node"})]
++    (is (= 201 (:status r)) (str "created " title))
++    (get-in r [:body :ident])))
++
++(def ^:private refusal "Root Tag is not a valid class restriction")
++
++(deftest create-property-refuses-root-test
++  (async done
++    (run done
++      (fn [{:keys [self conn client forms]}]
++        (p/doseq [[form v] forms]
++          (p/let [alone (str "alone " form)
++                  listed (str "listed " form)
++                  r1 (request! self "POST" "/semantic/properties" {:title alone :type "node" :classes [v]})
++                  r2 (request! self "POST" "/semantic/properties" {:title listed :type "node" :classes [client v]})]
++            (testing (str "createProperty classes [Root by " form "]")
++              (is (= 400 (:status r1)) (pr-str (:body r1)))
++              (is (string/includes? (str (get-in r1 [:body :error])) (str "classes 0: " refusal))
++                  (pr-str (:body r1)))
++              (is (not (titled conn alone)) "no property was created"))
++            (testing (str "createProperty classes [Client, Root by " form "]")
++              (is (= 400 (:status r2)) (pr-str (:body r2)))
++              (is (string/includes? (str (get-in r2 [:body :error])) (str "classes 1: " refusal))
++                  (pr-str (:body r2)))
++              (is (not (titled conn listed)) "no property was created"))))))))
++
++(deftest update-property-refuses-root-test
++  (async done
++    (run done
++      (fn [{:keys [self conn client forms]}]
++        ;; p/doseq takes one binding, so the cases are built with for.
++        (p/doseq [[form v mode] (for [[form v] forms mode [:set :add]] [form v mode])]
++          (p/let [ident (property! self (str "upd " form " " (name mode)))
++                  r (request! self "PATCH" (property-path ident) {:classes {mode [client v]}})]
++            (testing (str "updateProperty classes." (name mode) " [Client, Root by " form "]")
++              (is (= 400 (:status r)) (pr-str (:body r)))
++              (is (string/includes? (str (get-in r [:body :error]))
++                                    (str "classes." (name mode) " 1: " refusal))
++                  (pr-str (:body r)))
++              (is (= #{} (class-idents conn ident)) "nothing stored, not even Client"))))))))
++
++(deftest update-property-root-refused-with-type-change-and-dry-run-test
++  (async done
++    (run done
++      (fn [{:keys [self conn client client-ident]}]
++        (p/let [;; A default property made a node property in the same call: classes are judged
++                ;; on the type the call applies, and Root is still refused.
++                default-r (request! self "POST" "/semantic/properties" {:title "notes" :type "default"})
++                default-ident (get-in default-r [:body :ident])
++                typed (request! self "PATCH" (property-path default-ident)
++                                {:type "node" :classes {:set ["logseq.class/Root"]}})
++                ;; A property that already holds Client: set and add with Root leave it as it was.
++                held (property! self "held")
++                _ (request! self "PATCH" (property-path held) {:classes {:set [client]}})
++                set-r (request! self "PATCH" (property-path held) {:classes {:set ["logseq.class/Root"]}})
++                dry (request! self "PATCH" (str (property-path held) "?dry-run=true")
++                              {:classes {:add ["Root Tag"]}})]
++          (testing "type change to node with classes.set [Root]"
++            (is (= 400 (:status typed)) (pr-str (:body typed)))
++            (is (string/includes? (str (get-in typed [:body :error])) (str "classes.set 0: " refusal)))
++            (is (= :default (:logseq.property/type (d/entity @conn (keyword default-ident))))
++                "the type change wasn't written either"))
++          (testing "classes.set [Root] on a property limited to Client"
++            (is (= 400 (:status set-r)) (pr-str (:body set-r)))
++            (is (= #{client-ident} (class-idents conn held)) "Client kept, Root not stored"))
++          (testing "dry-run classes.add [Root]"
++            (is (= 400 (:status dry)) (pr-str (:body dry)))
++            (is (string/includes? (str (get-in dry [:body :error])) (str "classes.add 0: " refusal)))))))))
++
++(deftest root-other-forms-and-neighbours-test
++  (async done
++    (run done
++      (fn [{:keys [self conn]}]
++        (p/let [root (d/entity @conn :logseq.class/Root)
++                ;; Root's db id is not a selector: as a string it names no tag, as a number the
++                ;; list is refused. Either way Root isn't stored.
++                id-str (property! self "db id string")
++                r-id-str (request! self "PATCH" (property-path id-str) {:classes {:add [(str (:db/id root))]}})
++                id-num (property! self "db id number")
++                r-id-num (request! self "PATCH" (property-path id-num) {:classes {:add [(:db/id root)]}})
++                ;; Other built-in classes the app's picker offers stay accepted.
++                page-task (request! self "POST" "/semantic/properties"
++                                    {:title "page or task" :type "node" :classes ["logseq.class/Page" "Task"]})
++                ;; A property that already holds Root (written before this rule) can be cleaned up.
++                legacy (property! self "legacy")
++                _ (d/transact! conn [[:db/add (:db/id (d/entity @conn (keyword legacy)))
++                                      :logseq.property/classes (:db/id root)]])
++                removed (request! self "PATCH" (property-path legacy) {:classes {:remove ["logseq.class/Root"]}})]
++          (testing "Root by db id"
++            (is (= 400 (:status r-id-str)) (pr-str (:body r-id-str)))
++            (is (= #{} (class-idents conn id-str)))
++            (is (= 400 (:status r-id-num)) (pr-str (:body r-id-num)))
++            (is (= #{} (class-idents conn id-num))))
++          (testing "Page and Task are still valid classes"
++            (is (= 201 (:status page-task)) (pr-str (:body page-task)))
++            (is (= #{:logseq.class/Page :logseq.class/Task}
++                   (class-idents conn (get-in page-task [:body :ident])))))
++          (testing "classes.remove takes Root off a property that holds it"
++            (is (= 200 (:status removed)) (pr-str (:body removed)))
++            (is (= #{} (class-idents conn legacy)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 5e3ab34..f2e1e92 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -20,6 +20,7 @@
+             [logseq.db-sync.semantic-node-value-read-test]
+             [logseq.db-sync.semantic-today-tz-test]
+             [logseq.db-sync.semantic-property-schema-test]
++            [logseq.db-sync.semantic-property-classes-root-test]
+             [logseq.db-sync.semantic-promote-page-to-tag-test]
+             [logseq.db-sync.semantic-private-tags-test]
+             [logseq.db-sync.semantic-readable-writes-test]
