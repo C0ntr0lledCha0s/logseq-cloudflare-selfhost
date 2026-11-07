@@ -1,5 +1,8 @@
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { auditRetentionDays } from "../config";
-import type { AffectedTarget } from "../tools/readable";
+import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/common";
+import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
+import type { GraphAccess } from "../tools/semantic";
 
 /**
  * The owner-only write log (design 2026-11-07-connector-write-audit-log §3.2, §3.6). A write call
@@ -132,8 +135,18 @@ const NO_SUCH_TABLE = /no such table: audit_log(?![A-Za-z0-9_])/;
  */
 export class AuditLog {
   private readonly insertCost = new Map<number, { written: number; read: number }>();
+  /** Set once a probe found the table; a missing table is probed again on the next write. */
+  private present = false;
 
   constructor(private readonly db: D1Database) {}
+
+  /** `probe`, run once per instance (one per isolate) while it answers "ok". */
+  async ready(): Promise<"ok" | "missing"> {
+    if (this.present) return "ok";
+    const found = await this.probe();
+    if (found === "ok") this.present = true;
+    return found;
+  }
 
   /** "missing" when migration 0004 has not been applied; any other error is rethrown. Reads 0 rows. */
   async probe(): Promise<"ok" | "missing"> {
@@ -230,4 +243,181 @@ export class AuditLog {
 export async function purgeAuditLog(env: Env, now: number): Promise<PurgeResult> {
   const cutoff = now - auditRetentionDays(env) * DAY_MS;
   return new AuditLog(env.DB).purge(cutoff);
+}
+
+/** What `audited()` needs for one request: the isolate's log and graphs, and who is calling. */
+export interface AuditContext {
+  log: AuditLog;
+  access: GraphAccess;
+  /** The User-Agent family (`userAgentFamily`), or null when no request named one. */
+  client: string | null;
+  /** The request's `mcp-session-id` header, or null. */
+  session: string | null;
+}
+
+/** A write that ran: its result (summary first, ending with the entry line), and item 17's outcome. */
+export interface AuditedWrite {
+  result: CallToolResult;
+  reason: string | undefined;
+  targets: AffectedTarget[];
+}
+
+export const AUDIT_MIGRATION_MISSING = "audit log unavailable: migration 0004 has not been applied; nothing was written";
+
+/** ToolError statuses that are refusals rather than failures: the call was turned down as given. */
+const REFUSALS = new Set(["refused", "unknown-graph", "read-only"]);
+
+/** The argument names whose string values name what a call addresses (UUIDs, titles, dates or idents). */
+const ADDRESS_KEYS = ["block-id", "block-ids", "page-id", "target-id", "tag-id", "property-id", "page"];
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The UUIDs or selectors a call names, read only from the known argument names at the top level, in
+ * `body` and in each of `body.entries` and `body.moves`. Never anything else: block text, property
+ * values and other arguments stay out of the log.
+ */
+export function addressedBy(args: Record<string, unknown>): string[] {
+  const out = new Set<string>();
+  const take = (holder: Record<string, unknown> | undefined) => {
+    if (!holder) return;
+    for (const key of ADDRESS_KEYS) {
+      const value = holder[key];
+      if (typeof value === "string") out.add(value);
+      else if (Array.isArray(value)) for (const item of value) if (typeof item === "string") out.add(item);
+    }
+  };
+  take(args);
+  const body = record(args.body);
+  take(body);
+  for (const list of [body?.entries, body?.moves]) {
+    if (Array.isArray(list)) for (const item of list) take(record(item));
+  }
+  return [...out];
+}
+
+/** A dry run takes `dry-run: true` as a query argument or in its body. */
+function isDryRun(args: Record<string, unknown>): boolean {
+  return args["dry-run"] === true || record(args.body)?.["dry-run"] === true;
+}
+
+/** Each page a write's targets name, by title and UUID, including where a move came from and went to. */
+function pagesOf(targets: AffectedTarget[]): string[] {
+  const out = new Set<string>();
+  const add = (value: string | undefined) => {
+    if (value !== undefined && value !== "") out.add(value);
+  };
+  for (const t of targets) {
+    add(t.pageTitle);
+    add(t.pageUuid);
+    for (const loc of [t.from, t.to]) {
+      add(loc?.pageTitle);
+      add(loc?.pageUuid);
+    }
+  }
+  return [...out];
+}
+
+/** The line a result gains when its entry could not be finished. */
+function unfinished(id: number, error: unknown): string {
+  return `Audit log entry ${id} could not be completed: ${messageOf(error)}`;
+}
+
+/**
+ * Runs one write call with its audit entry (design §3.3): the probe (once per isolate), the reason
+ * and graph checks, a `pending` row, the write, then the outcome on that row. A refusal before the
+ * write is logged too. A pending row that can't be stored refuses the write before anything reaches
+ * the sync server; an outcome that can't be stored leaves the write standing and leads the result
+ * with a line saying so. `run` gets the arguments without `reason`. Throws what the call threw.
+ */
+export function audited(
+  ctx: AuditContext,
+  tool: string,
+  alias: string,
+  args: Record<string, unknown>,
+  run: (rest: Record<string, unknown>) => Promise<CallToolResult>,
+): Promise<AuditedWrite> {
+  return withCallGraphs(async () => {
+    let probed: "ok" | "missing";
+    try {
+      probed = await ctx.log.ready();
+    } catch (error) {
+      throw new ToolError(`audit log unavailable: ${messageOf(error)}; nothing was written`, "audit-unavailable");
+    }
+    if (probed === "missing") throw new ToolError(AUDIT_MIGRATION_MISSING, "audit-unavailable");
+
+    // The checks that ran before the handler today, in the same order, so a refusal reads as before.
+    let graphId: string | null = null;
+    let reason: string | undefined;
+    let rest: Record<string, unknown> = args;
+    let refusal: unknown;
+    try {
+      graphId = (await lookupGraph(ctx.access, alias))?.graphId ?? null;
+      ({ reason, rest } = takeReason(args));
+      await resolveGraph(ctx.access, alias, true);
+    } catch (error) {
+      refusal = error;
+    }
+
+    let id: number;
+    try {
+      id = await ctx.log.begin({
+        at: Date.now(),
+        graphId,
+        alias,
+        tool,
+        dryRun: isDryRun(args),
+        reason: reason ?? null,
+        client: ctx.client,
+        session: ctx.session,
+        addressed: addressedBy(args),
+        before: null,
+      });
+    } catch (error) {
+      throw new ToolError(`audit log unavailable: ${messageOf(error)}; nothing was written`, "audit-unavailable");
+    }
+
+    const fail = async (error: unknown): Promise<unknown> => {
+      const status = error instanceof ToolError && REFUSALS.has(error.status) ? "refused" : "error";
+      try {
+        await ctx.log.finish(id, { status, error: messageOf(error), targets: null, pages: [] });
+      } catch (finishError) {
+        if (error instanceof ToolError) return new ToolError(`${unfinished(id, finishError)}\n${error.message}`, error.status);
+      }
+      return error;
+    };
+    if (refusal !== undefined) throw await fail(refusal);
+
+    let result: CallToolResult;
+    try {
+      result = await run(rest);
+    } catch (error) {
+      throw await fail(error);
+    }
+
+    const { targets, summary } = describeWrite(tool, result, reason);
+    const lines: string[] = [];
+    try {
+      await ctx.log.finish(id, { status: "ok", error: null, targets, pages: pagesOf(targets) });
+    } catch (error) {
+      lines.push(unfinished(id, error));
+    }
+    if (summary !== "") lines.push(summary);
+    lines.push(`Logged as audit entry ${id}`);
+    return { result: { ...result, content: [{ type: "text", text: lines.join("\n") }, ...result.content] }, reason, targets };
+  });
+}
+
+/** The short client family `client` stores: never the User-Agent itself (design §3.8). */
+export function userAgentFamily(userAgent: string | null): "claude-ai" | "claude-code" | "other" {
+  if (userAgent === null) return "other";
+  if (/claude[-_ ]?(code|cli)/i.test(userAgent)) return "claude-code";
+  if (/claude|anthropic/i.test(userAgent)) return "claude-ai";
+  return "other";
 }

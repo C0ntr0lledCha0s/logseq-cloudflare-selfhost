@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { type StatelessMcpHandler, createMcpHandler } from "agents/mcp/server";
 import openapi from "../vendor/openapi.json";
+import { type AuditContext, AuditLog, userAgentFamily } from "./audit/log";
 import { isOwner } from "./auth/github";
 import type { GrantProps } from "./auth/routes";
 import { GraphStore } from "./graphs";
@@ -22,6 +23,8 @@ interface IsolateTools {
   store: GraphStore;
   access: GraphAccess;
   graphTools: GraphTool[];
+  /** The audit log; it probes for its table once per isolate. */
+  audit: AuditLog;
   /** Null while semantic search is off (no AI and VECTORIZE bindings). */
   semantic: { store: SemanticStore; bindings: SemanticBindings } | null;
 }
@@ -39,7 +42,7 @@ function isolateTools(env: Env): IsolateTools {
     const access: GraphAccess = { env, resolve: (alias) => store.resolve(alias) };
     const bindings = semanticBindings(env);
     const semantic = bindings ? { store: new SemanticStore(env.DB), bindings } : null;
-    tools = { store, access, graphTools: buildGraphTools(spec, access), semantic };
+    tools = { store, access, graphTools: buildGraphTools(spec, access), audit: new AuditLog(env.DB), semantic };
     isolates.set(env, tools);
   }
   return tools;
@@ -65,10 +68,25 @@ async function markDirty(env: Env, tool: string, alias: string): Promise<void> {
   }
 }
 
-/** The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are now. */
-export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler {
-  const { store, access, graphTools, semantic } = isolateTools(env);
-  // A write's outcome (its reason and targets) is for item 28's audit log; today's uses ignore it.
+/** Who sent a request, as the audit log stores it (design §3.8). Neither is a token. */
+export interface Caller {
+  client: string | null;
+  session: string | null;
+}
+
+/** The caller of an MCP request: its User-Agent family and its `mcp-session-id` header. */
+export function callerOf(request: Request): Caller {
+  return { client: userAgentFamily(request.headers.get("User-Agent")), session: request.headers.get("mcp-session-id") };
+}
+
+/**
+ * The MCP endpoint for one request: a fresh server whose tools read the graphs from D1 as they are
+ * now. Every write is logged to audit_log with `caller`'s client and session (null when not given).
+ */
+export function mcpHandler(env: Env, ctx: ExecutionContext, caller: Caller = { client: null, session: null }): StatelessMcpHandler {
+  const { store, access, graphTools, audit: log, semantic } = isolateTools(env);
+  const audit: AuditContext = { log, access, ...caller };
+  // audited() logs each write's reason and targets; onSuccess only records the use.
   const onSuccess: OnSuccess = (tool, alias) => {
     ctx.waitUntil(touch(store, tool, alias));
     if (KB_INDEX_WRITE_TOOLS.has(tool)) ctx.waitUntil(markDirty(env, tool, alias));
@@ -77,8 +95,8 @@ export function mcpHandler(env: Env, ctx: ExecutionContext): StatelessMcpHandler
     () => {
       const server = new McpServer({ name: "logseq-connector", version: "0.0.0" });
       registerHandwrittenTools(server, env, store, semantic !== null);
-      registerGraphTools(server, graphTools, onSuccess);
-      registerAssetTools(server, access, onSuccess);
+      registerGraphTools(server, graphTools, onSuccess, audit);
+      registerAssetTools(server, access, onSuccess, audit);
       registerKbIndexTool(server, access, onSuccess);
       if (semantic) registerSemanticTools(server, { access, ...semantic }, onSuccess);
       return server;
@@ -97,6 +115,6 @@ export const mcpApiHandler = {
     // The provider sets props to the decrypted GrantProps stored with the grant (src/auth/routes.ts).
     const props = ctx.props as GrantProps;
     if (!isOwner(props.githubUserId, env)) return new Response("Forbidden", { status: 403 });
-    return mcpHandler(env, ctx)(request, env, ctx);
+    return mcpHandler(env, ctx, callerOf(request))(request, env, ctx);
   },
 };

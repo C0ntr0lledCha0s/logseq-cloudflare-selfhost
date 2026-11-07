@@ -1,4 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "@modelcontextprotocol/server";
+import type { ResolvedGraph } from "../graphs";
+import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN } from "./spec.mjs";
 
 const ALIAS = new RegExp(ALIAS_PATTERN);
@@ -89,4 +92,35 @@ export async function runTool(
 
 export function textResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
+}
+
+/** The graphs one tool call has looked up, by alias, so the audit wrapper and the handler share one D1 read. */
+const callGraphs = new AsyncLocalStorage<Map<string, ResolvedGraph | null>>();
+
+/** Runs `fn` as one tool call: within it, each alias is read from D1 at most once. */
+export function withCallGraphs<T>(fn: () => Promise<T>): Promise<T> {
+  return callGraphs.run(new Map(), fn);
+}
+
+/** The graph behind `alias`, or null for an unknown alias; read once per tool call (`withCallGraphs`). */
+export async function lookupGraph(access: GraphAccess, alias: string): Promise<ResolvedGraph | null> {
+  const seen = callGraphs.getStore();
+  if (seen?.has(alias)) return seen.get(alias) ?? null;
+  const graph = await access.resolve(alias);
+  seen?.set(alias, graph);
+  return graph;
+}
+
+/**
+ * The graph behind `alias` for one tool call. Throws `ToolError` for an unknown alias, and for a
+ * write on a read-only graph, before anything reaches the sync server.
+ */
+export async function resolveGraph(access: GraphAccess, alias: string, write: boolean): Promise<ResolvedGraph> {
+  const graph = await lookupGraph(access, alias);
+  if (!graph) {
+    throw new ToolError(`unknown graph '${alias}' — call list_graphs for the connected aliases`, "unknown-graph");
+  }
+  if (graph.mode !== "read" && graph.mode !== "write") throw new Error(`graph '${alias}' has an invalid mode`);
+  if (graph.mode === "read" && write) throw new ToolError(`graph '${alias}' is read-only`, "read-only");
+  return graph;
 }

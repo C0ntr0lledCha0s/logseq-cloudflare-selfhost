@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import committedManifest from "../tools-manifest.json";
 import openapi from "../vendor/openapi.json";
 import { GraphStore } from "../src/graphs";
-import { mcpHandler } from "../src/mcp";
+import { AuditLog, userAgentFamily } from "../src/audit/log";
+import { mcpApiHandler, mcpHandler } from "../src/mcp";
 import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
@@ -91,13 +92,20 @@ function logged(): string[] {
 type Handler = (request: Request, env: unknown, ctx: ExecutionContext) => Promise<Response>;
 
 /** One JSON-RPC call to an MCP handler; returns the `result` member. */
-async function rpc(handler: Handler, method: string, params: unknown, e: Env = testEnv()): Promise<any> {
+async function rpc(
+  handler: Handler,
+  method: string,
+  params: unknown,
+  e: Env = testEnv(),
+  extraHeaders: Record<string, string> = {},
+): Promise<any> {
   const request = new Request(`${ORIGIN}/mcp`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       "MCP-Protocol-Version": "2025-06-18",
+      ...extraHeaders,
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
@@ -119,6 +127,12 @@ async function rpc(handler: Handler, method: string, params: unknown, e: Env = t
 
 function connector(e: Env = testEnv()): Handler {
   return (request, _env, ctx) => mcpHandler(e, ctx)(request, e, ctx);
+}
+
+/** The server's JSON in a write's joined text: what follows the summary's audit entry line. */
+function writeJson(text: string): unknown {
+  expect(text).toMatch(/(^|\n)Logged as audit entry \d+\n/);
+  return JSON.parse(text.replace(/^[\s\S]*?Logged as audit entry \d+\n/, ""));
 }
 
 async function listTools(): Promise<any[]> {
@@ -359,8 +373,9 @@ function observedConnector(onSuccess: (...args: unknown[]) => void): Handler {
     return createMcpHandler(
       () => {
         const server = new McpServer({ name: "test", version: "0.0.0" });
-        registerGraphTools(server, tools, onSuccess);
-        registerAssetTools(server, access, onSuccess);
+        const audit = { log: new AuditLog(e.DB), access, client: null, session: null };
+        registerGraphTools(server, tools, onSuccess, audit);
+        registerAssetTools(server, access, onSuccess, audit);
         return server;
       },
       { route: "/mcp" },
@@ -434,7 +449,7 @@ describe("reason", () => {
     for (const reason of ["x".repeat(200), "🙂".repeat(200)]) {
       const ok = await callContent("delete_block", { graph: "work", "block-id": "b1", reason });
       expect(ok.isError).toBe(false);
-      expect(ok.content[0].text).toBe(`Reason: ${reason}`);
+      expect(ok.content[0].text).toMatch(new RegExp(`^Reason: ${reason}\nLogged as audit entry \\d+$`, "u"));
     }
     expect(syncRequests).toHaveLength(2);
   });
@@ -442,16 +457,23 @@ describe("reason", () => {
   it("reason is repeated as the first content item, ahead of the unchanged result", async () => {
     syncHandler = () => Response.json({ uuid: "b1", title: "New title" });
     const args = { graph: "work", "block-id": "b1", body: { title: "New title" } };
+    // Every write's summary ends with its audit entry line; the server's result follows unchanged.
+    const entry = (text: string) => Number(/Logged as audit entry (\d+)$/.exec(text)?.[1]);
     const without = await callContent("update_block", args);
-    expect(without.content).toHaveLength(1);
+    expect(without.content).toHaveLength(2);
+    const id = entry(without.content[0].text);
+    expect(without.content[0].text).toBe(`Logged as audit entry ${id}`);
     const withReason = await callContent("update_block", { ...args, reason: `  ${REASON} ` });
     expect(withReason).toEqual({
       isError: false,
-      content: [{ type: "text", text: `Reason: ${REASON}` }, ...without.content],
+      content: [{ type: "text", text: `Reason: ${REASON}\nLogged as audit entry ${id + 1}` }, without.content[1]],
     });
-    // No reason, an empty one or one of only spaces leaves the result as it was.
-    for (const reason of ["", "   "]) {
-      expect(await callContent("update_block", { ...args, reason }), JSON.stringify(reason)).toEqual(without);
+    // No reason, an empty one or one of only spaces leaves the summary without a reason line.
+    for (const [i, reason] of ["", "   "].entries()) {
+      expect(await callContent("update_block", { ...args, reason }), JSON.stringify(reason)).toEqual({
+        isError: false,
+        content: [{ type: "text", text: `Logged as audit entry ${id + 2 + i}` }, without.content[1]],
+      });
     }
     // A write the server refuses carries only the refusal.
     syncHandler = () => Response.json({ error: "block not found" }, { status: 409 });
@@ -527,7 +549,7 @@ describe("reason", () => {
     );
     expect(result.isError).toBe(false);
     expect(result.content[0].text).toMatch(/^Deleted 3 blocks:\n- Nov 5th, 2026 > Meeting > Agenda > "Call Sam/);
-    expect(result.content[0].text.endsWith(`\nReason: ${REASON}`)).toBe(true);
+    expect(result.content[0].text).toMatch(new RegExp(`\nReason: ${REASON}\nLogged as audit entry \\d+$`));
     // The server's JSON follows, unchanged.
     expect(JSON.parse(result.content[1].text)).toEqual(deleted);
     expect(result.content).toHaveLength(2);
@@ -612,7 +634,7 @@ describe("routing", () => {
     const result = await callTool("create_page", { graph: "work", body: { title: "Standup [[Ann]]" } });
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.text)).toEqual({ id: "p1", title: "Standup [[Ann]]" });
+    expect(writeJson(result.text)).toEqual({ id: "p1", title: "Standup [[Ann]]" });
     expect(syncRequests).toHaveLength(1);
     expect(syncRequests[0]).toEqual({
       method: "POST",
@@ -1002,7 +1024,7 @@ describe("hand-written tools", () => {
       body: { extends: ["Food"] },
     });
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.text)).toMatchObject({ promoted: { blocks: 3, references: 2 }, "dry-run": true });
+    expect(writeJson(result.text)).toMatchObject({ promoted: { blocks: 3, references: 2 }, "dry-run": true });
     const url = new URL(syncRequests[0].url);
     expect(url.pathname).toBe(`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`);
     expect(url.searchParams.get("dry-run")).toBe("true");
@@ -1184,5 +1206,607 @@ describe("large write results", () => {
     expect(content[0].text).toContain("- … and 80 more, listed in the JSON result");
     expect(content[1].text).toMatch(/\[truncated: the write was applied; its result had \d+ characters and the limit is 150000, so the JSON is cut\. Read the pages it names to see the outcome\.\]$/);
     expect(content[1].text).not.toContain("request less");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Audit log (design 2026-11-07-connector-write-audit-log §3.3, §3.8; plan stage 2)
+// ---------------------------------------------------------------------------------------------
+
+const B1 = "aaaaaaaa-0000-4000-8000-000000000001";
+const B2 = "aaaaaaaa-0000-4000-8000-000000000002";
+const P1 = "pppppppp-0000-4000-8000-000000000001";
+const NOTES_PAGE = "66666666-6666-4666-8666-666666666666";
+
+/**
+ * One valid call per generated non-read tool. The keys must be exactly the manifest's generated
+ * non-read tools, so a new write tool fails "one row per write call" until it is listed here.
+ */
+const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
+  create_page: { body: { title: "Standup" } },
+  delete_page: { "page-id": PAGE_UUID },
+  update_page: { "page-id": PAGE_UUID, body: { title: "Notes" } },
+  promote_page_to_tag: { "page-id": PAGE_UUID },
+  delete_blocks: { body: { "block-ids": [B1, B2] } },
+  refresh_refs: { body: { "page-id": PAGE_UUID } },
+  update_block: { "block-id": B1, body: { title: "New title" } },
+  delete_block: { "block-id": B1 },
+  move_blocks: { body: { "block-ids": [B1], "target-id": B2, position: "after" } },
+  batch_move_blocks: { body: { moves: [{ "block-ids": [B1], "target-id": B2, position: "after" }] } },
+  insert_block_children: { "block-id": B1, body: { position: "append", blocks: [{ title: "Child" }] } },
+  insert_block_tree: { body: { "target-id": B1, blocks: [{ title: "Child" }] } },
+  batch_insert_block_trees: { body: { entries: [{ page: "Meeting", blocks: [{ title: "Agenda" }] }] } },
+  set_block_property: { "block-id": B1, "property-id": P1, body: { value: 1 } },
+  delete_block_property: { "block-id": B1, "property-id": P1 },
+  batch_set_block_property: { body: { entries: [{ "block-id": B1, "property-id": P1, value: 1 }] } },
+  batch_delete_block_property: { body: { entries: [{ "block-id": B2, "property-id": P1 }] } },
+  capture_to_today: { body: { blocks: [{ title: "Note" }] } },
+  create_task: { body: { title: "Call Sam" } },
+  create_tag: { body: { title: "Meeting" } },
+  update_tag: { "tag-id": "Meeting", body: {} },
+  delete_tag: { "tag-id": "Meeting" },
+  create_property: { body: { title: "Venue" } },
+  update_property: { "property-id": "Venue", body: {} },
+  delete_property: { "property-id": "Venue" },
+};
+
+/** The selectors each call above names, as `addressed` stores them. */
+const AUDIT_ADDRESSED: Record<string, string[]> = {
+  create_page: [],
+  delete_page: [PAGE_UUID],
+  update_page: [PAGE_UUID],
+  promote_page_to_tag: [PAGE_UUID],
+  delete_blocks: [B1, B2],
+  refresh_refs: [PAGE_UUID],
+  update_block: [B1],
+  delete_block: [B1],
+  move_blocks: [B1, B2],
+  batch_move_blocks: [B1, B2],
+  insert_block_children: [B1],
+  insert_block_tree: [B1],
+  batch_insert_block_trees: ["Meeting"],
+  set_block_property: [B1, P1],
+  delete_block_property: [B1, P1],
+  batch_set_block_property: [B1, P1],
+  batch_delete_block_property: [B2, P1],
+  capture_to_today: [],
+  create_task: [],
+  create_tag: [],
+  update_tag: ["Meeting"],
+  delete_tag: ["Meeting"],
+  create_property: [],
+  update_property: ["Venue"],
+  delete_property: ["Venue"],
+};
+
+/** Where each tool with a dry run takes its flag. */
+const DRY_RUN_IN: Record<string, "query" | "body"> = {
+  delete_page: "query",
+  promote_page_to_tag: "query",
+  move_blocks: "query",
+  delete_tag: "query",
+  update_property: "query",
+  delete_property: "query",
+  delete_blocks: "body",
+  batch_move_blocks: "body",
+  batch_insert_block_trees: "body",
+};
+
+/** A response naming one target and one affected block, as patch 0028's BlockContext does. */
+const CONTEXT_RESPONSE = {
+  target: { uuid: B2, kind: "block", page: { uuid: NOTES_PAGE, title: "Notes" }, breadcrumb: ["Meeting"], snippet: "Agenda" },
+  affected: [
+    {
+      uuid: B1,
+      kind: "block",
+      page: { uuid: PAGE_UUID, title: "Nov 5th, 2026" },
+      breadcrumb: [],
+      snippet: "Call Sam",
+      from: { page: { uuid: PAGE_UUID, title: "Nov 5th, 2026" }, breadcrumb: [] },
+      to: { page: { uuid: NOTES_PAGE, title: "Notes" }, breadcrumb: ["Meeting"] },
+    },
+  ],
+};
+
+interface AuditDbRow {
+  id: number;
+  graph_id: string | null;
+  alias: string;
+  tool: string;
+  kind: string;
+  status: string;
+  dry_run: number;
+  reason: string | null;
+  client: string | null;
+  session: string | null;
+  addressed: string | null;
+  pages: string | null;
+  targets: string | null;
+  before: string | null;
+  error: string | null;
+  rows_written: number | null;
+  rows_read: number | null;
+}
+
+async function auditRows(afterId = 0): Promise<AuditDbRow[]> {
+  return (await env.DB.prepare("SELECT * FROM audit_log WHERE id > ? ORDER BY id").bind(afterId).all<AuditDbRow>()).results;
+}
+
+async function lastAuditId(): Promise<number> {
+  const row = await env.DB.prepare("SELECT id FROM audit_log ORDER BY id DESC LIMIT 1").first<{ id: number }>();
+  return row?.id ?? 0;
+}
+
+/** Calls once and answers the single audit row the call left (fails unless exactly one). */
+async function callAudited(name: string, args: Record<string, unknown>, handler: Handler = connector()) {
+  const before = await lastAuditId();
+  const result = await callContent(name, args, handler);
+  const rows = await auditRows(before);
+  expect(rows, `${name}: rows for one call`).toHaveLength(1);
+  return { result, row: rows[0] };
+}
+
+/** env.DB, with statements whose SQL matches `fails` rejecting with `message`. */
+function dbFailing(fails: RegExp, message: string): D1Database {
+  return new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) => {
+          if (!fails.test(sql)) return target.prepare(sql);
+          const failing = {
+            bind: () => failing,
+            run: () => Promise.reject(new Error(message)),
+            all: () => Promise.reject(new Error(message)),
+            first: () => Promise.reject(new Error(message)),
+          };
+          return failing;
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** Restores migration 0004 after a test dropped audit_log. */
+async function restoreAuditLog(): Promise<void> {
+  await env.DB.exec("DROP TABLE IF EXISTS audit_log");
+  const migrations = (env as unknown as { TEST_MIGRATIONS: { name: string; queries: string[] }[] }).TEST_MIGRATIONS;
+  for (const query of migrations.find((m) => m.name.startsWith("0004_"))!.queries) await env.DB.prepare(query).run();
+}
+
+const GENERATED_WRITES = committedManifest.filter((e) => e.method !== null && !e.annotations.readOnlyHint).map((e) => e.name);
+const ALL_WRITES = committedManifest.filter((e) => !e.annotations.readOnlyHint).map((e) => e.name);
+
+describe("audit log", () => {
+  it("one row per write call: success, sync 409, refused reason, unknown alias, read-only graph and dry run", async () => {
+    expect(Object.keys(AUDIT_CALLS).sort()).toEqual([...GENERATED_WRITES].sort());
+    for (const name of GENERATED_WRITES) {
+      const args: Record<string, unknown> = { graph: "work", ...AUDIT_CALLS[name] };
+
+      // Success: the row is ok, with the reason, the addressed selectors and describeWrite's targets.
+      syncRequests = [];
+      syncHandler = () => Response.json(CONTEXT_RESPONSE);
+      const ok = await callAudited(name, { ...args, reason: REASON });
+      expect(ok.result.isError, name).toBe(false);
+      expect(syncRequests, name).toHaveLength(1);
+      expect(ok.row, name).toMatchObject({
+        graph_id: WORK_ID,
+        alias: "work",
+        tool: name,
+        kind: "write",
+        status: "ok",
+        dry_run: 0,
+        reason: REASON,
+        error: null,
+        before: null,
+        rows_written: 3,
+        rows_read: 1,
+      });
+      expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
+      expect(JSON.parse(ok.row.targets!), name).toEqual(toAffectedTargets(CONTEXT_RESPONSE));
+      expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID].sort());
+
+      // Sync 409: an error row carrying the server's message, not ok and not two rows.
+      syncRequests = [];
+      syncHandler = () => Response.json({ error: "entry 0: block not found" }, { status: 409 });
+      const conflict = await callAudited(name, args);
+      expect(conflict.result.isError, name).toBe(true);
+      expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, targets: null, pages: null, graph_id: WORK_ID });
+
+      // Refusals before the handler: nothing reaches the sync server.
+      syncRequests = [];
+      syncHandler = () => Response.json(CONTEXT_RESPONSE);
+      const long = await callAudited(name, { ...args, reason: "x".repeat(201) });
+      expect(long.row, name).toMatchObject({
+        status: "refused",
+        error: "reason is 201 characters; at most 200 are accepted — shorten it",
+        reason: null,
+        graph_id: WORK_ID,
+        dry_run: 0,
+      });
+      const unknown = await callAudited(name, { ...args, graph: "nope", reason: REASON });
+      expect(unknown.row, name).toMatchObject({
+        status: "refused",
+        error: "unknown graph 'nope' — call list_graphs for the connected aliases",
+        alias: "nope",
+        graph_id: null,
+        reason: REASON,
+      });
+      const readOnly = await callAudited(name, { ...args, graph: "notes" });
+      expect(readOnly.row, name).toMatchObject({
+        status: "refused",
+        error: "graph 'notes' is read-only",
+        alias: "notes",
+        graph_id: NOTES_ID,
+      });
+      expect(syncRequests, name).toHaveLength(0);
+
+      // Dry run, where the tool has one: dry_run = 1, targets from the dry-run response.
+      const where = DRY_RUN_IN[name];
+      if (where !== undefined) {
+        const dry = { ...CONTEXT_RESPONSE, "dry-run": true };
+        syncHandler = () => Response.json(dry);
+        const dryArgs =
+          where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
+        const preview = await callAudited(name, dryArgs);
+        expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
+        expect(JSON.parse(preview.row.targets!), name).toEqual(toAffectedTargets(dry));
+        // dry-run: false is a real call.
+        const real =
+          where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };
+        expect((await callAudited(name, real)).row.dry_run, name).toBe(0);
+      }
+    }
+  });
+
+  it("a ToolError the handler throws before the request (a '.' path argument) is refused", async () => {
+    const { result, row } = await callAudited("delete_block", { graph: "work", "block-id": ".." });
+    expect(result.isError).toBe(true);
+    expect(row).toMatchObject({ status: "refused", error: "path arguments may not be '.' or '..'" });
+    expect(syncRequests).toHaveLength(0);
+  });
+
+  it("every write is audited: each non-read tool on a server built as mcpHandler builds it calls begin once", async () => {
+    acceptEverything();
+    const begin = vi.spyOn(AuditLog.prototype, "begin");
+    try {
+      const calls: [string, Record<string, unknown>][] = [
+        ...GENERATED_WRITES.map((name) => [name, { graph: "work", ...AUDIT_CALLS[name] }] as [string, Record<string, unknown>]),
+        ["save_document", { graph: "work", fileName: "a.md", text: "a" }],
+        // Refused before any fetch, so no public fetch is needed; the call is still logged.
+        ["save_file_from_url", { graph: "work", url: "https://example.com/a.txt", reason: "x".repeat(201) }],
+      ];
+      expect(calls.map(([name]) => name).sort()).toEqual([...ALL_WRITES].sort());
+      for (const [name, args] of calls) await callContent(name, args, connector(semanticOnEnv()));
+      // Reads never begin a row.
+      await callContent("get_page", { graph: "work", "page-id": PAGE_UUID }, connector(semanticOnEnv()));
+      await callContent("list_graphs", {}, connector(semanticOnEnv()));
+      expect(begin.mock.calls.map(([entry]) => entry.tool).sort()).toEqual([...ALL_WRITES].sort());
+    } finally {
+      begin.mockRestore();
+    }
+  });
+
+  it("INSERT fails: the write is refused, naming the reason, and nothing reaches the sync server", async () => {
+    acceptEverything();
+    const e = testEnv({ DB: dbFailing(/^\s*INSERT INTO audit_log/, "D1_ERROR: database is locked") });
+    const before = await lastAuditId();
+    for (const [name, args] of [
+      ["update_block", { graph: "work", "block-id": B1, body: { title: "New title" }, reason: REASON }],
+      ["delete_blocks", { graph: "work", body: { "block-ids": [B1] } }],
+      ["save_document", { graph: "work", fileName: "a.md", text: "a" }],
+      // A refusal can't be logged either; it says so rather than hiding the failure.
+      ["delete_block", { graph: "notes", "block-id": B1 }],
+    ] as const) {
+      const result = await callContent(name, args, connector(e));
+      expect(result, name).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "audit log unavailable: D1_ERROR: database is locked; nothing was written" }],
+      });
+    }
+    expect(syncRequests).toHaveLength(0);
+    expect(await auditRows(before)).toEqual([]);
+  });
+
+  it("UPDATE fails: the write stands, the row stays pending, and the result leads with the line", async () => {
+    const e = testEnv({ DB: dbFailing(/^\s*UPDATE audit_log/, "D1_ERROR: network connection lost") });
+    syncHandler = () => Response.json(CONTEXT_RESPONSE);
+    const before = await lastAuditId();
+    const result = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "New title" }, reason: REASON }, connector(e));
+    const rows = await auditRows(before);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "pending", tool: "update_block", reason: REASON, targets: null });
+    expect(syncRequests.map((r) => r.method)).toEqual(["PATCH"]);
+    expect(result.isError).toBe(false);
+    const lines = result.content[0].text.split("\n");
+    expect(lines[0]).toBe(`Audit log entry ${rows[0].id} could not be completed: D1_ERROR: network connection lost`);
+    expect(lines.at(-1)).toBe(`Logged as audit entry ${rows[0].id}`);
+    expect(JSON.parse(result.content[1].text)).toEqual(CONTEXT_RESPONSE);
+
+    // A refused or failed write whose row can't be finished says so ahead of its own error.
+    syncHandler = () => Response.json({ error: "entry 0: block not found" }, { status: 409 });
+    const failed = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
+    const pending = (await auditRows(rows[0].id))[0];
+    expect(pending.status).toBe("pending");
+    expect(failed).toEqual({
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Audit log entry ${pending.id} could not be completed: D1_ERROR: network connection lost\nentry 0: block not found`,
+        },
+      ],
+    });
+  });
+
+  it("migration missing: writes refused with the migration message, reads still work, probe cached only on success", async () => {
+    acceptEverything();
+    const probe = vi.spyOn(AuditLog.prototype, "probe");
+    // One env is one isolate.
+    const e = testEnv();
+    try {
+      await env.DB.exec("DROP TABLE audit_log");
+      for (const [name, args] of [
+        ["update_block", { graph: "work", "block-id": B1, body: { title: "x" } }],
+        ["delete_block", { graph: "notes", "block-id": B1 }],
+        ["save_document", { graph: "work", fileName: "a.md", text: "a" }],
+      ] as const) {
+        expect(await callContent(name, args, connector(e)), name).toEqual({
+          isError: true,
+          content: [{ type: "text", text: "audit log unavailable: migration 0004 has not been applied; nothing was written" }],
+        });
+      }
+      expect(syncRequests).toHaveLength(0);
+      // A missing table is probed again on each write, not cached.
+      expect(probe).toHaveBeenCalledTimes(3);
+      const read = await callContent("get_page", { graph: "work", "page-id": PAGE_UUID }, connector(e));
+      expect(read.isError).toBe(false);
+      expect(probe).toHaveBeenCalledTimes(3);
+    } finally {
+      await restoreAuditLog();
+    }
+    // Once the migration is applied, the same isolate writes, and probes once for any number of writes.
+    probe.mockClear();
+    syncRequests = [];
+    for (let i = 0; i < 3; i++) {
+      const ok = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
+      expect(ok.isError).toBe(false);
+    }
+    expect(syncRequests).toHaveLength(3);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockRestore();
+  });
+
+  it("a probe that fails for another reason refuses the write with that reason", async () => {
+    acceptEverything();
+    const e = testEnv({ DB: dbFailing(/^SELECT 1 FROM audit_log/, "D1_ERROR: network connection lost") });
+    const result = await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
+    expect(result.content[0].text).toBe("audit log unavailable: D1_ERROR: network connection lost; nothing was written");
+    expect(syncRequests).toHaveLength(0);
+  });
+
+  it("result names the entry: the summary item ends with 'Logged as audit entry <id>' and the id reads back", async () => {
+    // A write whose summary is otherwise empty (no context, no reason) gets the line on its own.
+    syncHandler = () => Response.json({ id: "p1", title: "Standup" }, { status: 201 });
+    const created = await callContent("create_page", { graph: "work", body: { title: "Standup" } });
+    expect(created.isError).toBe(false);
+    const id = Number(/^Logged as audit entry (\d+)$/.exec(created.content[0].text)?.[1]);
+    expect(Number.isSafeInteger(id)).toBe(true);
+    expect(JSON.parse(created.content[1].text)).toEqual({ id: "p1", title: "Standup" });
+    const row = await new AuditLog(env.DB).get(WORK_ID, id);
+    expect(row).toMatchObject({ id, tool: "create_page", status: "ok", alias: "work" });
+
+    // A write with a summary ends it with the line.
+    syncHandler = () => Response.json(CONTEXT_RESPONSE);
+    const moved = await callContent("move_blocks", { graph: "work", ...AUDIT_CALLS.move_blocks, reason: REASON });
+    const text = moved.content[0].text;
+    expect(text.startsWith("Moved 1 block:\n")).toBe(true);
+    const next = Number(/\nReason: tidy duplicate notes\nLogged as audit entry (\d+)$/.exec(text)?.[1]);
+    expect(next).toBe(id + 1);
+    expect(await new AuditLog(env.DB).get(WORK_ID, next)).toMatchObject({ tool: "move_blocks", reason: REASON });
+
+    // connector_help tells Claude so.
+    const help = (await callContent("connector_help", {})).content[0].text;
+    expect(help).toContain("Every write is logged with its reason");
+    expect(help).toContain("Logged as audit entry <id>");
+    expect(help).toContain("audit log unavailable: …; nothing was written");
+  });
+
+  it("one graph lookup per write: the handler reuses the graph audited() resolved", async () => {
+    acceptEverything();
+    let lookups = 0;
+    const counting = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (/FROM graphs WHERE alias = \?/.test(sql)) lookups += 1;
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const e = testEnv({ DB: counting });
+    await callContent("update_block", { graph: "work", "block-id": B1, body: { title: "x" } }, connector(e));
+    expect(lookups).toBe(1);
+    lookups = 0;
+    await callContent("save_document", { graph: "work", fileName: "a.md", text: "a" }, connector(e));
+    expect(lookups).toBe(1);
+  });
+
+  it("no secrets: the PAT, the Authorization header, GRAPH_TOKEN_KEY and sent block text appear in no column", async () => {
+    const BLOCK_TEXT = "CANARY-BLOCK-TEXT-7f3a";
+    const BEARER = "CANARY-OAUTH-TOKEN-91c2";
+    const before = await lastAuditId();
+    const headers = { Authorization: `Bearer ${BEARER}`, "User-Agent": "claude-code/2.0.0", "mcp-session-id": "s-1" };
+    const call = (name: string, args: Record<string, unknown>) =>
+      rpc(connector(), "tools/call", { name, arguments: args }, testEnv(), headers);
+    syncHandler = () => Response.json(CONTEXT_RESPONSE);
+    await call("update_block", { graph: "work", "block-id": B1, body: { title: BLOCK_TEXT }, reason: REASON });
+    await call("insert_block_tree", { graph: "work", body: { "target-id": B1, blocks: [{ title: BLOCK_TEXT }] } });
+    await call("update_block", { graph: "work", "block-id": B1, body: { title: BLOCK_TEXT }, reason: "x".repeat(201) });
+    await call("update_block", { graph: "notes", "block-id": B1, body: { title: BLOCK_TEXT } });
+    await call("save_document", { graph: "work", fileName: "a.md", text: BLOCK_TEXT });
+    syncHandler = () => Response.json({ error: "entry 0: block not found" }, { status: 409 });
+    await call("update_block", { graph: "work", "block-id": B1, body: { title: BLOCK_TEXT } });
+    const rows = await auditRows(before);
+    expect(rows).toHaveLength(6);
+    const stored = JSON.stringify(rows);
+    for (const secret of [WORK_TOKEN, NOTES_TOKEN, BEARER, env.GRAPH_TOKEN_KEY, BLOCK_TEXT]) {
+      expect(stored, secret).not.toContain(secret);
+    }
+  });
+
+  it("client and session: User-Agent families and mcp-session-id stored, or null", async () => {
+    acceptEverything();
+    const owner = (e: Env): Handler => (request, _env, ctx) => {
+      (ctx as unknown as { props: unknown }).props = { githubUserId: 1001, login: "owner" };
+      return mcpApiHandler.fetch(request, e, ctx);
+    };
+    const cases: [Record<string, string>, string, string | null][] = [
+      [{ "User-Agent": "Claude-User (claude.ai)", "mcp-session-id": "s-ai" }, "claude-ai", "s-ai"],
+      [{ "User-Agent": "claude-code/2.0.31 (cli)" }, "claude-code", null],
+      [{ "User-Agent": "curl/8.5.0", "mcp-session-id": "s-curl" }, "other", "s-curl"],
+      [{}, "other", null],
+    ];
+    for (const [headers, client, session] of cases) {
+      const before = await lastAuditId();
+      const e = testEnv();
+      await rpc(owner(e), "tools/call", { name: "create_page", arguments: { graph: "work", body: { title: "x" } } }, e, headers);
+      const [row] = await auditRows(before);
+      expect({ client: row.client, session: row.session }, JSON.stringify(headers)).toEqual({ client, session });
+    }
+    // Called without a request's caller (as tests and scripts do), both are null.
+    const [row] = await (async () => {
+      const before = await lastAuditId();
+      await callContent("create_page", { graph: "work", body: { title: "x" } });
+      return auditRows(before);
+    })();
+    expect({ client: row.client, session: row.session }).toEqual({ client: null, session: null });
+  });
+
+  it("pages: each target's page title and UUID, lower-cased, for every kind of target the server names", async () => {
+    const fixture = async (name: string) => (await import(`./fixtures/readable/${name}.json`)).default.response;
+    const J5 = "00000001-2026-1105-0000-000000000000";
+    const J6 = "00000001-2026-1106-0000-000000000000";
+    const cases: [string, unknown, string[] | null][] = [
+      // A move names only where each block was and is now; both pages count.
+      ["move_blocks", await fixture("move-blocks"), ["nov 5th, 2026", J5]],
+      ["batch_move_blocks", { affected: [{ uuid: B1, kind: "block", snippet: "x", from: { page: { uuid: J5, title: "Nov 5th, 2026" }, breadcrumb: [] }, to: { page: { uuid: NOTES_PAGE, title: "Notes" }, breadcrumb: [] } }] }, ["nov 5th, 2026", J5, "notes", NOTES_PAGE]],
+      // A page or journal target names itself as its page.
+      ["delete_page", await fixture("delete-page-today"), ["nov 6th, 2026", J6]],
+      // E2EE: the page's UUID only, its title is encrypted.
+      ["delete_blocks", await fixture("delete-blocks-e2ee"), [J5]],
+      // Batch entries: each entry's target and affected blocks.
+      ["batch_insert_block_trees", await fixture("batch-insert-block-trees"), ["nov 5th, 2026", J5, "ideas", "5d0f4c7a-2222-4b4e-8c1e-000000000003"]],
+      // A response with no context names no page.
+      ["create_page", { id: "p1", title: "Standup" }, null],
+    ];
+    for (const [name, response, pages] of cases) {
+      syncHandler = () => Response.json(response);
+      const { row } = await callAudited(name, { graph: "work", ...AUDIT_CALLS[name] });
+      expect(row.status, name).toBe("ok");
+      expect(JSON.parse(row.targets!), name).toEqual(toAffectedTargets(response));
+      expect(row.pages === null ? null : row.pages.split("\n").sort(), name).toEqual(pages === null ? null : [...pages].sort());
+    }
+  });
+
+  it("status: refusals are refused; sync errors of every status, and unexpected failures, are error", async () => {
+    const cases: [() => Response, string, string][] = [
+      [() => Response.json({ error: "title: required" }, { status: 400 }), "error", "title: required"],
+      [() => Response.json({ error: "no" }, { status: 401 }), "error", "token for graph 'work' expired or lacks permission — reconnect it at https://mcp.example.com/graphs"],
+      [() => Response.json({ error: "slow" }, { status: 429, headers: { "Retry-After": "5" } }), "error", "rate limited — retry after 5 s"],
+      [() => Response.json({ error: "boom" }, { status: 500 }), "error", "sync server error (HTTP 500): boom"],
+    ];
+    for (const [handler, status, error] of cases) {
+      syncHandler = handler;
+      const { result, row } = await callAudited("update_block", { graph: "work", ...AUDIT_CALLS.update_block });
+      expect(result.isError, error).toBe(true);
+      expect(row, error).toMatchObject({ status, error });
+    }
+    // A failure that is not a ToolError (here, a body that isn't JSON) still finishes its row.
+    syncHandler = () => new Response("not json", { status: 200 });
+    const before = await lastAuditId();
+    const request = new Request(`${ORIGIN}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "update_block", arguments: { graph: "work", ...AUDIT_CALLS.update_block } } }),
+    });
+    const ctx = createExecutionContext();
+    const e = testEnv();
+    await (await mcpHandler(e, ctx)(request, e, ctx)).text();
+    await waitOnExecutionContext(ctx);
+    const rows = await auditRows(before);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("error");
+    expect(rows[0].error).toMatch(/JSON/);
+  });
+
+  it("addressed keeps the call's order, for chained, swapped and reversed entries, and only names selectors", async () => {
+    acceptEverything();
+    const B3 = "aaaaaaaa-0000-4000-8000-000000000003";
+    const move = (pairs: [string, string][]) => ({
+      graph: "work",
+      body: { moves: pairs.map(([from, to]) => ({ "block-ids": [from], "target-id": to, position: "after" })) },
+    });
+    const cases: [Record<string, unknown>, string[]][] = [
+      // A chain, the same chain reversed, and a swap.
+      [move([[B1, B2], [B2, B3]]), [B1, B2, B3]],
+      [move([[B2, B3], [B1, B2]]), [B2, B3, B1]],
+      [move([[B1, B2], [B2, B1]]), [B1, B2]],
+    ];
+    for (const [args, addressed] of cases) {
+      const { row } = await callAudited("batch_move_blocks", args);
+      expect(row.status).toBe("ok");
+      expect(JSON.parse(row.addressed!)).toEqual(addressed);
+    }
+    // Each selector kind: a UUID, a title, a journal date and an ident; values and block text never.
+    const entries = [
+      { "block-id": B1, "property-id": "user.property/venue-x1", value: "Town Hall" },
+      { "block-id": "2026-11-05", "property-id": "Venue", value: 3 },
+    ];
+    for (const list of [entries, [...entries].reverse()]) {
+      const { row } = await callAudited("batch_set_block_property", { graph: "work", body: { entries: list } });
+      const want = list.flatMap((e) => [e["block-id"], e["property-id"]]);
+      expect(JSON.parse(row.addressed!)).toEqual(want);
+      expect(row.addressed).not.toContain("Town Hall");
+    }
+  });
+
+  it("a healthy log refuses nothing that worked before: re-sends, no-ops, replace-style writes, large batches and long reasons", async () => {
+    acceptEverything();
+    const hundred = Array.from({ length: 100 }, (_, i) => `aaaaaaaa-0000-4000-8000-${String(i).padStart(12, "0")}`);
+    const calls: [string, Record<string, unknown>][] = [
+      // The same write sent twice, and an update that changes nothing.
+      ["update_block", { graph: "work", "block-id": B1, body: { title: "Same" } }],
+      ["update_block", { graph: "work", "block-id": B1, body: { title: "Same" } }],
+      // Replace-style: a reset of existing values, and properties.set.
+      ["batch_set_block_property", { graph: "work", body: { entries: [{ "block-id": B1, "property-id": P1, value: ["Food"] }], isResetExistingValues: true } }],
+      ["update_tag", { graph: "work", "tag-id": "Meeting", body: { properties: { set: [] } } }],
+      // The largest batch, and the longest reason (emoji count as one character each).
+      ["delete_blocks", { graph: "work", body: { "block-ids": hundred }, reason: "🙂".repeat(200) }],
+      ["delete_blocks", { graph: "work", body: { "block-ids": hundred, "dry-run": true } }],
+      ["save_document", { graph: "work", fileName: "a.md", text: "a".repeat(1000) }],
+    ];
+    for (const [name, args] of calls) {
+      syncRequests = [];
+      const { result, row } = await callAudited(name, args);
+      expect(result.isError, name).toBe(false);
+      expect(syncRequests, name).toHaveLength(1);
+      expect(row.status, name).toBe("ok");
+    }
+  });
+
+  it("userAgentFamily maps claude.ai, Claude Code and anything else", () => {
+    expect(userAgentFamily("Claude-User (claude.ai)")).toBe("claude-ai");
+    expect(userAgentFamily("claude-ai/1.0")).toBe("claude-ai");
+    expect(userAgentFamily("Anthropic/1.0")).toBe("claude-ai");
+    expect(userAgentFamily("claude-code/2.0.31")).toBe("claude-code");
+    expect(userAgentFamily("claude-cli/2.0.31 (external, cli)")).toBe("claude-code");
+    expect(userAgentFamily("Mozilla/5.0")).toBe("other");
+    expect(userAgentFamily("curl/8.5.0")).toBe("other");
+    expect(userAgentFamily(null)).toBe("other");
   });
 });
