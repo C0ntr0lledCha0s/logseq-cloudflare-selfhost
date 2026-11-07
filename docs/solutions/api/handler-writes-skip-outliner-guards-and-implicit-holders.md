@@ -5,6 +5,7 @@ tags: [built-in, raw-transact, delete-blocks, default-value, placeholder, destru
 seen:
   - 2026-11-06 – item 26, patch 0026, review rounds 1 and 2 (r1-correctness, r2-correctness-1, r2-integrity-1)
   - 2026-11-07 – item 17, patch 0028, review round 3 (r3-correctness-1): delete summaries counted a block's hidden property value blocks as children ("+1 child" on a leaf holding Owner: Ann), because ldb/get-block-full-children-ids includes them
+  - 2026-11-07 – item 26 defect 4, patch 0030: the same convert_values delete-blocks! also flattened references to the deleted value blocks (see api/convert-values-deleted-referenced-value-blocks.md)
 promoted_to: ["REVIEW.md"]
 ---
 
