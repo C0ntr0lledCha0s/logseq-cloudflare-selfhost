@@ -48,6 +48,8 @@ export interface AffectedTarget {
   roots?: string[];
   /** batch_insert_block_trees dry run, on an entry's target: the entry would create this page. */
   wouldCreate?: boolean;
+  /** batch_insert_block_trees, on an entry's target: the entry inserts no blocks, only sets its properties. */
+  propertiesOnly?: boolean;
   from?: TargetLocation;
   to?: TargetLocation;
   e2ee?: boolean;
@@ -147,6 +149,8 @@ export function toAffectedTargets(response: unknown): AffectedTarget[] {
     if (!holder) return;
     const t = target(holder.target, "target");
     if (t && holder["would-create"] === true) t.wouldCreate = true;
+    // An insert entry answers affected, its new top-level blocks, even when it inserts none.
+    if (t && Array.isArray(holder.affected) && holder.affected.length === 0) t.propertiesOnly = true;
     if (t) out.push(t);
     if (Array.isArray(holder.affected)) {
       for (const item of holder.affected) {
@@ -203,6 +207,8 @@ export interface SummaryOptions {
   dryRun?: boolean;
   /** The write was applied but the server could not read what it touched; the server's reason. */
   unavailable?: string;
+  /** delete_page on today's journal: its blocks are (or would be) deleted and the page kept. */
+  truncated?: { cleared?: number };
 }
 
 const E2EE_NOTE = "titles unavailable on an E2EE graph";
@@ -242,7 +248,9 @@ function line(t: AffectedTarget): string {
 
 /**
  * The plain-text summary that leads a write's result: one line per block or page the write deleted,
- * moved or inserted (or, when it names none, per block it wrote to), each as page > breadcrumb >
+ * moved or inserted (or, when it names none and is not an insert, per block it wrote to; a batch
+ * insert entry with no blocks is listed under "Set properties on", and today's journal under
+ * "Cleared today's journal" since its page is kept), each as page > breadcrumb >
  * "snippet" with the middle of a long path elided, and the counts the server gave (descendants, and
  * on a dry run references, a page's blocks and its first blocks); on a dry run, a line per page an
  * insert would create; then a line when the context could not be read; then `Reason: …`. Empty when
@@ -250,20 +258,38 @@ function line(t: AffectedTarget): string {
  */
 export function summarise(targets: AffectedTarget[], opts: SummaryOptions): string {
   const lines: string[] = [];
+  const [past, present] = (opts.tool !== undefined && CONTEXT_TOOLS[opts.tool]) || ["Changed", "change"];
   const affected = targets.filter((t) => t.role === "affected");
-  const shown = affected.length > 0 ? affected : targets;
-  if (shown.length > 0) {
-    const [past, present] = (opts.tool !== undefined && CONTEXT_TOOLS[opts.tool]) || ["Changed", "change"];
-    const pages = shown.every((t) => t.kind === "page" || t.kind === "journal");
-    const noun = `${pages ? "page" : "block"}${shown.length === 1 ? "" : "s"}`;
-    const head = opts.dryRun ? `Dry run, nothing changed: would ${present} ${shown.length} ${noun}` : `${past} ${shown.length} ${noun}`;
-    lines.push(`${head}${shown.some((t) => t.e2ee) ? ` (${E2EE_NOTE})` : ""}:`);
+  // An insert's targets are where it wrote, not what it inserted, so only other writes fall back to them.
+  const shown = affected.length > 0 || present === "insert" ? affected : targets;
+  // Insert entries that only set properties on their target say so, rather than count as inserts.
+  const propertied = targets.filter((t) => t.propertiesOnly);
+  const section = (items: AffectedTarget[], pastVerb: string, presentVerb: string, first: boolean) => {
+    if (items.length === 0) return;
+    const pages = items.every((t) => t.kind === "page" || t.kind === "journal");
+    const noun = `${pages ? "page" : "block"}${items.length === 1 ? "" : "s"}`;
+    const verb = opts.dryRun ? `${first ? "Dry run, nothing changed: would" : "Would"} ${presentVerb}` : pastVerb;
+    lines.push(`${verb} ${items.length} ${noun}${items.some((t) => t.e2ee) ? ` (${E2EE_NOTE})` : ""}:`);
+    for (const t of items) lines.push(`- ${line(t)}`);
+  };
+  if (opts.truncated !== undefined && shown.length > 0) {
+    // Today's journal: Logseq deletes its blocks and keeps the page.
+    const cleared = opts.truncated.cleared;
+    lines.push(
+      opts.dryRun
+        ? "Dry run, nothing changed: would clear today's journal, deleting its blocks and keeping the page:"
+        : `Cleared today's journal: ${cleared === undefined ? "its blocks were" : `${count(cleared, "block was", "blocks were")}`} deleted and the page kept:`,
+    );
     for (const t of shown) lines.push(`- ${line(t)}`);
+  } else {
+    section(shown, past, present, true);
   }
+  section(propertied, "Set properties on", "set properties on", shown.length === 0);
   // Only a dry run's entries carry would-create; a real insert says created instead.
   for (const t of targets.filter((t) => t.wouldCreate)) lines.push(`Would create page "${t.pageTitle ?? t.uuid}".`);
   if (opts.unavailable !== undefined) {
-    lines.push(`Context unavailable (${opts.unavailable || "no reason given"}); the write was applied.`);
+    // A dry run changes nothing, whether or not its context could be read.
+    lines.push(`Context unavailable (${opts.unavailable || "no reason given"}); ${opts.dryRun ? "nothing was changed" : "the write was applied"}.`);
   }
   if (opts.reason !== undefined) lines.push(`Reason: ${opts.reason}`);
   return lines.join("\n");
@@ -288,7 +314,8 @@ export function describeWrite(tool: string, result: CallToolResult, reason: stri
   const response = record(resultJson(result));
   const targets = toAffectedTargets(response);
   const unavailable = response?.context === "unavailable" ? (text(response["context-reason"]) ?? "") : undefined;
-  return { targets, summary: summarise(targets, { tool, reason, dryRun: response?.["dry-run"] === true, unavailable }) };
+  const truncated = response?.truncated === true ? { cleared: typeof response.cleared === "number" ? response.cleared : undefined } : undefined;
+  return { targets, summary: summarise(targets, { tool, reason, dryRun: response?.["dry-run"] === true, unavailable, truncated }) };
 }
 
 /** `result` with `summary` as its first content item, or unchanged when the summary is empty. */

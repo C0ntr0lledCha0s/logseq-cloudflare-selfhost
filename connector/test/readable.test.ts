@@ -17,6 +17,8 @@ import {
 } from "../src/tools/readable";
 import batchInsertBlockTrees from "./fixtures/readable/batch-insert-block-trees.json";
 import batchInsertDryRun from "./fixtures/readable/batch-insert-dry-run.json";
+import batchInsertPropertiesOnly from "./fixtures/readable/batch-insert-properties-only.json";
+import batchInsertPropertiesOnlyDryRun from "./fixtures/readable/batch-insert-properties-only-dry-run.json";
 import batchMoveDryRun from "./fixtures/readable/batch-move-dry-run.json";
 import batchSetBlockProperty from "./fixtures/readable/batch-set-block-property.json";
 import deleteBlocks from "./fixtures/readable/delete-blocks.json";
@@ -24,6 +26,8 @@ import deleteBlocksDryRun from "./fixtures/readable/delete-blocks-dry-run.json";
 import deleteBlocksE2ee from "./fixtures/readable/delete-blocks-e2ee.json";
 import deletePage from "./fixtures/readable/delete-page.json";
 import deletePageDryRun from "./fixtures/readable/delete-page-dry-run.json";
+import deletePageToday from "./fixtures/readable/delete-page-today.json";
+import deletePageTodayDryRun from "./fixtures/readable/delete-page-today-dry-run.json";
 import insertBlockTree from "./fixtures/readable/insert-block-tree.json";
 import insertUnavailable from "./fixtures/readable/insert-unavailable.json";
 import moveBlocks from "./fixtures/readable/move-blocks.json";
@@ -98,6 +102,8 @@ type Fixture = { operationId: string; status: string; tool: string; response: Re
 const FIXTURES: Record<string, Fixture> = {
   "batch-insert-block-trees": batchInsertBlockTrees,
   "batch-insert-dry-run": batchInsertDryRun,
+  "batch-insert-properties-only": batchInsertPropertiesOnly,
+  "batch-insert-properties-only-dry-run": batchInsertPropertiesOnlyDryRun,
   "batch-move-dry-run": batchMoveDryRun,
   "batch-set-block-property": batchSetBlockProperty,
   "delete-blocks": deleteBlocks,
@@ -105,6 +111,8 @@ const FIXTURES: Record<string, Fixture> = {
   "delete-blocks-e2ee": deleteBlocksE2ee,
   "delete-page": deletePage,
   "delete-page-dry-run": deletePageDryRun,
+  "delete-page-today": deletePageToday,
+  "delete-page-today-dry-run": deletePageTodayDryRun,
   "insert-block-tree": insertBlockTree,
   "insert-unavailable": insertUnavailable,
   "move-blocks": moveBlocks,
@@ -289,6 +297,65 @@ describe("summarise", () => {
     expect(summaryOf("insert-unavailable", "add the agenda")).toBe(
       "Context unavailable (the block is no longer in the graph); the write was applied.\nReason: add the agenda",
     );
+  });
+
+  // Review round 1.
+  it("a batch_insert_block_trees entry that only sets properties is not called an insert", () => {
+    expect(summaryOf("batch-insert-properties-only", "tag pages")).toBe(
+      [
+        "Inserted 1 block:",
+        '- Nov 5th, 2026 > Notes > "Hotel" (+0 children)',
+        "Set properties on 2 pages:",
+        '- page "Alpha"',
+        '- page "Beta"',
+        "Reason: tag pages",
+      ].join("\n"),
+    );
+    expect(summaryOf("batch-insert-properties-only-dry-run")).toBe(
+      [
+        "Dry run, nothing changed: would set properties on 2 pages:",
+        '- page "Alpha"',
+        '- page "Beta"',
+        'Would create page "Beta".',
+      ].join("\n"),
+    );
+    // A dry run that also inserts keeps its dry-run head on the inserts.
+    const mixed = { ...fixture("batch-insert-properties-only").response, "dry-run": true };
+    expect(describeWrite("batch_insert_block_trees", { content: [{ type: "text", text: JSON.stringify(mixed) }] }, undefined).summary).toBe(
+      [
+        "Dry run, nothing changed: would insert 1 block:",
+        '- Nov 5th, 2026 > Notes > "Hotel" (+0 children)',
+        "Would set properties on 2 pages:",
+        '- page "Alpha"',
+        '- page "Beta"',
+      ].join("\n"),
+    );
+  });
+
+  it("an insert never falls back to naming its targets as what it inserted, while other writes still do", () => {
+    const target: AffectedTarget = { uuid: "u", kind: "page", role: "target", pageTitle: "Alpha", breadcrumb: [], snippet: "Alpha" };
+    for (const tool of ["insert_block_tree", "insert_block_children", "batch_insert_block_trees", "capture_to_today"]) {
+      expect(summarise([target], { tool }), tool).toBe("");
+    }
+    expect(summarise([target], { tool: "set_block_property" })).toBe('Set a property on 1 page:\n- page "Alpha"');
+    expect(summarise([target], { tool: "update_block" })).toBe('Updated 1 page:\n- page "Alpha"');
+  });
+
+  it("delete_page on today's journal says its blocks were cleared and the page kept", () => {
+    expect(summaryOf("delete-page-today", "clear today")).toBe(
+      "Cleared today's journal: 2 blocks were deleted and the page kept:\n- journal \"Nov 6th, 2026\"\nReason: clear today",
+    );
+    expect(summaryOf("delete-page-today-dry-run")).toBe(
+      'Dry run, nothing changed: would clear today\'s journal, deleting its blocks and keeping the page:\n- journal "Nov 6th, 2026" (2 blocks, 0 references; first blocks: "Nov 6th, 2026 note")',
+    );
+    expect(summaryOf("delete-page")).toBe('Deleted 1 page:\n- page "Scratch"');
+  });
+
+  it("a dry run whose context could not be read says nothing was changed", () => {
+    const response = { ...fixture("move-blocks").response, "dry-run": true, context: "unavailable", "context-reason": "boom" };
+    const summary = describeWrite("move_blocks", { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined).summary;
+    expect(summary).toContain("Context unavailable (boom); nothing was changed.");
+    expect(summary).not.toContain("the write was applied");
   });
 
   it("a tool that names no targets keeps the stage 2 summary", () => {

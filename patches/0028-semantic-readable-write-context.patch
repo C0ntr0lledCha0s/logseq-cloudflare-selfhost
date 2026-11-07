@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index bb7c5be..38e8904 100644
+index bb7c5be..9197bcc 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1184,14 +1184,18 @@
@@ -22,7 +22,7 @@ index bb7c5be..38e8904 100644
            (or (::rejected data) (= :notification (:type data)))
            (http/bad-request (or (::rejected data) (get-in data [:payload :message])))
            :else (throw error))))))
-@@ -1347,6 +1351,308 @@
+@@ -1347,6 +1351,330 @@
                        holders)}
       409)))
  
@@ -92,10 +92,11 @@ index bb7c5be..38e8904 100644
 +
 +(defn- confirm-removed!
 +  "Throws when any of `ids` (UUIDs a delete removed) is still in `db`, so a delete never answers
-+  success it didn't have. `rejecting` answers it as 500 with the survivors under not-removed."
++  success it didn't have. `rejecting` answers it as 500 with the survivors under not-removed, and
++  the message names them too, since a client may pass on only the error text."
 +  [db ids]
 +  (when-let [left (seq (remove #(removed? db %) ids))]
-+    (throw (ex-info (str (count left) " of " (count ids) " deleted blocks were not removed")
++    (throw (ex-info (str (count left) " of " (count ids) " deleted blocks were not removed: " (string/join ", " (map str left)))
 +                    {:status 500 ::not-removed (mapv str left)}))))
 +
 +(defn- with-context-or-unavailable
@@ -203,21 +204,41 @@ index bb7c5be..38e8904 100644
 +(defn- first-line [entity]
 +  (or (first (string/split-lines (feed-text entity))) ""))
 +
++(defn- separated [text]
++  (vec (.split (or text "") label-separator)))
++
 +(defn- label-matches?
-+  "True when `label` names `entity` (a page or a block) as section 3.4 of the design says. `segments`
-+  is the label split on \" > \"."
-+  [entity segments]
-+  (let [[page-segment & below] segments
-+        block? (some? (:block/page entity))
-+        page (if block? (:block/page entity) entity)]
-+    (and (= (label-text page-segment) (label-text (:block/title page)))
++  "True when `label` names `entity` (a page or a block) as section 3.4 of the design says. A page
++  title or a line may itself hold \" > \", so `pieces` (the label split on every separator) are
++  grouped back into segments in whichever way fits: the page title takes as many pieces as it
++  holds, and a segment holds at most as many as the line it matches."
++  [entity pieces]
++  (let [block? (some? (:block/page entity))
++        page (if block? (:block/page entity) entity)
++        page-count (count (separated (:block/title page)))
++        joined (fn [from to] (string/join label-separator (subvec pieces from to)))]
++    (and (<= page-count (count pieces))
++         (= (label-text (joined 0 page-count)) (label-text (:block/title page)))
 +         (if-not block?
-+           (empty? below)
-+           (let [ancestors (feed-ancestors entity (dec (count below)))
-+                 lines (map first-line (cons entity (reverse ancestors)))]
-+             (and (seq below)
-+                  (<= (count below) (count lines))
-+                  (every? true? (map segment-matches? (reverse below) lines))))))))
++           (= page-count (count pieces))
++           (let [below (- (count pieces) page-count)
++                 lines (mapv first-line (cons entity (reverse (feed-ancestors entity (dec below)))))
++                 seen (volatile! {})
++                 ;; Whether pieces page-count..end fit lines from index `at` on, read from the end
++                 ;; back: the last segment is the target's line, each earlier one a nearer ancestor's.
++                 fits? (fn fits? [end at]
++                         (cond
++                           (= end page-count) (pos? at)
++                           (>= at (count lines)) false
++                           (contains? @seen [end at]) (@seen [end at])
++                           :else
++                           (let [line (nth lines at)
++                                 starts (range (dec end) (dec (max page-count (- end (count (separated line))))) -1)
++                                 result (boolean (some #(and (segment-matches? (joined % end) line) (fits? % (inc at)))
++                                                       starts))]
++                             (vswap! seen assoc [end at] result)
++                             result)))]
++             (and (pos? below) (fits? (count pieces) 0)))))))
 +
 +(defn- label-found
 +  "How the target reads as a label, page title first: what a mismatch reports was found."
@@ -231,12 +252,12 @@ index bb7c5be..38e8904 100644
 +  "Why `label` doesn't name `target` (an entity, or {:page title} for a page the write will create),
 +  or nil when it does."
 +  [target label]
-+  (let [segments (vec (.split label label-separator))
++  (let [segments (separated label)
 +        page-title (:page target)]
 +    (cond
 +      (some string/blank? segments) (str "target-label \"" label "\" has an empty segment")
 +      (if page-title
-+        (and (= 1 (count segments)) (= (label-text label) (label-text page-title)))
++        (= (label-text label) (label-text page-title))
 +        (label-matches? target segments))
 +      nil
 +      :else (str "target-label \"" label "\" does not match target \""
@@ -317,21 +338,22 @@ index bb7c5be..38e8904 100644
 +
 +(defn- moved-response
 +  "`response` with each moved block's snippet, where it was (`before`: contexts read before the
-+  move) and where it is now in `db`. If the read after the move fails, `to` is left out."
-+  [response db before e2ee?]
++  move) and where it is now in `db`. If the read after a move fails, `to` is left out; a dry run's
++  context is all it answers, so there the failed read fails the call."
++  [response db before e2ee? dry-run?]
 +  (let [affected (mapv #(-> (select-keys % [:uuid :kind :snippet :e2ee])
 +                            (assoc :from (select-keys % [:page :breadcrumb])))
-+                       before)]
-+    (with-context-or-unavailable
-+      (assoc response :affected affected)
-+      (fn []
-+        {:affected (mapv #(assoc % :to (block-location (d/entity db [:block/uuid (uuid (:uuid %))]) e2ee?))
-+                         affected)}))))
++                       before)
++        read (fn []
++               {:affected (mapv #(assoc % :to (block-location (d/entity db [:block/uuid (uuid (:uuid %))]) e2ee?))
++                                affected)})
++        response (assoc response :affected affected)]
++    (if dry-run? (merge response (read)) (with-context-or-unavailable response read))))
 +
  ;; deletePage, deleteTag and deleteProperty refuse to lose references, holders, child tags or
  ;; values unless the matching acknowledge-* query flag is true; dry-run=true reports the counts.
  (def ^:private loss-acknowledgements
-@@ -1368,19 +1674,43 @@
+@@ -1368,19 +1696,43 @@
  (defn- visible-entity-ids [db datoms]
    (into #{} (comp (map :e) (remove #(entity-util/hidden? (d/entity db %)))) datoms))
  
@@ -386,7 +408,7 @@ index bb7c5be..38e8904 100644
  
  (defn- delete-impact [db kind entity]
    (let [id (:db/id entity)]
-@@ -1412,38 +1742,43 @@
+@@ -1412,38 +1764,46 @@
  (defn- delete-node!
    "Deletes a page, tag or property through Logseq's page deletion rules once every loss it causes
    is acknowledged. Logseq clears today's journal instead of recycling it, so for a journal, today
@@ -441,13 +463,16 @@ index bb7c5be..38e8904 100644
 +       invalid (http/bad-request (str invalid " must be true or false"))
 +       (ldb/built-in? entity) (http/bad-request (str "built-in " kind " cannot be deleted"))
 +       (and journal? (nil? time-zone)) (invalid-time-zone-response self)
-+       (get flags "dry-run") (http/json-response nil (merge {:dry-run true
-+                                                             :uuid (uuid-string (:block/uuid entity))
-+                                                             :kind kind
-+                                                             :title (:block/title entity)}
-+                                                            impact
-+                                                            {:requires requires}
-+                                                            (preview impact)))
++       (get flags "dry-run") (http/json-response nil (cond-> (merge {:dry-run true
++                                                                     :uuid (uuid-string (:block/uuid entity))
++                                                                     :kind kind
++                                                                     :title (:block/title entity)}
++                                                                    impact
++                                                                    {:requires requires}
++                                                                    (preview impact))
++                                                       ;; Today's journal would be cleared, not deleted.
++                                                       (and journal? (= (:block/journal-day entity) (today-journal-day time-zone)))
++                                                       (assoc :truncated true)))
 +       (seq requires) (http/json-response nil (merge {:error (loss-message kind entity impact requires)}
 +                                                     impact
 +                                                     {:requires requires})
@@ -462,7 +487,7 @@ index bb7c5be..38e8904 100644
  
  (defn- atomic-write!
    "Runs (mutate conn) as one authored transaction and returns its result: all of its changes land,
-@@ -1474,50 +1809,64 @@
+@@ -1474,50 +1834,69 @@
            (http/json-response nil {:uuid (str page-id) :kind "page" :title title} 201))))
  
      :semantic/pages-blocks
@@ -551,17 +576,22 @@ index bb7c5be..38e8904 100644
 +          (not (page? page)) (http/bad-request "block is not a page")
 +          :else
 +          (let [affected [(block-context page {:e2ee? e2ee?})]
-+                ;; Today's journal is cleared rather than recycled: its blocks are what goes.
-+                roots (mapv :block/uuid (page-root-blocks db page))]
++                ;; Today's journal is cleared rather than recycled: its blocks are what goes, and the
++                ;; response says so (truncated, with the number of blocks cleared) as the page is kept.
++                root-blocks (page-root-blocks db page)
++                roots (mapv :block/uuid root-blocks)]
 +            (delete-node! context page
 +                          (fn [result]
 +                            (rejecting #(do (confirm-removed! @conn (if (:truncated? result) roots [(:block/uuid page)]))
-+                                            (http/json-response nil {:affected affected}))))
++                                            (http/json-response nil (cond-> {:affected affected}
++                                                                      (:truncated? result)
++                                                                      (assoc :truncated true
++                                                                             :cleared (reduce + (map (fn [root] (inc (count (ldb/get-block-full-children-ids db (:db/id root))))) root-blocks))))))))
 +                          (fn [impact] {:affected [(page-delete-preview db page e2ee? (:references impact))]}))))))))
  
  (defn- move-destination
    "The outliner target and options that put `blocks` at `position` relative to `target`. The
-@@ -1538,10 +1887,13 @@
+@@ -1538,10 +1917,13 @@
  
  (defn- insert-tree-response
    "Inserts identity-checked `nodes` under `target` in one transaction: 400 for a property that
@@ -578,7 +608,7 @@ index bb7c5be..38e8904 100644
     (let [verbose? (verbose-option url)
           prepared (prepare-tree db nodes e2ee? "blocks")]
       (cond
-@@ -1551,10 +1903,14 @@
+@@ -1551,10 +1933,14 @@
         (rejecting
          #(let [inserted (atomic-write! conn creator false :insert-blocks
                                         (fn [tx-conn]
@@ -594,7 +624,7 @@ index bb7c5be..38e8904 100644
  
  (defn- refresh-candidates
    "Body blocks (not pages or property values) of `page`, or of the whole graph, whose stored title
-@@ -1617,7 +1973,12 @@
+@@ -1617,7 +2003,12 @@
      (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
        truncated? (assoc :truncated true))))
  
@@ -608,7 +638,7 @@ index bb7c5be..38e8904 100644
    (case handler
  
      :semantic/blocks-get
-@@ -1631,19 +1992,24 @@
+@@ -1631,25 +2022,33 @@
        (if (or (nil? block) (not (non-blank-string? (:title body))))
          (http/bad-request "invalid block-id or title")
          (let [prepared (volatile! nil)]
@@ -646,7 +676,17 @@ index bb7c5be..38e8904 100644
  
      :semantic/refresh-refs
      (p/let [body (body-clj request)
-@@ -1663,30 +2029,54 @@
+-            page (when-let [page-id (:page-id body)] (find-entity db page-id))]
++            selected (when (contains? body :page-id)
++                       (resolve-page-selector db (:page-id body) "page-id" {:e2ee? e2ee? :find find-entity}))
++            page (:ok selected)]
+       (cond
+         e2ee? (http/error-response "refresh-refs is unavailable for E2EE graphs" 409)
++        (:error selected) (selector-refusal selected)
+         (and (:page-id body) (not (page? page))) (http/bad-request "page not found")
+         :else (let [result (refresh-refs conn creator page (true? (:apply body)))]
+                 (when (and (:applied result) (seq (:changed result)))
+@@ -1663,30 +2062,54 @@
          "page" (http/bad-request "block is a page: delete it with deletePage")
          "tag" (http/bad-request "block is a tag: delete it with deleteTag")
          "property" (http/bad-request "block is a property: delete it with deleteProperty")
@@ -706,12 +746,12 @@ index bb7c5be..38e8904 100644
 +                                                                 (d/entity @tx-conn (:db/id target')) opts)))
 +                    (when-not dry-run? (broadcast-change! self))
 +                    (http/json-response nil (cond-> (moved-response {:uuids (mapv (fn [b] (str (:block/uuid b))) blocks) :moved true}
-+                                                                    @write-conn before e2ee?)
++                                                                    @write-conn before e2ee? dry-run?)
 +                                              dry-run? (assoc :dry-run true))))))))))
  
      :semantic/blocks-insert-children
      (p/let [body (body-clj request)
-@@ -1694,14 +2084,18 @@
+@@ -1694,14 +2117,18 @@
        (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
                (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target, position, or blocks")
@@ -734,7 +774,7 @@ index bb7c5be..38e8904 100644
  
  (defn- batch-entries-error
    "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
-@@ -1716,7 +2110,14 @@
+@@ -1716,7 +2143,14 @@
                (str "entry " index ": " reason)))
            (map-indexed vector resolved))))
  
@@ -750,7 +790,7 @@ index bb7c5be..38e8904 100644
    (case handler
  
      :semantic/blocks-set-property
-@@ -1731,19 +2132,27 @@
+@@ -1731,19 +2165,27 @@
          (not (contains? body :value)) (http/bad-request "missing property value")
          (:error prepared) (http/bad-request (:error prepared))
          :else
@@ -785,7 +825,7 @@ index bb7c5be..38e8904 100644
  
      :semantic/blocks-batch-set-property
      (p/let [body (body-clj request)
-@@ -1774,15 +2183,18 @@
+@@ -1774,15 +2216,18 @@
                                            (cond-> replace? (update :replaced conj (:db/id block)))))))
                                  {:entries [] :added {} :replaced #{}}
                                  entries)))]
@@ -807,7 +847,7 @@ index bb7c5be..38e8904 100644
  
      :semantic/blocks-batch-delete-property
      (p/let [body (body-clj request)
-@@ -1791,15 +2203,18 @@
+@@ -1791,15 +2236,18 @@
                         (mapv (fn [{:keys [block-id property-id]}]
                                 {:block (find-entity db block-id)
                                  :property-ident (resolve-property-ident db property-id)}) entries))]
@@ -829,7 +869,7 @@ index bb7c5be..38e8904 100644
  
  (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
           unverified!)
-@@ -2007,7 +2422,8 @@
+@@ -2007,7 +2455,8 @@
      :semantic/pages-promote-to-tag
      (p/let [body (body-clj request)]
        (let [page-id (:page-id path-params)
@@ -839,7 +879,7 @@ index bb7c5be..38e8904 100644
              dry-run? (flag-param url "dry-run")
              body-errors (cond-> (cond
                                    (nil? body) []
-@@ -2025,6 +2441,7 @@
+@@ -2025,6 +2474,7 @@
                         (:error promotion) (conj {:status 400 :error (:error promotion)}))]
          (cond
            e2ee? (http/bad-request "promote_page_to_tag isn't available on an E2EE graph")
@@ -847,7 +887,7 @@ index bb7c5be..38e8904 100644
            (seq refusals)
            (http/json-response nil
                                (cond-> {:error (string/join "; " (map :error refusals))}
-@@ -2082,11 +2499,13 @@
+@@ -2082,11 +2532,13 @@
              priority-choice (when priority
                                (resolve-property-choice db :logseq.property/priority
                                                         task-priority-idents priority task-scope))
@@ -863,7 +903,7 @@ index bb7c5be..38e8904 100644
            (nil? status-choice) (http/bad-request "invalid task status")
            (and priority (nil? priority-choice)) (http/bad-request "invalid task priority")
            (and (:page-id body) (not (page? target))) (http/bad-request "invalid task page-id")
-@@ -2115,8 +2534,9 @@
+@@ -2115,8 +2567,9 @@
                     (outliner-property/set-block-property! temp-conn (:db/id task) property-ident value)))))
              (broadcast-change! self)
              (let [task (d/entity @conn [:block/uuid @task-id])]
@@ -875,7 +915,7 @@ index bb7c5be..38e8904 100644
                                    201))))))))
  
  (defn- handle-assets
-@@ -3124,18 +3544,22 @@
+@@ -3124,18 +3577,22 @@
          "before and after need a block target, not a page")))
  
  (defn- resolve-moves
@@ -903,7 +943,7 @@ index bb7c5be..38e8904 100644
                    (-> result
                        (update :moves conj move)
                        (update :moved into (map :db/id (:blocks move)))))))
-@@ -3183,7 +3607,9 @@
+@@ -3183,7 +3640,9 @@
    maps an insert-entry-key to the tags earlier entries give that target."
    [db e2ee? added index entry]
    (let [prefix (str "entries[" index "]")
@@ -914,7 +954,7 @@ index bb7c5be..38e8904 100644
          page (:page entry)
          existing-page (when (and (non-blank-string? page) (not e2ee?)) (ldb/get-page db page))
          scope (scope-with-tags db (or target existing-page {})
-@@ -3192,6 +3618,7 @@
+@@ -3192,6 +3651,7 @@
                       (prepare-properties db (:properties entry) e2ee? scope))
          error (cond
                  (and (contains? entry :target-id) (contains? entry :page)) "give target-id or page, not both"
@@ -922,7 +962,7 @@ index bb7c5be..38e8904 100644
                  (contains? entry :target-id) (when (nil? target) "target not found")
                  (not (contains? entry :page)) "give target-id or page"
                  (not (non-blank-string? page)) "page must be a non-blank title"
-@@ -3211,7 +3638,8 @@
+@@ -3211,7 +3671,8 @@
          tree (when (and (nil? error) (contains? entry :blocks))
                 (prepare-tree db (:blocks entry) e2ee? (str prefix ".blocks")))]
      (cond
@@ -932,7 +972,7 @@ index bb7c5be..38e8904 100644
        (:error tree) tree
        :else {:entry {:target target
                       :key (insert-entry-key target existing-page page)
-@@ -3233,7 +3661,7 @@
+@@ -3233,7 +3694,7 @@
                          {:keys [key properties]} (:entry resolved)
                          entry-uuids (tree-uuids (:blocks entry))]
                      (cond
@@ -941,7 +981,7 @@ index bb7c5be..38e8904 100644
                        (some uuids entry-uuids)
                        (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
                        :else (-> result
-@@ -3263,6 +3691,17 @@
+@@ -3263,6 +3724,17 @@
                (nil? existing) (assoc :created true))))
          entries))
  
@@ -959,7 +999,7 @@ index bb7c5be..38e8904 100644
  (defn- bulk-write-response
    "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
    [body dry-run? status]
-@@ -3289,45 +3728,77 @@
+@@ -3289,45 +3761,77 @@
              blocks (when (sequential? block-ids) (mapv #(find-entity db %) block-ids))
              dry-run? (dry-run-option body)]
          (if-let [error (or (delete-blocks-error block-ids blocks)
@@ -1012,7 +1052,7 @@ index bb7c5be..38e8904 100644
 +                               (check-labels! @tx-conn e2ee? (entry-label-checks (:moves body) moves :target))
 +                               (move-all! tx-conn moves)))
 +              (when-not dry-run? (broadcast-change! self))
-+              (bulk-write-response (moved-response response @write-conn before e2ee?) dry-run? 200))))))
++              (bulk-write-response (moved-response response @write-conn before e2ee? dry-run?) dry-run? 200))))))
  
      :semantic/blocks-batch-insert-tree
      (p/let [body (body-clj request)]
@@ -1056,7 +1096,7 @@ index bb7c5be..38e8904 100644
  
  ;; getPageBacklinks, getGraphHealth and listKnowledgeIndex read the whole graph through
  ;; graph-insights. They read titles and text, so they refuse E2EE graphs like getPageOutline.
-@@ -3451,10 +3922,11 @@
+@@ -3451,10 +3955,11 @@
        :else
        (case handler
          :semantic/pages-backlinks
@@ -1072,7 +1112,7 @@ index bb7c5be..38e8904 100644
  
          :semantic/graph-health
          (let [checks (or (comma-list url "checks") health-checks)
-@@ -3514,19 +3986,6 @@
+@@ -3514,19 +4019,6 @@
         (not (entity-util/hidden? entity))
         (not (string/blank? (:block/title entity)))))
  
@@ -1093,7 +1133,7 @@ index bb7c5be..38e8904 100644
    (let [page (:block/page block)
          above (feed-ancestors block)]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index cdf8ac9..485b279 100644
+index cdf8ac9..45364b1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -133,26 +133,26 @@
@@ -1101,12 +1141,12 @@ index cdf8ac9..485b279 100644
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
 -   "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting.")]
-+   "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); a page still there afterwards answers 500 under not-removed.")]
++   "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
 -   "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
 -   "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
 -   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
-+   "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500 under not-removed."]
++   "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
 +   "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
 +   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
@@ -1114,7 +1154,7 @@ index cdf8ac9..485b279 100644
     "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
 -   "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty."]
 -   "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
-+   "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty. Answers the block's page, breadcrumb and snippet (affected), read before the delete; a block still there afterwards answers 500 under not-removed."]
++   "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty. Answers the block's page, breadcrumb and snippet (affected), read before the delete; a block still there afterwards answers 500, naming it in the error and under not-removed."]
 +   "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order. Each moved block is named under affected with where it was (from) and is (to): page and breadcrumb. Pass dry-run=true to move them in a throwaway copy of the graph instead and get the same answer with dry-run: true, changing nothing."]
     "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
     "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
@@ -1150,7 +1190,7 @@ index cdf8ac9..485b279 100644
 +       "inside the write and never used to find it: the first segment must be the page title, ignoring case; the "
 +       "others match, from the last one back, the target's first line and then its nearest parent blocks (upper "
 +       "ones may be left out), each as a case-insensitive prefix of at least 3 characters, or the whole line when "
-+       "that is shorter. A mismatch refuses the whole call with 409, naming what was given and what was found, "
++       "that is shorter. A page title or line that itself holds \" > \" is given as it reads. A mismatch refuses the whole call with 409, naming what was given and what was found, "
 +       "and writes nothing. Unavailable for E2EE graphs."))
 +
 +(def ^:private target-label-schema
@@ -1179,7 +1219,14 @@ index cdf8ac9..485b279 100644
     "promotePageToTag" [(delete-flag-parameter "dry-run" "When true, check and convert a throwaway copy of the graph and answer the same body with dry-run: true: what the tag would extend and the promoted counts, without ident, which only the real call assigns (it carries a random suffix). A dry run writes nothing; refusals are the same as the real call's.")]})
  
  (def ^:private summary-prefix-parameter
-@@ -292,28 +320,35 @@
+@@ -286,34 +314,41 @@
+   (case operation-id
+     "createPage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+     "updatePage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
+-    "refreshRefs" {:properties {:page-id {:type "string"}
++    "refreshRefs" {:properties {:page-id {:type "string" :description (str "Optional. " page-selector-description " Omit to cover the whole graph.")}
+                                 :apply {:type "boolean" :default false}}}
+     "updateBlock" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
      "moveBlocks" {:required ["block-ids" "target-id" "position"]
                    :properties {:block-ids {:type "array" :minItems 1 :uniqueItems true
                                             :items {:type "string"}}
@@ -1317,16 +1364,18 @@ index cdf8ac9..485b279 100644
             {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
              "204" {:description "Deleted"}
              "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
-@@ -578,6 +644,8 @@
+@@ -578,6 +644,10 @@
                                                                            :description "createTag only: true on a page promotePageToTag can turn into this tag, keeping its blocks and references."}}}}}}
     :DeleteImpact {:type "object" :required ["requires"]
                    :properties {:dry-run {:type "boolean"}
 +                               :affected {:type "array" :items {:$ref "#/components/schemas/BlockContext"}
 +                                          :description "deletePage with dry-run=true: the page, with references, blocks and roots."}
++                               :truncated {:type "boolean"
++                                           :description "deletePage with dry-run=true: the page is today's journal, so the delete would clear its blocks and keep the page."}
                                 :uuid {:type "string"}
                                 :kind {:enum ["page" "tag" "property"]}
                                 :title {:type "string"}
-@@ -601,6 +669,68 @@
+@@ -601,6 +671,71 @@
                                                                 :holders {:type "integer"}
                                                                 :default {:type "boolean"}}}}}}))
  
@@ -1370,7 +1419,10 @@ index cdf8ac9..485b279 100644
 +                             :not-removed {:type "array" :items {:type "string"}}}}
 +   :DeletedPageResponse {:type "object" :required ["affected"]
 +                         :properties {:affected {:type "array" :items {:$ref "#/components/schemas/BlockContext"}
-+                                                 :description "The page, read before it was deleted."}}}
++                                                 :description "The page, read before it was deleted."}
++                                      :truncated {:type "boolean"
++                                                  :description "True when the page was today's journal: its blocks were deleted and the page was kept."}
++                                      :cleared {:type "integer" :description "With truncated: how many blocks were deleted."}}}
 +   :MovedBlocksResponse {:type "object" :required ["uuids" "moved"]
 +                         :properties (merge {:uuids {:type "array" :items {:type "string"}}
 +                                             :moved {:type "boolean"}
@@ -1395,7 +1447,7 @@ index cdf8ac9..485b279 100644
  (def ^:private bulk-schemas
    "Schemas of block tree properties and of the bulk and insert operations' responses."
    (ordered-map
-@@ -612,7 +742,12 @@
+@@ -612,7 +747,12 @@
                                  :title {:type "string" :description "Omitted when verbose is false."}
                                  :children {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}
     :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
@@ -1409,7 +1461,7 @@ index cdf8ac9..485b279 100644
                                           :count {:type "integer" :description "Blocks inserted or reused, nested ones included."}
                                           :page-id {:type "string" :description "captureToToday only: today's journal page."}
                                           :page-title {:type "string" :description "captureToToday only: today's journal title, e.g. Nov 6th, 2026."}}}
-@@ -620,9 +755,15 @@
+@@ -620,9 +760,15 @@
                           :properties {:entries {:type "array"
                                                  :items {:type "object" :required ["target-id" "blocks"]
                                                          :properties {:target-id {:type "string"}
@@ -1425,7 +1477,7 @@ index cdf8ac9..485b279 100644
                                        :dry-run {:type "boolean"}}}
     :BlocksResponse {:type "object" :required ["blocks" "missing"]
                      :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockDetailResponse"}}
-@@ -630,9 +771,15 @@
+@@ -630,9 +776,15 @@
     :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
                            :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
                                         :total-removed {:type "integer" :description "Those blocks and all their descendants."}
@@ -1441,7 +1493,7 @@ index cdf8ac9..485b279 100644
                                       :dry-run {:type "boolean"}}}))
  
  (defn openapi-document [issuer]
-@@ -848,7 +995,9 @@
+@@ -848,7 +1000,9 @@
                                                      :deadline {:type "integer"}}}]}
                 :CreatedTaskResponse {:allOf [{:$ref "#/components/schemas/TaskResponse"}
                                               {:type "object" :required ["page-id" "page-title"]
@@ -1452,7 +1504,7 @@ index cdf8ac9..485b279 100644
                 :CreatedAssetResponse {:allOf [{:$ref "#/components/schemas/AssetResponse"}
                                                {:type "object" :required ["page-id" "page-title"]
                                                 :properties {:page-id {:type "string"}
-@@ -858,7 +1007,7 @@
+@@ -858,7 +1012,7 @@
                  :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
                          {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
                write-guard-schemas)
@@ -1583,10 +1635,10 @@ index f011645..c759955 100644
              (is (= 200 (:status upper)) (str "an upper-case UUID " (pr-str upper)))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs
 new file mode 100644
-index 0000000..d63a31a
+index 0000000..d48820f
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_readable_writes_test.cljs
-@@ -0,0 +1,1282 @@
+@@ -0,0 +1,1387 @@
 +(ns logseq.db-sync.semantic-readable-writes-test
 +  "Readable write results (patch 0028). Deletes, moves, inserts and property writes answer the page
 +  title, breadcrumb (up to the five nearest ancestors below the page) and an 80-character snippet of
@@ -1782,12 +1834,15 @@ index 0000000..d63a31a
 +              (is (= 500 (:status batch)) (pr-str batch))
 +              (is (= (set (map ids [:agenda :call :c1 :c2 :c3])) (set (get-in batch [:body :not-removed]))))
 +              (is (string/includes? (get-in batch [:body :error]) "not removed"))
++              (is (every? #(string/includes? (get-in batch [:body :error]) (ids %)) [:agenda :call :c1 :c2 :c3])
++                  "the error names each survivor, since the connector passes on only the error text")
 +              (is (gone? conn (ids :flights)) "what was deleted stays deleted"))
 +            (testing "a single delete"
 +              (is (= [500 [(ids :ref)]] [(:status single) (get-in single [:body :not-removed])])
 +                  (pr-str single)))
 +            (testing "a page delete"
 +              (is (= [500 [scratch-id]] [(:status page) (get-in page [:body :not-removed])]) (pr-str page))
++              (is (= (str "1 of 1 deleted blocks were not removed: " scratch-id) (get-in page [:body :error])))
 +              (is (not (entity-util/hidden? (d/entity @conn [:block/uuid (uuid scratch-id)])))))))))))
 +
 +(deftest snippet-text-kinds-test
@@ -2869,8 +2924,110 @@ index 0000000..d63a31a
 +    (is (= "array" (get-in schemas [:DeleteImpact :properties :affected :type])))
 +    (is (= 2 (count (get-in operations ["deletePage" :responses "200" :content "application/json" :schema :anyOf])))
 +        "a deletePage dry run's body fits both DeleteImpact and DeletedPageResponse, so oneOf would refuse it")))
++
++;; Review round 1.
++
++(deftest dry-run-context-read-fails-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (let [block-context @#'semantic-handler/block-context
++              agenda-id (:db/id (d/entity @conn [:block/uuid (uuid (ids :agenda))]))
++              move {:block-ids [(ids :flights)] :target-id (ids :agenda) :position "last-child"}]
++          (p/let [before @conn
++                  responses
++                  (p/with-redefs [semantic-handler/block-context
++                                  ;; Fails on blocks under Agenda: after the insert and the move, not before.
++                                  (fn [entity opts]
++                                    (if (= agenda-id (:db/id (:block/parent entity)))
++                                      (throw (js/Error. "forced context failure"))
++                                      (block-context entity opts)))]
++                    (in-order
++                     [#(request! self "POST" "/semantic/block-trees/batch"
++                                 {:entries [{:target-id (ids :agenda) :blocks [{:title "Never inserted"}]}] :dry-run true})
++                      #(request! self "POST" "/semantic/block-moves?dry-run=true" move)
++                      #(request! self "POST" "/semantic/block-moves/batch" {:moves [move] :dry-run true})]))]
++            ;; A dry run answers only its context, so one whose context can't be read fails rather
++            ;; than answer context: unavailable, which reads as a write that was applied.
++            (doseq [[operation response] (map vector ["batchInsertBlockTrees" "moveBlocks" "batchMoveBlocks"] responses)]
++              (testing operation
++                (is (= 500 (:status response)) (pr-str response))
++                (is (not (contains? (:body response) :context)))
++                (is (not (contains? (:body response) :dry-run)))))
++            (is (= unchanged (graph-diff before @conn)) "no dry run wrote anything")))))))
++
++(deftest label-separator-in-text-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [property-id (add-owner! self ids)
++                page (request! self "POST" "/semantic/pages" {:title "Plan > Q4"})
++                page-id (get-in page [:body :uuid])
++                [revenue-id net-id] (repeatedly 2 #(str (random-uuid)))
++                tree (request! self "POST" "/semantic/block-trees"
++                               {:target-id page-id
++                                :blocks [{:uuid revenue-id :title "Revenue > target for Q4"
++                                          :children [{:uuid net-id :title "Net > gross"}]}]})
++                put! (fn [id label] (request! self "PUT" (labelled (str "/semantic/blocks/" id "/properties/" property-id) label)
++                                              {:value "Cy"}))
++                refusal (put! net-id "Plan > Q4 > Net > grass")
++                found (second (re-find #"does not match target \"(.*)\"$" (get-in refusal [:body :error])))
++                before @conn
++                accepted (in-order
++                          [;; a page title holding the separator, on a page target
++                           #(request! self "POST" (labelled "/semantic/block-trees" "plan > q4")
++                                      {:target-id page-id :blocks [{:title "Under the page"}]})
++                           ;; every segment in full
++                           #(put! revenue-id "Plan > Q4 > Revenue > target for Q4")
++                           ;; a prefix that itself holds the separator
++                           #(put! revenue-id "Plan > Q4 > Revenue > tar")
++                           ;; a child, with and without its parent
++                           #(put! net-id "Plan > Q4 > Revenue > target for Q4 > Net > gross")
++                           #(put! net-id "Plan > Q4 > Net > gr")
++                           ;; what a refusal reported as found
++                           #(put! net-id found)
++                           ;; a page the batch creates, titled with the separator
++                           #(request! self "POST" "/semantic/block-trees/batch"
++                                      {:entries [{:page "New > Page" :target-label "new > page" :blocks [{:title "One"}]}]})])
++                refused-labels ["Plan > Q4 > Revenue > target for Q5"
++                                "Plan > Revenue > target for Q4"
++                                "Plan > Q4"
++                                "Plan > Q4 > Revenue > target for Q4 > Net"]
++                after-accepted @conn
++                refusals (in-order (map (fn [label] #(put! revenue-id label)) refused-labels))]
++          (is (= [201 201] (map :status [page tree])) (pr-str [page tree]))
++          (is (= [409 "Plan > Q4 > Revenue > target for Q4 > Net > gross"] [(:status refusal) found]) (pr-str refusal))
++          (is (= [201 200 200 200 200 200 201] (map :status accepted))
++              (pr-str (remove #(< (:status %) 300) accepted)))
++          (is (not= unchanged (graph-diff before after-accepted)))
++          (doseq [[label response] (map vector refused-labels refusals)]
++            (is (= [409 (mismatch label "Plan > Q4 > Revenue > target for Q4")] (refused response)) label))
++          (is (= unchanged (graph-diff after-accepted @conn)) "no refused call wrote anything"))))))
++
++(deftest refresh-refs-page-selector-test
++  (async done
++    (with-selector-graph done
++      (fn [{:keys [self ids]}]
++        (p/let [calls [{:page-id "notes"} {:page-id "2026-11-05"} {:page-id (ids :notes)} {:page-id "Projects/Alpha"}
++                       {:page-id "2026-11-06"} {:page-id "Nowhere"} {:page-id "Hidden"}]
++                [by-title by-date by-uuid slash ambiguous missing hidden]
++                (in-order (map (fn [body] #(request! self "POST" "/semantic/refresh-refs" body)) calls))
++                e2ee (request! self "POST" "/semantic/refresh-refs?graph-e2ee=true" {:page-id "Notes"})
++                whole (request! self "POST" "/semantic/refresh-refs" {})]
++          (is (= [200 200 200 200 200] (map :status [by-title by-date by-uuid slash whole]))
++              (pr-str (remove #(= 200 (:status %)) [by-title by-date by-uuid slash whole])))
++          (is (= [409 [(ids :nov6) (ids :iso)]] [(:status ambiguous) (map :uuid (get-in ambiguous [:body :candidates]))])
++              (pr-str ambiguous))
++          (is (= [404 "page-id: no page titled \"Nowhere\""] (refused missing)))
++          (is (= [404 "page-id: no page titled \"Hidden\""] (refused hidden)))
++          (is (= [409 "refresh-refs is unavailable for E2EE graphs"] (refused e2ee)))
++          (is (string/includes? (get-in (semantic-routes/openapi-document "https://issuer.example")
++                                        [:paths "/api/v1/graphs/{graph-id}/refresh-refs" :post :requestBody
++                                         :content "application/json" :schema :properties :page-id :description])
++                                "journal date")
++              "the spec says page-id takes a selector"))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
-index c922306..5d6f576 100644
+index c922306..debf518 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 @@ -219,8 +219,8 @@
@@ -2884,12 +3041,43 @@ index c922306..5d6f576 100644
  
  (deftest delete-journal-decides-today-in-the-configured-zone-test
    (async done
-@@ -262,6 +262,6 @@
+@@ -262,6 +262,37 @@
                (is (some? page-e))
                (is (not (entity-util/hidden? page-e)) "the journal is not recycled")
                (is (some? (d/entity @conn [:block/uuid (uuid (:block nov5))])) "its block is kept"))
 -            (is (= 204 (:status page-response)) "a page that isn't a journal is still deleted")))
 +            (is (= 200 (:status page-response)) "a page that isn't a journal is still deleted")))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
++
++(deftest delete-today-says-it-cleared-the-journal-test
++  ;; At 10:00 NZDT on Nov 6th, Nov 6th is today: deletePage clears its blocks and keeps the page,
++  ;; and the response must say so rather than read as a page delete. Nov 5th is recycled as before.
++  (async done
++    (-> (with-clock
++         "2026-11-05T21:00:00Z" "UTC"
++         #(p/let [^js self (make-self "Pacific/Auckland")
++                  conn (.-conn self)
++                  nov5 (journal-with-block! self "Nov 5th, 2026")
++                  nov6 (journal-with-block! self "Nov 6th, 2026")
++                  _ (request! self "POST" "/semantic/block-trees"
++                              {:target-id (:block nov6) :blocks [{:title "child"}]})
++                  dry6 (request! self "DELETE" (str "/semantic/pages/" (:page nov6) "?dry-run=true") nil)
++                  dry5 (request! self "DELETE" (str "/semantic/pages/" (:page nov5) "?dry-run=true") nil)
++                  d6 (request! self "DELETE" (str "/semantic/pages/" (:page nov6)) nil)
++                  d5 (request! self "DELETE" (str "/semantic/pages/" (:page nov5)) nil)]
++            (testing "today's journal: cleared, page kept"
++              (is (= [200 true 2] [(:status dry6) (get-in dry6 [:body :truncated]) (get-in dry6 [:body :affected 0 :blocks])])
++                  (pr-str dry6))
++              (is (= [200 true 2 (:page nov6)]
++                     [(:status d6) (get-in d6 [:body :truncated]) (get-in d6 [:body :cleared])
++                      (get-in d6 [:body :affected 0 :uuid])])
++                  (pr-str d6))
++              (is (not (entity-util/hidden? (d/entity @conn [:block/uuid (uuid (:page nov6))]))) "the page is kept"))
++            (testing "another journal: recycled, and nothing says truncated"
++              (is (= [200 nil] [(:status dry5) (get-in dry5 [:body :truncated])]) (pr-str dry5))
++              (is (= [200 nil nil] [(:status d5) (get-in d5 [:body :truncated]) (get-in d5 [:body :cleared])]) (pr-str d5))
++              (is (entity-util/hidden? (d/entity @conn [:block/uuid (uuid (:page nov5))]))))))
          (p/catch #(is false (str %)))
          (p/finally done))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
