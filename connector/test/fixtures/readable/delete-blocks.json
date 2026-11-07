@@ -1,0 +1,53 @@
+{
+  "operationId": "deleteBlocks",
+  "status": "200",
+  "tool": "delete_blocks",
+  "response": {
+    "deleted": 3,
+    "total-removed": 6,
+    "affected": [
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d01",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "Call Sam about the contract renewal before Friday's review meeting with the boar",
+        "descendants": 3
+      },
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d02",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [],
+        "snippet": "[[Meeting]]",
+        "descendants": 0
+      },
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d03",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "L3",
+          "L4",
+          "L5",
+          "L6",
+          "L7"
+        ],
+        "snippet": "Deep leaf",
+        "descendants": 0
+      }
+    ]
+  }
+}

@@ -9,6 +9,8 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
+import { toAffectedTargets } from "../src/tools/readable";
+import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
 import {
   ANNOTATIONS,
   type OpenApiSpec,
@@ -502,6 +504,31 @@ describe("reason", () => {
       ["get_page", "work"],
     ]);
     expect(Object.keys(onSuccess.mock.calls[1][2])).toEqual(["reason", "targets"]);
+  });
+
+  it("onSuccess receives the targets the server names, and the summary leads the result", async () => {
+    const deleted = deleteBlocksFixture.response;
+    syncHandler = () => Response.json(deleted);
+    const onSuccess = vi.fn();
+    const handler = observedConnector(onSuccess);
+    const result = await callContent(
+      "delete_blocks",
+      { graph: "work", body: { "block-ids": deleted.affected.map((a) => a.uuid) }, reason: REASON },
+      handler,
+    );
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+    const [tool, alias, outcome] = onSuccess.mock.calls[0];
+    expect([tool, alias, outcome.reason]).toEqual(["delete_blocks", "work", REASON]);
+    expect(outcome.targets).toEqual(toAffectedTargets(deleted));
+    expect(outcome.targets.map((t: { uuid: string; pageTitle: string }) => [t.uuid, t.pageTitle])).toEqual(
+      deleted.affected.map((a) => [a.uuid, "Nov 5th, 2026"]),
+    );
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toMatch(/^Deleted 3 blocks:\n- Nov 5th, 2026 > Meeting > Agenda > "Call Sam/);
+    expect(result.content[0].text.endsWith(`\nReason: ${REASON}`)).toBe(true);
+    // The server's JSON follows, unchanged.
+    expect(JSON.parse(result.content[1].text)).toEqual(deleted);
+    expect(result.content).toHaveLength(2);
   });
 
   it("a generated operation that already takes a reason stops the build", () => {

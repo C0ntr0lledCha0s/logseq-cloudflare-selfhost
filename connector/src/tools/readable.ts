@@ -2,8 +2,8 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { ToolError } from "./common";
 
-// What a write tool call says about itself: the caller's `reason` and, from Stage 3 of the readable
-// tool calls plan, the targets the server names in its response (spec section 3.7,
+// What a write tool call says about itself: the caller's `reason` and the targets the server names in
+// its response, turned into a plain-text summary that leads the result (spec section 3.7,
 // docs/superpowers/specs/2026-11-07-readable-tool-calls-reason-targets-design.md). Item 28 (audit
 // log) consumes the same `WriteOutcome` through `onSuccess`. Nothing here fetches.
 
@@ -18,9 +18,135 @@ export const reasonSchema = z
     `One plain sentence on why (at most ${REASON_MAX} characters); shown with the result, never sent to the graph.`,
   );
 
-/** One block or page a write touched, as the server names it (filled from Stage 3). */
+/** Where a moved block was (`from`) or is now (`to`). */
+export interface TargetLocation {
+  pageUuid?: string;
+  pageTitle?: string;
+  breadcrumb: string[];
+}
+
+/**
+ * One block or page a write touched, as the server names it in a `BlockContext` (patch 0028).
+ * `role` is "target" for what the write wrote to or under (an insert's parent, a property write's
+ * block) and "affected" for a block it deleted, moved or inserted. On an E2EE graph titles and text
+ * are encrypted, so `pageTitle`, `breadcrumb` and `snippet` are empty and `e2ee` is true.
+ */
 export interface AffectedTarget {
   uuid: string;
+  kind: string;
+  role: "target" | "affected";
+  pageUuid?: string;
+  pageTitle?: string;
+  breadcrumb: string[];
+  snippet?: string;
+  descendants?: number;
+  from?: TargetLocation;
+  to?: TargetLocation;
+  e2ee?: boolean;
+}
+
+/**
+ * The write tools whose responses name what they touched, with the verb a summary uses ([past,
+ * present]). Every non-read tool is in exactly one of `CONTEXT_TOOLS` and `NO_CONTEXT_TOOLS`; a test
+ * over the manifest holds that (`contextClassFor`), so a new write tool can't ship without a decision.
+ */
+export const CONTEXT_TOOLS: Readonly<Record<string, readonly [string, string]>> = Object.freeze({
+  delete_block: ["Deleted", "delete"],
+  delete_blocks: ["Deleted", "delete"],
+  delete_page: ["Deleted", "delete"],
+  move_blocks: ["Moved", "move"],
+  batch_move_blocks: ["Moved", "move"],
+  insert_block_children: ["Inserted", "insert"],
+  insert_block_tree: ["Inserted", "insert"],
+  batch_insert_block_trees: ["Inserted", "insert"],
+  capture_to_today: ["Inserted", "insert"],
+  create_task: ["Created", "create"],
+  update_block: ["Updated", "update"],
+  set_block_property: ["Set a property on", "set a property on"],
+  delete_block_property: ["Removed a property from", "remove a property from"],
+  batch_set_block_property: ["Set properties on", "set properties on"],
+  batch_delete_block_property: ["Removed properties from", "remove properties from"],
+});
+
+/** The write tools whose responses add no context, each with the reason. */
+export const NO_CONTEXT_TOOLS: Readonly<Record<string, string>> = Object.freeze({
+  create_page: "the response already names the page by title",
+  update_page: "the response already names the page by title",
+  create_tag: "the response already names the tag by title",
+  update_tag: "the response already names the tag by title",
+  delete_tag: "the dry run and refusal already name the tag; deletes of tags are not block writes",
+  promote_page_to_tag: "the response already names the page and tag by title",
+  create_property: "the response already names the property by title",
+  update_property: "the response already names the property by title",
+  delete_property: "the dry run and refusal already name the property; deletes of properties are not block writes",
+  refresh_refs: "the response already lists each changed block's text before and after",
+  save_document: "the response already names the asset and its journal or page",
+  save_file_from_url: "the response already names the asset and its journal or page",
+});
+
+/** Whether a write tool's response names what it touched. Throws for a tool in neither table. */
+export function contextClassFor(name: string): "context" | "no-context" {
+  if (Object.hasOwn(CONTEXT_TOOLS, name)) return "context";
+  if (Object.hasOwn(NO_CONTEXT_TOOLS, name)) return "no-context";
+  throw new Error(`no context class for write tool ${name}: add it to CONTEXT_TOOLS or NO_CONTEXT_TOOLS`);
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function location(value: unknown): TargetLocation | undefined {
+  const loc = record(value);
+  if (!loc) return undefined;
+  const page = record(loc.page);
+  return { pageUuid: text(page?.uuid), pageTitle: text(page?.title), breadcrumb: strings(loc.breadcrumb) };
+}
+
+function target(value: unknown, role: AffectedTarget["role"]): AffectedTarget | undefined {
+  const ctx = record(value);
+  if (!ctx || typeof ctx.uuid !== "string") return undefined;
+  const page = record(ctx.page);
+  const out: AffectedTarget = { uuid: ctx.uuid, kind: text(ctx.kind) ?? "block", role, breadcrumb: strings(ctx.breadcrumb) };
+  if (typeof page?.uuid === "string") out.pageUuid = page.uuid;
+  if (typeof page?.title === "string") out.pageTitle = page.title;
+  if (typeof ctx.snippet === "string") out.snippet = ctx.snippet;
+  if (typeof ctx.descendants === "number") out.descendants = ctx.descendants;
+  if (ctx.from !== undefined) out.from = location(ctx.from);
+  if (ctx.to !== undefined) out.to = location(ctx.to);
+  if (ctx.e2ee === true) out.e2ee = true;
+  return out;
+}
+
+/**
+ * The targets a write's response names, in order: each `target`, then each `affected` entry, at the
+ * top level and in each of `entries` (batch inserts). Anything that is not a `BlockContext` with a
+ * UUID is skipped, so a response without context gives [].
+ */
+export function toAffectedTargets(response: unknown): AffectedTarget[] {
+  const out: AffectedTarget[] = [];
+  const collect = (holder: Record<string, unknown> | undefined) => {
+    if (!holder) return;
+    const t = target(holder.target, "target");
+    if (t) out.push(t);
+    if (Array.isArray(holder.affected)) {
+      for (const item of holder.affected) {
+        const a = target(item, "affected");
+        if (a) out.push(a);
+      }
+    }
+  };
+  const top = record(response);
+  collect(top);
+  if (Array.isArray(top?.entries)) for (const entry of top.entries) collect(record(entry));
+  return out;
 }
 
 /** What `onSuccess` learns about an accepted write. `targets` is empty until the server names them. */
@@ -57,9 +183,87 @@ export function takeReason<A extends Record<string, unknown>>(args: A): { reason
   return { reason: reason === "" ? undefined : reason, rest };
 }
 
-/** The plain-text summary that leads a write's result: for now only `Reason: …`, or nothing. */
-export function summarise(_targets: AffectedTarget[], opts: { reason?: string }): string {
-  return opts.reason === undefined ? "" : `Reason: ${opts.reason}`;
+/** Options for `summarise`: the tool (for its verb), the caller's reason and what the server said. */
+export interface SummaryOptions {
+  tool?: string;
+  reason?: string;
+  /** The response was a dry run: nothing changed. */
+  dryRun?: boolean;
+  /** The write was applied but the server could not read what it touched; the server's reason. */
+  unavailable?: string;
+}
+
+const E2EE_NOTE = "titles unavailable on an E2EE graph";
+
+/** `segments` joined with " > ", keeping the first and last two when there are more than four. */
+function path(segments: string[]): string {
+  const shown = segments.length > 4 ? [segments[0], "…", ...segments.slice(-2)] : segments;
+  return shown.join(" > ");
+}
+
+function children(n: number | undefined): string {
+  if (n === undefined) return "";
+  return ` (+${n} ${n === 1 ? "child" : "children"})`;
+}
+
+function where(loc: TargetLocation | undefined): string {
+  if (!loc) return "(not read)";
+  return path([loc.pageTitle ?? "?", ...loc.breadcrumb]);
+}
+
+function line(t: AffectedTarget): string {
+  if (t.e2ee) return `${t.kind} ${t.uuid}${children(t.descendants)}`;
+  const quoted = `"${t.snippet ?? ""}"`;
+  if (t.from !== undefined || t.to !== undefined) return `${quoted} from ${where(t.from)} to ${where(t.to)}`;
+  if (t.kind === "page" || t.kind === "journal") return `${t.kind} ${quoted}${children(t.descendants)}`;
+  return `${path([t.pageTitle ?? "?", ...t.breadcrumb, quoted])}${children(t.descendants)}`;
+}
+
+/**
+ * The plain-text summary that leads a write's result: one line per block or page the write deleted,
+ * moved or inserted (or, when it names none, per block it wrote to), each as page > breadcrumb >
+ * "snippet" with the middle of a long path elided; then a line when the context could not be read;
+ * then `Reason: …`. Empty when there is nothing to say. Nothing here fetches.
+ */
+export function summarise(targets: AffectedTarget[], opts: SummaryOptions): string {
+  const lines: string[] = [];
+  const affected = targets.filter((t) => t.role === "affected");
+  const shown = affected.length > 0 ? affected : targets;
+  if (shown.length > 0) {
+    const [past, present] = (opts.tool !== undefined && CONTEXT_TOOLS[opts.tool]) || ["Changed", "change"];
+    const pages = shown.every((t) => t.kind === "page" || t.kind === "journal");
+    const noun = `${pages ? "page" : "block"}${shown.length === 1 ? "" : "s"}`;
+    const head = opts.dryRun ? `Dry run, nothing changed: would ${present} ${shown.length} ${noun}` : `${past} ${shown.length} ${noun}`;
+    lines.push(`${head}${shown.some((t) => t.e2ee) ? ` (${E2EE_NOTE})` : ""}:`);
+    for (const t of shown) lines.push(`- ${line(t)}`);
+  }
+  if (opts.unavailable !== undefined) {
+    lines.push(`Context unavailable (${opts.unavailable || "no reason given"}); the write was applied.`);
+  }
+  if (opts.reason !== undefined) lines.push(`Reason: ${opts.reason}`);
+  return lines.join("\n");
+}
+
+/** The JSON a generated tool's result carries in its first text item, or undefined. */
+export function resultJson(result: CallToolResult): unknown {
+  const first = result.content[0];
+  if (first?.type !== "text") return undefined;
+  try {
+    return JSON.parse(first.text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A write's targets and summary, from its result. Whatever context the response carries is read, so
+ * nothing here can fail a call after its write; a tool in `NO_CONTEXT_TOOLS` simply names none.
+ */
+export function describeWrite(tool: string, result: CallToolResult, reason: string | undefined): { targets: AffectedTarget[]; summary: string } {
+  const response = record(resultJson(result));
+  const targets = toAffectedTargets(response);
+  const unavailable = response?.context === "unavailable" ? (text(response["context-reason"]) ?? "") : undefined;
+  return { targets, summary: summarise(targets, { tool, reason, dryRun: response?.["dry-run"] === true, unavailable }) };
 }
 
 /** `result` with `summary` as its first content item, or unchanged when the summary is empty. */

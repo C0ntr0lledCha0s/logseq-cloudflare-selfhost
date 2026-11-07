@@ -1,0 +1,20 @@
+{
+  "operationId": "deleteBlocks",
+  "status": "200",
+  "tool": "delete_blocks",
+  "response": {
+    "deleted": 1,
+    "total-removed": 3,
+    "affected": [
+      {
+        "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d01",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000"
+        },
+        "e2ee": true,
+        "descendants": 2
+      }
+    ]
+  }
+}
