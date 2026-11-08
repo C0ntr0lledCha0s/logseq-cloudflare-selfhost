@@ -118,11 +118,11 @@ Queries of 2 content words or fewer are left alone, so a search for "Dashboards"
 3. drop words under 3 characters, and de-duplicate;
 4. keep the `KEYWORD_TERMS` (3) longest, ties by first appearance. Length stands in for distinctiveness: inverse document frequency would need a D1 scan. **(call)**
 
-If the query has 2 content words or fewer, the leg runs `searchGraph` once on the whole phrase, as today, so "rego" and "Queenstown" behave as now. Otherwise it runs `searchGraph` once per term, in parallel, with `limit` `KEYWORD_TERM_LIMIT` (20).
+If the query has 2 content words or fewer, the leg runs `searchGraph` once on the whole phrase, as today, so "rego" and "Queenstown" behave as now. Otherwise it runs `searchGraph` once per term and once on the whole phrase, in parallel, each with `limit` `KEYWORD_TERM_LIMIT` (20). The whole-phrase search keeps the case single words can't reach: `searchGraph` ranks an exact title first only when the needle is the whole title, and fills a capped list in title order, so a page titled "Project status meeting" can be missing from every term's 20 (review round 1, r1-correctness-1).
 
-`mergeKeywordLists(lists)` orders uuids by the number of term lists that contain them (more first), then by their best single rank, then by first appearance across the lists in term order. It caps the result at `KEYWORD_LIMIT` (50) before `blocksFor`, so the D1 bind list never grows past today's 50 + 50. The term lists are merged before fusion, so RRF still sees two lists, `semantic` and `keyword`, and the RRF constant and maths are unchanged.
+`mergeKeywordLists(lists)` orders uuids by the number of term lists that contain them (more first), then by their best single rank, then by first appearance across the lists in term order. `phraseFirst(phrase, merged)` then puts the whole-phrase list ahead of the merged term lists, with a uuid in both counted once at its phrase rank, and caps the result at `KEYWORD_LIMIT` (50) before `blocksFor`, so the D1 bind list never grows past today's 50 + 50. The term lists are merged before fusion, so RRF still sees two lists, `semantic` and `keyword`, and the RRF constant and maths are unchanged.
 
-A failed term search fails the call, as a failed keyword search does today, and the error names the term: `keyword search for "dashboard": <reason>` (CLAUDE.md, errors name the entry and reason).
+A failed term or phrase search fails the call, as a failed keyword search does today, and the error names the term (or the phrase): `keyword search for "dashboard": <reason>` (CLAUDE.md, errors name the entry and reason). With several failing, it names the first in term order, then the phrase.
 
 For "stock level reporting dashboard" the terms are `reporting`, `dashboard`, `stock` (9, 9, 5 characters; `stock` before `level` by first appearance).
 
@@ -153,7 +153,7 @@ The stopword list moves from `test/semantic-fakes.ts` to `ranking.ts` and the fa
 - `SEMANTIC_HELP` (part of `connector_help`): how to read `similarity` for `@cf/baai/bge-small-en-v1.5`, with the bands from the live check (section 9). The text names the model, because the bands change with it.
 - `tools-manifest.json` via `npm --prefix connector run update:manifest`.
 - README 11.11 (how ranking works) and 11.8 (what Claude can do).
-- Logseq skill note in the PR body: read `similarity` and `keyword-rank` rather than `score` to judge a match; pass `min_similarity` when only strong matches are wanted; a long question is searched by its longest words, so put the distinctive word in it.
+- Logseq skill note in the PR body: read `similarity` and `keyword-rank` rather than `score` to judge a match; pass `min_similarity` when only strong matches are wanted; a long question is title-searched by its longest words and as a whole phrase (an exact title stays first), so put the distinctive word in it.
 
 ## 4. Tool contract
 
@@ -177,7 +177,7 @@ with `null` for a leg that didn't return the hit. The top level keeps `results` 
 
 **Behaviour changes:**
 
-- (a) For a query of 3 or more content words, the keyword leg searches up to 3 distinctive words, each separately, and merges the lists by the number of words matched, then best rank. Queries of 2 content words or fewer search the whole phrase, as today.
+- (a) For a query of 3 or more content words, the keyword leg searches up to 3 distinctive words, each separately, and the whole phrase. Phrase matches come first; the word lists follow, merged by the number of words matched, then best rank. Queries of 2 content words or fewer search the whole phrase, as today.
 - (b) For a query of 3 or more content words, blocks of 2 words or fewer are ordered by similarity × 0.75 in the meaning leg. The reported `similarity` is the raw value.
 - (c) A failed word search answers an error naming the word.
 
@@ -194,8 +194,8 @@ Per query:
 | Vectorize storage | 384 per block, cap 13,020 blocks in 5M | same | no new vectors |
 | D1 rows read | `blocksFor` ≤ 50 vector ids + ≤ 50 keyword uuids via indexes, `state` 1, `counts` per graph | same | merged keyword list capped at 50 before the read; no new query, no scan |
 | D1 rows written | 0 | 0 | |
-| Subrequests | 1 AI + 1 Vectorize + 1 sync + D1 | up to 3 sync calls instead of 1, only for 3+ content-word queries | at most about 8 of the 50 allowed |
-| Worker requests | 1 front + 1 sync | worst case 1 front + 3 sync | if service-binding calls count against the 100k daily cap (not confirmed, question 3), 50 queries a day add about 100 requests |
+| Subrequests | 1 AI + 1 Vectorize + 1 sync + D1 | up to 4 sync calls (3 terms + the phrase) instead of 1, only for 3+ content-word queries | at most about 9 of the 50 allowed |
+| Worker requests | 1 front + 1 sync | worst case 1 front + 4 sync | if service-binding calls count against the 100k daily cap (not confirmed, question 3), 50 queries a day add about 150 requests |
 | CPU | | + tokenising and re-sorting ≤ 100 ids | well under 1 ms |
 
 Per indexer run: unchanged. No extra neurons, rows or vectors, and no reindex.
@@ -204,7 +204,7 @@ Per indexer run: unchanged. No extra neurons, rows or vectors, and no reindex.
 
 - **Read-only.** `semantic_search` writes nothing, so dry-run and read-back don't apply. Nothing stored changes; a bad rule is reverted by one deploy.
 - **Private blocks.** Unchanged: private blocks are never embedded, so they can't come back by meaning. Keyword hits are what `search_graph` already returns. Searching several words instead of one phrase can return more keyword hits, but only ones `search_graph` would return for those words, which Claude can already call. The eval's "no private block by meaning" assertion stays.
-- **Rate limit.** The sync server limits semantic API reads to 120 a minute per token, operation and graph. A 3-term query uses 3. At Claude's pace this is far from the limit; a 429 on a term answers the error naming the term.
+- **Rate limit.** The sync server limits semantic API reads to 120 a minute per token, operation and graph. A 3-term query uses 4 (3 terms + the phrase). At Claude's pace this is far from the limit; a 429 on a term answers the error naming the term.
 - **No silent empty result.** `below-min-similarity` says how many hits a floor removed.
 
 ## 7. Risks
@@ -212,7 +212,7 @@ Per indexer run: unchanged. No extra neurons, rows or vectors, and no reindex.
 1. **The fake embedder may not show the live effect.** A hashed bag of words with a synonym table is not bge-small. The eval can pass offline while the live graph still misranks. Mitigation: the live check in section 9, before and after, recorded here labelled offline and live.
 2. **Weight and cut-off tuned on a small fixture.** 0.75 and 2 words could demote a genuinely short answer, such as an exact title block. Mitigation: the rule applies only to queries of 3+ content words, the keyword leg still ranks an exact title match first, and each threshold has a boundary test.
 3. **Longest is a crude stand-in for distinctive.** A long common word ("everything") can crowd out a short distinctive one ("WOF"), and a 6-word question loses half its words. The skill note tells Claude to put the distinctive word in the question.
-4. **More sync calls.** Up to 3 `searchGraph` calls per query, in parallel; latency is the slowest of the three. Whether they count against the daily request cap is not confirmed (question 3).
+4. **More sync calls.** Up to 4 `searchGraph` calls per query (3 terms + the phrase), in parallel; latency is the slowest of the four. Whether they count against the daily request cap is not confirmed (question 3).
 5. **Model-specific bands.** The similarity bands in `connector_help` hold for bge-small only; a model change must update them, which is why the text names the model.
 6. **Stopword move shifts the baseline.** Moving the list (3.6) is its own commit, and the baseline is recorded after it.
 
@@ -225,7 +225,7 @@ Test first, in the real Worker pool, with no stubs inside the ranking path:
    - (a) A 2-word block outranks a 3-word block on raw similarity, and drops below it for a 3-content-word query; it doesn't drop for a 2-content-word query; a 3-word block is not demoted. Pins the query threshold, the word-count boundary and the weight (vectors chosen so 0.75 flips the order and 0.85 doesn't).
    - (b) A hit's `similarity` equals the fake index's cosine at 3 dp; `keyword-rank` is null for a semantic-only hit; `similarity` and `semantic-rank` are null for a keyword-only hit.
    - (c) `distinctiveTerms`: stopwords dropped, words under 3 characters dropped, at most 3 terms, the longest kept, ties by first appearance, duplicates removed.
-   - (d) A uuid matched by 2 terms ranks above one matched by 1 term at a better single rank; the merged list is capped at 50 (seed more than 50 matches); `FakeGraph.searchRequests` shows one request per term with `limit=20`.
+   - (d) A uuid matched by 2 terms ranks above one matched by 1 term at a better single rank; the merged list is capped at 50 (seed more than 50 matches); `FakeGraph.searchRequests` shows one request per term, then one for the whole phrase, each with `limit=20`; a whole-phrase title match keeps keyword-rank 1 when each term matches more than 20 earlier-sorting titles.
    - (e) A 2-content-word query sends exactly one search request, with the whole phrase.
    - (f) `min_similarity` drops a semantic hit just below the value and keeps one exactly at it (pins `<` against `<=`), keeps a keyword-only hit, reports `below-min-similarity`, and zod refuses -0.1 and 1.1.
    - (g) A failed term search (`FakeGraph.failStatus`) answers an error that names the term.

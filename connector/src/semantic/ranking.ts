@@ -94,3 +94,19 @@ export function mergeKeywordLists(lists: KeywordResult[][]): KeywordResult[] {
     .slice(0, KEYWORD_LIMIT)
     .map((e) => e.result);
 }
+
+/**
+ * The whole-phrase search's list ahead of the merged term lists, so an exact or substring phrase
+ * match keeps the rank `searchGraph` gave it. A uuid in both counts once, at its phrase rank. Capped
+ * at `KEYWORD_LIMIT`, like the merge.
+ */
+export function phraseFirst(phrase: KeywordResult[], terms: KeywordResult[]): KeywordResult[] {
+  const seen = new Set<string>();
+  const out: KeywordResult[] = [];
+  for (const result of [...phrase, ...terms]) {
+    if (seen.has(result.uuid)) continue;
+    seen.add(result.uuid);
+    out.push(result);
+  }
+  return out.slice(0, KEYWORD_LIMIT);
+}

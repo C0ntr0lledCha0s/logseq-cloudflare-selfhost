@@ -18,7 +18,7 @@ import {
 } from "../src/semantic/config";
 import { documentText, parseFeedPage, toDocument, vectorId } from "../src/semantic/document";
 import { runIndexer } from "../src/semantic/indexer";
-import { STOPWORDS, contentWords, distinctiveTerms, mergeKeywordLists, wordCount } from "../src/semantic/ranking";
+import { STOPWORDS, contentWords, distinctiveTerms, mergeKeywordLists, phraseFirst, wordCount } from "../src/semantic/ranking";
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
@@ -219,6 +219,18 @@ describe("ranking terms", () => {
     expect(ids(mergeKeywordLists(lists(["a", "b"], ["b", "c"], ["c", "a"])))).toEqual(["a", "b", "c"]);
     expect(ids(mergeKeywordLists(lists(["c", "a"], ["b", "c"], ["a", "b"])))).toEqual(["c", "a", "b"]);
     expect(mergeKeywordLists([])).toEqual([]);
+  });
+
+  it("phraseFirst puts the phrase list first, counts a shared uuid once at its phrase rank, and caps at 50", () => {
+    const r = (uuid: string) => ({ uuid, title: uuid, resource: "blocks" });
+    const ids = (merged: { uuid: string }[]) => merged.map((m) => m.uuid);
+    expect(ids(phraseFirst(["p", "s"].map(r), ["a", "s", "b"].map(r)))).toEqual(["p", "s", "a", "b"]);
+    expect(ids(phraseFirst([], ["a", "b"].map(r)))).toEqual(["a", "b"]);
+    expect(ids(phraseFirst(["p"].map(r), []))).toEqual(["p"]);
+    const many = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => r(`${prefix}${i}`));
+    const capped = phraseFirst(many("p", 20), many("t", 50));
+    expect(capped).toHaveLength(50);
+    expect(capped.at(-1)?.uuid).toBe("t29");
   });
 
   it("wordCount counts the stored text on whitespace", () => {
@@ -941,7 +953,7 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
     expect(hits.filter((h) => h.uuid === repeated)).toHaveLength(1);
   });
 
-  it("sends one request per term with limit=20 and types=blocks,pages, in term order", async () => {
+  it("sends one request per term, then one for the whole phrase, each with limit=20 and types=blocks,pages", async () => {
     work.addBlock(work.addPage("Misc"), "Stock on hand dashboard");
     await runUntilReady();
     const cases: [string, string[]][] = [
@@ -954,7 +966,7 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
       expect(distinctiveTerms(q), q).toEqual(terms);
       work.searchRequests = [];
       await search(q);
-      expect(requested(), q).toEqual(terms.map((t) => [t, "20", "blocks,pages"]));
+      expect(requested(), q).toEqual([...terms, q].map((t) => [t, "20", "blocks,pages"]));
     }
   });
 
@@ -1036,12 +1048,34 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
     expect(two.text).toMatch(/^keyword search for "dashboard": /);
     work.failSearchFor = ["stock"];
     expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q })).text).toMatch(/^keyword search for "stock": /);
+    // The whole-phrase search failing alone names the phrase.
+    work.failSearchFor = q;
+    expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q })).text).toBe(
+      `keyword search for "${q}": sync server error (HTTP 500): search for ${q} failed`,
+    );
 
     // Every request failing names the first term; a whole-phrase query keeps today's text.
     work.failSearchFor = null;
     work.failStatus = 503;
     expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q })).text).toMatch(/^keyword search for "reporting": sync server error \(HTTP 503\)/);
     expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q: "stock" })).text).toMatch(/^sync server error \(HTTP 503\)/);
+  });
+
+  it("a whole-phrase title match keeps keyword-rank 1 when each term matches more than 20 earlier titles", async () => {
+    // Each term's 20-result list fills with "A project NN" etc., which sort before the targets.
+    const pad = (i: number) => String(i).padStart(2, "0");
+    for (const term of ["project", "status", "meeting"]) for (let i = 0; i < 25; i++) work.addPage(`A ${term} ${pad(i)}`);
+    const exact = work.addPage("Project status meeting");
+    const notes = work.addPage("Notes");
+    const within = work.addBlock(notes, "Notes from the project status meeting on Friday");
+    const stopworded = work.addPage("Notes about the project status meeting");
+    await runUntilReady();
+    // An exact title, the phrase inside a block's text, and a phrase with stopwords in a title.
+    expect(keywordOrder(await search("Project status meeting")).slice(0, 3)).toEqual([exact, stopworded, within]);
+    expect(keywordOrder(await search("about the project status meeting"))[0]).toBe(stopworded);
+    // Four content words: "friday" is not one of the three terms, but the phrase still finds the block.
+    expect(distinctiveTerms("project status meeting on Friday")).not.toContain("friday");
+    expect(keywordOrder(await search("project status meeting on Friday"))[0]).toBe(within);
   });
 
   it("the warehouse question finds its target through both legs", async () => {
