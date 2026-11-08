@@ -57,6 +57,18 @@ review   Scope ─ Review (one agent per lens, tests first) ∥ Re-check open id
 
 The recipe skills (`add-upstream-patch`, `add-connector-tool`, `add-d1-migration`) are what the implementer follows for those kinds of change.
 
+## Tiers
+
+The bug and feature lanes run at one of three tiers. Intake suggests one, the run log names it, and `args.tier` overrides it. In Phases 1 and 2 the first review round found nearly every defect that would have damaged data, while later rounds, skeptics and mutation re-runs mostly found untested rules at far higher cost, so the depth now follows the risk.
+
+| Tier | Use for | What runs |
+|---|---|---|
+| `quick` | A small, non-destructive change in one place: one tool's text or output, one resolver branch, a script. Nothing stored changes. | Bug: one investigation lens, one root-cause skeptic. Feature: one design, no per-stage checks. One combined review pass (tests, correctness, integrity, security and contract), mutation cap 3, skeptics only for blockers (1) and security (3). |
+| `standard` (default) | Fixes and features that change how values are stored or read. | Bug: two investigation lenses, one skeptic. Feature: one design, per-stage checks. The four review lenses, at most 2 review rounds, mutation cap 6. |
+| `full` | Writes that delete, retire, convert or restructure data or the schema; auth, tokens, secrets or access; migrations. | Everything: two skeptics on the root cause, the three-angle design panel (skipped when the issue already names the design), per-stage checks, the four lenses, up to 3 review rounds, mutation cap 12. |
+
+In every tier a targeted round still runs on blockers and majors left open, and security findings keep three skeptics and block the lane. Below `full`, should-fix items aren't fixed in the lane: the closeout proposes them as backlog items.
+
 ## Models
 
 Each stage runs on the model that fits its job. The table is `MODELS` at the top of each lane script, and it is the same in all four.

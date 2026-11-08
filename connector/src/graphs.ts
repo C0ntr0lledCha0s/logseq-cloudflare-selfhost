@@ -14,6 +14,8 @@ export interface GraphRecord {
   expiresAt: string | null;
   /** ISO-8601 UTC, or null if never used. */
   lastUsedAt: string | null;
+  /** Whether writes send `x-logseq-edit-stamp: claude`, so the server stamps the blocks they touch. */
+  editStamps: boolean;
 }
 
 /** A connected graph as a tool call uses it: where to send the request, with which PAT, and whether writes are allowed. */
@@ -21,10 +23,15 @@ export interface ResolvedGraph {
   graphId: string;
   mode: GraphMode;
   pat: string;
+  /** Whether writes send `x-logseq-edit-stamp: claude` (migration 0005; on unless the owner turned it off). */
+  editStamps: boolean;
+  /** Set when a read-only service token lowered `mode` to read (e.g. `service token 'ci'`); the write refusal names it. */
+  readOnlyBy?: string;
 }
 
-export type NewGraph = Omit<GraphRecord, "lastUsedAt"> & { token: string };
-export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "permission" | "expiresAt">>;
+/** A new graph starts with edit stamps on (the column's default). */
+export type NewGraph = Omit<GraphRecord, "lastUsedAt" | "editStamps"> & { token: string };
+export type GraphPatch = Partial<Pick<GraphRecord, "alias" | "mode" | "permission" | "expiresAt" | "editStamps">>;
 
 const DAY_MS = 86_400_000;
 /** Token expiries this close (in days) or closer are flagged to the owner. */
@@ -62,9 +69,10 @@ interface Row {
   permission: GraphPermission;
   expires_at: string | null;
   last_used_at: string | null;
+  edit_stamps: number;
 }
 
-const RECORD_COLUMNS = "alias, graph_id, graph_name, mode, permission, expires_at, last_used_at";
+const RECORD_COLUMNS = "alias, graph_id, graph_name, mode, permission, expires_at, last_used_at, edit_stamps";
 
 function toRecord(row: Row): GraphRecord {
   return {
@@ -75,6 +83,7 @@ function toRecord(row: Row): GraphRecord {
     permission: row.permission,
     expiresAt: row.expires_at,
     lastUsedAt: row.last_used_at,
+    editStamps: row.edit_stamps === 1,
   };
 }
 
@@ -105,6 +114,19 @@ export class GraphStore {
     return row ? toRecord(row) : null;
   }
 
+  /**
+   * The current aliases of the connected graphs among `graphIds`, ordered by alias; an id no longer
+   * connected drops out. One statement reading at most the graphs listed; none for an empty list.
+   */
+  async aliasesFor(graphIds: readonly string[]): Promise<string[]> {
+    if (graphIds.length === 0) return [];
+    const { results } = await this.db
+      .prepare(`SELECT alias FROM graphs WHERE graph_id IN (${graphIds.map(() => "?").join(", ")}) ORDER BY alias`)
+      .bind(...graphIds)
+      .all<{ alias: string }>();
+    return results.map((row) => row.alias);
+  }
+
   /** The decrypted PAT. Throws if the alias is unknown or the ciphertext does not authenticate. */
   async token(alias: string): Promise<string> {
     const graph = await this.resolve(alias);
@@ -118,9 +140,9 @@ export class GraphStore {
    */
   async resolve(alias: string): Promise<ResolvedGraph | null> {
     const row = await this.db
-      .prepare("SELECT graph_id, mode, token_ct, token_iv, key_id FROM graphs WHERE alias = ?")
+      .prepare("SELECT graph_id, mode, token_ct, token_iv, key_id, edit_stamps FROM graphs WHERE alias = ?")
       .bind(alias)
-      .first<{ graph_id: string; mode: GraphMode; token_ct: string; token_iv: string; key_id: string }>();
+      .first<{ graph_id: string; mode: GraphMode; token_ct: string; token_iv: string; key_id: string; edit_stamps: number }>();
     if (!row) return null;
     if (row.key_id !== KEY_ID) throw new Error(`unsupported token key id: ${row.key_id}`);
     const plain = await crypto.subtle.decrypt(
@@ -128,7 +150,7 @@ export class GraphStore {
       await this.key,
       fromBase64url(row.token_ct),
     );
-    return { graphId: row.graph_id, mode: row.mode, pat: new TextDecoder().decode(plain) };
+    return { graphId: row.graph_id, mode: row.mode, pat: new TextDecoder().decode(plain), editStamps: row.edit_stamps === 1 };
   }
 
   /** Rejects an invalid alias or token, a duplicate alias, and a graph ID that is already connected. */
@@ -163,7 +185,7 @@ export class GraphStore {
   async update(alias: string, patch: GraphPatch): Promise<void> {
     if (!(await this.get(alias))) throw new Error(`unknown graph alias: ${alias}`);
     const sets: string[] = [];
-    const values: (string | null)[] = [];
+    const values: (string | number | null)[] = [];
     if (patch.alias !== undefined) {
       const next = normalizeAlias(patch.alias);
       if (next !== alias && (await this.get(next))) throw new Error(`graph alias already exists: ${next}`);
@@ -181,6 +203,10 @@ export class GraphStore {
     if (patch.expiresAt !== undefined) {
       sets.push("expires_at = ?");
       values.push(patch.expiresAt);
+    }
+    if (patch.editStamps !== undefined) {
+      sets.push("edit_stamps = ?");
+      values.push(patch.editStamps ? 1 : 0);
     }
     if (sets.length === 0) return;
     await this.db

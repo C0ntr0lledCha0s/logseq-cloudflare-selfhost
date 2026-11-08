@@ -10,7 +10,8 @@ import {
 import { BindingError } from "../semantic/indexer";
 import { reciprocalRankFusion } from "../semantic/rrf";
 import type { SemanticStore, StoredBlock } from "../semantic/store";
-import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION } from "./spec.mjs";
+import type { OnSuccess } from "./readable";
+import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
@@ -116,9 +117,8 @@ export async function hybridSearch(
 export function registerSemanticTools(
   server: McpServer,
   deps: HybridSearchDeps,
-  onSuccess: (tool: string, alias: string) => void,
+  onSuccess: OnSuccess,
 ): void {
-  const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
   const graph = z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION);
 
   server.registerTool(
@@ -132,7 +132,7 @@ export function registerSemanticTools(
         limit: z.number().int().min(1).max(50).default(10).describe("Results to return (1-50, default 10)"),
         tag: z.string().min(1).optional().describe("Only indexed blocks with this tag (on the block, an ancestor or its page)"),
       }),
-      annotations: readOnly,
+      annotations: annotationsFor("semantic_search"),
     },
     (args) =>
       runTool("semantic_search", args.graph, async () => {
@@ -153,7 +153,7 @@ export function registerSemanticTools(
       description:
         "How much of a graph the semantic index holds: building, ready, full, error or skipped (end-to-end encrypted), the number of indexed blocks, when it last changed and any error.",
       inputSchema: z.object({ graph }),
-      annotations: readOnly,
+      annotations: annotationsFor("semantic_index_status"),
     },
     (args) =>
       runTool("semantic_index_status", args.graph, async () => {

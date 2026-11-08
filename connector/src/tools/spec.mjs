@@ -9,7 +9,7 @@ import { resolveOpenApiRefs } from "../../vendor/semantic_api_tools.mjs";
  * @typedef {{ operationId?: string, summary?: string, description?: string, parameters?: OpenApiParameter[], [key: string]: unknown }} OpenApiOperation
  * @typedef {{ paths: Record<string, Record<string, OpenApiOperation>>, [key: string]: unknown }} OpenApiSpec
  * @typedef {{ operationId: string, name: string, method: string, path: string, operation: OpenApiOperation }} GraphOperation
- * @typedef {{ name: string, method: string | null, path: string | null }} ManifestEntry
+ * @typedef {{ name: string, method: string | null, path: string | null, annotations: ToolHints }} ManifestEntry
  */
 
 /** A connected graph's alias, as the connector's GraphStore enforces it. */
@@ -18,6 +18,7 @@ export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 /** Tools registered by hand rather than from the spec; listed here so the manifest covers them. */
 export const HANDWRITTEN_TOOLS = [
   "connector_help",
+  "get_activity_log",
   "kb_index",
   "list_graphs",
   "read_file",
@@ -28,6 +29,93 @@ export const HANDWRITTEN_TOOLS = [
 ];
 /** Hand-written tools registered only when semantic search is configured (src/semantic/config.ts). */
 export const SEMANTIC_TOOLS = ["semantic_index_status", "semantic_search"];
+
+/**
+ * @typedef {{ readOnlyHint: boolean, destructiveHint: boolean, idempotentHint: boolean, openWorldHint: boolean }} ToolHints
+ */
+
+// The four classes of spec section 4 (docs/superpowers/specs/2026-11-07-readable-tool-calls-reason-targets-design.md).
+// Annotations are static per tool, so a tool that can lose data in any mode is destructive in every
+// mode (update_property, refresh_refs, and batch_insert_block_trees, whose entry properties replace an
+// existing target's values). Only save_file_from_url reaches outside the owner's graphs.
+/** Reads: change nothing, so repeating them is harmless. */
+const READ = Object.freeze({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+/** Writes that overwrite or remove data, where a second identical call changes something more or is refused. */
+const DESTRUCTIVE = Object.freeze({ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false });
+/** Deletes and sets: overwrite or remove data, and a second identical call has no further effect. */
+const DESTRUCTIVE_IDEMPOTENT = Object.freeze({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+/** Writes that add or move without overwriting; a second call adds again. */
+const ADDITIVE = Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false });
+
+/**
+ * Every tool's MCP annotations, generated and hand-written alike. They replace upstream's hints, which
+ * the generator derives from the HTTP method and which mark POST and PATCH writes that lose data as
+ * non-destructive. A tool missing here fails `annotationsFor`, so the manifest and the Worker refuse it.
+ * @type {Readonly<Record<string, Readonly<ToolHints>>>}
+ */
+export const ANNOTATIONS = Object.freeze({
+  batch_delete_block_property: DESTRUCTIVE_IDEMPOTENT,
+  batch_insert_block_trees: DESTRUCTIVE,
+  batch_move_blocks: ADDITIVE,
+  batch_set_block_property: DESTRUCTIVE_IDEMPOTENT,
+  capture_to_today: ADDITIVE,
+  connector_help: READ,
+  create_page: ADDITIVE,
+  create_property: ADDITIVE,
+  create_tag: ADDITIVE,
+  create_task: ADDITIVE,
+  delete_block: DESTRUCTIVE_IDEMPOTENT,
+  delete_block_property: DESTRUCTIVE_IDEMPOTENT,
+  delete_blocks: DESTRUCTIVE_IDEMPOTENT,
+  delete_page: DESTRUCTIVE_IDEMPOTENT,
+  delete_property: DESTRUCTIVE_IDEMPOTENT,
+  delete_tag: DESTRUCTIVE_IDEMPOTENT,
+  get_activity_log: READ,
+  get_block: READ,
+  get_blocks: READ,
+  get_graph_health: READ,
+  get_page: READ,
+  get_page_backlinks: READ,
+  get_page_outline: READ,
+  get_property: READ,
+  get_tag: READ,
+  insert_block_children: ADDITIVE,
+  insert_block_tree: ADDITIVE,
+  kb_index: READ,
+  list_assets: READ,
+  list_graphs: READ,
+  list_page_blocks: READ,
+  list_page_references: READ,
+  list_pages: READ,
+  list_properties: READ,
+  list_tag_objects: READ,
+  list_tags: READ,
+  list_tasks: READ,
+  move_blocks: ADDITIVE,
+  promote_page_to_tag: DESTRUCTIVE,
+  read_file: READ,
+  refresh_refs: DESTRUCTIVE,
+  save_document: ADDITIVE,
+  save_file_from_url: Object.freeze({ ...ADDITIVE, openWorldHint: true }),
+  search_graph: READ,
+  semantic_index_status: READ,
+  semantic_search: READ,
+  set_block_property: DESTRUCTIVE_IDEMPOTENT,
+  update_block: DESTRUCTIVE,
+  update_page: DESTRUCTIVE,
+  update_property: DESTRUCTIVE,
+  update_tag: DESTRUCTIVE,
+});
+
+/**
+ * The annotations of the tool `name`. Throws for a tool with no entry.
+ * @param {string} name
+ * @returns {ToolHints}
+ */
+export function annotationsFor(name) {
+  if (!Object.hasOwn(ANNOTATIONS, name)) throw new Error(`no annotations for tool ${name}`);
+  return { ...ANNOTATIONS[name] };
+}
 
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
@@ -142,8 +230,8 @@ export function transformSpec(spec) {
 export function buildManifest(spec) {
   /** @type {ManifestEntry[]} */
   const entries = [
-    ...graphOperations(spec).map(({ name, method, path }) => ({ name, method, path })),
-    ...HANDWRITTEN_TOOLS.map((name) => ({ name, method: null, path: null })),
+    ...graphOperations(spec).map(({ name, method, path }) => ({ name, method, path, annotations: annotationsFor(name) })),
+    ...HANDWRITTEN_TOOLS.map((name) => ({ name, method: null, path: null, annotations: annotationsFor(name) })),
   ];
   return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
@@ -153,9 +241,26 @@ export function formatManifest(manifest) {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
+/** The hints an entry sets, e.g. `[destructive idempotent]`, so a changed hint shows in the diff. */
+const HINT_LABELS = /** @type {const} */ ([
+  ["readOnlyHint", "read-only"],
+  ["destructiveHint", "destructive"],
+  ["idempotentHint", "idempotent"],
+  ["openWorldHint", "open-world"],
+]);
+
+/** @param {Partial<ManifestEntry>} entry */
+function describeHints(entry) {
+  const hints = entry.annotations;
+  if (hints === undefined || hints === null || typeof hints !== "object") return "[annotations missing]";
+  const set = HINT_LABELS.filter(([key]) => hints[key] === true).map(([, label]) => label);
+  return `[${set.length > 0 ? set.join(" ") : "no hints"}]`;
+}
+
 /** @param {ManifestEntry} entry */
 function describeEntry(entry) {
-  return entry.method === null ? `${entry.name} (hand-written)` : `${entry.name} ${entry.method} ${entry.path}`;
+  const where = entry.method === null ? `${entry.name} (hand-written)` : `${entry.name} ${entry.method} ${entry.path}`;
+  return `${where} ${describeHints(entry)}`;
 }
 
 /**

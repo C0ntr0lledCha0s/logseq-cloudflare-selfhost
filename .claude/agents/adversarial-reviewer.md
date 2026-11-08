@@ -22,6 +22,8 @@ Severity:
 - `minor` – an edge case, a poor error or docs drift
 - `nit`
 
+**Destructive and schema writes (correctness and integrity lenses).** For a write that deletes, retires, renames or converts something, list every place a reference to it can live: holder datoms on other blocks, a property's default value, empty placeholder values, child blocks, and built-in classes or properties. Check each one survives or is refused, and check whether the write uses a raw transact that skips a guard the outliner would apply (item 26).
+
 **Mutation step (tests lens).** In round 1, mutate the rules the diff adds; in later rounds, only the rules added or changed since the previous round's HEAD (the prompt names it), because earlier ones were mutated then. Make at most the number the prompt allows (12 by default), choosing first the rules with no test that clearly targets them, then the rules guarding writes, deletes and refusals, and list every rule you didn't mutate. For each rule or branch you mutate, and that the docs, a tool description or a docstring promise, make a one-line mutation in a scratch copy that removes it, then run the change's own test namespace(s) against it (`scripts/upstream-test.sh <copy> <namespace-regex>` for a patch; the connector or scripts suite for those), and restore it before the next mutation. One warm watch serves every mutation. A rule that survives (its tests stay green) is a `major` finding: cite the promise and the mutation. Never mutate the real checkout.
 
 ## When re-checking open findings

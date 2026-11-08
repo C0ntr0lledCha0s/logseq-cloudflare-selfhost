@@ -6,6 +6,7 @@ import {
   requireOwnerSession,
   sealPendingGraph,
 } from "../auth/session";
+import { DEFAULT_EXPIRY_DAYS, MAX_EXPIRY_DAYS, type ServiceTokenAccess, ServiceTokenStore } from "../auth/service-tokens";
 import { readForm } from "../form";
 import { type GraphMode, type GraphPermission, GraphStore, normalizeAlias, normalizeToken } from "../graphs";
 import { InspectError, SyncError, type TokenGraph, inspectToken } from "../sync";
@@ -18,6 +19,10 @@ import {
   graphListPage,
   messagePage,
   newGraphPage,
+  newTokenPage,
+  tokenCreatedPage,
+  tokenListPage,
+  type TokenFormValues,
 } from "./views";
 
 // The "Connect a graph" wizard: every route needs the owner's session, and every POST its CSRF token.
@@ -47,6 +52,10 @@ interface FormCtx extends Ctx {
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const ALIAS_ACTION = /^\/graphs\/([a-z0-9][a-z0-9-]{0,39})\/(edit|token|disconnect)$/;
+const TOKEN_REVOKE = /^\/tokens\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/revoke$/;
+const TOKEN_NAME = /^[a-z0-9-]{1,40}$/;
+const WHOLE_DAYS = /^\d{1,3}$/;
+const DAY_MS = 86_400_000;
 
 function text(form: FormData, name: string): string {
   const value = form.get(name);
@@ -236,7 +245,7 @@ async function confirmGraph({ env, session, csrf, store, form }: FormCtx): Promi
   }
 }
 
-/** POST /graphs/:alias/edit: alias, mode and expiry. */
+/** POST /graphs/:alias/edit: alias, mode, expiry and edit stamps (an unticked box is not posted, so it saves off). */
 async function editGraph({ store, form }: FormCtx, alias: string): Promise<Response> {
   const graph = await store.get(alias);
   if (!graph) return notFound();
@@ -246,7 +255,8 @@ async function editGraph({ store, form }: FormCtx, alias: string): Promise<Respo
     checkModeFits(mode, graph.permission);
     const expiresAt = parseExpiry(form);
     if (next !== alias && (await store.get(next))) throw new FormError(`The alias “${next}” is already in use.`, 409);
-    await store.update(alias, { alias: next, mode, expiresAt });
+    const editStamps = text(form, "edit_stamps") === "1";
+    await store.update(alias, { alias: next, mode, expiresAt, editStamps });
     return toList();
   } catch (error) {
     if (error instanceof FormError) return messagePage(error.status, "Not saved", error.message);
@@ -283,11 +293,118 @@ async function replaceToken({ env, store, form }: FormCtx, alias: string): Promi
   }
 }
 
-/** POST /graphs/:alias/disconnect: deletes the graph and its stored token at once. */
-async function disconnectGraph({ store }: FormCtx, alias: string): Promise<Response> {
-  if (!(await store.get(alias))) return notFound();
+/**
+ * POST /graphs/:alias/disconnect: revokes the service tokens that cover the graph, then deletes the
+ * graph and its stored token. Tokens are scoped by graph id, so without the revoke, reconnecting the
+ * same graph would silently give old tokens their access back. Revoking first means a failure leaves
+ * the graph connected rather than the tokens live.
+ */
+async function disconnectGraph({ env, store }: FormCtx, alias: string): Promise<Response> {
+  const record = await store.get(alias);
+  if (!record) return notFound();
+  const revoked = await new ServiceTokenStore(env.DB).revokeForGraph(record.graphId, Date.now());
   await store.remove(alias);
-  return disconnectedPage(alias);
+  return disconnectedPage(alias, revoked);
+}
+
+/** GET /tokens: every token, revoked and expired ones included, with its graphs by current alias. */
+async function listTokens({ env, store, csrf }: Ctx): Promise<Response> {
+  const [list, graphs] = await Promise.all([new ServiceTokenStore(env.DB).list(), store.list()]);
+  return tokenListPage(list, graphs, csrf, Date.now());
+}
+
+/** GET /tokens/new: read-only and DEFAULT_EXPIRY_DAYS unless the owner changes them. */
+async function newToken({ store, csrf }: Ctx): Promise<Response> {
+  const values: TokenFormValues = { name: "", graphIds: [], access: "read", expiresDays: String(DEFAULT_EXPIRY_DAYS) };
+  return newTokenPage(csrf, await store.list(), values);
+}
+
+interface TokenInput {
+  name: string;
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  days: number;
+}
+
+/** Every field of the create form, checked before anything is read or written; each refusal names its field. */
+function parseTokenForm(form: FormData, connected: ReadonlySet<string>): TokenInput {
+  const name = text(form, "name").trim();
+  if (!TOKEN_NAME.test(name)) throw new FormError("name: use 1–40 lowercase letters, digits or hyphens.");
+  const graphIds = [...new Set(form.getAll("graph").map((value) => (typeof value === "string" ? value : "")))];
+  if (graphIds.length === 0) throw new FormError("graph: choose at least one graph.");
+  if (!graphIds.every((id) => connected.has(id))) throw new FormError("graph: a chosen graph is not connected. Reload the page and choose again.");
+  const access = text(form, "access");
+  if (access !== "read" && access !== "write") throw new FormError("access: choose read-only or read-write.");
+  const days = text(form, "expires_days").trim();
+  const count = WHOLE_DAYS.test(days) ? Number(days) : NaN;
+  if (!(count >= 1 && count <= MAX_EXPIRY_DAYS)) {
+    throw new FormError(`expires_days: a whole number of days from 1 to ${MAX_EXPIRY_DAYS}.`);
+  }
+  return { name, graphIds, access, days: count };
+}
+
+/** The first field the stored row disagrees on, or undefined when it holds exactly what was submitted. */
+function readBackMismatch(
+  row: Awaited<ReturnType<ServiceTokenStore["get"]>>,
+  want: TokenInput & { expiresAt: number },
+): string | undefined {
+  if (!row) return "token";
+  if (row.name !== want.name) return "name";
+  if (row.graphIds.length !== want.graphIds.length || row.graphIds.some((id, i) => id !== want.graphIds[i])) return "graph";
+  if (row.access !== want.access) return "access";
+  if (row.expiresAt !== want.expiresAt) return "expires_days";
+  return undefined;
+}
+
+/** POST /tokens/new: validate, insert, read back and compare, then show the token once. */
+async function createToken({ env, session, csrf, store, form }: FormCtx): Promise<Response> {
+  const graphs = await store.list();
+  const tokens = new ServiceTokenStore(env.DB);
+  try {
+    const input = parseTokenForm(form, new Set(graphs.map((graph) => graph.graphId)));
+    if (await tokens.nameInUse(input.name)) {
+      throw new FormError(`name: “${input.name}” is already in use by another token, revoked or not.`, 409);
+    }
+    const createdAt = Date.now();
+    const expiresAt = createdAt + input.days * DAY_MS;
+    const { id, token } = await tokens.create({
+      name: input.name,
+      ownerId: session.githubUserId,
+      graphIds: input.graphIds,
+      access: input.access,
+      createdAt,
+      expiresAt,
+    });
+    const field = readBackMismatch(await tokens.get(id), { ...input, expiresAt });
+    if (field !== undefined) {
+      await tokens.remove(id);
+      throw new FormError(`${field}: the stored token did not match the form, so it was deleted. No token was created.`, 500);
+    }
+    return tokenCreatedPage(input.name, token);
+  } catch (error) {
+    if (!(error instanceof FormError)) throw error;
+    // Echo only values that are already valid; an invalid name could be anything the owner pasted.
+    const name = text(form, "name").trim();
+    const access = text(form, "access");
+    const days = text(form, "expires_days").trim();
+    const values: TokenFormValues = {
+      name: TOKEN_NAME.test(name) ? name : "",
+      graphIds: form.getAll("graph").filter((id): id is string => typeof id === "string"),
+      access: access === "read" || access === "write" ? access : "",
+      expiresDays: WHOLE_DAYS.test(days) ? days : "",
+    };
+    return newTokenPage(csrf, graphs, values, error.status, error.message);
+  }
+}
+
+/** POST /tokens/:id/revoke: sets revoked_at once; a re-send keeps the first time and still redirects. */
+async function revokeToken({ env }: FormCtx, id: string): Promise<Response> {
+  const tokens = new ServiceTokenStore(env.DB);
+  // The lookup runs only when nothing changed, to tell an unknown id from an already revoked one.
+  if (!(await tokens.revoke(id, Date.now())) && !(await tokens.get(id))) {
+    return messagePage(404, "Not found", "No service token has that id.");
+  }
+  return new Response(null, { status: 303, headers: { Location: "/tokens", "Cache-Control": "no-store" } });
 }
 
 const ACTIONS = { edit: editGraph, token: replaceToken, disconnect: disconnectGraph } as const;
@@ -300,6 +417,11 @@ export function wizardRoute(request: Request, env: Env): Promise<Response> | und
   if (pathname === "/graphs/new" && method === "GET") return withSession(request, env, async ({ csrf }) => newGraphPage(csrf));
   if (pathname === "/graphs/new" && method === "POST") return withForm(request, env, submitToken);
   if (pathname === "/graphs/confirm" && method === "POST") return withForm(request, env, confirmGraph);
+  if (pathname === "/tokens" && method === "GET") return withSession(request, env, listTokens);
+  if (pathname === "/tokens/new" && method === "GET") return withSession(request, env, newToken);
+  if (pathname === "/tokens/new" && method === "POST") return withForm(request, env, createToken);
+  const revoke = TOKEN_REVOKE.exec(pathname);
+  if (revoke && method === "POST") return withForm(request, env, (ctx) => revokeToken(ctx, revoke[1]));
   const match = ALIAS_ACTION.exec(pathname);
   if (match && method === "POST") {
     const [, alias, action] = match;

@@ -4,7 +4,9 @@ area: api
 tags: [built-in, raw-transact, delete-blocks, default-value, placeholder, destructive, retire]
 seen:
   - 2026-11-06 – item 26, patch 0026, review rounds 1 and 2 (r1-correctness, r2-correctness-1, r2-integrity-1)
-promoted_to: []
+  - 2026-11-07 – item 17, patch 0028, review round 3 (r3-correctness-1): delete summaries counted a block's hidden property value blocks as children ("+1 child" on a leaf holding Owner: Ann), because ldb/get-block-full-children-ids includes them
+  - 2026-11-07 – item 26 defect 4, patch 0030: the same convert_values delete-blocks! also flattened references to the deleted value blocks (see api/convert-values-deleted-referenced-value-blocks.md)
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
@@ -28,3 +30,7 @@ Refuse `classes` on built-in properties up front (set, add, remove, `set: []`, b
 - Any new write that bypasses the outliner (raw transact) needs its own built-in and ownership checks, tested on a built-in property.
 - For a destructive call, list every place a reference can live (holder datoms, the default value, placeholders, child blocks) and give each a test.
 - After the write, read back through the real read path, and give the read-back a tamper test that makes it answer 500.
+
+## Also: counts shown to the owner
+
+`ldb/get-block-full-children-ids` includes the hidden value blocks of text, URL and number properties. A count the owner reads ("2 children") must walk `:block/parent` and skip blocks created from a property (patch 0028, `child-block-count`). Keep the full set for what is actually removed and for the read-back.

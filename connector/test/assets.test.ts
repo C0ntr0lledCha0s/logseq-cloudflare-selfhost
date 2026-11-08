@@ -22,6 +22,7 @@ interface SyncCall {
   url: URL;
   auth: string | null;
   contentType: string | null;
+  stamp: string | null;
   bytes: Uint8Array;
 }
 
@@ -44,6 +45,7 @@ function testEnv(): Env {
         url: new URL(request.url),
         auth: request.headers.get("Authorization"),
         contentType: request.headers.get("Content-Type"),
+        stamp: request.headers.get("x-logseq-edit-stamp"),
         bytes: new Uint8Array(await request.clone().arrayBuffer()),
       });
       return syncHandler(request);
@@ -124,6 +126,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<{ 
   return { isError: json.result.isError === true, content: json.result.content };
 }
 
+/** A write's JSON: the result is the summary (ending with its audit entry line), then the JSON. */
+function writtenJson(result: { content: Content[] }): unknown {
+  expect(result.content).toHaveLength(2);
+  expect((result.content[0] as { text: string }).text).toMatch(/(^|\n)Logged as audit entry \d+$/);
+  return JSON.parse((result.content[1] as { text: string }).text);
+}
+
 function onlyText(result: { content: Content[] }): string {
   expect(result.content).toHaveLength(1);
   expect(result.content[0].type).toBe("text");
@@ -162,7 +171,7 @@ describe("save_document", () => {
     const result = await callTool("save_document", { graph: "work", fileName: "standup.md", text });
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(onlyText(result))).toEqual({
+    expect(writtenJson(result)).toEqual({
       assetUuid: ASSET_ID,
       fileName: "standup.md",
       size: bytes.length,
@@ -188,7 +197,7 @@ describe("save_document", () => {
     const raw = new Uint8Array([0, 255, 1, 2, 128, 64]);
     const fromBase64 = await callTool("save_document", { graph: "work", fileName: "blob.bin", base64: base64(raw) });
     expect(fromBase64.isError).toBe(false);
-    expect(JSON.parse(onlyText(fromBase64))).toEqual({
+    expect(writtenJson(fromBase64)).toEqual({
       assetUuid: ASSET_ID,
       fileName: "blob.bin",
       size: 6,
@@ -209,7 +218,7 @@ describe("save_document", () => {
     expect(byUuid.isError).toBe(false);
     expect(syncCalls).toHaveLength(1);
     expect(syncCalls[0].url.searchParams.get("page-id")).toBe(PAGE_ID);
-    expect(JSON.parse(onlyText(byUuid))).toMatchObject({ pageId: PAGE_ID, pageTitle: "Standup" });
+    expect(writtenJson(byUuid)).toMatchObject({ pageId: PAGE_ID, pageTitle: "Standup" });
 
     syncCalls = [];
     const upload = syncHandler;
@@ -516,7 +525,7 @@ describe("save_file_from_url", () => {
     });
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(onlyText(result))).toEqual({
+    expect(writtenJson(result)).toEqual({
       assetUuid: ASSET_ID,
       fileName: "Q3 report.pdf",
       size: pdf.length,
@@ -539,7 +548,7 @@ describe("save_file_from_url", () => {
     const toToday = await callTool("save_file_from_url", { graph: "work", url: "https://files.example.com/a.pdf" });
     expect(toToday.isError).toBe(false);
     expect(syncCalls[0].url.searchParams.has("page-id")).toBe(false);
-    expect(JSON.parse(onlyText(toToday))).toMatchObject({ pageId: JOURNAL_ID, pageTitle: "Nov 6th, 2026" });
+    expect(writtenJson(toToday)).toMatchObject({ pageId: JOURNAL_ID, pageTitle: "Nov 6th, 2026" });
 
     // A refused URL becomes a tool error and nothing is uploaded.
     syncCalls = [];
@@ -701,6 +710,65 @@ describe("read_file", () => {
   });
 });
 
+describe("reason", () => {
+  const REASON = "keep the standup transcript";
+
+  it("save_document and save_file_from_url send the same upload with or without a reason, and repeat it first", async () => {
+    acceptUploads();
+    const pdf = new TextEncoder().encode("%PDF-1.7 report");
+    const calls: [string, Record<string, unknown>][] = [
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup", page: PAGE_ID }],
+      ["save_document", { graph: "work", fileName: "blob.bin", base64: base64(new Uint8Array([1, 2, 3])) }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf", page: PAGE_ID }],
+    ];
+    for (const [name, args] of calls) {
+      fetchSpy.mockImplementation(async () => new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+      syncCalls = [];
+      const without = await callTool(name, args);
+      const sentWithout = syncCalls.map(({ method, url, bytes }) => ({ method, url: url.href, bytes }));
+      syncCalls = [];
+      fetchSpy.mockClear();
+      const withReason = await callTool(name, { ...args, reason: REASON });
+      const sentWith = syncCalls.map(({ method, url, bytes }) => ({ method, url: url.href, bytes }));
+      expect(sentWith, name).toEqual(sentWithout);
+      expect(sentWith, name).toHaveLength(1);
+      expect(sentWith[0].url, name).not.toContain("reason");
+      expect(sentWith[0].url, name).not.toContain("standup%20transcript");
+      expect(new TextDecoder().decode(sentWith[0].bytes), name).not.toContain(REASON);
+      // The public fetch, when there is one, goes to the URL as given.
+      for (const [input] of fetchSpy.mock.calls) expect(String(input), name).not.toContain("transcript");
+      // Both lead with the summary: the reason (when given), then the audit entry line.
+      expect(without.content, name).toHaveLength(2);
+      const entry = (r: { content: Content[] }) => Number(/^(?:Reason: .*\n)?Logged as audit entry (\d+)$/.exec((r.content[0] as { text: string }).text)?.[1]);
+      expect(withReason, name).toEqual({
+        isError: false,
+        content: [{ type: "text", text: `Reason: ${REASON}\nLogged as audit entry ${entry(without) + 1}` }, without.content[1]],
+      });
+    }
+  });
+
+  it("a reason over 200 characters is refused before any sync call or public fetch", async () => {
+    acceptUploads();
+    for (const [name, args] of [
+      ["save_document", { graph: "work", fileName: "a.md", text: "a" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/a.pdf" }],
+    ] as const) {
+      const result = await callTool(name, { ...args, reason: "r".repeat(201) });
+      expect(result, name).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "reason is 201 characters; at most 200 are accepted — shorten it" }],
+      });
+    }
+    expect(syncCalls).toHaveLength(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const lines = consoleSpies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
+    expect(lines.map((line) => line.replace(/ms=\d+$/, "ms=N"))).toEqual([
+      "tool save_document graph=work status=refused reason=yes ms=N",
+      "tool save_file_from_url graph=work status=refused reason=yes ms=N",
+    ]);
+  });
+});
+
 describe("logging", () => {
   it("file tools log only tool, alias, status and duration — no PAT, URL or hostname", async () => {
     acceptUploads();
@@ -726,9 +794,9 @@ describe("logging", () => {
 
     const lines = consoleSpies.flatMap((s) => s.mock.calls).map((args) => args.map(String).join(" "));
     expect(lines.map((line) => line.replace(/ms=\d+$/, "ms=N"))).toEqual([
-      "tool save_document graph=work status=ok ms=N",
-      "tool save_file_from_url graph=work status=ok ms=N",
-      "tool save_file_from_url graph=work status=refused ms=N",
+      "tool save_document graph=work status=ok reason=no ms=N",
+      "tool save_file_from_url graph=work status=ok reason=no ms=N",
+      "tool save_file_from_url graph=work status=refused reason=no ms=N",
       "tool read_file graph=work status=ok ms=N",
     ]);
     for (const line of lines) {
@@ -736,5 +804,142 @@ describe("logging", () => {
         expect(line).not.toContain(leak);
       }
     }
+  });
+});
+
+describe("audit log", () => {
+  interface Row {
+    id: number;
+    graph_id: string | null;
+    alias: string;
+    tool: string;
+    status: string;
+    dry_run: number;
+    reason: string | null;
+    addressed: string | null;
+    targets: string | null;
+    pages: string | null;
+    error: string | null;
+  }
+  const REASON = "file the Nov 5th transcript";
+
+  async function rowsFor(call: () => Promise<{ isError: boolean; content: Content[] }>) {
+    const last = (await env.DB.prepare("SELECT max(id) AS id FROM audit_log").first<{ id: number | null }>())?.id ?? 0;
+    const result = await call();
+    const rows = (await env.DB.prepare("SELECT * FROM audit_log WHERE id > ? ORDER BY id").bind(last).all<Row>()).results;
+    expect(rows).toHaveLength(1);
+    return { result, row: rows[0] };
+  }
+
+  it("one row per call of each file write: success, sync 409, refused reason, unknown alias and read-only graph", async () => {
+    const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    fetchSpy.mockImplementation(async () => new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+    const calls: [string, Record<string, unknown>][] = [
+      ["save_document", { graph: "work", fileName: "notes.md", text: "# Notes", page: PAGE_ID }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/report.pdf", page: PAGE_ID }],
+    ];
+    for (const [name, args] of calls) {
+      acceptUploads();
+      syncCalls = [];
+      const ok = await rowsFor(() => callTool(name, { ...args, reason: REASON }));
+      expect(ok.result.isError, name).toBe(false);
+      expect(ok.row, name).toMatchObject({ graph_id: WORK_ID, alias: "work", tool: name, status: "ok", dry_run: 0, reason: REASON, error: null });
+      expect(JSON.parse(ok.row.addressed!), name).toEqual([PAGE_ID]);
+      expect(JSON.parse(ok.row.targets!), name).toEqual([]);
+      const first = (ok.result.content[0] as { text: string }).text;
+      expect(first, name).toBe(`Reason: ${REASON}\nLogged as audit entry ${ok.row.id}`);
+
+      syncHandler = () => Response.json({ error: "asset already exists" }, { status: 409 });
+      const conflict = await rowsFor(() => callTool(name, args));
+      expect(conflict.row, name).toMatchObject({ status: "error", error: "asset already exists", targets: null });
+
+      acceptUploads();
+      syncCalls = [];
+      const publicFetches = fetchSpy.mock.calls.length;
+      const long = await rowsFor(() => callTool(name, { ...args, reason: "x".repeat(201) }));
+      expect(long.row, name).toMatchObject({ status: "refused", graph_id: WORK_ID, reason: null });
+      const unknown = await rowsFor(() => callTool(name, { ...args, graph: "nope" }));
+      expect(unknown.row, name).toMatchObject({ status: "refused", graph_id: null, alias: "nope" });
+      const readOnly = await rowsFor(() => callTool(name, { ...args, graph: "notes" }));
+      expect(readOnly.row, name).toMatchObject({ status: "refused", graph_id: NOTES_ID, error: "graph 'notes' is read-only" });
+      expect(syncCalls, name).toHaveLength(0);
+      expect(fetchSpy.mock.calls.length, name).toBe(publicFetches);
+    }
+    // A refusal inside the handler (a URL that can't be fetched) is refused too, after the row began.
+    const bad = await rowsFor(() => callTool("save_file_from_url", { graph: "work", url: "http://files.example.com/a.pdf" }));
+    expect(bad.row.status).toBe("refused");
+    expect(bad.row.error).toMatch(/^cannot fetch that URL: /);
+  });
+});
+
+describe("edit stamps", () => {
+  /** Uploads as acceptUploads does, and a page search that finds the page titled Standup. */
+  function acceptUploadsAndSearch(): void {
+    acceptUploads();
+    const uploads = syncHandler;
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === `/api/v1/graphs/${WORK_ID}/search`) {
+        return Response.json({ results: [{ uuid: PAGE_ID, title: "Standup" }] });
+      }
+      return uploads(request);
+    };
+  }
+
+  it("save_document and save_file_from_url send x-logseq-edit-stamp: claude on the upload exactly when the graph's setting is on; the page search never does", async () => {
+    const pdf = new TextEncoder().encode("%PDF-1.7 report");
+    const calls: [string, Record<string, unknown>][] = [
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup" }],
+      ["save_document", { graph: "work", fileName: "blob.bin", base64: base64(new Uint8Array([1, 2, 3])), page: PAGE_ID }],
+      // A page named by title is found with a GET search before the upload.
+      ["save_document", { graph: "work", fileName: "standup.md", text: "# Standup", page: "Standup" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf" }],
+      ["save_file_from_url", { graph: "work", url: "https://files.example.com/docs/report.pdf", page: "Standup" }],
+    ];
+    for (const [name, args] of calls) {
+      fetchSpy.mockImplementation(async () => new Response(pdf, { headers: { "Content-Type": "application/pdf" } }));
+      acceptUploadsAndSearch();
+      const sent: Record<string, SyncCall[]> = {};
+      for (const editStamps of [1, 0]) {
+        await env.DB.prepare("UPDATE graphs SET edit_stamps = ? WHERE alias = 'work'").bind(editStamps).run();
+        syncCalls = [];
+        const result = await callTool(name, args);
+        expect(result.isError, name).toBe(false);
+        sent[editStamps] = syncCalls;
+      }
+      const on = sent[1];
+      const off = sent[0];
+      expect(on.filter((c) => c.method === "POST").map((c) => c.stamp), name).toEqual(["claude"]);
+      for (const c of on.filter((c) => c.method !== "POST")) expect([c.method, c.stamp], name).toEqual(["GET", null]);
+      expect(off.map((c) => c.stamp), name).toEqual(off.map(() => null));
+      // The same requests either way: no extra Worker request or rate-limited write.
+      const strip = (cs: SyncCall[]) => cs.map(({ stamp: _stamp, ...rest }) => ({ ...rest, url: rest.url.href }));
+      expect(strip(on), name).toEqual(strip(off));
+      if (args.page === "Standup") expect(on.map((c) => c.method), name).toEqual(["GET", "POST"]);
+    }
+  });
+
+  it("read_file's GETs never carry the header", async () => {
+    syncHandler = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === `/api/v1/graphs/${WORK_ID}/assets/${ASSET_ID}`) {
+        return Response.json({
+          uuid: ASSET_ID,
+          title: "standup",
+          type: "md",
+          size: 9,
+          checksum: "0".repeat(64),
+          url: `https://sync.internal/assets/${WORK_ID}/${ASSET_ID}.md?expires=1999999999&signature=abcd`,
+          "expires-at": 1999999999,
+        });
+      }
+      return new Response("# Standup");
+    };
+    const result = await callTool("read_file", { graph: "work", assetUuid: ASSET_ID });
+    expect(result.isError).toBe(false);
+    expect(syncCalls.map((c) => [c.method, c.stamp])).toEqual([
+      ["GET", null],
+      ["GET", null],
+    ]);
   });
 });

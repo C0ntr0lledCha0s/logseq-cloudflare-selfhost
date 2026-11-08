@@ -4,8 +4,10 @@ import { z } from "zod";
 import type { ResolvedGraph } from "../graphs";
 import { SafeFetchError, readUpTo, safeFetch } from "../net/safe-fetch";
 import { RESULT_CHAR_LIMIT, ToolError, aliasArg, runTool, textResult } from "./common";
-import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
-import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION } from "./spec.mjs";
+import { type AuditContext, audited } from "../audit/log";
+import { type OnSuccess, reasonGiven, reasonSchema } from "./readable";
+import { type GraphAccess, STAMP_HINT, editStampHeaders, graphFetch, resolveGraph } from "./semantic";
+import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 // The file tools replace the generated createAsset/getAsset (design §7). createAsset takes the raw
 // bytes as `application/octet-stream` with their exact `size` and SHA-256 `checksum` as query
@@ -163,7 +165,7 @@ async function upload(
     path: graphPath(graph, "/assets"),
     query,
     body: file.bytes,
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: { "Content-Type": "application/octet-stream", ...editStampHeaders(graph, "POST") },
   });
   const asset = (await response.json()) as { uuid?: unknown; "page-id"?: unknown; "page-title"?: unknown };
   if (typeof asset.uuid !== "string") throw new Error("createAsset answered without an asset uuid");
@@ -255,24 +257,37 @@ async function readFile(access: GraphAccess, alias: string, assetUuid: string): 
   return textResult(fileText(text, complete, fileName, meta.size));
 }
 
-/** `save_document`, `save_file_from_url` and `read_file`. `onSuccess` runs after each successful call. */
-export function registerAssetTools(
-  server: McpServer,
-  access: GraphAccess,
-  onSuccess: (tool: string, alias: string) => void,
-): void {
-  const write = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
-
-  function handle<A>(name: string, call: (alias: string, args: A) => Promise<CallToolResult>) {
+/**
+ * `save_document`, `save_file_from_url` and `read_file`. `onSuccess` runs after each successful call.
+ * The two writes take a `reason`, which is taken out of their arguments before anything else runs
+ * (it is never sent anywhere) and repeated as the result's first content item.
+ */
+export function registerAssetTools(server: McpServer, access: GraphAccess, onSuccess: OnSuccess, audit: AuditContext): void {
+  function handle<A extends Record<string, unknown>>(
+    name: string,
+    call: (alias: string, args: Omit<A, "reason">) => Promise<CallToolResult>,
+  ) {
+    const write = !annotationsFor(name).readOnlyHint;
     return (args: A) => {
       const alias = aliasArg(args);
-      return runTool(name, alias, async () => {
-        // The input schema requires a well-formed alias, so a call that got this far has one.
-        if (alias === undefined) throw new Error("file tool ran without a valid alias");
-        const result = await call(alias, args);
-        onSuccess(name, alias);
-        return result;
-      });
+      return runTool(
+        name,
+        alias,
+        async () => {
+          // The input schema requires a well-formed alias, so a call that got this far has one.
+          if (alias === undefined) throw new Error("file tool ran without a valid alias");
+          if (!write) {
+            const result = await call(alias, args);
+            onSuccess(name, alias);
+            return result;
+          }
+          // audited() logs the call and takes out `reason`; the summary it adds names the entry.
+          const { result, reason, targets } = await audited(audit, name, alias, args, (rest) => call(alias, rest as Omit<A, "reason">));
+          onSuccess(name, alias, { reason, targets });
+          return result;
+        },
+        write ? reasonGiven(args) : undefined,
+      );
     };
   }
 
@@ -280,15 +295,16 @@ export function registerAssetTools(
     "save_document",
     {
       description:
-        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
+        "Save a document to the graph as a file asset (e.g. a transcript, report or note), from text (utf-8) or base64 bytes, at most 150,000 characters. The file name's extension sets its type. Returns the asset's UUID and the page it was attached to (pageId, pageTitle). " + STAMP_HINT,
       inputSchema: z.object({
         graph: graphArg,
         fileName: z.string().min(1).describe("File name with an extension, e.g. meeting-notes.md"),
         text: z.string().optional().describe("The document as text, saved as utf-8. Pass this or base64."),
         base64: z.string().optional().describe("The document's bytes, base64-encoded. Pass this or text."),
         page: pageArg,
+        reason: reasonSchema,
       }),
-      annotations: write,
+      annotations: annotationsFor("save_document"),
     },
     handle("save_document", async (alias, args) => {
       const graph = await resolveGraph(access, alias, true);
@@ -312,7 +328,7 @@ export function registerAssetTools(
     "save_file_from_url",
     {
       description:
-        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID and the page it was attached to (pageId, pageTitle).",
+        "Download a file from a public https URL (at most 25 MiB; text, PDF, PNG, JPEG, GIF, WebP, JSON or Office documents) and save it to the graph as a file asset. Returns the asset's UUID and the page it was attached to (pageId, pageTitle). " + STAMP_HINT,
       inputSchema: z.object({
         graph: graphArg,
         url: z.string().describe("Public https URL of the file"),
@@ -322,8 +338,9 @@ export function registerAssetTools(
           .optional()
           .describe("File name with an extension; defaults to the URL's last path segment"),
         page: pageArg,
+        reason: reasonSchema,
       }),
-      annotations: write,
+      annotations: annotationsFor("save_file_from_url"),
     },
     handle("save_file_from_url", async (alias, args) => {
       const graph = await resolveGraph(access, alias, true);
@@ -355,7 +372,7 @@ export function registerAssetTools(
           .regex(UUID)
           .describe("The asset block's UUID, e.g. from save_document, list_assets or search_graph"),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+      annotations: annotationsFor("read_file"),
     },
     handle("read_file", (alias, args) => readFile(access, alias, args.assetUuid)),
   );

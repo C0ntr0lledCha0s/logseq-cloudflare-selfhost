@@ -37,10 +37,12 @@ Call the Workflow tool with the saved workflow's name and `args`. Every lane tak
 
 | Lane | name | Lane-specific args |
 |---|---|---|
-| bug | `lane-bug` | `issue` or `brief`. Optional: `stop_after: "investigate"` when the owner only wants a diagnosis, and `max_fix_rounds` (default 2). |
-| feature | `lane-feature` | `issue` or `brief`. The first run stops after the spec. Rerun with `spec: "<path>"` after approval. Optional: `stop_after: "plan"`. |
+| bug | `lane-bug` | `issue` or `brief`. Optional: `stop_after: "investigate"` when the owner only wants a diagnosis, `tier`, and `max_fix_rounds` (default from the tier). |
+| feature | `lane-feature` | `issue` or `brief`. The first run stops after the spec. Rerun with `spec: "<path>"` after approval. Optional: `stop_after: "plan"` and `tier`. |
 | spike | `lane-spike` | `issue`, or `brief` and `questions` |
 | review | `lane-review` | `base: "origin/main"`. To re-check an earlier result, add `open` (its findings) and `round`. |
+
+**Tier (bug and feature lanes).** Intake suggests `quick`, `standard` or `full` (see docs/lanes/README.md, *Tiers*) and the run log names it. Pass `tier` when the owner chose one. Never pass `quick` for a change that deletes, converts or restructures stored data or the schema, or touches auth, tokens or secrets. Report the tier in the status, with any should-fix items it left for the backlog.
 
 Tell the owner which lane is running and that you'll report back. Don't predict results while it runs. If the run is interrupted, resume it with `resumeFromRunId`.
 

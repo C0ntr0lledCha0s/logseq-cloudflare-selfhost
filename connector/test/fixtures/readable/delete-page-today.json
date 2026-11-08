@@ -1,0 +1,21 @@
+{
+  "operationId": "deletePage",
+  "status": "200",
+  "tool": "delete_page",
+  "response": {
+    "affected": [
+      {
+        "uuid": "00000001-2026-1106-0000-000000000000",
+        "kind": "journal",
+        "page": {
+          "uuid": "00000001-2026-1106-0000-000000000000",
+          "title": "Nov 6th, 2026"
+        },
+        "breadcrumb": [],
+        "snippet": "Nov 6th, 2026"
+      }
+    ],
+    "truncated": true,
+    "cleared": 2
+  }
+}

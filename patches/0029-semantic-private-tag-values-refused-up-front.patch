@@ -1,0 +1,438 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 5a85364..e5c4c90 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -23,6 +23,7 @@
+             [logseq.db.frontend.entity-util :as entity-util]
+             [logseq.db.frontend.property :as db-property]
+             [logseq.db.frontend.property.type :as db-property-type]
++            [logseq.graph-parser.block :as gp-block]
+             [logseq.graph-parser.mldoc :as gp-mldoc]
+             [logseq.outliner.core :as outliner-core]
+             [logseq.outliner.page :as outliner-page]
+@@ -955,19 +956,38 @@
+    ::refusal reason})
+ 
+ (defn- tag-value-refusal
+-  "Why the resolved :block/tags `values` for `scope` (see prepare-property-value) can't hold Tag, or
+-  nil. The outliner refuses Tag as a tags value (validate-tags-property), which surfaced as a server
+-  error. A page becomes a tag through promotePageToTag, which also gives it the :db/ident a tag
+-  needs, so a page is pointed there. A tag already holds Tag, so re-sending it is allowed, and
+-  set-prepared-property! doesn't set it again."
++  "Why the resolved :block/tags `values` for `scope` (see prepare-property-value) can't hold a
++  private tag, or nil. The outliner refuses Tag as a tags value (validate-tags-property), which
++  surfaced as a server error. A page becomes a tag through promotePageToTag, which also gives it the
++  :db/ident a tag needs, so a page is pointed there. A tag already holds Tag, so re-sending it is
++  allowed, and set-prepared-property! doesn't set it again.
++  The outliner refuses every other private tag too (disallow-node-cant-tag-with-private-tags:
++  Journal, Whiteboard, Pdf-annotation, Property, Asset; Page has its own guard), which surfaced as a
++  server error on a set and as its bare text on an insert. Logseq sets these itself, so they are
++  refused here, except one the target already holds (a journal re-sending Journal, an asset
++  re-sending Asset), which set-prepared-tags! skips as a no-op. The outliner's other exception,
++  Asset on an asset, is covered by that: an asset entity must hold Asset to be valid. A page a batch
++  insert creates has no :db/id yet; its scope's ::held-tags names the tags create! gives it (Journal
++  for a journal day), so a new journal may be sent Journal too."
+   [db scope values]
+-  (let [target (some->> (:db/id scope) (d/entity db))]
+-    (when (and (some #{(:db/id (d/entity db :logseq.class/Tag))} values)
+-               (not (entity-util/class? target)))
++  (let [target (some->> (:db/id scope) (d/entity db))
++        held (into (set (map :db/id (:block/tags target))) (::held-tags scope))]
++    (cond
++      (and (some #{(:db/id (d/entity db :logseq.class/Tag))} values)
++           (not (entity-util/class? target)))
+       (str "Tag marks a page as a tag and can't be set as a value; "
+            (if (page? target)
+              (str "use promote_page_to_tag on page " (:block/uuid target))
+-             "use promote_page_to_tag")))))
++             "use promote_page_to_tag"))
++
++      :else
++      (some (fn [id]
++              (let [tag (d/entity db id)
++                    ident (:db/ident tag)]
++                (when (and (contains? (disj ldb/private-tags :logseq.class/Page) ident)
++                           (not (contains? held id)))
++                  (str (:block/title tag) " is a built-in tag Logseq sets itself and can't be set as a value"))))
++            values))))
+ 
+ (defn- prepare-property-value
+   "Resolves `value` for `property-ident` to {:value v} or {:error reason}. `scope` is the block
+@@ -1060,16 +1080,18 @@
+   [db scope tag-ids]
+   (if (seq tag-ids)
+     (cond-> {:block/tags (concat (:block/tags scope) (map #(d/entity db %) tag-ids))}
+-      (:db/id scope) (assoc :db/id (:db/id scope)))
++      (:db/id scope) (assoc :db/id (:db/id scope))
++      (::held-tags scope) (assoc ::held-tags (::held-tags scope)))
+     scope))
+ 
+ (defn- with-property-tags
+-  "`scope` with the tags that a `properties` object adds to the block."
++  "`scope` with the tags that a `properties` object adds to the block. The tags are resolved for
++  `scope` itself, so a private tag the block holds doesn't drop the list's other tags."
+   [db scope properties e2ee?]
+   (scope-with-tags db scope
+                    (tag-ids (some (fn [[k value]]
+                                     (when (= :block/tags (resolve-property-ident db (property-selector k)))
+-                                      (:value (prepare-property-value db :block/tags value e2ee? nil))))
++                                      (:value (prepare-property-value db :block/tags value e2ee? scope))))
+                                   properties))))
+ 
+ (defn- prepare-properties
+@@ -3665,6 +3687,15 @@
+     (date-time-util/int->journal-title day (:logseq.property.journal/title-format (d/entity db :logseq.class/Journal)))
+     page))
+ 
++(defn- new-page-held-tags
++  "The tag db ids of the page a batch insert entry's `page` title creates, as outliner-page/create!
++  tags it: Journal for a title that names a journal day, else Page."
++  [db page]
++  (let [formatter (:logseq.property.journal/title-format (d/entity db :logseq.class/Journal))]
++    (set (keep #(:db/id (d/entity db %))
++               (:block/tags (gp-block/page-name->map page db false formatter
++                                                     {:skip-existing-page-check? true}))))))
++
+ (defn- insert-entry-key
+   "What a batch insert entry writes to: the existing target or page, else the page title to create."
+   [target existing-page page]
+@@ -3681,7 +3712,8 @@
+         target (:ok selected)
+         page (:page entry)
+         existing-page (when (and (non-blank-string? page) (not e2ee?)) (insert-page db page))
+-        scope (scope-with-tags db (or target existing-page {})
++        scope (scope-with-tags db (or target existing-page
++                                      (if (non-blank-string? page) {::held-tags (new-page-held-tags db page)} {}))
+                                (get added (insert-entry-key target existing-page page)))
+         properties (when (contains? entry :properties)
+                      (prepare-properties db (:properties entry) e2ee? scope))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs
+new file mode 100644
+index 0000000..aa65306
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs
+@@ -0,0 +1,312 @@
++(ns logseq.db-sync.semantic-private-tags-test
++  "Private tags as a tags value (item 26, defect 6). Logseq sets its private tags itself
++  (ldb/private-tags: Journal, Whiteboard, Pdf-annotation, Property, Asset, plus Tag and Page, which
++  have their own guards), and the outliner refuses them as a tags value on server writes
++  (disallow-node-cant-tag-with-private-tags). The handler refused only Tag up front, so any other
++  private tag reached the outliner: setBlockProperty and batch-set answered 500, and a tree insert
++  answered the outliner's bare 400 with no entry or path. Every private tag, on every tags write
++  path, is refused up front with a 400 that names the entry and the tag, and nothing is written. A
++  private tag the target already holds (a journal re-sending Journal) and Asset on an asset stay
++  allowed. The graph has a tag Food, pages Restaurant and Notes (with one block), a journal, a
++  whiteboard, an asset block and a property."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid id]))
++
++(defn- tag-titles [conn id]
++  (set (map :block/title (:block/tags (entity conn id)))))
++
++(defn- raw-page
++  "A page transacted as-is, as the app or a sync would store it, for kinds the API doesn't create."
++  [id title & {:as more}]
++  (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++         more))
++
++(defn- seed-graph
++  "A conn with the entities the namespace docstring names, and the handler context to call it
++  through."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          food (request! self "POST" "/semantic/tags" {:title "Food"})
++          [restaurant diner notes note-block journal board asset] (repeatedly 7 random-uuid)
++          _ (d/transact! conn [(raw-page restaurant "Restaurant")
++                               (raw-page diner "Diner")
++                               (raw-page notes "Notes")
++                               (raw-page journal "Nov 6th, 2026" :block/journal-day 20261106
++                                         :block/tags #{:logseq.class/Journal})
++                               (raw-page board "Board" :block/tags #{:logseq.class/Whiteboard})])
++          _ (d/transact! conn [{:block/uuid note-block :block/title "A note"
++                                :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                                :block/order "a0" :block/created-at 1 :block/updated-at 1}
++                               ;; A write validates the whole entity, so the asset is a full one.
++                               {:block/uuid asset :block/title "photo" :block/order "a9"
++                                :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                                :block/tags #{:logseq.class/Asset} :logseq.property.asset/type "png"
++                                :logseq.property.asset/checksum "abc" :logseq.property.asset/size 1
++                                :block/created-at 1 :block/updated-at 1}])
++          property (outliner-property/upsert-property!
++                    conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                    {:property-name "rating"})]
++    {:conn conn :self self :food (uuid (get-in food [:body :uuid]))
++     :restaurant restaurant :diner diner :notes notes :note-block note-block
++     :journal journal :board board :asset asset :property (:block/uuid property)}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(def ^:private tags-property (js/encodeURIComponent "block/tags"))
++
++(defn- set-tags! [self id value]
++  (request! self "PUT" (str "/semantic/blocks/" id "/properties/" tags-property) {:value value}))
++
++(defn- batch-set! [self reset? entries]
++  (request! self "POST" "/semantic/block-properties/batch-set"
++            {:isResetExistingValues reset? :entries entries}))
++
++(def ^:private private-tags
++  "Every private tag the outliner refuses as a value, other than Tag (refused since patch 0027) and
++  Page (allowed, with its own outliner guard)."
++  [:logseq.class/Journal :logseq.class/Whiteboard :logseq.class/Pdf-annotation
++   :logseq.class/Property :logseq.class/Asset])
++
++(defn- title-of [conn ident] (:block/title (d/entity @conn ident)))
++
++(defn- value-forms
++  "Each way a caller names the private tag `ident`: its title, its ident, its UUID, and a list that
++  also holds a tag the target may take."
++  [conn ident]
++  (let [tag (d/entity @conn ident)]
++    [["title" (:block/title tag)]
++     ["ident" (subs (str ident) 1)]
++     ["UUID" (str (:block/uuid tag))]
++     ["list with another tag" ["Food" (:block/title tag)]]]))
++
++(defn- refused-up-front?
++  "The response is a 400 whose error starts with `prefix` (the entry or path, then the property)
++  and names the tag."
++  [response prefix tag-title]
++  (and (= 400 (:status response))
++       (string? (get-in response [:body :error]))
++       (string/starts-with? (get-in response [:body :error]) prefix)
++       (string/includes? (get-in response [:body :error]) tag-title)))
++
++;; Before the fix, through the real handler, e.g. Journal on the page Restaurant:
++;;   500 {:error "server error", :debug-message "#error {:message \"Can't set tag with built-in
++;;        #Journal\", :data {:type :notification ...}}"}
++;; from the outliner's disallow-node-cant-tag-with-private-tags.
++(deftest set-private-tag-on-page-or-block-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant note-block]}]
++        ;; p/doseq takes one binding, so the cases are built with for.
++        (p/doseq [[target-kind target held ident form value]
++                  (for [[target-kind target held] [["a page" restaurant #{"Page"}] ["a block" note-block #{}]]
++                        ident private-tags
++                        [form value] (value-forms conn ident)]
++                    [target-kind target held ident form value])]
++          (p/let [title (title-of conn ident)
++                  before (snapshot conn)
++                  response (set-tags! self target value)]
++            (testing (str target-kind ", " title ", " form)
++              (is (refused-up-front? response "Tags: " title) (pr-str response))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= held (tag-titles conn target))))))))))
++
++;; Before the fix: 500 "server error" (Can't set tag with built-in #Journal) for entry 1, with entry
++;; 0 already prepared.
++(deftest batch-set-private-tag-names-entry-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self restaurant diner]}]
++        (p/doseq [[reset? ident] (for [reset? [false true] ident private-tags] [reset? ident])]
++          (p/let [title (title-of conn ident)
++                  before (snapshot conn)
++                  response (batch-set! self reset?
++                                       [{:block-id (str diner) :property-id "block/tags" :value "Food"}
++                                        {:block-id (str restaurant) :property-id "block/tags" :value [title]}])]
++            (testing (str "isResetExistingValues " reset? ", " title)
++              (is (refused-up-front? response "entry 1: Tags: " title) (pr-str response))
++              (is (= before (snapshot conn)) "entry 0 isn't written either")
++              (is (= #{"Page"} (tag-titles conn diner)))
++              (is (= #{"Page"} (tag-titles conn restaurant))))))))))
++
++;; Before the fix a tree insert answered the outliner's bare text, with no entry or path:
++;;   400 {:error "Can't set tag with built-in #Journal"}
++(deftest insert-tree-private-tag-names-path-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes restaurant]}]
++        (p/doseq [ident private-tags]
++          (p/let [title (title-of conn ident)
++                  before (snapshot conn)
++                  tree (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str notes)
++                                  :blocks [{:title "Fine"}
++                                           {:title "Bistro" :properties {"Tags" ["Food" title]}}]})
++                  nested (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:target-id (str notes)
++                                               :blocks [{:title "Parent"
++                                                         :children [{:title "Bistro" :properties {"Tags" title}}]}]}]})
++                  existing-page (request! self "POST" "/semantic/block-trees/batch"
++                                          {:entries [{:target-id (str restaurant) :properties {"Tags" title}}]})
++                  new-page (request! self "POST" "/semantic/block-trees/batch"
++                                     {:entries [{:page "Bistro" :properties {"Tags" [title]}}]})]
++            (testing title
++              (is (refused-up-front? tree "blocks[1]: Tags: " title) (pr-str tree))
++              (is (refused-up-front? nested "entries[0].blocks[0].children[0]: Tags: " title) (pr-str nested))
++              (is (refused-up-front? existing-page "entries[0]: Tags: " title) (pr-str existing-page))
++              (is (refused-up-front? new-page "entries[0]: Tags: " title) (pr-str new-page))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= #{"Page"} (tag-titles conn restaurant)))
++              (is (nil? (ldb/get-page @conn "Bistro"))))))))))
++
++;; Controls, which passed before the fix too: a private tag the target already holds is a no-op on
++;; a retry, a list with it adds the other tag, and Asset on an asset is the outliner's own exception.
++(deftest private-tag-the-target-holds-still-allowed-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self journal board asset property]}]
++        (p/doseq [[kind id private path call]
++                  (for [[kind id private] [["a journal" journal "Journal"]
++                                           ["a whiteboard" board "Whiteboard"]
++                                           ["an asset" asset "Asset"]
++                                           ["a property" property "Property"]]
++                        [path call] [["set_block_property, title" #(set-tags! self id private)]
++                                     ["set_block_property, list" #(set-tags! self id [private "Food"])]
++                                     ["batch set" #(batch-set! self false [{:block-id (str id) :property-id "block/tags"
++                                                                            :value private}])]
++                                     ["batch set under reset" #(batch-set! self true [{:block-id (str id) :property-id "block/tags"
++                                                                                       :value [private "Food"]}])]]]
++                    [kind id private path call])]
++          (p/let [response (call)]
++            (testing (str kind ", " path)
++              (is (= 200 (:status response)) (pr-str response))
++              (is (contains? (tag-titles conn id) private)))))))))
++
++;; Guard: Page is a private tag too, but the outliner leaves it to its own guards, and a new page
++;; holds it already, so a page created with its own tags (Page and a user tag) isn't refused.
++(deftest new-page-with-page-tag-still-allowed-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [response (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "Bistro" :properties {"Tags" ["Page" "Food"]}}]})]
++          (is (= 201 (:status response)) (pr-str response))
++          (is (= #{"Page" "Food"} (set (map :block/title (:block/tags (ldb/get-page @conn "Bistro")))))))))))
++
++(defn- with-food-scoped-triage
++  "with-graph plus rating choices: \"open\" for every block, and \"triage\" limited to the tag Food."
++  [done run]
++  (with-graph done
++    (fn [{:keys [conn food property] :as graph}]
++      (let [rating (:db/ident (entity conn property))
++            food-id (:db/id (entity conn food))]
++        (p/let [_ (outliner-property/upsert-closed-value! conn rating {:id (random-uuid) :value "open"})
++                _ (outliner-property/upsert-closed-value! conn rating {:id (random-uuid) :value "triage"
++                                                                       :scoped-class-id food-id})]
++          (run (assoc graph :rating rating)))))))
++
++(defn- choice-title [conn id property-ident]
++  (:block/title (get (entity conn id) property-ident)))
++
++;; Review round 1 (r1-correctness-1). Before the fix, the pre-pass that works out which tags a
++;; properties object adds ran with no target, so a private tag the target holds was refused there and
++;; the other tags in the list (Food) never reached the choice scope:
++;;   400 {:error "entries[0]: rating: property value must resolve to one of rating's choices for this
++;;        block (open), got \"triage\""}
++(deftest held-private-tag-keeps-the-lists-other-tags-in-scope-test
++  (async done
++    (with-food-scoped-triage done
++      (fn [{:keys [conn self journal board asset property rating]}]
++        (p/doseq [[kind id private selector]
++                  [["a journal by its date" journal "Journal" {:page "2026-11-06"}]
++                   ["a journal by target-id" journal "Journal" {:target-id (str journal)}]
++                   ["a whiteboard" board "Whiteboard" {:target-id (str board)}]
++                   ["an asset" asset "Asset" {:target-id (str asset)}]
++                   ["a property" property "Property" {:target-id (str property)}]]]
++          (p/let [response (request! self "POST" "/semantic/block-trees/batch"
++                                     {:entries [(assoc selector :properties {"Tags" [private "Food"]
++                                                                             "rating" "triage"})]})]
++            (testing kind
++              (is (= 201 (:status response)) (pr-str response))
++              (is (= #{private "Food"} (disj (tag-titles conn id) "Page")))
++              (is (= "triage" (choice-title conn id rating))))))))))
++
++;; Review round 1 (r1-integrity-1, r1-light-1). Before the fix a page entry that creates a journal
++;; was refused Journal, though outliner-page/create! makes it a journal holding Journal:
++;;   400 {:error "entries[0]: Tags: Journal is a built-in tag Logseq sets itself and can't be set as
++;;        a value"}
++(deftest new-journal-may-be-sent-journal-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/doseq [[kind entries day]
++                  [["by its ISO date" [{:page "2026-11-08" :properties {"Tags" ["Journal" "Food"]}}] 20261108]
++                   ["by its journal title" [{:page "Nov 9th, 2026" :properties {"Tags" ["Journal" "Food"]}}] 20261109]
++                   ["created by an earlier entry" [{:page "2026-11-10" :blocks [{:title "First"}]}
++                                                   {:page "2026-11-10" :properties {"Tags" ["Journal" "Food"]}}]
++                    20261110]
++                   ["tagged Food by an earlier entry" [{:page "2026-11-12" :properties {"Tags" ["Food"]}}
++                                                       {:page "2026-11-12" :properties {"Tags" ["Journal"]}}]
++                    20261112]]]
++          (p/let [response (request! self "POST" "/semantic/block-trees/batch" {:entries entries})
++                  page (ldb/get-journal-page-by-day @conn day)]
++            (testing kind
++              (is (= 201 (:status response)) (pr-str response))
++              (is (= #{"Journal" "Food"} (set (map :block/title (:block/tags page))))))))))))
++
++;; Guard: a journal the batch creates holds Journal only, so another private tag is still refused.
++(deftest new-journal-other-private-tag-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [before (snapshot conn)
++                response (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "2026-11-11" :properties {"Tags" ["Journal" "Whiteboard"]}}]})]
++          (is (refused-up-front? response "entries[0]: Tags: " "Whiteboard") (pr-str response))
++          (is (= before (snapshot conn)))
++          (is (nil? (ldb/get-journal-page-by-day @conn 20261111))))))))
++
++;; Guard: a page that isn't a non-blank title is refused as before, not read as a title to create.
++(deftest page-must-be-a-title-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/doseq [page [7 ""]]
++          (p/let [response (request! self "POST" "/semantic/block-trees/batch"
++                                     {:entries [{:page page :properties {"Tags" ["Food"]}}]})]
++            (testing (pr-str page)
++              (is (= 400 (:status response)) (pr-str response))
++              (is (= "entries[0]: page must be a non-blank title" (get-in response [:body :error]))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 4574c2b..d71fd8a 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -20,6 +20,7 @@
+             [logseq.db-sync.semantic-today-tz-test]
+             [logseq.db-sync.semantic-property-schema-test]
+             [logseq.db-sync.semantic-promote-page-to-tag-test]
++            [logseq.db-sync.semantic-private-tags-test]
+             [logseq.db-sync.semantic-readable-writes-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]

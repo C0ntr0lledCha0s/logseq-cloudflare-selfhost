@@ -2,251 +2,562 @@
   {
     "name": "batch_delete_block_property",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-delete"
+    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-delete",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "batch_insert_block_trees",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-trees/batch"
+    "path": "/api/v1/graphs/{graph-id}/block-trees/batch",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "batch_move_blocks",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-moves/batch"
+    "path": "/api/v1/graphs/{graph-id}/block-moves/batch",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "batch_set_block_property",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-set"
+    "path": "/api/v1/graphs/{graph-id}/block-properties/batch-set",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "capture_to_today",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/capture"
+    "path": "/api/v1/graphs/{graph-id}/capture",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "connector_help",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "create_page",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/pages"
+    "path": "/api/v1/graphs/{graph-id}/pages",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "create_property",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/properties"
+    "path": "/api/v1/graphs/{graph-id}/properties",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "create_tag",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/tags"
+    "path": "/api/v1/graphs/{graph-id}/tags",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "create_task",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/tasks"
+    "path": "/api/v1/graphs/{graph-id}/tasks",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_block",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_block_property",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_blocks",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/blocks"
+    "path": "/api/v1/graphs/{graph-id}/blocks",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_page",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_property",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "delete_tag",
     "method": "DELETE",
-    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "get_activity_log",
+    "method": null,
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_block",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_blocks",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/blocks"
+    "path": "/api/v1/graphs/{graph-id}/blocks",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_graph_health",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/health"
+    "path": "/api/v1/graphs/{graph-id}/health",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_page",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_page_backlinks",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/backlinks",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_page_outline",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/outline"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/outline",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_property",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "get_tag",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "insert_block_children",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/children"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/children",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "insert_block_tree",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-trees"
+    "path": "/api/v1/graphs/{graph-id}/block-trees",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "kb_index",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_assets",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/assets"
+    "path": "/api/v1/graphs/{graph-id}/assets",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_graphs",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_page_blocks",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/blocks"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/blocks",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_page_references",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/references"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/references",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_pages",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/pages"
+    "path": "/api/v1/graphs/{graph-id}/pages",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_properties",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/properties"
+    "path": "/api/v1/graphs/{graph-id}/properties",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_tag_objects",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}/objects"
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}/objects",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_tags",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/tags"
+    "path": "/api/v1/graphs/{graph-id}/tags",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "list_tasks",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/tasks"
+    "path": "/api/v1/graphs/{graph-id}/tasks",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "move_blocks",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/block-moves"
+    "path": "/api/v1/graphs/{graph-id}/block-moves",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "promote_page_to_tag",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/promote-to-tag"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/promote-to-tag",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "read_file",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "refresh_refs",
     "method": "POST",
-    "path": "/api/v1/graphs/{graph-id}/refresh-refs"
+    "path": "/api/v1/graphs/{graph-id}/refresh-refs",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "save_document",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "save_file_from_url",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
   },
   {
     "name": "search_graph",
     "method": "GET",
-    "path": "/api/v1/graphs/{graph-id}/search"
+    "path": "/api/v1/graphs/{graph-id}/search",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "semantic_index_status",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "semantic_search",
     "method": null,
-    "path": null
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "set_block_property",
     "method": "PUT",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
   },
   {
     "name": "update_block",
     "method": "PATCH",
-    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}"
+    "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "update_page",
     "method": "PATCH",
-    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}"
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "update_property",
     "method": "PATCH",
-    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}"
+    "path": "/api/v1/graphs/{graph-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   },
   {
     "name": "update_tag",
     "method": "PATCH",
-    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}"
+    "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   }
 ]

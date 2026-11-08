@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // Usage: usage-report.mjs --settings <settings.json> [--threshold 0.7]
-// Env: CLOUDFLARE_API_TOKEN (Account Analytics Read is enough), CLOUDFLARE_ACCOUNT_ID.
+// Env: CLOUDFLARE_API_TOKEN (Account Analytics Read; D1 Read too for the audit log), CLOUDFLARE_ACCOUNT_ID,
+// and optionally CONNECTOR_D1_DATABASE_ID (the connector's D1 database).
 // Prints the account's usage of each Workers Free plan allowance as a markdown table, and appends
 // it to $GITHUB_STEP_SUMMARY when that is set. Daily allowances count from 00:00 UTC, when
-// Cloudflare resets them. Exits 1 when any allowance is at or above the threshold, or when its
-// recent rate would pass the limit before the allowance resets.
+// Cloudflare resets them. With CONNECTOR_D1_DATABASE_ID set, an Audit log section follows: one
+// aggregate query over the connector's audit_log table and the database's size. Exits 1 when any
+// allowance is at or above the threshold, when its recent rate would pass the limit before the
+// allowance resets, or when the Audit log section couldn't be read.
 import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,7 +42,19 @@ export const ANALYTICS_LAG_MS = 300_000;
 /** The monthly allowance is projected from the month's average, which is too noisy before this share. */
 export const MIN_PROJECTION_SHARE = 1 / 8;
 
-const GRAPHQL = "https://api.cloudflare.com/client/v4/graphql";
+const API = "https://api.cloudflare.com/client/v4";
+const GRAPHQL = `${API}/graphql`;
+
+/** The Free plan's size limit for one D1 database. */
+export const D1_DATABASE_LIMIT_BYTES = 500_000_000;
+
+/**
+ * The connector database's latest size: the newest daily group from the last few days, since the
+ * storage dataset is daily and today's may not be reported yet.
+ */
+const STORAGE_DAYS = 3;
+const STORAGE = `
+    d1Storage: d1StorageAdaptiveGroups(limit: 1, orderBy: [date_DESC], filter: {databaseId: $database, date_geq: $storageSince, date_leq: $day}) { max { databaseSizeBytes } dimensions { date } }`;
 
 export const QUERY = `query Usage($account: string!, $start: Time!, $end: Time!, $day: Date!, $monthStart: Date!) {
   viewer { accounts(filter: {accountTag: $account}) {
@@ -55,6 +70,25 @@ export const QUERY = `query Usage($account: string!, $start: Time!, $end: Time!,
     vectorQueries: vectorizeV2QueriesAdaptiveGroups(limit: 1, filter: {date_geq: $monthStart, date_leq: $day}) { sum { queriedVectorDimensions } }
   } }
 }`;
+
+/** QUERY with the connector database's size added, for the daily call when the database is known. */
+const STORAGE_QUERY = QUERY.replace("$monthStart: Date!)", "$monthStart: Date!, $database: string!, $storageSince: Date!)").replace(
+  "{ sum { queriedVectorDimensions } }\n",
+  `{ sum { queriedVectorDimensions } }${STORAGE}\n`,
+);
+
+/**
+ * The Audit log section's one query (spec 2026-11-07-connector-write-audit-log-design.md §3.7): it
+ * reads every row of audit_log once. `?1` is today's start in ms, like `at`. Each sum is null on an
+ * empty table. Bytes are counted as stored (UTF-8), not as characters.
+ */
+export const AUDIT_SQL = `SELECT count(*) AS entries,
+  sum(at >= ?1) AS today,
+  sum(rows_written) AS rows_written,
+  sum(CASE WHEN kind = 'read' THEN rows_read END) AS rows_read,
+  sum(length(CAST(before AS BLOB))) AS before_bytes,
+  sum(length(CAST(targets AS BLOB))) AS target_bytes
+FROM audit_log`;
 
 const DAY_MS = 86_400_000;
 
@@ -83,22 +117,24 @@ export function periods(now) {
  * Runs QUERY with the time-windowed datasets over [start, end) and the monthly Vectorize queries up
  * to `now`; returns the account's datasets.
  */
-export async function fetchUsage({ accountId, token, start, end, now, fetch = globalThis.fetch }) {
+export async function fetchUsage({ accountId, token, start, end, now, databaseId, fetch = globalThis.fetch }) {
   const { monthStart } = periods(now);
   const date = (d) => d.toISOString().slice(0, 10);
+  const variables = {
+    account: accountId,
+    start: start.toISOString(),
+    end: end.toISOString(),
+    day: date(now),
+    monthStart: date(monthStart),
+  };
+  if (databaseId) {
+    variables.database = databaseId;
+    variables.storageSince = date(new Date(now.getTime() - (STORAGE_DAYS - 1) * DAY_MS));
+  }
   const response = await fetch(GRAPHQL, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      query: QUERY,
-      variables: {
-        account: accountId,
-        start: start.toISOString(),
-        end: end.toISOString(),
-        day: date(now),
-        monthStart: date(monthStart),
-      },
-    }),
+    body: JSON.stringify({ query: databaseId ? STORAGE_QUERY : QUERY, variables }),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`Cloudflare analytics failed: HTTP ${response.status} ${text.slice(0, 500)}`);
@@ -109,6 +145,42 @@ export async function fetchUsage({ accountId, token, start, end, now, fetch = gl
   const account = body.data?.viewer?.accounts?.[0];
   if (!account) throw new Error(`Cloudflare analytics returned no data for account ${accountId}`);
   return account;
+}
+
+/**
+ * Runs AUDIT_SQL on the connector database through the D1 REST query API and returns its totals,
+ * with each null sum (an empty table) as 0. A 403 names the D1 Read permission the token lacks.
+ */
+export async function fetchAuditLog({ accountId, databaseId, token, now, fetch = globalThis.fetch }) {
+  const response = await fetch(`${API}/accounts/${accountId}/d1/database/${databaseId}/query`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ sql: AUDIT_SQL, params: [periods(now).dayStart.getTime()] }),
+  });
+  const text = await response.text();
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // Reported below with the raw text.
+  }
+  const messages = body?.errors?.map((e) => e.message).join("; ");
+  if (response.status === 403) {
+    throw new Error(`D1 query failed: HTTP 403. The token needs the D1 Read permission (Account → D1 → Read) for database ${databaseId}. ${messages || text.slice(0, 200)}`.trim());
+  }
+  if (!response.ok || body?.success === false) {
+    throw new Error(`D1 query failed: HTTP ${response.status} ${messages || text.slice(0, 500)}`.trim());
+  }
+  const row = body?.result?.[0]?.results?.[0];
+  if (!row) throw new Error(`D1 query failed: no result row from database ${databaseId}`);
+  const n = (v) => v ?? 0;
+  return {
+    entries: n(row.entries),
+    today: n(row.today),
+    rowsWritten: n(row.rows_written),
+    rowsRead: n(row.rows_read),
+    bytes: n(row.before_bytes) + n(row.target_bytes),
+  };
 }
 
 const total = (groups, pick) => groups.reduce((n, g) => n + pick(g), 0);
@@ -159,6 +231,35 @@ const number = (n) => Math.round(n).toLocaleString("en-US");
 const percent = (n, limit) => `${Math.round((100 * n) / limit)}%`;
 const PERIOD = { day: "today", month: "this month", total: "stored" };
 
+const megabytes = (n) => `${(n / 1_000_000).toFixed(1)} MB`;
+
+/**
+ * The Audit log section: `{skipped}` names why it wasn't read, `{error}` why it failed, otherwise the
+ * totals and the database size (`storage`, the newest d1StorageAdaptiveGroups group, or undefined).
+ */
+export function formatAuditSection(audit) {
+  const lines = ["### Audit log", ""];
+  if (audit.skipped) return [...lines, `Skipped: ${audit.skipped}.`].join("\n") + "\n";
+  if (audit.error) return [...lines, `Failed: ${audit.error}`].join("\n") + "\n";
+  const { totals, storage } = audit;
+  lines.push(
+    storage
+      ? `Connector database: ${megabytes(storage.max.databaseSizeBytes)} of ${megabytes(D1_DATABASE_LIMIT_BYTES).replace(".0", "")} (${percent(storage.max.databaseSizeBytes, D1_DATABASE_LIMIT_BYTES)}), as of ${storage.dimensions.date}.`
+      : "Connector database: size not reported yet.",
+    "",
+    "Over the entries kept (the hourly purge removes them after `connector.auditRetentionDays`):",
+    "",
+    "| | |",
+    "|---|---|",
+    `| Entries kept | ${number(totals.entries)} |`,
+    `| Entries today | ${number(totals.today)} |`,
+    `| D1 rows written by the log | ${number(totals.rowsWritten)} |`,
+    `| D1 rows read by get_activity_log | ${number(totals.rowsRead)} |`,
+    `| Snapshot and target bytes | ${number(totals.bytes)} |`,
+  );
+  return lines.join("\n") + "\n";
+}
+
 /** The rows as a markdown report, with each Worker's errors today below the table. */
 export function formatReport({ rows, now, threshold, workers }) {
   const lines = [
@@ -184,15 +285,28 @@ export function formatReport({ rows, now, threshold, workers }) {
   return lines.join("\n") + "\n";
 }
 
-/** Fetches, assesses and formats; returns the report and whether any allowance alerts. */
-export async function usageReport({ accountId, token, now, threshold, fetch }) {
+/**
+ * Fetches, assesses and formats; returns the report and whether it alerts: an allowance alerts, or
+ * the Audit log section failed. Without `databaseId` the section is skipped and nothing is queried
+ * for it.
+ */
+export async function usageReport({ accountId, token, databaseId, now, threshold, fetch }) {
   const p = periods(now);
-  const [account, recent] = await Promise.all([
-    fetchUsage({ accountId, token, start: p.dayStart, end: now, now, fetch }),
+  const auditTotals = databaseId
+    ? fetchAuditLog({ accountId, databaseId, token, now, fetch }).then(
+        (totals) => ({ totals }),
+        (error) => ({ error: error.message }),
+      )
+    : Promise.resolve({ skipped: "CONNECTOR_D1_DATABASE_ID not set" });
+  const [account, recent, audit] = await Promise.all([
+    fetchUsage({ accountId, token, start: p.dayStart, end: now, now, databaseId, fetch }),
     fetchUsage({ accountId, token, start: p.recent.start, end: p.recent.end, now, fetch }),
+    auditTotals,
   ]);
+  if (audit.totals) audit.storage = account.d1Storage?.[0];
   const rows = assess(measure(account), measure(recent), { share: p.share, dayLeftHours: p.dayLeftHours, threshold });
-  return { report: formatReport({ rows, now, threshold, workers: account.workers }), alert: rows.some((r) => r.alert) };
+  const report = `${formatReport({ rows, now, threshold, workers: account.workers })}\n${formatAuditSection(audit)}`;
+  return { report, alert: rows.some((r) => r.alert) || Boolean(audit.error) };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -211,12 +325,17 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.error(`usage-report knows only the Workers Free plan allowances, and settings.plan is ${plan}. On Workers Paid, watch Billing → Billable usage instead.`);
     process.exit(1);
   }
-  const { CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_ACCOUNT_ID: accountId, GITHUB_STEP_SUMMARY: summary } = process.env;
+  const {
+    CLOUDFLARE_API_TOKEN: token,
+    CLOUDFLARE_ACCOUNT_ID: accountId,
+    CONNECTOR_D1_DATABASE_ID: databaseId,
+    GITHUB_STEP_SUMMARY: summary,
+  } = process.env;
   if (!token || !accountId) {
     console.error("usage-report: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are required");
     process.exit(1);
   }
-  const { report, alert } = await usageReport({ accountId, token, now: new Date(), threshold });
+  const { report, alert } = await usageReport({ accountId, token, databaseId, now: new Date(), threshold });
   process.stdout.write(report);
   if (summary) appendFileSync(summary, report);
   process.exit(alert ? 1 : 0);

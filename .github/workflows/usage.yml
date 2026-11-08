@@ -31,9 +31,12 @@ jobs:
           install_args: node
 
       # Fails the run, which emails you, when an allowance is at 70% or on course to pass its
-      # limit. The table is on the run's summary page.
+      # limit, or when the Audit log section can't be read. The table is on the run's summary page.
+      # CONNECTOR_D1_DATABASE_ID (a production variable, the connector's D1 database id) turns on
+      # the Audit log section; the token then needs D1 Read as well as Account Analytics Read.
       - name: Report usage
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ANALYTICS_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CONNECTOR_D1_DATABASE_ID: ${{ vars.CONNECTOR_D1_DATABASE_ID }}
         run: node scripts/usage-report.mjs --settings config/settings.json

@@ -3,7 +3,8 @@ import { z } from "zod";
 import { GraphStore } from "../graphs";
 import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
-import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION } from "./spec.mjs";
+import type { OnSuccess } from "./readable";
+import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 // kb_index (design: README §11.8) answers "what is in this graph?" in one call. The sync server's
 // listKnowledgeIndex does the expensive part (summaries, reference counts, class lineage); the
@@ -183,7 +184,7 @@ export function renderKbIndex(
 export function registerKbIndexTool(
   server: McpServer,
   access: GraphAccess,
-  onSuccess: (tool: string, alias: string) => void,
+  onSuccess: OnSuccess,
 ): void {
   server.registerTool(
     "kb_index",
@@ -207,7 +208,7 @@ export function registerKbIndexTool(
           .describe(`Most pages listed per group (default ${DEFAULT_LIMIT}). Group counts are always complete.`),
         refresh: z.boolean().optional().describe("Rebuild the index from the graph now instead of using the cache."),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      annotations: annotationsFor("kb_index"),
     },
     ({ graph: alias, tag, limit, refresh }) =>
       runTool("kb_index", alias, async () => {

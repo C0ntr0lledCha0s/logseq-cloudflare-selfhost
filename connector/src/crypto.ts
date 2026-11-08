@@ -15,3 +15,11 @@ export function fromBase64url(value: string): Uint8Array {
 }
 
 export { base64url };
+
+/** Constant-time string compare (UTF-8 bytes); false at once when the lengths differ. */
+export function timingSafeEqual(a: string, b: string): boolean {
+  const left = new TextEncoder().encode(a);
+  const right = new TextEncoder().encode(b);
+  if (left.length !== right.length) return false;
+  return crypto.subtle.timingSafeEqual(left, right);
+}

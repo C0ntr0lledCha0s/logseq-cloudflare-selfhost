@@ -254,3 +254,5 @@ Patch 0026 follows this design: the four existing endpoints gain optional fields
 - **Flags.** `dry-run` and `acknowledge-holders` stayed query parameters (open question 4).
 
 Not built, and now on the README backlog: `replace-with` on retire (open question 1), and resolving node-property titles against entities created earlier in the same `batch_insert_block_trees` call (3.8). The empty-page-into-a-tag 500 belongs to item 16.
+
+**Later change (patch 0032).** Patch 0026 let `classes` take Root Tag (`logseq.class/Root`), which the app never offers: its tag picker loads classes with `:except-root-class? true`, and its value picker strips Root before building choices. A stored Root restriction meant "any node" in the app but "tagged nodes only" in server writes. `patches/0032-semantic-property-classes-refuse-root.patch` refuses Root in `create_property` `classes` and `update_property` `classes.set` and `classes.add`, by title, UUID or ident, naming the entry and writing nothing. `classes.remove` still takes a stored Root off.

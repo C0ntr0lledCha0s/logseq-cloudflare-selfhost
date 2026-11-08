@@ -1,4 +1,4 @@
-import { aesKeyFromHex, fromBase64url } from "../crypto";
+import { aesKeyFromHex, fromBase64url, timingSafeEqual } from "../crypto";
 import { readForm } from "../form";
 import { base64url, isOwner } from "./github";
 
@@ -70,13 +70,6 @@ function now(): number {
 
 function randomToken(): string {
   return base64url(crypto.getRandomValues(new Uint8Array(32)));
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  const left = new TextEncoder().encode(a);
-  const right = new TextEncoder().encode(b);
-  if (left.length !== right.length) return false;
-  return crypto.subtle.timingSafeEqual(left, right);
 }
 
 /** A `Set-Cookie` value for a new 8 h wizard session, encrypted with COOKIE_ENCRYPTION_KEY. */

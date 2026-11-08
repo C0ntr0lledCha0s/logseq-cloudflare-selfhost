@@ -1,0 +1,31 @@
+{
+  "operationId": "deletePage",
+  "status": "200",
+  "tool": "delete_page",
+  "response": {
+    "dry-run": true,
+    "uuid": "00000001-2026-1106-0000-000000000000",
+    "kind": "page",
+    "title": "Nov 6th, 2026",
+    "references": 0,
+    "requires": [],
+    "truncated": true,
+    "affected": [
+      {
+        "uuid": "00000001-2026-1106-0000-000000000000",
+        "kind": "journal",
+        "page": {
+          "uuid": "00000001-2026-1106-0000-000000000000",
+          "title": "Nov 6th, 2026"
+        },
+        "breadcrumb": [],
+        "snippet": "Nov 6th, 2026",
+        "references": 0,
+        "blocks": 2,
+        "roots": [
+          "Nov 6th, 2026 note"
+        ]
+      }
+    ]
+  }
+}

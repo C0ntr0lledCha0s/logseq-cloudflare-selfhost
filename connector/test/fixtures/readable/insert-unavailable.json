@@ -1,0 +1,15 @@
+{
+  "operationId": "insertBlockTree",
+  "status": "201",
+  "tool": "insert_block_tree",
+  "response": {
+    "blocks": [
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb0"
+      }
+    ],
+    "count": 1,
+    "context": "unavailable",
+    "context-reason": "the block is no longer in the graph"
+  }
+}

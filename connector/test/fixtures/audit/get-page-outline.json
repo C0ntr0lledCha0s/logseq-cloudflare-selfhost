@@ -1,0 +1,10 @@
+{
+  "uuid": "00000001-2026-1105-0000-000000000000",
+  "kind": "journal",
+  "title": "Nov 5th, 2026",
+  "tags": [{ "uuid": "cccccccc-0000-4000-8000-000000000002", "title": "Journal" }],
+  "properties": [{ "ident": "user.property/venue-x1", "title": "Venue", "type": "default", "value": "Town Hall" }],
+  "markdown": "- Meeting\n  - Agenda\n  - Actions\n- Call Sam",
+  "block-count": 4,
+  "truncated": false
+}

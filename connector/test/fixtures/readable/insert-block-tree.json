@@ -1,0 +1,66 @@
+{
+  "operationId": "insertBlockTree",
+  "status": "201",
+  "tool": "insert_block_tree",
+  "response": {
+    "blocks": [
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fad",
+        "children": [
+          {
+            "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fae"
+          },
+          {
+            "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652faf"
+          }
+        ]
+      },
+      {
+        "uuid": "2519cd5d-b480-40d7-b2e4-624972ce17d7"
+      }
+    ],
+    "count": 4,
+    "target": {
+      "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d05",
+      "kind": "block",
+      "page": {
+        "uuid": "00000001-2026-1105-0000-000000000000",
+        "title": "Nov 5th, 2026"
+      },
+      "breadcrumb": [
+        "Meeting"
+      ],
+      "snippet": "Agenda"
+    },
+    "affected": [
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fad",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "New item",
+        "descendants": 2
+      },
+      {
+        "uuid": "2519cd5d-b480-40d7-b2e4-624972ce17d7",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "Second",
+        "descendants": 0
+      }
+    ]
+  }
+}

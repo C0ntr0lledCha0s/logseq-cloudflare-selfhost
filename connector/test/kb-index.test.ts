@@ -263,8 +263,10 @@ describe("kb_index", () => {
       });
     const promoted = await promote();
     expect(promoted.isError).toBe(false);
-    expect(JSON.parse(promoted.text).promoted).toEqual({ blocks: 3, references: 2 });
-    expect(syncRequests.map((u) => u.pathname)).toEqual([`/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`]);
+    // The summary item, ending with the audit entry line, comes before the server's JSON.
+    expect(JSON.parse(promoted.text.replace(/^[\s\S]*?Logged as audit entry \d+\n/, "")).promoted).toEqual({ blocks: 3, references: 2 });
+    // The page is read first, as promote_page_to_tag's audit before-snapshot (getPage), then promoted.
+    expect(syncRequests.map((u) => u.pathname)).toEqual([`/api/v1/graphs/${WORK_ID}/pages/p1`, `/api/v1/graphs/${WORK_ID}/pages/p1/promote-to-tag`]);
     await vi.waitFor(async () => expect(await dirty()).toEqual(["kb-index-dirty:work"]));
   });
 

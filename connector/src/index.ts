@@ -1,9 +1,11 @@
 import { OAuthProvider, type OAuthProviderOptions } from "@cloudflare/workers-oauth-provider";
 import type { GitHubFetch } from "./auth/github";
 import { isAllowedRedirectUri } from "./auth/redirect-uris";
+import { verifyServiceToken } from "./auth/service-tokens";
 import { type DefaultEnv, authRoute } from "./auth/routes";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
 import { GraphStore } from "./graphs";
+import { purgeAuditLog } from "./audit/log";
 import { mcpApiHandler } from "./mcp";
 import { refreshAllKbIndexes } from "./tools/kb-index";
 import { semanticBindings } from "./semantic/config";
@@ -27,6 +29,7 @@ function defaultHandler(githubFetch: GitHubFetch): ExportedHandler<DefaultEnv> {
  * `https://<host>/mcp` URL the client reaches, and the provider takes it as a fixed string.
  */
 export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthProviderOptions<Env> {
+  const resource = `https://${host}/mcp`;
   return {
     apiRoute: "/mcp",
     apiHandler: mcpApiHandler,
@@ -35,7 +38,12 @@ export function providerOptions(host: string, githubFetch: GitHubFetch): OAuthPr
     tokenEndpoint: "/token",
     clientRegistrationEndpoint: "/register",
     clientIdMetadataDocumentEnabled: true,
-    resourceMetadata: { resource: `https://${host}/mcp`, resource_name: "Logseq graphs" },
+    resourceMetadata: { resource, resource_name: "Logseq graphs" },
+    // A bearer that is not an issued OAuth token: a service token, or the generic 401 (design §3.2).
+    async resolveExternalToken({ token, env }) {
+      const props = await verifyServiceToken(env, token, Date.now());
+      return props ? { audience: resource, props } : null;
+    },
     clientRegistrationCallback({ clientMetadata }) {
       const uris = clientMetadata.redirect_uris;
       const allowed =
@@ -76,9 +84,31 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
     async scheduled(controller, env) {
       checkConfig(env);
       switch (controller.cron) {
-        case KB_INDEX_CRON:
-          await refreshAllKbIndexes(env);
+        case KB_INDEX_CRON: {
+          // The KB index refresh and the audit log purge run independently: either one's failure is
+          // logged and surfaces after both ran, the KB index's first.
+          // refreshAllKbIndexes logs each graph's outcome itself.
+          let kbFailure: { error: unknown } | undefined;
+          try {
+            await refreshAllKbIndexes(env);
+          } catch (error) {
+            kbFailure = { error };
+          }
+          let purgeFailure: { error: unknown } | undefined;
+          const started = Date.now();
+          try {
+            const { deleted, rowsRead, rowsWritten } = await purgeAuditLog(env, controller.scheduledTime);
+            if (deleted > 0) {
+              console.log(`audit-purge deleted=${deleted} rows_read=${rowsRead} rows_written=${rowsWritten} ms=${Date.now() - started}`);
+            }
+          } catch (error) {
+            purgeFailure = { error };
+            console.error(`audit-purge failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          if (kbFailure) throw kbFailure.error;
+          if (purgeFailure) throw purgeFailure.error;
           return;
+        }
         case SEMANTIC_CRON: {
           // This cron is rendered only with semantic search on, so a run without its bindings is a deploy error.
           const bindings = semanticBindings(env);
