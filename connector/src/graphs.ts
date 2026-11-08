@@ -27,6 +27,8 @@ export interface ResolvedGraph {
   editStamps: boolean;
   /** Set when a read-only service token lowered `mode` to read (e.g. `service token 'ci'`); the write refusal names it. */
   readOnlyBy?: string;
+  /** Set when a write-no-delete service token reaches this graph (e.g. `service token 'worker'`); every delete is refused naming it. */
+  deletesRefusedBy?: string;
 }
 
 /** A new graph starts with edit stamps on (the column's default). */

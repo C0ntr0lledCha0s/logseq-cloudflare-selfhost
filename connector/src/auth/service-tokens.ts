@@ -15,7 +15,9 @@ export const TOUCH_INTERVAL_MS = 3_600_000;
 export const MAX_EXPIRY_DAYS = 365;
 export const DEFAULT_EXPIRY_DAYS = 90;
 
-export type ServiceTokenAccess = "read" | "write";
+import { type ServiceTokenAccess, acceptedAccess } from "./access";
+
+export { MODE_RANK, type ServiceTokenAccess, acceptedAccess, rank } from "./access";
 
 /** A token as the wizard sees it. Deliberately has no hash field. */
 export interface ServiceTokenRow {
@@ -280,7 +282,7 @@ function refuse(description: string): never {
  * bearer that is not a service token never reaches D1), the lookup by the full hash, a constant-time
  * compare, and only then the reasons, revoked, expired and previous owner, each thrown as a 401 that
  * names the token. `null` is the provider's generic `Invalid access token`, so a wrong token never
- * learns a reason. Logs nothing; the token and its hash never leave this function.
+ * learns a reason; a row whose access is not accepted (see `acceptedAccess`) gets it too. Logs nothing; the token and its hash never leave this function.
  */
 export async function verifyServiceToken(env: Env, token: string, now: number): Promise<ServiceProps | null> {
   if (!TOKEN_PATTERN.test(token)) return null;
@@ -290,6 +292,7 @@ export async function verifyServiceToken(env: Env, token: string, now: number): 
   if (row.revokedAt !== null) refuse(`service token '${row.name}' was revoked`);
   if (row.expiresAt <= now) refuse(`service token '${row.name}' expired on ${new Date(row.expiresAt).toISOString().slice(0, 10)}`);
   if (!isOwner(row.ownerId, env)) refuse(`service token '${row.name}' belongs to a previous owner`);
+  if (!acceptedAccess(row.access)) return null;
   return {
     kind: "service",
     tokenId: row.id,

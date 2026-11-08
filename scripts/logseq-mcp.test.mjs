@@ -573,31 +573,32 @@ test("wiring: .mcp.json reads the host and token from the environment and holds 
   assert.doesNotMatch(raw, /lsct_/);
 });
 
-test("wiring: settings enable logseq-service and allow exactly the read tools allowed for mcp__Logseq__", () => {
+test("wiring: settings enable logseq-service and allow all of its tools; mcp__Logseq__ stays read-only", () => {
+  // Owner decision: cloud sessions run every logseq-service tool without a prompt. The service
+  // token, not the client, sets the limits (read, write without deletes, write), so a session
+  // whose token is write-no-delete can't delete however the client is configured. The claude.ai
+  // connector (mcp__Logseq__) has no such server-side limit, so only its read tools are allowed.
   const settings = JSON.parse(readFileSync(join(root, ".claude", "settings.json"), "utf8"));
   const manifest = JSON.parse(readFileSync(join(root, "connector", "tools-manifest.json"), "utf8"));
   const readOnly = new Map(manifest.map((t) => [t.name, t.annotations.readOnlyHint === true]));
   const allow = settings.permissions.allow;
 
   assert.deepEqual(settings.enabledMcpjsonServers, ["logseq-service"]);
+  assert.ok(allow.includes("mcp__logseq-service"), "every logseq-service tool is allowed (server-wide rule)");
+  assert.deepEqual(
+    allow.filter((a) => a.startsWith("mcp__logseq-service__")),
+    [],
+    "no per-tool logseq-service entries beside the server-wide rule",
+  );
 
-  const tools = (prefix) =>
-    allow
-      .filter((a) => a.startsWith(prefix))
-      .map((a) => a.slice(prefix.length))
-      .sort();
-  const logseq = tools("mcp__Logseq__");
-  const service = tools("mcp__logseq-service__");
+  const logseq = allow.filter((a) => a.startsWith("mcp__Logseq__")).map((a) => a.slice("mcp__Logseq__".length));
   assert.ok(logseq.length > 0);
-  assert.deepEqual(service, logseq, "the same tools are allowed under both servers");
-  for (const t of service) {
+  for (const t of logseq) {
     assert.ok(readOnly.has(t), `${t} is a tool in tools-manifest.json`);
-    assert.equal(readOnly.get(t), true, `${t} is read-only`);
+    assert.equal(readOnly.get(t), true, `mcp__Logseq__${t} is read-only`);
   }
-  for (const a of allow) {
-    assert.notEqual(a, "mcp__logseq-service", "no server-wide allow");
-    assert.doesNotMatch(a, /^mcp__logseq-service__.*[*:]/, "no wildcard allow");
-  }
+  assert.ok(!allow.includes("mcp__Logseq"), "no server-wide allow for the claude.ai connector");
+  for (const a of allow) assert.doesNotMatch(a, /^mcp__Logseq__.*[*:]/, "no wildcard allow for the claude.ai connector");
 
   // The existing deny list and hooks are kept.
   assert.ok(settings.permissions.deny.includes("Read(./.env.local)"));

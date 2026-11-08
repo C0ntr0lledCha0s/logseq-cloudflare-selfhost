@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { connectorHostname } from "../config";
 import { EXPIRY_WARN_DAYS, type GraphRecord, type GraphStore, daysUntilExpiry } from "../graphs";
-import { currentScope, runTool, textResult } from "./common";
+import { currentScope, effectiveMode, runTool, textResult } from "./common";
 import { annotationsFor } from "./spec.mjs";
 import { SEMANTIC_HELP } from "./semantic-search";
 import { TEXT_LIMIT, thousands } from "./suggest-links";
@@ -10,7 +10,7 @@ import { TEXT_LIMIT, thousands } from "./suggest-links";
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
   "Address a graph by its alias from list_graphs; graphs marked read-only refuse every write.",
-  "Under a service token, list_graphs shows only the token's graphs, other aliases are refused as outside its scope, and a read-only token refuses every write.",
+  "Under a service token, list_graphs shows only the token's graphs, other aliases are refused as outside its scope, and a read-only token refuses every write. A write-no-delete token (list_graphs mode write-no-delete) creates, inserts, moves and overwrites, but refuses every delete before anything reaches the sync server: delete_page, delete_block, delete_blocks, delete_tag, delete_property, delete_block_property, batch_delete_block_property, update_property with convert_values: true or a non-empty choices.retire, and set_block_property or batch_set_block_property with an empty value (\"\", [], [\"\"] or the empty placeholder ident, or a Tags list of only built-in type tags such as [\"Page\"], which would clear the user tags). A dry run is allowed where the tool declares one (dry-run: true on delete_page, delete_tag, delete_property and update_property; in the body for delete_blocks). Don't retry a refused delete: report what it would delete and leave the delete to the owner.",
   "For a broad topic, an overview or 'what do I know about X', call kb_index first: one call lists the graph's pages grouped by class with their summaries and UUIDs, so you can pick the pages to read instead of searching keyword by keyword. Use search_graph for specific words.",
   "To see how a page is used, call get_page_backlinks: links in text, tagged objects and property values that point at it, with counts. For a periodic review, get_graph_health lists unused tags and properties, duplicate titles, pages without a summary or a tag, and property values that are not one of their property's own choices (mismatched-choice-values: another property's choice, also on a node property, or a choice the holder's tags don't allow).",
   "Start a new page with a first block that begins with **Summary:** and one or two sentences; kb_index shows it as the page's summary.",
@@ -60,7 +60,7 @@ export function registerHandwrittenTools(server: McpServer, env: Env, store: Gra
     "list_graphs",
     {
       description:
-        "List the connected Logseq graphs: the alias every other tool's `graph` argument takes, the Logseq graph name, read or write mode, and token expiry.",
+        "List the connected Logseq graphs: the alias every other tool's `graph` argument takes, the Logseq graph name, the mode (read, write-no-delete or write: under a service token, the lower of the graph's own mode and the token's access), and token expiry.",
       inputSchema: z.object({}),
       annotations: annotationsFor("list_graphs"),
     },
@@ -71,11 +71,10 @@ export function registerHandwrittenTools(server: McpServer, env: Env, store: Gra
         // Under a service token: only its graphs, each at the lower of its own and the token's mode.
         const scope = currentScope();
         const listed = (await store.list()).filter((graph) => scope.kind === "oauth" || scope.graphIds.has(graph.graphId));
-        const readOnly = scope.kind === "service" && scope.access === "read";
         const graphs = listed.map((graph) => ({
           alias: graph.alias,
           graphName: graph.graphName,
-          mode: readOnly ? "read" : graph.mode,
+          mode: effectiveMode(graph, scope),
           expiresAt: graph.expiresAt,
           expiryWarning: expiryWarning(graph, now, host),
         }));

@@ -15,6 +15,8 @@ import {
   type ServiceTokenRow,
   ServiceTokenStore,
   type TokenScope,
+  acceptedAccess,
+  rank,
 } from "../auth/service-tokens";
 import { readForm } from "../form";
 import { type GraphMode, type GraphPermission, GraphStore, normalizeAlias, normalizeToken } from "../graphs";
@@ -351,7 +353,7 @@ function parseGraphsAndAccess(form: FormData, connected: ReadonlySet<string>): {
   if (graphIds.length === 0) throw new FormError("graph: choose at least one graph.");
   if (!graphIds.every((id) => connected.has(id))) throw new FormError("graph: a chosen graph is not connected. Reload the page and choose again.");
   const access = text(form, "access");
-  if (access !== "read" && access !== "write") throw new FormError("access: choose read-only or read-write.");
+  if (!acceptedAccess(access)) throw new FormError("access: choose read-only, read-write without deletes, or read-write.");
   return { graphIds, access };
 }
 
@@ -460,7 +462,7 @@ async function createToken({ env, session, csrf, store, form }: FormCtx): Promis
     const values: TokenFormValues = {
       name: TOKEN_NAME.test(name) ? name : "",
       graphIds: form.getAll("graph").filter((id): id is string => typeof id === "string"),
-      access: access === "read" || access === "write" ? access : "",
+      access: acceptedAccess(access) ? access : "",
       expiresDays: WHOLE_DAYS.test(days) ? days : "",
     };
     return newTokenPage(csrf, graphs, values, error.status, error.message);
@@ -508,10 +510,13 @@ function changedSince(row: ServiceTokenRow): Response {
   return messagePage(409, "Not edited", `Service token '${row.name}' changed since you opened this page; reload and edit again.`);
 }
 
-/** An added graph (a swap counts, whatever else is removed) or read to write: the edits that need the confirm. */
+/**
+ * An added graph (a swap counts, whatever else is removed) or any raise in access by rank (read to
+ * write-no-delete, write-no-delete to write, read to write): the edits that need the confirm.
+ */
 function isWidening(before: TokenScope, after: TokenScope): boolean {
   const had = new Set(before.graphIds);
-  return after.graphIds.some((graphId) => !had.has(graphId)) || (before.access === "read" && after.access === "write");
+  return after.graphIds.some((graphId) => !had.has(graphId)) || rank(after.access) > rank(before.access);
 }
 
 /**
@@ -543,8 +548,8 @@ function baseMatches(raw: string, stored: TokenScope): boolean {
  * written, whether the edit narrows or widens (409), except that a stale confirm of a widening shows
  * the confirm page again against the current values. A form asking for what is already stored
  * redirects without a write, which also makes a double submit or a retry harmless. A narrowing, a
- * shorter expiry or both apply at once. A widening (an added graph, including a swap, or read to
- * write) shows the confirm page and writes nothing, until a re-post carries `confirm=1` and a current
+ * shorter expiry or both apply at once. A widening (an added graph, including a swap, or any raise
+ * in access) shows the confirm page and writes nothing, until a re-post carries `confirm=1` and a current
  * `base`; that re-post runs every check above again. Each refusal comes before the batch.
  */
 async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id: string): Promise<Response> {
@@ -571,7 +576,7 @@ async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id:
     const days = text(form, "expires_days").trim();
     const values: TokenEditValues = {
       graphIds: form.getAll("graph").filter((graphId): graphId is string => typeof graphId === "string"),
-      access: access === "read" || access === "write" ? access : "",
+      access: acceptedAccess(access) ? access : "",
       expiresDays: WHOLE_DAYS.test(days) ? days : "",
     };
     return editTokenPage(csrf, row, graphs, values, { base: JSON.stringify(before), openedAt: now }, error.status, error.message);

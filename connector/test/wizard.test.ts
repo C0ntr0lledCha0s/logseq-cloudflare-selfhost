@@ -1,6 +1,6 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { ServiceTokenStore, hashServiceToken } from "../src/auth/service-tokens";
+import { type ServiceTokenAccess, ServiceTokenStore, hashServiceToken } from "../src/auth/service-tokens";
 import { createSession } from "../src/auth/session";
 import { GraphStore } from "../src/graphs";
 import { createConnector } from "../src/index";
@@ -1159,7 +1159,7 @@ describe("service tokens", () => {
     const EFFECTIVE = "effective: read only (the graph is read-only)";
     const RANGE = "expires_days: a whole number of days from 1 to 365.";
     const NOT_CONNECTED = "graph: a chosen graph is not connected. Reload the page and choose again.";
-    const ACCESS = "access: choose read-only or read-write.";
+    const ACCESS = "access: choose read-only, read-write without deletes, or read-write.";
     const extension = (expiresAt: number) =>
       `expires_days: that would extend the expiry past ${day(expiresAt)}. A token's expiry can only be shortened; issue a new token instead.`;
     const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
@@ -1211,7 +1211,7 @@ describe("service tokens", () => {
     /** A token stored directly: the owner's, read-write on both graphs, 30 days left, unless `scope` says otherwise. */
     async function stored(
       name: string,
-      scope: { graphIds?: string[]; access?: "read" | "write"; expiresAt?: number; ownerId?: number } = {},
+      scope: { graphIds?: string[]; access?: ServiceTokenAccess; expiresAt?: number; ownerId?: number } = {},
     ) {
       return tokens().create({
         name,
@@ -2309,6 +2309,227 @@ describe("service tokens", () => {
         m.measured.length = 0;
         expect((await h.page("/tokens")).res.status).toBe(200);
         expect(m.measured.map((x) => [x.read, x.written])).toEqual([[4, 0]]);
+      });
+    });
+
+    describe("write-no-delete in the wizard (spec 2026-11-08 write-no-delete §3.7)", () => {
+      const NO_DELETE_ACCESS = "access: choose read-only, read-write without deletes, or read-write.";
+      type Access = ServiceTokenAccess;
+      const deleteRefused = (tool: string, why: string, next: string) =>
+        `service token 'worker' may not delete (write, no deletes): ${tool} on graph 'my-work-graph' ${why}. ${next}`;
+      const DELETE_PAGE_REFUSED = deleteRefused(
+        "delete_page",
+        "deletes the page and its blocks",
+        "Run it with dry-run=true to see what it would delete, and leave the delete to the owner.",
+      );
+      const DELETE_BLOCK_REFUSED = deleteRefused("delete_block", "deletes the block and its children", "Leave the delete to the owner.");
+
+      /** The access tag the token list shows for `name`. */
+      async function listTag(h: Harness, name: string): Promise<string> {
+        const { html } = await h.page("/tokens");
+        const section = html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
+        return /<span class="tag[^"]*">([^<]*)<\/span>/.exec(section)?.[1] ?? "";
+      }
+
+      /** The access radios a form draws, in page order, and which one is ticked. */
+      function radios(html: string): { values: string[]; ticked: string[] } {
+        const inputs = [...html.matchAll(/<input type="radio" name="access" value="([^"]*)"([^>]*)>/g)];
+        return { values: inputs.map((m) => m[1]), ticked: inputs.filter((m) => m[2].includes(" checked")).map((m) => m[1]) };
+      }
+
+      /** Sync API requests (not the token checks), as "METHOD path". */
+      const apiCalls = () =>
+        syncRequests.filter((r) => new URL(r.url).pathname !== "/api/v1/graphs").map((r) => `${r.method} ${new URL(r.url).pathname}`);
+
+      async function tool(h: Harness, token: string, name: string, args: Record<string, unknown>) {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return { isError: res.json.result.isError === true, text: res.json.result.content.map((c: { text: string }) => c.text).join("\n") };
+      }
+
+      /** Each service:<name> token_edit row's before and after access, oldest first. */
+      async function accessEdits(name: string): Promise<[string, string][]> {
+        return (await auditRows())
+          .filter((r) => r.alias === `service:${name}` && r.tool === "token_edit" && r.status === "ok")
+          .map((r) => JSON.parse(r.before as string).data)
+          .map((d) => [d.before.access, d.after.access]);
+      }
+
+      it("create with write-no-delete stores it, the list shows 'read-write, no deletes', the forms offer the three in rank order, and its first delete_block is refused while writes reach sync", async () => {
+        const h = await twoGraphs();
+        answerPages();
+        const form = await h.page("/tokens/new");
+        expect(radios(form.html)).toEqual({ values: ["read", "write-no-delete", "write"], ticked: ["read"] });
+        expect(form.html).toContain("Read and write, no deletes");
+        const { token } = await create(h, { name: "worker", access: "write-no-delete" }, [A]);
+        await create(h, { name: "reader", access: "read" }, [A]);
+        await create(h, { name: "writer", access: "write" }, [A]);
+        const row = (await rawRows()).find((r) => r.name === "worker")!;
+        expect(row.access).toBe("write-no-delete");
+        expect(await listTag(h, "worker")).toBe("read-write, no deletes");
+        expect(await listTag(h, "reader")).toBe("read-only");
+        expect(await listTag(h, "writer")).toBe("read-write");
+        const page = await h.page(`/tokens/${row.id}/edit`);
+        expect(radios(page.html)).toEqual({ values: ["read", "write-no-delete", "write"], ticked: ["write-no-delete"] });
+        syncRequests.length = 0;
+        expect(await tool(h, token, "delete_block", { graph: "my-work-graph", "block-id": PAGE_ID })).toEqual({ isError: true, text: DELETE_BLOCK_REFUSED });
+        expect(apiCalls()).toEqual([]);
+        const write = await tool(h, token, "update_block", { graph: "my-work-graph", "block-id": PAGE_ID, body: { title: "x" } });
+        expect(write.text).not.toMatch(/read-only|may not delete/);
+        expect(apiCalls().some((call) => call.endsWith(`/blocks/${PAGE_ID}`))).toBe(true);
+        assertNoToken();
+      });
+
+      it("six ordered pairs: the three raises show the confirm page with the right gain line and write nothing until confirmed; the three lowerings apply at once with one token_edit row; re-sends change nothing", async () => {
+        const h = await twoGraphs();
+        const raises: [string, Access, Access, string[], string[]][] = [
+          ["read-to-nd", "read", "write-no-delete", [A], ["gains write, no deletes on my-work-graph"]],
+          ["nd-to-write", "write-no-delete", "write", [A], ["gains deletes on my-work-graph"]],
+          ["read-to-write", "read", "write", [A], ["gains read-write on my-work-graph"]],
+          // Two writable graphs, in reversed order: one line per graph, in the form's order.
+          ["nd-to-write-reversed", "write-no-delete", "write", [C, A], ["gains deletes on third", "gains deletes on my-work-graph"]],
+        ];
+        await store().add({ ...THIRD });
+        for (const [name, from, to, graphIds, gains] of raises) {
+          const t = await stored(name, { graphIds, access: from });
+          const before = await snap();
+          const first = await edit(h, t.id, { access: to }, graphIds);
+          await confirmShown(first, before, name);
+          expect(changes(first.html), name).toEqual({ gains, losses: [] });
+          applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), name);
+          expect((await tokens().get(t.id))!, name).toMatchObject({ graphIds, access: to, revokedAt: null });
+          expect(await accessEdits(name), name).toEqual([[from, to]]);
+          const after = await snap();
+          applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), `${name} re-sent`);
+          expect(await snap(), `${name} re-sent`).toEqual(after);
+        }
+        const lowerings: [string, Access, Access, string[]][] = [
+          ["write-to-nd", "write", "write-no-delete", [A]],
+          ["write-to-read", "write", "read", [A]],
+          ["nd-to-read", "write-no-delete", "read", [A]],
+          ["write-to-nd-reversed", "write", "write-no-delete", [B, A]],
+        ];
+        for (const [name, from, to, graphIds] of lowerings) {
+          const t = await stored(name, { graphIds, access: from });
+          applied(await edit(h, t.id, { access: to }, graphIds), name);
+          expect((await tokens().get(t.id))!, name).toMatchObject({ graphIds, access: to, revokedAt: null });
+          expect(await accessEdits(name), name).toEqual([[from, to]]);
+          // The same form again (a double submit) is no change.
+          const after = await snap();
+          applied(await edit(h, t.id, { access: to }, graphIds), `${name} re-sent`);
+          expect(await snap(), `${name} re-sent`).toEqual(after);
+        }
+        // A write-no-delete token re-posted unchanged is no change, and so is a lowering chain's second step from a fresh page.
+        const same = await stored("nd-same", { graphIds: [A, B], access: "write-no-delete" });
+        const before = await snap();
+        applied(await edit(h, same.id, { access: "write-no-delete" }, [A, B]));
+        applied(await edit(h, same.id, { access: "write-no-delete" }, [B, A, B]));
+        expect(await snap()).toEqual(before);
+        const chain = await stored("chain-down", { graphIds: [A], access: "write" });
+        applied(await edit(h, chain.id, { access: "write-no-delete" }, [A]));
+        applied(await edit(h, chain.id, { access: "read" }, [A]));
+        expect(await accessEdits("chain-down")).toEqual([
+          ["write", "write-no-delete"],
+          ["write-no-delete", "read"],
+        ]);
+        // A raising chain needs the confirm at each step.
+        const up = await stored("chain-up", { graphIds: [A], access: "read" });
+        for (const to of ["write-no-delete", "write"] as const) {
+          const was = await snap();
+          const first = await edit(h, up.id, { access: to }, [A]);
+          await confirmShown(first, was, to);
+          applied(await h.page(`/tokens/${up.id}/edit`, confirmFields(first.html)), to);
+        }
+        expect(await accessEdits("chain-up")).toEqual([
+          ["read", "write-no-delete"],
+          ["write-no-delete", "write"],
+        ]);
+      });
+
+      it("a confirm that also narrows names both: a removed graph with a raise to write, and an added graph with a lowering to write-no-delete or read", async () => {
+        const h = await twoGraphs();
+        await store().add({ ...THIRD });
+        const cases: [string, string[], Access, string[], Access, string[], string[]][] = [
+          ["drop-and-delete", [A, B], "write-no-delete", [A], "write", ["gains deletes on my-work-graph"], ["loses access to other"]],
+          ["drop-and-nd", [A, B], "read", [A], "write-no-delete", ["gains write, no deletes on my-work-graph"], ["loses access to other"]],
+          ["add-and-lose-deletes", [A], "write", [A, C], "write-no-delete", ["gains read-write, no deletes on third"], ["loses deletes on my-work-graph"]],
+          ["add-and-lose-write", [A], "write-no-delete", [C, A], "read", ["gains read-only on third"], ["loses write on my-work-graph"]],
+        ];
+        for (const [name, graphIds, from, form, to, gains, losses] of cases) {
+          const t = await stored(name, { graphIds, access: from });
+          const before = await snap();
+          const first = await edit(h, t.id, { access: to }, form);
+          await confirmShown(first, before, name);
+          expect(changes(first.html), name).toEqual({ gains, losses });
+          applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), name);
+          expect((await tokens().get(t.id))!, name).toMatchObject({ graphIds: form, access: to });
+        }
+      });
+
+      it("a raise on a read-only graph says 'effective: read only', for write-no-delete, for deletes and for an added graph", async () => {
+        const h = await twoGraphs();
+        const cases: [string, string[], Access, string[], Access, string[]][] = [
+          ["read-to-nd", [B], "read", [B], "write-no-delete", [`gains write, no deletes on other; ${EFFECTIVE}`]],
+          ["nd-to-write", [B], "write-no-delete", [B], "write", [`gains deletes on other; ${EFFECTIVE}`]],
+          ["add-nd", [A], "write-no-delete", [A, B], "write-no-delete", [`gains read-write, no deletes on other; ${EFFECTIVE}`]],
+          ["mixed", [A, B], "read", [A, B], "write-no-delete", ["gains write, no deletes on my-work-graph", `gains write, no deletes on other; ${EFFECTIVE}`]],
+          // Read access needs no "effective" line, even on a read-only graph.
+          ["add-read", [A], "read", [A, B], "read", ["gains read-only on other"]],
+        ];
+        for (const [name, graphIds, from, form, to, gains] of cases) {
+          const t = await stored(name, { graphIds, access: from });
+          const first = await edit(h, t.id, { access: to }, form);
+          expect(first.res.status, name).toBe(200);
+          expect(changes(first.html), name).toEqual({ gains, losses: [] });
+        }
+      });
+
+      it("the next /mcp request sees the edit both ways: write to write-no-delete refuses delete_page at once; confirmed back to write, it reaches sync", async () => {
+        const h = await twoGraphs();
+        answerPages();
+        const { token } = await create(h, { name: "worker", access: "write" }, [A]);
+        const id = (await rawRows())[0].id as string;
+        const del = { graph: "my-work-graph", "page-id": PAGE_ID };
+        syncRequests.length = 0;
+        expect((await tool(h, token, "delete_page", del)).text).not.toContain("may not delete");
+        expect(apiCalls().filter((call) => call.startsWith("DELETE "))).toEqual([`DELETE /api/v1/graphs/${A}/pages/${PAGE_ID}`]);
+        applied(await edit(h, id, { access: "write-no-delete" }, [A]));
+        syncRequests.length = 0;
+        expect(await tool(h, token, "delete_page", del)).toEqual({ isError: true, text: DELETE_PAGE_REFUSED });
+        expect(apiCalls()).toEqual([]);
+        const raise = await edit(h, id, { access: "write" }, [A]);
+        expect(changes(raise.html)).toEqual({ gains: ["gains deletes on my-work-graph"], losses: [] });
+        // Until confirmed, the token still refuses deletes.
+        expect(await tool(h, token, "delete_page", del)).toEqual({ isError: true, text: DELETE_PAGE_REFUSED });
+        applied(await h.page(`/tokens/${id}/edit`, confirmFields(raise.html)));
+        syncRequests.length = 0;
+        expect((await tool(h, token, "delete_page", del)).text).not.toContain("may not delete");
+        expect(apiCalls().filter((call) => call.startsWith("DELETE "))).toEqual([`DELETE /api/v1/graphs/${A}/pages/${PAGE_ID}`]);
+        assertNoToken();
+      });
+
+      it("an unknown access value is refused on create and edit naming the field, writing nothing; a refused form keeps write-no-delete ticked", async () => {
+        const h = await twoGraphs();
+        const unknown = ["delete", "admin", "", "Write-No-Delete", "write-no-deletes", "write_no_delete", " write-no-delete", "toString", "__proto__"];
+        const t = await stored("ci", { graphIds: [A], access: "read" });
+        const before = await snap();
+        for (const access of unknown) {
+          const created = await h.page("/tokens/new", createForm(h, { name: "fresh", access }));
+          expect(created.res.status, access).toBe(400);
+          expect(shown(created.html), access).toBe(NO_DELETE_ACCESS);
+          expect(radios(created.html).ticked, access).toEqual([]);
+          await refused(await edit(h, t.id, { access }, [A]), 400, NO_DELETE_ACCESS, before, `edit ${JSON.stringify(access)}`);
+        }
+        expect(await snap()).toEqual(before);
+        // Another field refused: the valid write-no-delete choice is drawn again, ticked.
+        const create400 = await h.page("/tokens/new", createForm(h, { name: "Bad Name", access: "write-no-delete" }));
+        expect(create400.res.status).toBe(400);
+        expect(radios(create400.html).ticked).toEqual(["write-no-delete"]);
+        const edit400 = await edit(h, t.id, { access: "write-no-delete", expires_days: "0" }, [A]);
+        expect(edit400.res.status).toBe(400);
+        expect(shown(edit400.html)).toBe(RANGE);
+        expect(radios(edit400.html).ticked).toEqual(["write-no-delete"]);
+        expect(await snap()).toEqual(before);
       });
     });
   });

@@ -28,3 +28,4 @@ There are two kinds of tool:
 
 - **Changing a tool is a contract change.** Renamed arguments and changed defaults break claude.ai sessions silently, so prefer adding over changing, and give old callers a clear error.
 - **After deploy, a new tool shows up in claude.ai only once the connector is reconnected.** Say so in the PR's live verification steps.
+- **Every write tool has a delete rule.** A new or changed write tool, or a vendor bump that adds a body field to one, needs its entry in `connector/src/tools/deletes.mjs` (`DELETE_RULES`) checked: `always` for a tool that deletes, `when(args)` for an argument that removes a value with nothing in its place, `never` with its reason for an overwrite or a move. A `write-no-delete` service token refuses from that table, and a write tool with no entry fails closed and fails the coverage test.
