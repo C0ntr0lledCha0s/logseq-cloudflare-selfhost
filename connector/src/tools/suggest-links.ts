@@ -3,9 +3,9 @@
 // titles and say which plain-text mentions could become [[links]]. The words come from item 27's
 // tokeniser (`wordSpans`, `STOPWORDS`), so matching and semantic search split text the same way.
 import { STOPWORDS, firstWord, wordSpans } from "../semantic/ranking";
+import type { KbTitlesPage } from "./kb-index";
 
-/** One knowledge-index page as the matcher needs it: its UUID, title and alias titles. */
-export type KbTitlesPage = [uuid: string, title: string, aliases: string[]];
+export type { KbTitlesPage };
 
 /** Longest draft accepted, in characters. */
 export const TEXT_LIMIT = 20_000;

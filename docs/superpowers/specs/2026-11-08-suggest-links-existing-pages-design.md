@@ -75,6 +75,8 @@ About 60 bytes a page, so about 1.2 MB at 20,000 pages. Both keys come from one 
 
 A new `freshTitles(access, alias, now)` reads the titles key and the dirty key and accepts the titles under the same rules as `freshRecord`: same graph id, `version: 2`, under the max age, and not dirty since `builtAt`. Otherwise `suggest_links` calls `rebuildKbIndex`, which rewrites both keys, and uses the titles from the record it returns. **(call)** Because both readers apply the same rules to the same `builtAt`, a failed write of one key shows up as a stale key and a rebuild, not as the two keys drifting apart. The titles key gets the same `expirationTtl` as the record.
 
+*As built (Stage 3):* one `isFresh` rule in `kb-index.ts` serves `freshRecord` and `freshTitles`, each reading its key and the dirty key (2 KV reads). A rebuild writes the titles key first and the record second, so a failed write never leaves a record newer than its titles. A titles key older than the record is rebuilt when the shared rule makes it stale (dirty since its `builtAt`, or past the max age), not merely for being older: comparing the two `builtAt`s would cost a third KV read of the large record on every warm call.
+
 **(call)** An alias page is a page in its own right (tagged Page), so it is also in the index as its own entry. When a page's title equals (ignoring case) an alias of another page in the index, the standalone entry is dropped as a candidate and the title only matches as the alias of its target. Otherwise "OI" would give an ambiguous suggestion between the alias page and its target.
 
 ### 3.3 The matcher (panel)
