@@ -1,7 +1,7 @@
 // Query terms for semantic search's ranking (design 2026-11-07, sections 3.2, 3.3 and 3.6). Pure
 // functions, no I/O. The stopword list is shared with the test embedder, so changing it changes the
 // offline eval's baseline.
-import { KEYWORD_TERMS } from "./config";
+import { KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
 
 /** Words too common to say what a query is about. `test/semantic-fakes.ts` imports this list. */
 export const STOPWORDS: ReadonlySet<string> = new Set(
@@ -40,4 +40,24 @@ export function distinctiveTerms(q: string): string[] {
 /** Words in a block's stored text, split on whitespace ("Stock on hand" is 3). */
 export function wordCount(text: string): number {
   return text.split(/\s+/).filter((w) => w !== "").length;
+}
+
+/**
+ * The semantic list re-ordered for a query of `RANKED_QUERY_WORDS` or more content words: a block
+ * whose stored text has `SHORT_BLOCK_WORDS` words or fewer is ordered by its similarity times
+ * `SHORT_BLOCK_WEIGHT`. The sort is stable, so ties keep vector order, and each entry is returned
+ * unchanged (its similarity stays raw). `textOf` gives the block's stored text, not its document.
+ */
+export function demoteShortBlocks<T extends { uuid: string; similarity: number }>(
+  semantic: T[],
+  textOf: (uuid: string) => string | undefined,
+  query: string,
+): T[] {
+  if (contentWords(query).length < RANKED_QUERY_WORDS) return semantic;
+  const weighted = semantic.map((hit) => {
+    const text = textOf(hit.uuid);
+    const short = text !== undefined && wordCount(text) <= SHORT_BLOCK_WORDS;
+    return { hit, order: short ? hit.similarity * SHORT_BLOCK_WEIGHT : hit.similarity };
+  });
+  return weighted.sort((a, b) => b.order - a.order).map((w) => w.hit);
 }

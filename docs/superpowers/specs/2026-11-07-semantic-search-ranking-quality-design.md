@@ -268,6 +268,7 @@ To be filled in by the build:
 |---|---|---|---|---|
 | Offline, current fixture, HEAD `c0e0fd4` | 0.20 | 0.20 | 1.00 | 0.88 |
 | Offline, extended fixture (12 questions), before: ranking code of `86cb347` | 0.17 | 0.17 | 1.00 | 0.85 |
+| Offline, extended fixture, after Stage 4 (short-block rule) | 0.17 | 0.17 | 1.00 | 0.90 (0.896) |
 | Offline, extended fixture, after | | | | |
 | Live, before | | | | |
 | Live, after | | | | |

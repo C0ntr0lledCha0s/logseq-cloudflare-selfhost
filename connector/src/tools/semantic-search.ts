@@ -8,6 +8,7 @@ import {
   type SemanticBindings,
 } from "../semantic/config";
 import { BindingError } from "../semantic/indexer";
+import { demoteShortBlocks } from "../semantic/ranking";
 import { reciprocalRankFusion } from "../semantic/rrf";
 import type { SemanticStore, StoredBlock } from "../semantic/store";
 import type { OnSuccess } from "./readable";
@@ -16,7 +17,7 @@ import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
 export const SEMANTIC_HELP =
-  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
+  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more words, one- and two-word blocks rank lower by meaning (their similarity is reported unchanged). Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
 
 /** One hybrid search hit. Keyword-only hits outside the index carry just their title and resource. */
 export interface SearchHit {
@@ -106,7 +107,9 @@ export async function hybridSearch(
     .filter((h) => allowed(h.uuid));
   // The floor compares the raw value, so 0.5996 is below 0.6 although it is reported as 0.600.
   const min = args.min_similarity;
-  const kept = min === undefined ? semanticHits : semanticHits.filter((h) => h.similarity >= min);
+  const floored = min === undefined ? semanticHits : semanticHits.filter((h) => h.similarity >= min);
+  // Short blocks are ordered lower for multi-word questions; reported similarities stay raw.
+  const kept = demoteShortBlocks(floored, (uuid) => byUuid.get(uuid)?.text, args.q);
   const similarityOf = new Map<string, number>();
   for (const h of kept) if (!similarityOf.has(h.uuid)) similarityOf.set(h.uuid, h.similarity);
   const semanticUuids = kept.map((h) => h.uuid);
@@ -141,7 +144,7 @@ export async function hybridSearch(
   });
   const index = { status: state?.status ?? "not started", blocks: counts.graph };
   if (min === undefined) return { results, index };
-  return { results, index, "below-min-similarity": semanticHits.length - kept.length };
+  return { results, index, "below-min-similarity": semanticHits.length - floored.length };
 }
 
 /** `semantic_search` and `semantic_index_status`; registered only when semantic search is configured. */
@@ -156,7 +159,7 @@ export function registerSemanticTools(
     "semantic_search",
     {
       description:
-        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed.",
+        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). For a query of three or more words, one- and two-word blocks rank lower by meaning; similarity stays raw. min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed.",
       inputSchema: z.object({
         graph,
         q: z.string().min(1).max(500).describe("What to look for, in plain words"),

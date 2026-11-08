@@ -84,10 +84,10 @@
     { "q": "Queenstown", "expected": ["flights"] },
     { "q": "How much is the holiday going to cost?", "expected": ["trip-budget"] },
     { "q": "rego", "expected": ["rego"] },
-    { "q": "stock level reporting dashboard", "expected": ["stock-dashboard"], "top": 3 },
+    { "q": "stock level reporting dashboard", "expected": ["stock-dashboard"], "top": 1 },
     { "q": "weekly sales report for the regions", "expected": ["sales-report"] }
   ],
   "private": ["therapy", "therapy-detail", "bank", "wifi"],
   "baseline": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } },
-  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } }
+  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.89 } }
 }

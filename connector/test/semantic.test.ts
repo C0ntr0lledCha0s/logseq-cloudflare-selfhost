@@ -763,6 +763,113 @@ describe("similarity and ranks", () => {
     expect(tool.inputSchema.properties.min_similarity).toMatchObject({ type: "number", minimum: 0, maximum: 1 });
     expect(tool.inputSchema.required).not.toContain("min_similarity");
   });
+
+  describe("short blocks (design 2026-11-07 section 3.2)", () => {
+    // Three content words; "stock level reporting" is no block's or page's substring, so the keyword
+    // leg returns nothing and the semantic order alone decides the results.
+    const MULTI = "stock level reporting";
+    const order = (body: Body) => body.results.map((r) => r.uuid);
+
+    function query(q: string): string {
+      crafted.vectors.set(q, axis(0));
+      return q;
+    }
+
+    it("a 2-word block at 0.58 drops below a 3-word block at 0.46 for a 3-content-word query, past a 0.50 decoy", async () => {
+      const page = work.addPage("Warehouse");
+      const short = block("Warehouse", page, "Stock dashboards", 0.58);
+      const decoy = block("Warehouse", page, "Forklift service due Friday", 0.5);
+      const target = block("Warehouse", page, "Stock on hand", 0.46);
+      await runUntilReady();
+      expect(contentWords(MULTI)).toHaveLength(3);
+      // 0.58 x 0.75 = 0.435 < 0.46, while 0.58 x 0.85 = 0.493 would stay above it: the weight is pinned.
+      const body = await search({ q: query(MULTI) });
+      expect(order(body)).toEqual([decoy, target, short]);
+      expect(body.results.every((r) => r["keyword-rank"] === null)).toBe(true);
+      // Ordering only: the demoted block reports its raw cosine and its rank after the rule.
+      expect(hit(body, short)).toMatchObject({ similarity: 0.58, "semantic-rank": 3 });
+      expect(hit(body, target)).toMatchObject({ similarity: 0.46, "semantic-rank": 2 });
+      // The floor compares the raw value: 0.58 passes 0.5 although its ordering value is 0.435.
+      const floored = await search({ q: query(MULTI), min_similarity: 0.5 });
+      expect(order(floored)).toEqual([decoy, short]);
+      expect(floored["below-min-similarity"]).toBe(1);
+      expect(hit(floored, short)).toMatchObject({ similarity: 0.58, "semantic-rank": 2 });
+    });
+
+    it("demotes 1-word and whitespace-padded 2-word blocks, and any query of 3 or more content words", async () => {
+      const page = work.addPage("Warehouse");
+      const one = block("Warehouse", page, "Dashboards", 0.58);
+      const padded = block("Warehouse", page, "  Stock \t  dashboards ", 0.57);
+      const target = block("Warehouse", page, "Stock on hand", 0.46);
+      await runUntilReady();
+      for (const q of [MULTI, "weekly stock level reporting", "what is the stock level reporting?"]) {
+        expect(contentWords(q).length, q).toBeGreaterThanOrEqual(3);
+        expect(order(await search({ q: query(q) })), q).toEqual([target, one, padded]);
+      }
+    });
+
+    it("does not demote for a query of 2 content words, stopwords and short words aside", async () => {
+      const page = work.addPage("Warehouse");
+      const short = block("Warehouse", page, "Stock dashboards", 0.58);
+      const decoy = block("Warehouse", page, "Forklift service due Friday", 0.5);
+      const target = block("Warehouse", page, "Stock on hand", 0.46);
+      await runUntilReady();
+      for (const q of ["stock reporting", "is it the stock reporting of us?", "reporting"]) {
+        expect(contentWords(q).length, q).toBeLessThan(3);
+        expect(order(await search({ q: query(q) })), q).toEqual([short, decoy, target]);
+      }
+    });
+
+    it("does not demote a 3-word block, whose text alone is counted (not the page title or breadcrumb)", async () => {
+      const page = work.addPage("Warehouse");
+      const three = block("Warehouse", page, "Stock on hand", 0.58);
+      const decoy = block("Warehouse", page, "Forklift service due Friday", 0.5);
+      const four = block("Warehouse", page, "Pallets in aisle four", 0.46);
+      // A 2-word child: its document ("Northwind warehouse > Stock on hand > Reorder now") is long, its text is not.
+      const parentTitle = "Northwind warehouse";
+      const other = work.addPage(parentTitle);
+      const parent = work.addBlock(other, "Stock on hand counts");
+      crafted.vectors.set(documentText({ pageTitle: parentTitle, breadcrumb: [], text: "Stock on hand counts" }), axis(3));
+      crafted.vectors.set(documentText({ pageTitle: parentTitle, breadcrumb: ["Stock on hand counts"], text: "Reorder now" }), unitAt(0.55));
+      const child = work.addBlock(other, "Reorder now", { parent });
+      await runUntilReady();
+      expect(order(await search({ q: query(MULTI) }))).toEqual([three, decoy, four, child]);
+    });
+
+    it("ties after demotion keep vector order", async () => {
+      const page = work.addPage("Warehouse");
+      // 0.5 x 0.75 = 0.375 exactly, equal to the 3-word block's raw 0.375; vector order puts the short block first.
+      const long = block("Warehouse", page, "Stock on hand", 0.375);
+      const short = block("Warehouse", page, "Stock dashboards", 0.5);
+      await runUntilReady();
+      expect(order(await search({ q: query(MULTI) }))).toEqual([short, long]);
+    });
+
+    it("adds no D1 statement: the demoting search prepares the same statements as one that does not demote", async () => {
+      const page = work.addPage("Warehouse");
+      block("Warehouse", page, "Stock dashboards", 0.58);
+      block("Warehouse", page, "Stock on hand", 0.46);
+      await runUntilReady();
+      const statements: string[] = [];
+      const db = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop === "prepare") return (sql: string) => (statements.push(sql), target.prepare(sql));
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const run = async (q: string) => {
+        statements.length = 0;
+        const result = await callTool({ ...semanticEnv(), DB: db } as Env, "semantic_search", { graph: "work", q: query(q) });
+        expect(result.isError, result.text).toBe(false);
+        return [...statements];
+      };
+      const demoting = await run(MULTI);
+      const plain = await run("stock reporting");
+      expect(demoting).toEqual(plain);
+      expect(demoting.filter((sql) => sql.includes("semantic_"))).toHaveLength(3);
+    });
+  });
 });
 
 it("fake embeddings put synonyms near each other", () => {

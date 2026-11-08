@@ -200,9 +200,9 @@ describe("semantic search evaluation", () => {
     expect(summary.hybrid.mrr).toBeGreaterThanOrEqual(floor.hybrid.mrr);
   });
 
-  // Known to fail until Stage 4 (the short-block rule, design 2026-11-07 section 3.2): on the unchanged
-  // ranking, "Dashboards" is rank 1 for "stock level reporting dashboard". Stage 4 makes this it(...).
-  it.fails("no block of 2 words or fewer is rank 1 for a question of 3 or more content words", () => {
+  // The short-block rule (design 2026-11-07 section 3.2). Before it, "Dashboards" was rank 1 for
+  // "stock level reporting dashboard".
+  it("no block of 2 words or fewer is rank 1 for a question of 3 or more content words", () => {
     const ranked = rows.filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
     expect(ranked.length).toBeGreaterThan(0);
     for (const r of ranked) {
