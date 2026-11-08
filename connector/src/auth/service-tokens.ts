@@ -198,10 +198,19 @@ export class ServiceTokenStore {
    * rotation. Throws, before any statement, if `after` would extend the expiry. True when it wrote.
    */
   async update(id: string, before: TokenScope, after: TokenScope, now: number): Promise<boolean> {
+    const result = await this.updateStatement(id, before, after, now).run();
+    return result.meta.changes > 0;
+  }
+
+  /**
+   * `update`'s guarded UPDATE as a statement, unrun, for a `db.batch` that must commit it together
+   * with the edit's audit row (AuditLog.tokenEditStatement). Throws as `update` does.
+   */
+  updateStatement(id: string, before: TokenScope, after: TokenScope, now: number): D1PreparedStatement {
     if (after.expiresAt > before.expiresAt) {
       throw new Error(`service token ${id}: an edit can only shorten the expiry, never extend it`);
     }
-    const result = await this.db
+    return this.db
       .prepare(
         `UPDATE service_tokens
             SET graph_ids = ?, access = ?, expires_at = ?, updated_at = ?
@@ -218,9 +227,7 @@ export class ServiceTokenStore {
         JSON.stringify(before.graphIds),
         before.access,
         before.expiresAt,
-      )
-      .run();
-    return result.meta.changes > 0;
+      );
   }
 
   /**

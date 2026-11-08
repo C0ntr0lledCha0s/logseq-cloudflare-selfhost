@@ -69,6 +69,8 @@ const TOKEN_REVOKE = new RegExp(`^/tokens/(${UUID})/revoke$`);
 const TOKEN_EDIT = new RegExp(`^/tokens/(${UUID})/edit$`);
 const TOKEN_NAME = /^[a-z0-9-]{1,40}$/;
 const WHOLE_DAYS = /^\d{1,3}$/;
+/** Milliseconds since 1970 as the edit forms carry them: up to 15 digits, so always a safe integer. */
+const EPOCH_MS = /^\d{1,15}$/;
 const DAY_MS = 86_400_000;
 
 function text(form: FormData, name: string): string {
@@ -375,20 +377,42 @@ function utcDate(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+function extensionPast(field: string, expiresAt: number): FormError {
+  return new FormError(
+    `${field}: that would extend the expiry past ${utcDate(expiresAt)}. A token's expiry can only be shortened; issue a new token instead.`,
+  );
+}
+
 /**
  * Every field of the edit form, checked before anything is written (spec 2026-11-08 §3.5 step 2).
- * `expires_days` blank keeps the stored expiry; otherwise it counts from `now` and may only shorten it.
+ * The expiry comes from one of two fields. `expires_at` is the absolute time a confirm page showed,
+ * applied exactly. `expires_days` counts from `opened_at`, the time the edit page was drawn, so a
+ * double submit or a retry asks for the same expiry. Blank keeps the stored one. A new expiry may only
+ * shorten the stored one and must still be in the future.
  */
 function parseTokenEditForm(form: FormData, connected: ReadonlySet<string>, row: ServiceTokenRow, now: number): TokenScope {
   const { graphIds, access } = parseGraphsAndAccess(form, connected);
   const days = text(form, "expires_days").trim();
-  if (days === "") return { graphIds, access, expiresAt: row.expiresAt };
-  const expiresAt = now + parseDays(days) * DAY_MS;
-  if (expiresAt > row.expiresAt) {
-    throw new FormError(
-      `expires_days: that would extend the expiry past ${utcDate(row.expiresAt)}. A token's expiry can only be shortened; issue a new token instead.`,
-    );
+  const at = text(form, "expires_at").trim();
+  if (days !== "" && at !== "") throw new FormError("expires_at: send expires_days or expires_at, not both.");
+  if (days === "" && at === "") return { graphIds, access, expiresAt: row.expiresAt };
+  let field: string;
+  let expiresAt: number;
+  if (at !== "") {
+    field = "expires_at";
+    if (!EPOCH_MS.test(at)) throw new FormError("expires_at: a whole number of milliseconds since 1970. Reload the page and edit again.");
+    expiresAt = Number(at);
+  } else {
+    field = "expires_days";
+    const count = parseDays(days);
+    const opened = text(form, "opened_at").trim();
+    if (!EPOCH_MS.test(opened) || Number(opened) > now) {
+      throw new FormError("opened_at: missing, or not a time this page could have been opened. Reload the page and edit again.");
+    }
+    expiresAt = Number(opened) + count * DAY_MS;
   }
+  if (expiresAt > row.expiresAt) throw extensionPast(field, row.expiresAt);
+  if (expiresAt <= now) throw new FormError(`${field}: that expiry has already passed. Reload the page and edit again.`);
   return { graphIds, access, expiresAt };
 }
 
@@ -465,11 +489,23 @@ function toTokens(): Response {
   return new Response(null, { status: 303, headers: { Location: "/tokens", "Cache-Control": "no-store" } });
 }
 
-/** GET /tokens/:id/edit: the current graphs and access ticked, and a blank "shorten expiry" field. */
+/** The part of a stored token an edit changes. */
+function scopeOf(row: ServiceTokenRow): TokenScope {
+  return { graphIds: row.graphIds, access: row.access, expiresAt: row.expiresAt };
+}
+
+/** GET /tokens/:id/edit: the current graphs and access ticked, a blank "shorten expiry" field, and the scope it was drawn from. */
 async function editTokenForm({ env, store, csrf }: Ctx, id: string): Promise<Response> {
-  const row = editable(await new ServiceTokenStore(env.DB).get(id), env, Date.now());
+  const now = Date.now();
+  const row = editable(await new ServiceTokenStore(env.DB).get(id), env, now);
   if (row instanceof Response) return row;
-  return editTokenPage(csrf, row, await store.list(), { graphIds: row.graphIds, access: row.access, expiresDays: "" });
+  const values: TokenEditValues = { graphIds: row.graphIds, access: row.access, expiresDays: "" };
+  return editTokenPage(csrf, row, await store.list(), values, { base: JSON.stringify(scopeOf(row)), openedAt: now });
+}
+
+/** The answer to a form drawn from values the token no longer holds, and to an UPDATE whose guard missed. */
+function changedSince(row: ServiceTokenRow): Response {
+  return messagePage(409, "Not edited", `Service token '${row.name}' changed since you opened this page; reload and edit again.`);
 }
 
 /** An added graph (a swap counts, whatever else is removed) or read to write: the edits that need the confirm. */
@@ -502,11 +538,14 @@ function baseMatches(raw: string, stored: TokenScope): boolean {
 
 /**
  * POST /tokens/:id/edit (spec 2026-11-08 §3.5): load and refuse, check audit_log, parse, diff, then
- * one guarded UPDATE, a read-back and the audit row. Nothing changed redirects without a write. A
- * narrowing, a shorter expiry or both apply at once. A widening (an added graph, including a swap, or
- * read to write) shows the confirm page and writes nothing, until a re-post carries `confirm=1` and a
- * `base` equal to the stored values; that re-post runs every check above again. Each refusal comes
- * before the UPDATE.
+ * one batch holding the guarded UPDATE and its audit row, and a read-back. The form's `base` is the
+ * scope the page was drawn from. When it is not the stored scope, the page is stale: nothing is
+ * written, whether the edit narrows or widens (409), except that a stale confirm of a widening shows
+ * the confirm page again against the current values. A form asking for what is already stored
+ * redirects without a write, which also makes a double submit or a retry harmless. A narrowing, a
+ * shorter expiry or both apply at once. A widening (an added graph, including a swap, or read to
+ * write) shows the confirm page and writes nothing, until a re-post carries `confirm=1` and a current
+ * `base`; that re-post runs every check above again. Each refusal comes before the batch.
  */
 async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id: string): Promise<Response> {
   const tokens = new ServiceTokenStore(env.DB);
@@ -518,44 +557,15 @@ async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id:
     return messagePage(503, "Not edited", "audit log is missing (apply migration 0004); nothing was changed.");
   }
   const graphs = await store.list();
+  const before = scopeOf(row);
+  const current = baseMatches(text(form, "base"), before);
+  let after: TokenScope;
   try {
-    const after = parseTokenEditForm(form, new Set(graphs.map((graph) => graph.graphId)), row, now);
-    const before: TokenScope = { graphIds: row.graphIds, access: row.access, expiresAt: row.expiresAt };
-    const had = new Set(before.graphIds);
-    const has = new Set(after.graphIds);
-    const added = after.graphIds.some((graphId) => !had.has(graphId));
-    const removed = before.graphIds.some((graphId) => !has.has(graphId));
-    if (!added && !removed && after.access === before.access && after.expiresAt === before.expiresAt) return toTokens();
-    if (isWidening(before, after)) {
-      // Confirmed only by a re-post of the confirm page drawn against the row as it is now. A forged or
-      // stale confirm shows the page again; the UPDATE's before-value guard would refuse it anyway.
-      const confirming = text(form, "confirm") === "1";
-      if (!confirming || !baseMatches(text(form, "base"), before)) {
-        const days = text(form, "expires_days").trim();
-        return tokenEditConfirmPage(csrf, row, graphs, after, days, JSON.stringify(before), confirming);
-      }
-    }
-    if (!(await tokens.update(id, before, after, now))) {
-      const current = editable(await tokens.get(id), env, now);
-      if (current instanceof Response) return current;
-      return messagePage(409, "Not edited", `Service token '${row.name}' changed since you opened this page; reload and edit again.`);
-    }
-    const stored = await tokens.get(id);
-    const field = readBackMismatch(stored, { name: row.name, ...after });
-    if (field !== undefined || !stored) {
-      await tokens.revoke(id, Date.now());
-      return messagePage(500, "Token revoked", `${field}: the stored token did not match the form, so it was revoked. Issue a new token.`);
-    }
-    await audit.recordTokenEdit({
-      at: now,
-      name: row.name,
-      ownerId: session.githubUserId,
-      before,
-      after: { graphIds: stored.graphIds, access: stored.access, expiresAt: stored.expiresAt },
-    });
-    return toTokens();
+    after = parseTokenEditForm(form, new Set(graphs.map((graph) => graph.graphId)), row, now);
   } catch (error) {
     if (!(error instanceof FormError)) throw error;
+    // A stale page is not drawn again with the current scope as its base: that would let it apply.
+    if (!current) return changedSince(row);
     // Echo only values that are already valid; boxes are drawn only for connected graphs.
     const access = text(form, "access");
     const days = text(form, "expires_days").trim();
@@ -564,8 +574,53 @@ async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id:
       access: access === "read" || access === "write" ? access : "",
       expiresDays: WHOLE_DAYS.test(days) ? days : "",
     };
-    return editTokenPage(csrf, row, graphs, values, error.status, error.message);
+    return editTokenPage(csrf, row, graphs, values, { base: JSON.stringify(before), openedAt: now }, error.status, error.message);
   }
+  const had = new Set(before.graphIds);
+  const has = new Set(after.graphIds);
+  const added = after.graphIds.some((graphId) => !had.has(graphId));
+  const removed = before.graphIds.some((graphId) => !has.has(graphId));
+  if (!added && !removed && after.access === before.access && after.expiresAt === before.expiresAt) return toTokens();
+  const confirming = text(form, "confirm") === "1";
+  if (isWidening(before, after) && !(confirming && current)) {
+    if (!confirming) {
+      if (!current) return changedSince(row);
+      return tokenEditConfirmPage(csrf, row, graphs, after, JSON.stringify(before), false);
+    }
+    // A forged or stale confirm: the page again, against the row as it is now.
+    return tokenEditConfirmPage(csrf, row, graphs, after, JSON.stringify(before), true);
+  }
+  if (!current) return changedSince(row);
+  // The UPDATE and its audit row commit together or not at all; the INSERT runs only if the UPDATE wrote.
+  const statements = [
+    tokens.updateStatement(id, before, after, now),
+    audit.tokenEditStatement({ at: now, name: row.name, ownerId: session.githubUserId, before, after }, { tokenId: id, updatedAt: now }),
+  ];
+  let wrote: boolean;
+  try {
+    const [update] = await env.DB.batch(statements);
+    wrote = update.meta.changes > 0;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return messagePage(
+      500,
+      "Not edited",
+      `Service token '${row.name}' was not edited: the change and its audit row are written together, and the write failed (${reason}); nothing was changed. Try again.`,
+    );
+  }
+  if (!wrote) {
+    const latest = editable(await tokens.get(id), env, now);
+    if (latest instanceof Response) return latest;
+    return changedSince(row);
+  }
+  const stored = await tokens.get(id);
+  const field = readBackMismatch(stored, { name: row.name, ...after });
+  if (field !== undefined) {
+    // The audit row already records the edit as asked; the revoke keeps a token that does not hold it from being used.
+    await tokens.revoke(id, Date.now());
+    return messagePage(500, "Token revoked", `${field}: the stored token did not match the form, so it was revoked. Issue a new token.`);
+  }
+  return toTokens();
 }
 
 /** POST /tokens/:id/revoke: sets revoked_at once; a re-send keeps the first time and still redirects. */

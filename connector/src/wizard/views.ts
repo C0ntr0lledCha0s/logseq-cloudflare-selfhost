@@ -382,6 +382,16 @@ export interface TokenEditValues {
 }
 
 /**
+ * What an edit page was drawn from, posted back as hidden fields: `base`, the stored scope as JSON,
+ * which the route compares with the row so a stale page cannot write; and `openedAt`, the time the
+ * page was drawn, from which a day count is counted so a double submit asks for the same expiry.
+ */
+export interface TokenEditDrawn {
+  base: string;
+  openedAt: number;
+}
+
+/**
  * GET /tokens/:id/edit, and the same form again after a refusal (spec 2026-11-08 §3.4). The name is
  * shown, not edited. A graph the token lists that is no longer connected has no box, so saving drops it.
  */
@@ -390,6 +400,7 @@ export function editTokenPage(
   token: ServiceTokenRow,
   graphs: GraphRecord[],
   values: TokenEditValues,
+  drawn: TokenEditDrawn,
   status = 200,
   error?: string,
 ): Response {
@@ -406,6 +417,8 @@ export function editTokenPage(
 ${errorBox(error)}
 <form class="card" method="post" action="/tokens/${escapeHtml(token.id)}/edit">
   ${csrfField(csrf)}
+  <input type="hidden" name="base" value="${escapeHtml(drawn.base)}">
+  <input type="hidden" name="opened_at" value="${drawn.openedAt}">
   <fieldset><legend>Graphs</legend>
   ${graphBoxes(graphs, values.graphIds)}
   ${gone}
@@ -419,8 +432,9 @@ ${errorBox(error)}
   </fieldset>
   <label class="field"><span>Shorten expiry to N days from now</span>
   <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}">
-  <small>Expires ${utc(token.expiresAt)}. Leave blank to keep it. An expiry can only be shortened.</small></label>
+  <small>Expires ${utc(token.expiresAt)}. Days count from when this page was opened (${utc(drawn.openedAt)}). Leave blank to keep it. An expiry can only be shortened.</small></label>
   <p class="hint">Removing graphs, read-only and a shorter expiry apply at once, from the token's next request. Adding a graph or raising to read-write first shows what the token gains, and applies only when you confirm.</p>
+  <p class="hint">If the token changes in another tab or window after this page was opened, saving is refused; reload and edit again.</p>
   <p class="hint">Editing does not change the token. If it may have leaked, revoke it and issue a new one.</p>
   <div class="actions"><button>Save changes</button><a class="button quiet" href="/tokens">Cancel</a></div>
 </form>`,
@@ -430,15 +444,16 @@ ${errorBox(error)}
 /**
  * The widening confirm (spec 2026-11-08 §3.5 step 4): what `after` gains and loses against the stored
  * `token`, by current alias, and the same fields again as hidden inputs with `confirm=1` and `base`
- * (the stored before-values as JSON). `stale` adds the line saying the token changed since the page
- * the owner confirmed was drawn. Writes nothing; the route applies only a re-post whose base matches.
+ * (the stored before-values as JSON). A shortened expiry goes back as `expires_at`, the absolute time
+ * the page shows, so the confirm stores exactly that rather than recounting days. `stale` adds the line
+ * saying the token changed since the page the owner confirmed was drawn. Writes nothing; the route
+ * applies only a re-post whose base matches.
  */
 export function tokenEditConfirmPage(
   csrf: string,
   token: ServiceTokenRow,
   graphs: GraphRecord[],
   after: TokenScope,
-  expiresDays: string,
   base: string,
   stale: boolean,
 ): Response {
@@ -481,7 +496,7 @@ ${losses.length > 0 ? `<h2>The token loses</h2>\n<ul class="losses">${items(loss
 <form class="card" method="post" action="${action}">
   ${csrfField(csrf)}
   ${hidden("access", after.access)}
-  ${hidden("expires_days", expiresDays)}
+  ${hidden("expires_at", after.expiresAt === token.expiresAt ? "" : String(after.expiresAt))}
   ${after.graphIds.map((id) => hidden("graph", id)).join("\n  ")}
   ${hidden("confirm", "1")}
   ${hidden("base", base)}

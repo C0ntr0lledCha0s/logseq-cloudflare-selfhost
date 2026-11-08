@@ -17,7 +17,7 @@ A token covered graph A read-only. In tab 1 the owner opened the edit form. In t
 
 ## Fix
 
-Not applied in the lane (deferred as should-fix). The remedy: put the scope the form was drawn from in a hidden `base` field on the edit form too. On every POST, narrowings included, refuse (409, or show the confirm page again) when `base` is missing or differs from the stored row, and diff against `base`. Flip the chain test to expect the refusal and add the two-tab test.
+Applied in the review-fix commit after the lane (r1-correctness-1). The edit page carries the stored scope as a hidden `base`. Every POST whose `base` is missing or differs from the stored row is refused 409 "changed since you opened this page; reload and edit again." before any write, narrowings included; only a stale confirm of a widening shows the confirm page again instead. A form asking for exactly what is stored is checked first and redirects with no write, so a double submit stays harmless. The chain test now expects the 409, and a two-tab test covers a shorter expiry, a narrowing, a widening and a missing base.
 
 ## How to catch it next time
 
