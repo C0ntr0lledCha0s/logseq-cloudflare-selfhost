@@ -81,12 +81,16 @@ All server work is one new patch, `patches/0037-semantic-display-type-and-code-l
 - Any other `:keyword`-typed property keeps the outliner's refusal, reworded: `<title>: takes a keyword; only display-type can be set as text`. **(panel)** This narrows the issue's "any keyword property" wording to display type (section 11, question 1).
 - `logseq.property.code/lang` is checked as a string of 1 to 40 characters with no whitespace, case kept (for example `mermaid`, `python`, `clojure`, `sql`). The app accepts any CodeMirror mode name, so there is no allowlist of languages.
 
+*As built:* `prepare-property-value` takes the same text for `logseq.property.code/lang` as the explicit field, so lang through `properties`, `set_block_property` and `batch_set_block_property` follows one rule.
+
 ### 3.2 Explicit fields (panel)
 
 - The OpenAPI `BlockTree` node gains optional `display-type` (enum `code`, `math`, `quote`) and `lang`. So insert_block_tree, insert_block_children, every batch_insert_block_trees entry and capture_to_today get them on every node.
 - The `updateBlock` body gains the same two fields.
 - The same values are also accepted through a node's `properties`, keyed by the ident or the title, and through set_block_property and batch_set_block_property.
 - `prepare-tree` merges the two forms. A node that gives both with different values is refused, naming the path: `blocks[0].children[1]: display-type given twice ("code", "math")`. The same value twice is accepted.
+
+*As built:* a child never takes its parent's type, so `lang` on a plain child of a code node is refused naming the child's path. Values given in `properties` and in the field are compared after conversion, so `"code"` and `":code"` count as the same value. A retried typed insert (same UUID, same fields) is a no-op, not a duplicate.
 
 ### 3.3 Cross-field guards (panel)
 
@@ -115,6 +119,8 @@ Each step goes through `outliner-property` inside the existing `atomic-write!`, 
 
 The server does not copy the client's "last used lang" (`:logseq.kv/latest-code-lang`) onto a code block written without one. **(call)** A block with no lang renders as plain code; Claude can say the language when it knows it.
 
+*As built:* a class tag the block already holds is never added a second time (`held-class-tag-never-re-added-test`). A write that sets a block's type through `set_block_property` keeps the stored title, as designed; the `warnings` array (on the single and batch responses, each warning naming its entry) is how the caller learns that `\#` escapes were kept.
+
 ### 3.5 Verbatim titles (panel)
 
 `prepare-block-title!` takes the node's final display type: from the explicit field, the property, the fence conversion or the stored block, in that order of precedence (an explicit value that conflicts with a fence is refused, section 3.6).
@@ -123,6 +129,8 @@ The server does not copy the client's "last used lang" (`:logseq.kv/latest-code-
 - **Quote** titles skip only the heading step and keep tag and ref handling, because the app renders a quote's markdown.
 - `tree-block` passes the node's final type instead of `nil`, so the decision is made before the title is prepared.
 - `refresh_refs` already passes the stored block, so it leaves code and math titles alone; a test pins this.
+
+*As built:* the decision uses the block's final type in one helper, `verbatim-title?`, for every path. `refresh_refs` skips code and math titles and rewrites nothing on a quote block that has nothing left to change, so the pinned test (`headings-0024-for-typed-blocks-test`) covers all three types on insert, update and refresh. This closes README Backlog item 10 in full, including the `refresh_refs` half that the design did not name.
 
 ### 3.6 Fence conversion (issue, panel)
 
@@ -134,9 +142,13 @@ The server does not copy the client's "last used lang" (`:logseq.kv/latest-code-
 - An explicit display type on the same node wins only if it agrees; a conflict (a ```` ``` ```` fence with `display-type: "quote"`) is refused, naming the node.
 - On an E2EE graph the title is ciphertext, so nothing is converted. Explicit fields still work there.
 
+*As built:* a fence whose language is longer than 40 characters is also left as text and listed under `kept` with the reason `the fence's language must be 1 to 40 characters; kept as text`, because lang could not store it. The kept path is `blocks[0].children[1]` on a tree, `entries[3].blocks[0]` in a batch and `title` on update_block. Fence conversion on update_block is limited to a text block (review round 2, as noted above). `convert-fences` is a query parameter on the five operations; any value but `true` or `false` is refused before anything is written.
+
 ### 3.7 Query fences stay text (panel)
 
 A ```` ```query ```` fence is left as text. The response lists it under `kept` as `{path, reason: "query fences stay text; a Query block is not supported yet"}`, so the outcome is visible. A real Query block needs the Query tag plus a `logseq.property/query` value entity with its own display type, and it runs Datalog on every client. It belongs in a follow-up with its own spec (section 10).
+
+*As built:* as designed. The follow-up is left for the owner's answer to open question 5.
 
 ### 3.8 Dry run and read-back (panel)
 
@@ -144,11 +156,15 @@ A ```` ```query ```` fence is left as text. The response lists it under `kept` a
 - After every real write, the handler re-reads each written entity inside the transaction. If the stored display type or lang differs from what was prepared, it throws through `rejecting`: the whole call fails, nothing is committed, and the error names the entry. A successful response carries the stored `display-type` and `lang` for each block.
 - set_block_property returns a warning, not a refusal, when it turns an existing text block into code or math and the stored title holds `\#` escapes from earlier writes. It suggests update_block with the title and display type together. The server cannot tell its own backslashes from the user's, so it does not remove them.
 
+*As built:* `dry-run` on insert_block_tree and insert_block_children is a request body field, like the one on batch_insert_block_trees, not a query flag. The responses carry `display-type`, `lang` and `converted` on each block only when `verbose` is true, as the insert tools default `verbose` to false; `kept` is always present. Read-back covers insert, update, set and delete, and a mismatch answers 500 naming the entry. Tests for the tree and update paths and for delete stub the outliner to force the mismatch, as designed for the one negative test.
+
 ### 3.9 Reads (panel)
 
 - `block-response` and `block-detail-response` (get_block, get_blocks, list_page_blocks, and the insert and update responses) gain top-level `display-type` and `lang` when set. `entity-properties-response` stays as it is.
 - `get_page_outline` shows a code block as a ```` ```lang ```` fence indented under its bullet, math as `$$…$$` and quote as `> ` lines. The heading prefix is never shown on these.
 - `connector/src/tools/readable.ts` shows the display type in a write's readable context.
+
+*As built:* `get_page_outline` indents a code block's fence lines under its bullet and shows a quote block's lines with `> `. `readable.ts` adds `display-type X, lang Y` to a block's summary line only when the response carries them; a text block's line is unchanged.
 
 ### 3.10 Contract text
 
@@ -156,6 +172,8 @@ A ```` ```query ```` fence is left as text. The response lists it under `kept` a
 - `connector_help` gains a section, "Code, math and quote blocks": the values, lang, fence conversion and its opt-out, verbatim titles, Mermaid (code, not a diagram), query fences (kept as text), and how to convert an existing block (update_block with the title and display type together).
 - README §1 gains a bullet for patch 0037 and §11.8 an entry.
 - Logseq skill note in the PR body: write code as `display-type: "code"` with a `lang`, not as ```` ``` ```` text; a whole-block fence is converted anyway; use `convert-fences=false` to keep a literal fence; query fences stay text.
+
+*As built:* the OpenAPI changes are inside patch 0037 (stages 2 and 3), so the re-vendored files came with them. The connector-side work is the `CODE_BLOCKS_HELP` section of `connector_help`, the pointers in the five title-writing tools and the two property-set tools, and `readable.ts`. `tools-manifest.json` did not change, because it lists tool names, paths and annotations, and no tool was added, removed or renamed. README 1 and 11.8, its Backlog item 10 and the Logseq skill note were written in the docs stage; the `docs/solutions` write-up and the REVIEW.md line (section 3.11) are left to the compound step.
 
 ### 3.11 Docs and compound (panel)
 
