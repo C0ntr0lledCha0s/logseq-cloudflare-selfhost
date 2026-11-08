@@ -669,6 +669,23 @@ describe("tools", () => {
     expect(a).toBeTruthy();
   });
 
+  // Memory mode and updated_after make a signals request; a vector whose row is gone must not reach its ids.
+  it.each([
+    ["rank memory", { rank: "memory" }],
+    ["updated_after", { updated_after: "2020-01-01" }],
+  ])("semantic_search with %s sends no stale vector id to the signals view after a row is deleted", async (_label, extra) => {
+    work.addBlock(work.addPage("P"), "Quarterly budget review");
+    await runUntilReady();
+    await env.DB.exec("DELETE FROM semantic_blocks");
+    work.signalsRequests = [];
+    const result = await callTool(semanticEnv(), "semantic_search", { graph: "work", q: "money", ...extra });
+    expect(result).toEqual({ isError: false, text: expect.stringContaining("\"results\"") });
+    expect(JSON.parse(result.text).results).toEqual([]);
+    expect(index.vectors.size).toBe(1);
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    for (const url of work.signalsRequests) for (const id of url.searchParams.get("ids")!.split(",")) expect(id).toMatch(uuid);
+  });
+
   it("semantic_search refuses an unknown graph and reports model failures as tool errors", async () => {
     const unknown = await callTool(semanticEnv(), "semantic_search", { graph: "nope", q: "x" });
     expect(unknown).toEqual({ isError: true, text: "unknown graph 'nope' — call list_graphs for the connected aliases" });
