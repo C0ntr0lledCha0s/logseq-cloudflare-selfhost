@@ -966,4 +966,38 @@ describe("service tokens", () => {
     expect(json.entries[0]).toMatchObject({ tool: "set_block_property", status: "ok", client: "service:ci", session: "session-ci" });
     expect(content.join("\n")).not.toContain(token);
   });
+
+  it("a token_edit row is never listed or found by id, under OAuth or a service token covering the graph", async () => {
+    await env.DB.exec("DELETE FROM service_tokens");
+    const now = Date.now();
+    const scope = { graphIds: [WORK_ID, OTHER_ID], access: "write" as const, expiresAt: now + DAY };
+    const { token } = await new ServiceTokenStore(env.DB).create({ name: "ci", ownerId: 1001, ...scope, createdAt: now - DAY });
+    const log = new AuditLog(env.DB);
+    const edit = await log.recordTokenEdit({ at: now - 1000, name: "ci", ownerId: 1001, before: scope, after: { ...scope, graphIds: [OTHER_ID, WORK_ID] } });
+    const work = await row({ at: now - 2000 });
+    const home = await row({ at: now - 2000, graph_id: OTHER_ID });
+
+    for (const [graph, neighbour] of [
+      ["work", work],
+      ["home", home],
+    ] as const) {
+      for (const filter of [{}, { tool: "token_edit" }, { session: "github:1001" }, { status: "ok" }]) {
+        const label = `${graph} ${JSON.stringify(filter)}`;
+        const oauth = await activity({ graph, ...filter });
+        expect(oauth.isError, label).toBe(false);
+        expect(oauth.json.entries.map((e) => e.id), label).not.toContain(edit);
+        const service = JSON.parse((await viaToken(token, "get_activity_log", { graph, ...filter }, "session-ci"))[1]);
+        expect(service.entries.map((e: { id: number }) => e.id), label).not.toContain(edit);
+        if (Object.keys(filter).length === 0) {
+          expect(oauth.json.entries.map((e) => e.id), label).toEqual([neighbour]);
+          expect(service.entries.map((e: { id: number }) => e.id), label).toEqual([neighbour]);
+        }
+      }
+      const byId = await call("get_activity_log", { graph, id: edit });
+      expect(byId.isError).toBe(true);
+      expect(byId.text).toContain(`id ${edit}: no such entry for graph ${graph}`);
+      const serviceById = (await viaToken(token, "get_activity_log", { graph, id: edit }, "session-ci")).join("\n");
+      expect(serviceById).toContain(`id ${edit}: no such entry for graph ${graph}`);
+    }
+  });
 });
