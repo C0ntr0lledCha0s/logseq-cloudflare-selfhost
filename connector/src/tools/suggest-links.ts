@@ -4,14 +4,15 @@
 // tokeniser (`wordSpans`, `STOPWORDS`), so matching and semantic search split text the same way.
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import type { SemanticBindings } from "../semantic/config";
+import { RELATED_LIMIT, RELATED_TEXT_CHARS, RELATED_TOP_K, type SemanticBindings } from "../semantic/config";
+import { BindingError } from "../semantic/indexer";
 import { STOPWORDS, firstWord, wordSpans } from "../semantic/ranking";
 import type { SemanticStore } from "../semantic/store";
 import { ToolError, resolveGraph, runTool, textResult, withCallGraphs } from "./common";
 import { type KbTitlesPage, age, loadTitles } from "./kb-index";
 import type { OnSuccess } from "./readable";
 import type { GraphAccess } from "./semantic";
-import { requestSignals } from "./semantic-search";
+import { requestSignals, semanticMatches } from "./semantic-search";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 export type { KbTitlesPage };
@@ -23,10 +24,8 @@ export const DEFAULT_LIMIT = 25;
 export const MAX_LIMIT = 50;
 /** Most pages `exclude` may name. */
 export const EXCLUDE_LIMIT = 50;
-/** `related: true`: pages returned, characters of the draft embedded, and vectors queried. */
-export const RELATED_LIMIT = 5;
-export const RELATED_TEXT_CHARS = 2_000;
-export const RELATED_TOP_K = 20;
+/** `related: true`'s limits live with the semantic settings, so SEMANTIC_HELP can name them without an import cycle. */
+export { RELATED_LIMIT, RELATED_TEXT_CHARS, RELATED_TOP_K };
 /** A one-word title shorter than this is never suggested (stoplist rule 2). Aliases are exempt. */
 export const MIN_SINGLE_WORD_CHARS = 4;
 
@@ -68,6 +67,8 @@ export interface MatchResult {
   ambiguous: AmbiguousMatch[];
   /** Titles of index pages the draft already links, in draft order. */
   alreadyLinked: string[];
+  /** The UUIDs of those pages, in the same order. */
+  linkedPages: string[];
   /** Distinct stoplisted titles and aliases the draft mentions. */
   skippedStoplist: number;
   truncated: boolean;
@@ -370,7 +371,15 @@ export function matchLinks(
     i += taken;
   }
 
-  return { suggestions, ambiguous, alreadyLinked, skippedStoplist: stopHits.size, truncated, tokenised };
+  return {
+    suggestions,
+    ambiguous,
+    alreadyLinked,
+    linkedPages: [...linkedPages],
+    skippedStoplist: stopHits.size,
+    truncated,
+    tokenised,
+  };
 }
 
 /** `text` with each suggestion's span replaced by its link, spliced from the end so offsets hold. */
@@ -435,6 +444,60 @@ function resolveRef(pages: KbTitlesPage[], ref: string, field: string, notes: st
   return found.uuid;
 }
 
+export interface RelatedPage {
+  page: PageRef;
+  similarity: number;
+  reason: "related by meaning";
+}
+
+/** The draft as `related` embeds it (spec 3.6): masked ranges removed, spaces collapsed, then the first `RELATED_TEXT_CHARS`. */
+export function relatedText(text: string): string {
+  let out = "";
+  let at = 0;
+  for (const [start, end] of maskRanges(text).ranges) {
+    out += `${text.slice(at, start)} `;
+    at = end;
+  }
+  out += text.slice(at);
+  return out.replace(/\s+/g, " ").trim().slice(0, RELATED_TEXT_CHARS);
+}
+
+/**
+ * Up to `RELATED_LIMIT` index pages close in meaning to the draft (spec 3.6): one embedding, one
+ * Vectorize query of `RELATED_TOP_K` and one `blocksFor` read by vector id. Hits are grouped by page,
+ * best similarity first; a page not in the titles key (a journal, a page tagged private) or in `skip`
+ * is left out.
+ */
+async function relatedPages(
+  semantic: { store: SemanticStore; bindings: SemanticBindings },
+  graphId: string,
+  text: string,
+  pages: KbTitlesPage[],
+  skip: Set<string>,
+): Promise<RelatedPage[]> {
+  const draft = relatedText(text);
+  if (draft === "") return [];
+  let matches;
+  try {
+    matches = await semanticMatches(semantic.bindings, graphId, draft, RELATED_TOP_K);
+  } catch (error) {
+    if (error instanceof BindingError) throw new ToolError(error.message, "binding-error");
+    throw error;
+  }
+  const blocks = await semantic.store.blocksFor(graphId, matches.map((m) => m.id), []);
+  const pageOf = new Map(blocks.map((b) => [b.vectorId, b.pageId]));
+  const titleOf = new Map(pages.map(([uuid, title]) => [uuid, title]));
+  const related = new Map<string, RelatedPage>();
+  for (const m of [...matches].sort((a, b) => b.similarity - a.similarity)) {
+    const uuid = pageOf.get(m.id);
+    const title = uuid === undefined ? undefined : titleOf.get(uuid);
+    if (uuid === undefined || title === undefined || skip.has(uuid) || related.has(uuid)) continue;
+    related.set(uuid, { page: { uuid, title }, similarity: Number(m.similarity.toFixed(3)), reason: "related by meaning" });
+    if (related.size === RELATED_LIMIT) break;
+  }
+  return [...related.values()];
+}
+
 /**
  * Registers `suggest_links`. `semantic` is the isolate's semantic search (null when off); the
  * `related` leg that uses it is spec section 3.6.
@@ -445,39 +508,52 @@ export function registerSuggestLinksTool(
   semantic: { store: SemanticStore; bindings: SemanticBindings } | null,
   onSuccess: OnSuccess,
 ): void {
-  void semantic;
+  const fields = {
+    graph: z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION),
+    text: z.string().min(1).describe(`The draft markdown, up to ${thousands(TEXT_LIMIT)} characters.`),
+    page: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("The page being written, by UUID or title; it is never suggested. A title several pages share is refused."),
+    exclude: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(`Up to ${EXCLUDE_LIMIT} more pages never to suggest, by UUID or title.`),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_LIMIT)
+      .optional()
+      .describe(`Most suggestions returned, in draft order (default ${DEFAULT_LIMIT}).`),
+    verify: z
+      .boolean()
+      .optional()
+      .describe("Read the suggested pages back with one getBlocks request and drop any deleted since the index was built (default true)."),
+  };
+  // With semantic search off, `related` is not in the schema; passthrough keeps a passed one visible so it is refused, not dropped.
+  const inputSchema = semantic
+    ? z.object({
+        ...fields,
+        related: z
+          .boolean()
+          .optional()
+          .describe(
+            `Also list at most ${RELATED_LIMIT} index pages close in meaning to the draft that it does not name, from one embedding of its first ${thousands(RELATED_TEXT_CHARS)} characters with links, code and the other masked text removed. They are verified with the suggestions and never added to linked_text (default false).`,
+          ),
+      })
+    : z.object(fields).passthrough();
   server.registerTool(
     "suggest_links",
     {
       description: SUGGEST_LINKS_DESCRIPTION,
-      inputSchema: z.object({
-        graph: z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION),
-        text: z.string().min(1).describe(`The draft markdown, up to ${thousands(TEXT_LIMIT)} characters.`),
-        page: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("The page being written, by UUID or title; it is never suggested. A title several pages share is refused."),
-        exclude: z
-          .array(z.string().min(1))
-          .optional()
-          .describe(`Up to ${EXCLUDE_LIMIT} more pages never to suggest, by UUID or title.`),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(MAX_LIMIT)
-          .optional()
-          .describe(`Most suggestions returned, in draft order (default ${DEFAULT_LIMIT}).`),
-        verify: z
-          .boolean()
-          .optional()
-          .describe("Read the suggested pages back with one getBlocks request and drop any deleted since the index was built (default true)."),
-      }),
+      inputSchema,
       annotations: annotationsFor("suggest_links"),
     },
-    ({ graph: alias, text, page, exclude = [], limit = DEFAULT_LIMIT, verify = true }) =>
-      runTool("suggest_links", alias, () =>
+    (args: z.infer<z.ZodObject<typeof fields>> & { related?: unknown }) => {
+      const { graph: alias, text, page, exclude = [], limit = DEFAULT_LIMIT, verify = true, related } = args;
+      return runTool("suggest_links", alias, () =>
         withCallGraphs(async () => {
           // Input checks run before any KV or sync call.
           if (text.length > TEXT_LIMIT) {
@@ -486,6 +562,11 @@ export function registerSuggestLinksTool(
           if (exclude.length > EXCLUDE_LIMIT) {
             throw new ToolError(`exclude: ${exclude.length} entries is over the ${EXCLUDE_LIMIT} limit`, "refused");
           }
+          // related: false is a no-op either way; any other value needs semantic search.
+          if (semantic === null && related !== undefined && related !== false) {
+            throw new ToolError("related: semantic search is off on this connector", "refused");
+          }
+          const wantRelated = semantic !== null && related === true;
 
           const now = Date.now();
           let titles;
@@ -518,12 +599,26 @@ export function registerSuggestLinksTool(
 
           const result = matchLinks(text, titles.pages, { exclude: excluded, limit });
           let suggestions = result.suggestions;
+          let graph: Awaited<ReturnType<typeof resolveGraph>> | undefined;
+          const resolved = async () => (graph ??= await resolveGraph(access, alias, false));
+          let relatedList: RelatedPage[] = [];
+          if (wantRelated) {
+            // Pages the draft names (suggested, ambiguous, already linked) or the call excludes are not "related".
+            const skip = new Set([
+              ...excluded,
+              ...suggestions.map((s) => s.page.uuid),
+              ...result.ambiguous.flatMap((a) => a.candidates.map((c) => c.uuid)),
+              ...result.linkedPages,
+            ]);
+            relatedList = await relatedPages(semantic, (await resolved()).graphId, text, titles.pages, skip);
+          }
           const droppedStale: PageRef[] = [];
-          if (verify && suggestions.length > 0) {
-            const graph = await resolveGraph(access, alias, false);
+          if (verify && suggestions.length + relatedList.length > 0) {
+            const { graphId, pat } = await resolved();
+            const ids = [...suggestions.map((s) => s.page.uuid), ...relatedList.map((r) => r.page.uuid)];
             let found: Awaited<ReturnType<typeof requestSignals>>;
             try {
-              found = await requestSignals(access, alias, graph.graphId, graph.pat, suggestions.map((s) => s.page.uuid));
+              found = await requestSignals(access, alias, graphId, pat, ids);
             } catch (error) {
               const reason = `verify: getBlocks failed: ${error instanceof Error ? error.message : String(error)}`;
               throw new ToolError(reason, error instanceof ToolError ? error.status : "verify-failed");
@@ -533,6 +628,8 @@ export function registerSuggestLinksTool(
             const live = (uuid: string) => found.signals.has(uuid) && !missing.has(uuid);
             for (const s of suggestions) if (!live(s.page.uuid)) droppedStale.push(s.page);
             suggestions = suggestions.filter((s) => live(s.page.uuid));
+            for (const r of relatedList) if (!live(r.page.uuid)) droppedStale.push(r.page);
+            relatedList = relatedList.filter((r) => live(r.page.uuid));
           }
 
           const built = new Date(titles.builtAt).toISOString();
@@ -542,6 +639,7 @@ export function registerSuggestLinksTool(
             `${count} link ${count === 1 ? "suggestion" : "suggestions"} for graph "${alias}" (index built ${built.slice(11, 16)} UTC, ${ago})`,
             `${result.alreadyLinked.length} already linked`,
             `${droppedStale.length} dropped as stale`,
+            ...(wantRelated ? [`${relatedList.length} related`] : []),
             ...(verify ? [] : [`not verified (verify: false): the UUIDs come from the index built ${ago}`]),
             ...notes,
           ].join("; ");
@@ -550,7 +648,7 @@ export function registerSuggestLinksTool(
             index_built_at: built,
             suggestions,
             ambiguous: result.ambiguous,
-            related: [],
+            related: relatedList,
             already_linked: result.alreadyLinked,
             dropped_stale: droppedStale,
             skipped_stoplist: result.skippedStoplist,
@@ -560,6 +658,7 @@ export function registerSuggestLinksTool(
           onSuccess("suggest_links", alias);
           return textResult(`${summary}\n${JSON.stringify(body, null, 2)}`);
         }),
-      ),
+      );
+    },
   );
 }

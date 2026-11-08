@@ -7,6 +7,8 @@ import {
   KEYWORD_LIMIT,
   KEYWORD_TERM_LIMIT,
   RANKED_QUERY_WORDS,
+  RELATED_LIMIT,
+  RELATED_TEXT_CHARS,
   SEMANTIC_TOP_K,
   SIGNALS_LIMIT,
   type SemanticBindings,
@@ -32,7 +34,8 @@ import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
 export const SEMANTIC_HELP =
-  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more content words (words of three or more letters other than common ones such as what, did, about; so the pricing question above has two), one- and two-word blocks rank lower by meaning (their similarity is reported unchanged), and title search looks for its three longest words separately as well as the whole phrase, keeping a title only when it holds the whole phrase or at least two of those words (an exact or containing title stays first), so put the distinctive words in the question. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed. rank defaults to \"relevance\", which is the order above and unchanged. For the current state of something (\"what is the starter tier price now?\"), pass rank: \"memory\": each hit's score becomes relevance x recency x importance, where relevance is the relevance-mode score, recency is 0.5 ^ (age in days / half_life_days) floored at 0.5 (1 when the block has no updated-at; half_life_days 1-3650, default 90), and importance is 1 + 0.1 x log2(1 + references: for a page, from other pages; for a block, from any other block, its own page included), capped at 1.5, then halved once if the hit is a done or canceled task, carries one of demote_tags (up to 10, on the block, an ancestor or its page, case-insensitive) or has one of demote_property's values ({property: ident, values: 1-10 titles}, on the block, else its page, case-insensitive). So recency runs 0.5 to 1 and importance 0.5 to 1.5. Memory mode re-orders every candidate before applying limit, never drops one, and reports relevance, recency, importance, updated-at, reference-count and demoted-by on each hit, with rank and half-life-days at the top; read relevance beside score to see why a hit moved. Recency is the block's own last edit (an edit to a child does not count). A hit deleted since it was indexed gets recency 1 and importance 1. demote_tags only sees indexed blocks' tags, so a title-only hit outside the index is never demoted by tag (demote_property still applies). Use relevance mode for what was decided back then; memory mode for what holds now. half_life_days, demote_tags and demote_property without rank: \"memory\" are refused, and a failed lookup of the ranking signals fails the call as ranking signals: <reason>. In either rank, updated_after (YYYY-MM-DD, read as midnight UTC, or a full ISO date-time with seconds and Z or an offset, such as 2026-11-08T10:00:00+13:00; anything else is refused as updated_after: not an ISO date) drops every hit last updated before it, including one with no updated-at and one deleted since it was indexed. It runs after tag and before min_similarity, on both searches before they are merged, so semantic-rank and keyword-rank count only what it kept, and before-updated-after says how many hits it dropped (each once, whichever searches found it); it costs one extra request to the sync server, as memory mode does.";
+  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more content words (words of three or more letters other than common ones such as what, did, about; so the pricing question above has two), one- and two-word blocks rank lower by meaning (their similarity is reported unchanged), and title search looks for its three longest words separately as well as the whole phrase, keeping a title only when it holds the whole phrase or at least two of those words (an exact or containing title stays first), so put the distinctive words in the question. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed. rank defaults to \"relevance\", which is the order above and unchanged. For the current state of something (\"what is the starter tier price now?\"), pass rank: \"memory\": each hit's score becomes relevance x recency x importance, where relevance is the relevance-mode score, recency is 0.5 ^ (age in days / half_life_days) floored at 0.5 (1 when the block has no updated-at; half_life_days 1-3650, default 90), and importance is 1 + 0.1 x log2(1 + references: for a page, from other pages; for a block, from any other block, its own page included), capped at 1.5, then halved once if the hit is a done or canceled task, carries one of demote_tags (up to 10, on the block, an ancestor or its page, case-insensitive) or has one of demote_property's values ({property: ident, values: 1-10 titles}, on the block, else its page, case-insensitive). So recency runs 0.5 to 1 and importance 0.5 to 1.5. Memory mode re-orders every candidate before applying limit, never drops one, and reports relevance, recency, importance, updated-at, reference-count and demoted-by on each hit, with rank and half-life-days at the top; read relevance beside score to see why a hit moved. Recency is the block's own last edit (an edit to a child does not count). A hit deleted since it was indexed gets recency 1 and importance 1. demote_tags only sees indexed blocks' tags, so a title-only hit outside the index is never demoted by tag (demote_property still applies). Use relevance mode for what was decided back then; memory mode for what holds now. half_life_days, demote_tags and demote_property without rank: \"memory\" are refused, and a failed lookup of the ranking signals fails the call as ranking signals: <reason>. In either rank, updated_after (YYYY-MM-DD, read as midnight UTC, or a full ISO date-time with seconds and Z or an offset, such as 2026-11-08T10:00:00+13:00; anything else is refused as updated_after: not an ISO date) drops every hit last updated before it, including one with no updated-at and one deleted since it was indexed. It runs after tag and before min_similarity, on both searches before they are merged, so semantic-rank and keyword-rank count only what it kept, and before-updated-after says how many hits it dropped (each once, whichever searches found it); it costs one extra request to the sync server, as memory mode does." +
+  ` suggest_links also takes related: true, which lists at most ${RELATED_LIMIT} pages close in meaning to the draft that it does not name (pages it suggests, already linked, ambiguous or excluded are left out, and so are journals and pages tagged private), from one embedding of the draft's first ${String(RELATED_TEXT_CHARS).replace(/\B(?=(\d{3})+(?!\d))/g, ",")} characters with links, code and other masked text removed. Each has its page, its best block's similarity and the reason "related by meaning"; they are verified with the suggestions and never added to linked_text, so decide yourself whether to link one.`;
 
 /** One hybrid search hit. Keyword-only hits outside the index carry just their title and resource. */
 export interface SearchHit {
@@ -84,7 +87,7 @@ export interface HybridSearchResult {
   "below-min-similarity"?: number;
 }
 
-interface SemanticMatch {
+export interface SemanticMatch {
   id: string;
   similarity: number;
 }
@@ -217,10 +220,19 @@ async function keywordResults(access: GraphAccess, alias: string, graphId: strin
   return phraseFirst(phrase, mergeKeywordLists(lists));
 }
 
-async function semanticMatches(bindings: SemanticBindings, graphId: string, q: string): Promise<SemanticMatch[]> {
+/**
+ * One embedding of `q` and one Vectorize query in the graph's namespace for the `topK` nearest
+ * vectors, with no values or metadata. A binding failure is thrown as a `BindingError`.
+ */
+export async function semanticMatches(
+  bindings: SemanticBindings,
+  graphId: string,
+  q: string,
+  topK = SEMANTIC_TOP_K,
+): Promise<SemanticMatch[]> {
   try {
     const [vector] = await bindings.embedder.embed([q]);
-    const { matches } = await bindings.index.query(vector, { topK: SEMANTIC_TOP_K, namespace: graphId });
+    const { matches } = await bindings.index.query(vector, { topK, namespace: graphId });
     return matches.map((m) => ({ id: m.id, similarity: m.score }));
   } catch (error) {
     throw new BindingError("semantic query", error);

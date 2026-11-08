@@ -6,6 +6,10 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
+import { DIMENSIONS } from "../src/semantic/config";
+import { SemanticStore, initialState } from "../src/semantic/store";
+import { SEMANTIC_HELP } from "../src/tools/semantic-search";
+import { FakeVectorIndex, axis, unitAt } from "./semantic-fakes";
 import { STOPWORDS, contentWords, wordSpans } from "../src/semantic/ranking";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
 import type { KbIndexEntry } from "../src/tools/kb-index";
@@ -616,6 +620,21 @@ describe("suggest_links tool", () => {
   let blocksHandler: SyncHandler;
   let kvCounts: { get: number; put: number; keysPut: string[] };
   let spies: MockInstance[];
+  /** Semantic search on: AI, VECTORIZE and the cap are bound, backed by these fakes. */
+  let semanticOn: boolean;
+  let aiRuns: string[][];
+  let aiFails: Error | null;
+  let vectors: RecordingIndex;
+  /** Every SQL statement the request prepared. */
+  let statements: string[];
+
+  class RecordingIndex extends FakeVectorIndex {
+    options: (VectorizeQueryOptions | undefined)[] = [];
+    override async query(vector: VectorFloatArray | number[], options?: VectorizeQueryOptions): Promise<VectorizeMatches> {
+      this.options.push(options);
+      return super.query(vector, options);
+    }
+  }
 
   const serveIndex: SyncHandler = (request) => {
     const url = new URL(request.url);
@@ -660,7 +679,23 @@ describe("suggest_links tool", () => {
       list: (...args: unknown[]) => (kv.list as (...a: unknown[]) => unknown)(...args),
       delete: (key: string) => kv.delete(key),
     } as unknown as KVNamespace;
-    return { ...env, SYNC: sync, KB_INDEX_KV: counted } as Env;
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") return (sql: string) => (statements.push(sql), target.prepare(sql));
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const ai = {
+      run: async (_model: string, input: { text: string[] }) => {
+        if (aiFails) throw aiFails;
+        aiRuns.push(input.text);
+        // Every draft embeds to axis 0, so a block stored at unitAt(cos) scores exactly cos.
+        return { shape: [input.text.length, DIMENSIONS], data: input.text.map(() => axis(0)) };
+      },
+    } as unknown as Ai;
+    const semantic = semanticOn ? { AI: ai, VECTORIZE: vectors as unknown as Vectorize, SEMANTIC_MAX_VECTORS: "10000" } : {};
+    return { ...env, SYNC: sync, KB_INDEX_KV: counted, DB: db, ...semantic } as Env;
   }
 
   async function rpc(method: string, params: unknown): Promise<any> {
@@ -711,6 +746,10 @@ describe("suggest_links tool", () => {
   function reset(): void {
     requests = [];
     kvCounts = { get: 0, put: 0, keysPut: [] };
+    aiRuns = [];
+    statements = [];
+    vectors.queries = 0;
+    vectors.options = [];
   }
 
   const blockCalls = () => requests.filter((r) => new URL(r.url).pathname.endsWith("/blocks"));
@@ -730,6 +769,11 @@ describe("suggest_links tool", () => {
       expiresAt: null,
       token: "logseq_pat_workToken123",
     });
+    await env.DB.exec("DELETE FROM semantic_blocks");
+    await env.DB.exec("DELETE FROM semantic_state");
+    semanticOn = false;
+    aiFails = null;
+    vectors = new RecordingIndex();
     stale = new Set();
     indexHandler = serveIndex;
     blocksHandler = serveSignals;
@@ -1041,5 +1085,227 @@ describe("suggest_links tool", () => {
     expect(CONNECTOR_HELP).toContain("suggest_links");
     const help = (await rpc("tools/call", { name: "connector_help", arguments: {} })).content[0].text;
     expect(help).toContain("call suggest_links");
+  });
+
+  describe("related: true (spec 3.6)", () => {
+    const JOURNAL = "00000000-0000-4000-8000-0000000000aa";
+    let hit = 0;
+
+    /** One indexed block on `page`, stored in D1 and in the fake index at similarity `cos` to any draft. */
+    async function indexed(page: string, cos: number, title = "x"): Promise<string> {
+      hit += 1;
+      const vectorId = `v-${hit}`;
+      const uuid = `00000000-0000-4000-9000-${hit.toString(16).padStart(12, "0")}`;
+      const store = new SemanticStore(env.DB);
+      // The indexer leases a graph, creating its state row, before it writes any block.
+      if (!(await store.state(WORK_ID))) await store.lease(WORK_ID, 0, 0);
+      await store.commit({
+        upserts: [{ vectorId, uuid, pageId: page, pageTitle: title, breadcrumb: [], text: "t", tags: [], document: "t", hash: "h", private: false }],
+        deleteVectorIds: [],
+        state: initialState(WORK_ID),
+      });
+      await vectors.upsert([{ id: vectorId, values: unitAt(cos), namespace: WORK_ID }]);
+      return vectorId;
+    }
+
+    const relatedOf = (body: any) => body.related.map((r: any) => [r.page.title, r.similarity]);
+    const semanticReads = () => statements.filter((sql) => sql.includes("semantic_"));
+
+    beforeEach(() => {
+      semanticOn = true;
+    });
+
+    it("costs exactly 1 embedding, 1 Vectorize query (topK 20, no values or metadata) and 1 blocksFor read", async () => {
+      await indexed(HOS, 0.9);
+      await warm();
+      const { body } = await suggestOk({ text: "A note about hiring.", related: true });
+      expect(aiRuns).toHaveLength(1);
+      expect(vectors.queries).toBe(1);
+      expect(vectors.options).toEqual([{ topK: RELATED_TOP_K, namespace: WORK_ID }]);
+      expect(semanticReads()).toHaveLength(1);
+      expect(semanticReads()[0]).toContain("FROM semantic_blocks");
+      expect(relatedOf(body)).toEqual([["Head of Sales", 0.9]]);
+      expect(body.related[0]).toEqual({ page: { uuid: HOS, title: "Head of Sales" }, similarity: 0.9, reason: "related by meaning" });
+    });
+
+    it("returns at most 5 pages, best similarity first, all in the index: none suggested, journal or private", async () => {
+      await indexed(WI, 0.99); // suggested by the draft
+      await indexed(JOURNAL, 0.98); // a journal block: not in the titles key
+      await indexed(SECRET, 0.97); // a page tagged private: not in the titles key
+      await indexed(HOS, 0.6);
+      await indexed(HOS, 0.95); // the page's best block wins
+      await indexed(MH, 0.94);
+      await indexed(IST, 0.93);
+      await indexed(OPS, 0.92);
+      await indexed(OPS_INTEL, 0.91);
+      await indexed(OI_PAGE, 0.5);
+      await indexed(WF, 0.4);
+      await warm();
+      const { summary, body } = await suggestOk({ text: "Notes on Workflow Intelligence.", related: true });
+      expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI]);
+      expect(relatedOf(body)).toEqual([
+        ["Head of Sales", 0.95],
+        ["Māori Health", 0.94],
+        ["İstanbul Office", 0.93],
+        ["Operational Intelligence", 0.92],
+        ["Ops Intel", 0.91],
+      ]);
+      expect(body.related).toHaveLength(RELATED_LIMIT);
+      expect(JSON.stringify(body)).not.toContain(SECRET);
+      expect(JSON.stringify(body)).not.toContain(JOURNAL);
+      expect(body.linked_text).toBe("Notes on [[Workflow Intelligence]].");
+      expect(summary).toMatch(/; 5 related$/);
+    });
+
+    it("lists a page once, with its best block's similarity, however many of its blocks are near", async () => {
+      await indexed(HOS, 0.9);
+      await indexed(HOS, 0.8);
+      await indexed(MH, 0.7);
+      await indexed(HOS, 0.6);
+      await warm();
+      const { body } = await suggestOk({ text: "A note about hiring.", related: true });
+      expect(relatedOf(body)).toEqual([
+        ["Head of Sales", 0.9],
+        ["Māori Health", 0.7],
+      ]);
+    });
+
+    it("leaves out pages already linked, excluded, the page being written and ambiguous, so the next ones fill in", async () => {
+      await indexed(HOS, 0.99); // already linked
+      await indexed(MH, 0.98); // excluded
+      await indexed(IST, 0.97); // the page being written
+      await indexed(SPRINT_A, 0.96); // ambiguous in the draft
+      await indexed(OPS, 0.5);
+      await warm();
+      const text = "Ask [[Head of Sales]] about the Sprint.";
+      const { body } = await suggestOk({ text, related: true, exclude: ["Māori Health"], page: IST });
+      expect(body.ambiguous).toHaveLength(1);
+      expect(relatedOf(body)).toEqual([["Operational Intelligence", 0.5]]);
+    });
+
+    it("embeds the draft with masked ranges removed, at most 2,000 characters", async () => {
+      await warm();
+      const text =
+        "```\ncodeword\n```\nSee [[Head of Sales]] and `inlineword` at https://example.com/urlword.\n" +
+        "plain ".repeat(400) +
+        "tailword";
+      await suggestOk({ text, related: true });
+      expect(aiRuns).toHaveLength(1);
+      const [embedded] = aiRuns[0];
+      expect(aiRuns[0]).toHaveLength(1);
+      expect(embedded.length).toBeLessThanOrEqual(RELATED_TEXT_CHARS);
+      expect(embedded).toContain("plain");
+      for (const masked of ["codeword", "Head of Sales", "inlineword", "urlword"]) expect(embedded).not.toContain(masked);
+      expect(embedded).not.toContain("tailword");
+    });
+
+    it("a draft that is all masks embeds nothing and returns no related pages", async () => {
+      await indexed(HOS, 0.9);
+      await warm();
+      const { body } = await suggestOk({ text: "[[Workflow Intelligence]] `code`", related: true });
+      expect(aiRuns).toEqual([]);
+      expect(vectors.queries).toBe(0);
+      expect(semanticReads()).toEqual([]);
+      expect(body.related).toEqual([]);
+    });
+
+    it("verifies related pages in the same single getBlocks call, and moves a stale one to dropped_stale", async () => {
+      await indexed(HOS, 0.9);
+      await indexed(MH, 0.8);
+      await warm();
+      stale = new Set([MH]);
+      const { body } = await suggestOk({ text: "Notes on Workflow Intelligence.", related: true });
+      expect(requests).toHaveLength(1);
+      expect(idsOf(blockCalls()[0])).toEqual([WI, HOS, MH]);
+      expect(relatedOf(body)).toEqual([["Head of Sales", 0.9]]);
+      expect(body.dropped_stale).toEqual([{ uuid: MH, title: "Māori Health" }]);
+      expect(body.linked_text).toBe("Notes on [[Workflow Intelligence]].");
+    });
+
+    it("verifies related pages when there is no suggestion, and verify: false reads nothing back", async () => {
+      await indexed(HOS, 0.9);
+      await warm();
+      stale = new Set([HOS]);
+      const verified = await suggestOk({ text: "A note about hiring.", related: true });
+      expect(blockCalls()).toHaveLength(1);
+      expect(idsOf(blockCalls()[0])).toEqual([HOS]);
+      expect(verified.body.related).toEqual([]);
+      expect(verified.body.dropped_stale).toEqual([{ uuid: HOS, title: "Head of Sales" }]);
+
+      reset();
+      const unverified = await suggestOk({ text: "A note about hiring.", related: true, verify: false });
+      expect(requests).toEqual([]);
+      expect(relatedOf(unverified.body)).toEqual([["Head of Sales", 0.9]]);
+    });
+
+    it("a failed embedding fails the call, naming the semantic query, with no getBlocks call", async () => {
+      await warm();
+      aiFails = new Error("AI down");
+      const failed = await suggest({ text: "Notes on Workflow Intelligence.", related: true });
+      expect(failed.isError).toBe(true);
+      expect(failed.text).toContain("semantic query");
+      expect(failed.text).toContain("AI down");
+      expect(blockCalls()).toEqual([]);
+    });
+
+    it("related absent or false makes no AI call, Vectorize query or semantic read, and returns related: []", async () => {
+      await indexed(HOS, 0.9);
+      await warm();
+      for (const args of [{}, { related: false }]) {
+        reset();
+        const { summary, body } = await suggestOk({ text: "Notes on Workflow Intelligence.", ...args });
+        expect(aiRuns).toEqual([]);
+        expect(vectors.queries).toBe(0);
+        expect(semanticReads()).toEqual([]);
+        expect(body.related).toEqual([]);
+        expect(summary).not.toContain("related");
+      }
+    });
+
+    it("is in the schema, and SEMANTIC_HELP describes it with the limit from the constant", async () => {
+      const tools = (await rpc("tools/list", {})).tools;
+      const tool = tools.find((t: { name: string }) => t.name === "suggest_links");
+      expect(tool.inputSchema.properties.related.type).toBe("boolean");
+      expect(tool.inputSchema.properties.related.description).toContain(`at most ${RELATED_LIMIT}`);
+      expect(SEMANTIC_HELP).toContain("suggest_links");
+      expect(SEMANTIC_HELP).toContain(`related: true`);
+      expect(SEMANTIC_HELP).toContain(`at most ${RELATED_LIMIT} pages`);
+      expect(SEMANTIC_HELP).toContain(`first ${RELATED_TEXT_CHARS.toLocaleString("en-NZ")} characters`);
+      expect(tool.inputSchema.properties.related.description).toContain(`first ${RELATED_TEXT_CHARS.toLocaleString("en-NZ")} characters`);
+      const help = (await rpc("tools/call", { name: "connector_help", arguments: {} })).content[0].text;
+      expect(help).toContain(`at most ${RELATED_LIMIT} pages`);
+    });
+  });
+
+  describe("related with semantic search off", () => {
+    it("is not in the schema, and the help does not describe it", async () => {
+      const tools = (await rpc("tools/list", {})).tools;
+      const tool = tools.find((t: { name: string }) => t.name === "suggest_links");
+      expect(Object.keys(tool.inputSchema.properties)).not.toContain("related");
+      const help = (await rpc("tools/call", { name: "connector_help", arguments: {} })).content[0].text;
+      expect(help).not.toContain("related: true");
+    });
+
+    it("related: true (or any value but false) is refused before any KV, sync or AI call", async () => {
+      for (const related of [true, "true", 1]) {
+        reset();
+        const refused = await suggest({ text: "Notes on Workflow Intelligence.", related });
+        expect(refused).toEqual({ isError: true, text: "related: semantic search is off on this connector" });
+        expect(requests).toEqual([]);
+        expect(kvCounts.get + kvCounts.put).toBe(0);
+        expect(aiRuns).toEqual([]);
+      }
+    });
+
+    it("related: false is a no-op, and calls without related are unchanged", async () => {
+      await warm();
+      for (const args of [{ related: false }, {}, { verify: false }]) {
+        reset();
+        const { body } = await suggestOk({ text: "Notes on Workflow Intelligence.", ...args });
+        expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI]);
+        expect(body.related).toEqual([]);
+        expect(aiRuns).toEqual([]);
+      }
+    });
   });
 });

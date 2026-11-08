@@ -13,6 +13,10 @@ export const LEASE_MS = 50_000;
 export const ORPHAN_BATCH = 500;
 /** Nearest neighbours fetched per query (Vectorize allows 100 without values or metadata). */
 export const SEMANTIC_TOP_K = 50;
+/** suggest_links' `related: true`: pages returned, characters of the draft embedded, and vectors queried. */
+export const RELATED_LIMIT = 5;
+export const RELATED_TEXT_CHARS = 2_000;
+export const RELATED_TOP_K = 20;
 /** Keyword results fetched per query. */
 export const KEYWORD_LIMIT = 50;
 /** Content words a query needs before the ranking rules for multi-word questions apply. */
