@@ -6,14 +6,25 @@ import {
   requireOwnerSession,
   sealPendingGraph,
 } from "../auth/session";
-import { DEFAULT_EXPIRY_DAYS, MAX_EXPIRY_DAYS, type ServiceTokenAccess, ServiceTokenStore } from "../auth/service-tokens";
+import { AuditLog } from "../audit/log";
+import { isOwner } from "../auth/github";
+import {
+  DEFAULT_EXPIRY_DAYS,
+  MAX_EXPIRY_DAYS,
+  type ServiceTokenAccess,
+  type ServiceTokenRow,
+  ServiceTokenStore,
+  type TokenScope,
+} from "../auth/service-tokens";
 import { readForm } from "../form";
 import { type GraphMode, type GraphPermission, GraphStore, normalizeAlias, normalizeToken } from "../graphs";
 import { InspectError, SyncError, type TokenGraph, inspectToken } from "../sync";
 import {
   type GraphFormValues,
+  type TokenEditValues,
   confirmPage,
   disconnectedPage,
+  editTokenPage,
   encryptedGraphPage,
   forbiddenPage,
   graphListPage,
@@ -52,7 +63,9 @@ interface FormCtx extends Ctx {
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const ALIAS_ACTION = /^\/graphs\/([a-z0-9][a-z0-9-]{0,39})\/(edit|token|disconnect)$/;
-const TOKEN_REVOKE = /^\/tokens\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/revoke$/;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const TOKEN_REVOKE = new RegExp(`^/tokens/(${UUID})/revoke$`);
+const TOKEN_EDIT = new RegExp(`^/tokens/(${UUID})/edit$`);
 const TOKEN_NAME = /^[a-z0-9-]{1,40}$/;
 const WHOLE_DAYS = /^\d{1,3}$/;
 const DAY_MS = 86_400_000;
@@ -326,28 +339,60 @@ interface TokenInput {
   days: number;
 }
 
-/** Every field of the create form, checked before anything is read or written; each refusal names its field. */
-function parseTokenForm(form: FormData, connected: ReadonlySet<string>): TokenInput {
-  const name = text(form, "name").trim();
-  if (!TOKEN_NAME.test(name)) throw new FormError("name: use 1–40 lowercase letters, digits or hyphens.");
+/**
+ * The `graph` and `access` fields, which the create and edit forms share so both refuse with the same
+ * words. Graphs keep the form's order with repeats dropped, and each must be connected.
+ */
+function parseGraphsAndAccess(form: FormData, connected: ReadonlySet<string>): { graphIds: string[]; access: ServiceTokenAccess } {
   const graphIds = [...new Set(form.getAll("graph").map((value) => (typeof value === "string" ? value : "")))];
   if (graphIds.length === 0) throw new FormError("graph: choose at least one graph.");
   if (!graphIds.every((id) => connected.has(id))) throw new FormError("graph: a chosen graph is not connected. Reload the page and choose again.");
   const access = text(form, "access");
   if (access !== "read" && access !== "write") throw new FormError("access: choose read-only or read-write.");
-  const days = text(form, "expires_days").trim();
+  return { graphIds, access };
+}
+
+/** `expires_days`, already trimmed: a whole number from 1 to MAX_EXPIRY_DAYS. */
+function parseDays(days: string): number {
   const count = WHOLE_DAYS.test(days) ? Number(days) : NaN;
   if (!(count >= 1 && count <= MAX_EXPIRY_DAYS)) {
     throw new FormError(`expires_days: a whole number of days from 1 to ${MAX_EXPIRY_DAYS}.`);
   }
-  return { name, graphIds, access, days: count };
+  return count;
 }
 
-/** The first field the stored row disagrees on, or undefined when it holds exactly what was submitted. */
-function readBackMismatch(
-  row: Awaited<ReturnType<ServiceTokenStore["get"]>>,
-  want: TokenInput & { expiresAt: number },
-): string | undefined {
+/** Every field of the create form, checked before anything is read or written; each refusal names its field. */
+function parseTokenForm(form: FormData, connected: ReadonlySet<string>): TokenInput {
+  const name = text(form, "name").trim();
+  if (!TOKEN_NAME.test(name)) throw new FormError("name: use 1–40 lowercase letters, digits or hyphens.");
+  const { graphIds, access } = parseGraphsAndAccess(form, connected);
+  return { name, graphIds, access, days: parseDays(text(form, "expires_days").trim()) };
+}
+
+/** `ms` since the epoch as YYYY-MM-DD (UTC). */
+function utcDate(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * Every field of the edit form, checked before anything is written (spec 2026-11-08 §3.5 step 2).
+ * `expires_days` blank keeps the stored expiry; otherwise it counts from `now` and may only shorten it.
+ */
+function parseTokenEditForm(form: FormData, connected: ReadonlySet<string>, row: ServiceTokenRow, now: number): TokenScope {
+  const { graphIds, access } = parseGraphsAndAccess(form, connected);
+  const days = text(form, "expires_days").trim();
+  if (days === "") return { graphIds, access, expiresAt: row.expiresAt };
+  const expiresAt = now + parseDays(days) * DAY_MS;
+  if (expiresAt > row.expiresAt) {
+    throw new FormError(
+      `expires_days: that would extend the expiry past ${utcDate(row.expiresAt)}. A token's expiry can only be shortened; issue a new token instead.`,
+    );
+  }
+  return { graphIds, access, expiresAt };
+}
+
+/** The first field the stored row disagrees on, or undefined when it holds exactly `want`. Create and edit share it. */
+function readBackMismatch(row: ServiceTokenRow | null, want: TokenScope & { name: string }): string | undefined {
   if (!row) return "token";
   if (row.name !== want.name) return "name";
   if (row.graphIds.length !== want.graphIds.length || row.graphIds.some((id, i) => id !== want.graphIds[i])) return "graph";
@@ -397,6 +442,97 @@ async function createToken({ env, session, csrf, store, form }: FormCtx): Promis
   }
 }
 
+/**
+ * The row when the owner may edit it, or the refusal page: 404 for an unknown id, 409 for a revoked or
+ * expired token or one a previous owner issued (verification refuses those anyway, so an edit would
+ * only mislead). The GET, the POST and a missed UPDATE's follow-up read all ask it.
+ */
+function editable(row: ServiceTokenRow | null, env: Env, now: number): ServiceTokenRow | Response {
+  if (!row) return messagePage(404, "Not found", "No service token has that id.");
+  const token = `Service token '${row.name}'`;
+  if (row.revokedAt !== null) {
+    return messagePage(409, "Not edited", `${token} was revoked on ${utcDate(row.revokedAt)}; it cannot be edited. Issue a new token.`);
+  }
+  if (row.expiresAt <= now) {
+    return messagePage(409, "Not edited", `${token} expired on ${utcDate(row.expiresAt)}; it cannot be edited. Issue a new token.`);
+  }
+  if (!isOwner(row.ownerId, env)) return messagePage(409, "Not edited", `${token} belongs to a previous owner; it cannot be edited.`);
+  return row;
+}
+
+function toTokens(): Response {
+  return new Response(null, { status: 303, headers: { Location: "/tokens", "Cache-Control": "no-store" } });
+}
+
+/** GET /tokens/:id/edit: the current graphs and access ticked, and a blank "shorten expiry" field. */
+async function editTokenForm({ env, store, csrf }: Ctx, id: string): Promise<Response> {
+  const row = editable(await new ServiceTokenStore(env.DB).get(id), env, Date.now());
+  if (row instanceof Response) return row;
+  return editTokenPage(csrf, row, await store.list(), { graphIds: row.graphIds, access: row.access, expiresDays: "" });
+}
+
+/**
+ * POST /tokens/:id/edit (spec 2026-11-08 §3.5): load and refuse, check audit_log, parse, diff, then
+ * one guarded UPDATE, a read-back and the audit row. Nothing changed redirects without a write. A
+ * widening (an added graph, including a swap, or read to write) is refused until the confirm step
+ * exists; a narrowing, a shorter expiry or both apply at once. Each refusal comes before the UPDATE.
+ */
+async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id: string): Promise<Response> {
+  const tokens = new ServiceTokenStore(env.DB);
+  const now = Date.now();
+  const row = editable(await tokens.get(id), env, now);
+  if (row instanceof Response) return row;
+  const audit = new AuditLog(env.DB);
+  if ((await audit.ready()) === "missing") {
+    return messagePage(503, "Not edited", "audit log is missing (apply migration 0004); nothing was changed.");
+  }
+  const graphs = await store.list();
+  try {
+    const after = parseTokenEditForm(form, new Set(graphs.map((graph) => graph.graphId)), row, now);
+    const before: TokenScope = { graphIds: row.graphIds, access: row.access, expiresAt: row.expiresAt };
+    const had = new Set(before.graphIds);
+    const has = new Set(after.graphIds);
+    const added = after.graphIds.some((graphId) => !had.has(graphId));
+    const removed = before.graphIds.some((graphId) => !has.has(graphId));
+    if (!added && !removed && after.access === before.access && after.expiresAt === before.expiresAt) return toTokens();
+    if (added || (before.access === "read" && after.access === "write")) {
+      throw new FormError(
+        "graph: adding graphs or raising to read-write needs the confirm step, which is not available yet; nothing was changed.",
+      );
+    }
+    if (!(await tokens.update(id, before, after, now))) {
+      const current = editable(await tokens.get(id), env, now);
+      if (current instanceof Response) return current;
+      return messagePage(409, "Not edited", `Service token '${row.name}' changed since you opened this page; reload and edit again.`);
+    }
+    const stored = await tokens.get(id);
+    const field = readBackMismatch(stored, { name: row.name, ...after });
+    if (field !== undefined || !stored) {
+      await tokens.revoke(id, Date.now());
+      return messagePage(500, "Token revoked", `${field}: the stored token did not match the form, so it was revoked. Issue a new token.`);
+    }
+    await audit.recordTokenEdit({
+      at: now,
+      name: row.name,
+      ownerId: session.githubUserId,
+      before,
+      after: { graphIds: stored.graphIds, access: stored.access, expiresAt: stored.expiresAt },
+    });
+    return toTokens();
+  } catch (error) {
+    if (!(error instanceof FormError)) throw error;
+    // Echo only values that are already valid; boxes are drawn only for connected graphs.
+    const access = text(form, "access");
+    const days = text(form, "expires_days").trim();
+    const values: TokenEditValues = {
+      graphIds: form.getAll("graph").filter((graphId): graphId is string => typeof graphId === "string"),
+      access: access === "read" || access === "write" ? access : "",
+      expiresDays: WHOLE_DAYS.test(days) ? days : "",
+    };
+    return editTokenPage(csrf, row, graphs, values, error.status, error.message);
+  }
+}
+
 /** POST /tokens/:id/revoke: sets revoked_at once; a re-send keeps the first time and still redirects. */
 async function revokeToken({ env }: FormCtx, id: string): Promise<Response> {
   const tokens = new ServiceTokenStore(env.DB);
@@ -422,6 +558,9 @@ export function wizardRoute(request: Request, env: Env): Promise<Response> | und
   if (pathname === "/tokens/new" && method === "POST") return withForm(request, env, createToken);
   const revoke = TOKEN_REVOKE.exec(pathname);
   if (revoke && method === "POST") return withForm(request, env, (ctx) => revokeToken(ctx, revoke[1]));
+  const tokenEdit = TOKEN_EDIT.exec(pathname);
+  if (tokenEdit && method === "GET") return withSession(request, env, (ctx) => editTokenForm(ctx, tokenEdit[1]));
+  if (tokenEdit && method === "POST") return withForm(request, env, (ctx) => submitTokenEdit(ctx, tokenEdit[1]));
   const match = ALIAS_ACTION.exec(pathname);
   if (match && method === "POST") {
     const [, alias, action] = match;

@@ -877,7 +877,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | `401` from `/mcp` with `service token 'x' was revoked`, `expired on YYYY-MM-DD` or `belongs to a previous owner` | The token was revoked at `/tokens`, passed its expiry, or was created under another `OWNER_GITHUB_USER_ID`. Create a new token (11.12) and replace the `LOGSEQ_SERVICE_TOKEN` secret. |
 | `401` from `/mcp` with `Invalid access token` and a service token | The secret isn't a token this connector issued: a typo, a truncated copy, or a token from another deployment. The connector gives no reason for an unknown token. Create a new one. |
 | `graph 'x' is read-only (service token 'y' is read-only)` | The token was created read-only. Create a read-write token for the graph (11.12). The graph itself must also be connected read-write. |
-| `graph 'x' is outside service token 'y''s scope (it covers: …)` | The token wasn't given that graph. Create a new token that includes it. Tokens can't be edited. |
+| `graph 'x' is outside service token 'y''s scope (it covers: …)` | The token wasn't given that graph. Create a new token that includes it. An edit at `/tokens/<id>/edit` can remove graphs from a token but can't add one yet. |
 | The `logseq-service` server shows as failed in a local Claude Code session | `.mcp.json` sends `Bearer ${LOGSEQ_SERVICE_TOKEN}`, and the variable is unset on your machine. Ignore it, or export a token. It does not affect the `Logseq` connector. |
 
 ### 11.11 Semantic search (optional)

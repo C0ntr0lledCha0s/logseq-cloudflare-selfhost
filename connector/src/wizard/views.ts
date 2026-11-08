@@ -329,17 +329,20 @@ ${list}
   );
 }
 
+/** A box per connected graph, with its own mode, ticked when its id is in `ticked`. */
+function graphBoxes(graphs: GraphRecord[], ticked: readonly string[]): string {
+  if (graphs.length === 0) return `<p class="hint">No graphs are connected. <a href="/graphs/new">Connect a graph</a> first.</p>`;
+  return graphs
+    .map((graph) => {
+      const mode = graph.mode === "write" ? "read-write" : "read-only";
+      return `<label class="check"><input type="checkbox" name="graph" value="${escapeHtml(graph.graphId)}"${checked(ticked.includes(graph.graphId))}> ${escapeHtml(graph.alias)} <small>(${mode})</small></label>`;
+    })
+    .join("\n  ");
+}
+
 /** GET /tokens/new, and the same form again after a refusal. */
 export function newTokenPage(csrf: string, graphs: GraphRecord[], values: TokenFormValues, status = 200, error?: string): Response {
-  const boxes =
-    graphs.length === 0
-      ? `<p class="hint">No graphs are connected. <a href="/graphs/new">Connect a graph</a> first.</p>`
-      : graphs
-          .map((graph) => {
-            const mode = graph.mode === "write" ? "read-write" : "read-only";
-            return `<label class="check"><input type="checkbox" name="graph" value="${escapeHtml(graph.graphId)}"${checked(values.graphIds.includes(graph.graphId))}> ${escapeHtml(graph.alias)} <small>(${mode})</small></label>`;
-          })
-          .join("\n  ");
+  const boxes = graphBoxes(graphs, values.graphIds);
   return page(
     status,
     "New service token",
@@ -364,6 +367,59 @@ ${errorBox(error)}
   <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}" required>
   <small>1 to ${MAX_EXPIRY_DAYS} days.</small></label>
   <div class="actions"><button>Create token</button><a class="button quiet" href="/tokens">Cancel</a></div>
+</form>`,
+  );
+}
+
+/** Fields the edit form shows: the stored scope on GET, the valid submitted values after a refusal. Never a token. */
+export interface TokenEditValues {
+  graphIds: string[];
+  access: string;
+  expiresDays: string;
+}
+
+/**
+ * GET /tokens/:id/edit, and the same form again after a refusal (spec 2026-11-08 §3.4). The name is
+ * shown, not edited. A graph the token lists that is no longer connected has no box, so saving drops it.
+ */
+export function editTokenPage(
+  csrf: string,
+  token: ServiceTokenRow,
+  graphs: GraphRecord[],
+  values: TokenEditValues,
+  status = 200,
+  error?: string,
+): Response {
+  const name = escapeHtml(token.name);
+  const connected = new Set(graphs.map((graph) => graph.graphId));
+  const gone = token.graphIds
+    .filter((id) => !connected.has(id))
+    .map((id) => `<p class="hint"><span class="warning">${escapeHtml(id)} (not connected; saving removes it)</span></p>`)
+    .join("\n  ");
+  return page(
+    status,
+    "Edit service token",
+    `<h1>Edit <span class="alias">${name}</span></h1>
+${errorBox(error)}
+<form class="card" method="post" action="/tokens/${escapeHtml(token.id)}/edit">
+  ${csrfField(csrf)}
+  <fieldset><legend>Graphs</legend>
+  ${graphBoxes(graphs, values.graphIds)}
+  ${gone}
+  <small>A token's access never exceeds a graph's own mode.</small>
+  </fieldset>
+  <fieldset><legend>What the token may do</legend>
+  <div class="choices">
+  ${choice("access", "read", values.access, "Read only", "Search and read pages and blocks.", true)}
+  ${choice("access", "write", values.access, "Read and write", "Also write to graphs connected read-write.")}
+  </div>
+  </fieldset>
+  <label class="field"><span>Shorten expiry to N days from now</span>
+  <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}">
+  <small>Expires ${utc(token.expiresAt)}. Leave blank to keep it. An expiry can only be shortened.</small></label>
+  <p class="hint">Removing graphs, read-only and a shorter expiry apply at once, from the token's next request. Adding a graph or raising to read-write is not available yet.</p>
+  <p class="hint">Editing does not change the token. If it may have leaked, revoke it and issue a new one.</p>
+  <div class="actions"><button>Save changes</button><a class="button quiet" href="/tokens">Cancel</a></div>
 </form>`,
   );
 }
