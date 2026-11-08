@@ -53,6 +53,10 @@ export interface AffectedTarget {
   from?: TargetLocation;
   to?: TargetLocation;
   e2ee?: boolean;
+  /** A code, math or quote block's type, when the response gives it (update_block, a verbose insert). */
+  displayType?: string;
+  /** A code block's language, given with its display type. */
+  lang?: string;
 }
 
 /**
@@ -113,6 +117,17 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/** The display types a block can have (patch 0037); any other value is not shown. */
+const DISPLAY_TYPES = new Set(["code", "math", "quote"]);
+
+/** Sets `t`'s display type and lang from a block the response gives (`BlockResponse` or `InsertedBlock`). */
+function display(t: AffectedTarget, block: Record<string, unknown> | undefined): void {
+  const type = block?.["display-type"];
+  if (typeof type !== "string" || !DISPLAY_TYPES.has(type)) return;
+  t.displayType = type;
+  if (typeof block?.lang === "string") t.lang = block.lang;
+}
+
 function location(value: unknown): TargetLocation | undefined {
   const loc = record(value);
   if (!loc) return undefined;
@@ -151,10 +166,15 @@ export function toAffectedTargets(response: unknown): AffectedTarget[] {
     if (t && holder["would-create"] === true) t.wouldCreate = true;
     // An insert entry answers affected, its new top-level blocks, even when it inserts none.
     if (t && Array.isArray(holder.affected) && holder.affected.length === 0) t.propertiesOnly = true;
+    // update_block answers the block it wrote, display type included, around its target.
+    if (t && holder.uuid === t.uuid) display(t, holder);
     if (t) out.push(t);
+    // A verbose insert gives each new top-level block's display type in its own blocks.
+    const blocks = Array.isArray(holder.blocks) ? holder.blocks.map(record) : [];
     if (Array.isArray(holder.affected)) {
       for (const item of holder.affected) {
         const a = target(item, "affected");
+        if (a) display(a, blocks.find((b) => b?.uuid === a.uuid));
         if (a) out.push(a);
       }
     }
@@ -235,9 +255,11 @@ function count(n: number, singular: string, plural: string): string {
   return `${n} ${n === 1 ? singular : plural}`;
 }
 
-/** The counts a line ends with, e.g. " (+3 children, 2 references)"; empty when there are none. */
+/** The display type and counts a line ends with, e.g. " (display-type code, lang python, +3 children)"; empty when there are none. */
 function counts(t: AffectedTarget): string {
   const parts: string[] = [];
+  if (t.displayType !== undefined) parts.push(`display-type ${t.displayType}`);
+  if (t.lang !== undefined) parts.push(`lang ${t.lang}`);
   if (t.descendants !== undefined) parts.push(`+${count(t.descendants, "child", "children")}`);
   if (t.blocks !== undefined) parts.push(count(t.blocks, "block", "blocks"));
   if (t.references !== undefined) parts.push(count(t.references, "reference", "references"));

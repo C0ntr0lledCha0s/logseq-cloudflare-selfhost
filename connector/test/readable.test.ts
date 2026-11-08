@@ -17,6 +17,7 @@ import {
   toAffectedTargets,
 } from "../src/tools/readable";
 import batchInsertBlockTrees from "./fixtures/readable/batch-insert-block-trees.json";
+import batchInsertDisplay from "./fixtures/readable/batch-insert-display.json";
 import batchInsertDryRun from "./fixtures/readable/batch-insert-dry-run.json";
 import batchInsertPropertiesOnly from "./fixtures/readable/batch-insert-properties-only.json";
 import batchInsertPropertiesOnlyDryRun from "./fixtures/readable/batch-insert-properties-only-dry-run.json";
@@ -30,10 +31,13 @@ import deletePageDryRun from "./fixtures/readable/delete-page-dry-run.json";
 import deletePageToday from "./fixtures/readable/delete-page-today.json";
 import deletePageTodayDryRun from "./fixtures/readable/delete-page-today-dry-run.json";
 import insertBlockTree from "./fixtures/readable/insert-block-tree.json";
+import insertBlockTreeDisplay from "./fixtures/readable/insert-block-tree-display.json";
 import insertUnavailable from "./fixtures/readable/insert-unavailable.json";
 import moveBlocks from "./fixtures/readable/move-blocks.json";
 import moveBlocksDryRun from "./fixtures/readable/move-blocks-dry-run.json";
 import setBlockProperty from "./fixtures/readable/set-block-property.json";
+import updateBlockCode from "./fixtures/readable/update-block-code.json";
+import updateBlockPlain from "./fixtures/readable/update-block-plain.json";
 
 describe("takeReason", () => {
   it("takes the reason out of the arguments and leaves the rest as they were", () => {
@@ -102,6 +106,7 @@ describe("summarise", () => {
 type Fixture = { operationId: string; status: string; tool: string; response: Record<string, unknown> };
 const FIXTURES: Record<string, Fixture> = {
   "batch-insert-block-trees": batchInsertBlockTrees,
+  "batch-insert-display": batchInsertDisplay,
   "batch-insert-dry-run": batchInsertDryRun,
   "batch-insert-properties-only": batchInsertPropertiesOnly,
   "batch-insert-properties-only-dry-run": batchInsertPropertiesOnlyDryRun,
@@ -115,10 +120,13 @@ const FIXTURES: Record<string, Fixture> = {
   "delete-page-today": deletePageToday,
   "delete-page-today-dry-run": deletePageTodayDryRun,
   "insert-block-tree": insertBlockTree,
+  "insert-block-tree-display": insertBlockTreeDisplay,
   "insert-unavailable": insertUnavailable,
   "move-blocks": moveBlocks,
   "move-blocks-dry-run": moveBlocksDryRun,
   "set-block-property": setBlockProperty,
+  "update-block-code": updateBlockCode,
+  "update-block-plain": updateBlockPlain,
 };
 
 function fixture(name: string) {
@@ -445,5 +453,67 @@ describe("summarise, long results", () => {
     expect(out.split("\n")[1]).toBe(`- ${"😀".repeat(80)} > Parent > "Block 0"`);
     const moved = summarise([{ ...t(0, ""), from: { pageTitle: title, breadcrumb: [] }, to: { pageTitle: title, breadcrumb: [] } }], { tool: "move_blocks" });
     expect(moved.split("\n")[1]).toBe(`- "Block 0" from ${"😀".repeat(80)} to ${"😀".repeat(80)}`);
+  });
+});
+
+// Patch 0037: a write whose response gives a block's display type (update_block's block, an insert's
+// verbose blocks) shows it on that block's summary line; a block without one reads as before.
+describe("summarise, code, math and quote blocks", () => {
+  it("an update_block result shows the block's display type and lang", () => {
+    expect(summaryOf("update-block-code")).toBe('Updated 1 block:\n- Nov 5th, 2026 > Notes > "print(1)" (display-type code, lang python)');
+  });
+
+  it("a plain block's update_block summary is unchanged", () => {
+    expect(summaryOf("update-block-plain")).toBe('Updated 1 block:\n- Nov 5th, 2026 > Notes > "Book flights"');
+  });
+
+  it("an insert shows each new top-level block's display type, before its counts; plain blocks are unchanged", () => {
+    expect(summaryOf("insert-block-tree-display")).toBe(
+      [
+        "Inserted 4 blocks:",
+        '- Nov 5th, 2026 > Meeting > Agenda > "#include <stdio.h>" (display-type code, lang c, +1 child)',
+        '- Nov 5th, 2026 > Meeting > Agenda > "E=mc^2" (display-type math, +0 children)',
+        '- Nov 5th, 2026 > Meeting > Agenda > "Example" (display-type quote, +0 children)',
+        '- Nov 5th, 2026 > Meeting > Agenda > "```query" (+0 children)',
+      ].join("\n"),
+    );
+    // Without verbose the server sends no display type, and the summary is the one it always was.
+    expect(summaryOf("insert-block-tree")).toBe(
+      'Inserted 2 blocks:\n- Nov 5th, 2026 > Meeting > Agenda > "New item" (+2 children)\n- Nov 5th, 2026 > Meeting > Agenda > "Second" (+0 children)',
+    );
+  });
+
+  it("a batch insert takes each entry's display types from that entry's own blocks", () => {
+    expect(summaryOf("batch-insert-display")).toBe(
+      'Inserted 2 blocks:\n- Ideas > "Example" (display-type quote, +0 children)\n- Ideas > "graph TD" (display-type code, lang mermaid, +0 children)',
+    );
+    // In the other entry order, each block keeps its own type.
+    const f = fixture("batch-insert-display");
+    const reversed = { ...f.response, entries: [...(f.response.entries as unknown[])].reverse() };
+    expect(describeWrite(f.tool, { content: [{ type: "text", text: JSON.stringify(reversed) }] }, undefined).summary).toBe(
+      'Inserted 2 blocks:\n- Ideas > "graph TD" (display-type code, lang mermaid, +0 children)\n- Ideas > "Example" (display-type quote, +0 children)',
+    );
+  });
+
+  it("a display type the server never answers, or a lang on its own, is not shown as a type", () => {
+    const f = fixture("update-block-code");
+    const line = (extra: Record<string, unknown>) =>
+      describeWrite(f.tool, { content: [{ type: "text", text: JSON.stringify({ ...f.response, ...extra }) }] }, undefined).summary.split("\n")[1];
+    expect(line({ "display-type": "cod", lang: undefined })).toBe('- Nov 5th, 2026 > Notes > "print(1)"');
+    expect(line({ "display-type": 3, lang: undefined })).toBe('- Nov 5th, 2026 > Notes > "print(1)"');
+    expect(line({ "display-type": undefined })).toBe('- Nov 5th, 2026 > Notes > "print(1)"');
+    expect(line({ "display-type": "math", lang: undefined })).toBe('- Nov 5th, 2026 > Notes > "print(1)" (display-type math)');
+    expect(line({ "display-type": "quote", lang: undefined })).toBe('- Nov 5th, 2026 > Notes > "print(1)" (display-type quote)');
+  });
+
+  it("toAffectedTargets carries the display type and lang on the block they belong to", () => {
+    const targets = toAffectedTargets(fixture("insert-block-tree-display").response);
+    expect(targets.map((t) => [t.role, t.snippet, t.displayType, t.lang])).toEqual([
+      ["target", "Agenda", undefined, undefined],
+      ["affected", "#include <stdio.h>", "code", "c"],
+      ["affected", "E=mc^2", "math", undefined],
+      ["affected", "Example", "quote", undefined],
+      ["affected", "```query", undefined, undefined],
+    ]);
   });
 });

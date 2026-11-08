@@ -9,6 +9,7 @@ import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
+import { CODE_BLOCKS_HELP, CONNECTOR_HELP } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import { toAffectedTargets } from "../src/tools/readable";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
@@ -2094,5 +2095,110 @@ describe("edit stamps contract", () => {
       expect(help, phrase).toContain(phrase);
     }
     expect(help.split("editedBy and claudeEditedAt are set by the server").length).toBe(2);
+  });
+});
+
+// Patch 0037: code, math and quote blocks, as Claude reads about them in the tool list and connector_help.
+describe("code, math and quote blocks", () => {
+  const TREE_TOOLS = ["insert_block_tree", "insert_block_children", "batch_insert_block_trees", "capture_to_today"];
+  const FENCE_TOOLS = [...TREE_TOOLS, "update_block"];
+  const DESCRIBED_TOOLS = [...FENCE_TOOLS, "set_block_property", "batch_set_block_property"];
+
+  /** The schema of a tree tool's top-level node. */
+  function nodeSchema(tool: any): any {
+    const body = tool.inputSchema.properties.body;
+    return tool.name === "batch_insert_block_trees" ? body.properties.entries.items.properties.blocks.items : body.properties.blocks.items;
+  }
+
+  it("each tree tool's nodes take display-type, exactly code, math or quote, and lang; update_block's body takes both", async () => {
+    const tools = await listTools();
+    for (const name of TREE_TOOLS) {
+      const node = nodeSchema(tools.find((t) => t.name === name));
+      expect(node.properties["display-type"].enum, name).toEqual(["code", "math", "quote"]);
+      expect(node.properties.lang.type, name).toBe("string");
+      expect(node.properties.lang.maxLength, name).toBe(40);
+    }
+    const update = tools.find((t) => t.name === "update_block").inputSchema.properties.body.properties;
+    expect(update["display-type"].enum).toEqual(["code", "math", "quote"]);
+    expect(update.lang.type).toBe("string");
+  });
+
+  it("insert_block_tree and insert_block_children take dry-run; the five fence tools take convert-fences, default true", async () => {
+    const tools = await listTools();
+    for (const name of ["insert_block_tree", "insert_block_children"]) {
+      expect(tools.find((t) => t.name === name).inputSchema.properties.body.properties["dry-run"].type, name).toBe("boolean");
+    }
+    for (const name of FENCE_TOOLS) {
+      const flag = tools.find((t) => t.name === name).inputSchema.properties["convert-fences"];
+      expect(flag?.type, name).toBe("boolean");
+      expect(flag.default, name).toBe(true);
+    }
+  });
+
+  it("display-type and lang reach the server on every node, at any depth and in either entry order, with convert-fences", async () => {
+    syncHandler = preReadsEmpty(() => Response.json({ entries: [], count: 0 }, { status: 201 }));
+    const chain = {
+      title: "print(1)",
+      "display-type": "code",
+      lang: "python",
+      children: [{ title: "E=mc^2", "display-type": "math", children: [{ title: "Example", "display-type": "quote" }] }],
+    };
+    const entries = [
+      { page: "Example", blocks: [chain] },
+      { page: "Example", blocks: [{ title: "```mermaid\ngraph TD\n```" }] },
+    ];
+    for (const order of [entries, [...entries].reverse()]) {
+      syncRequests = [];
+      const result = await callTool("batch_insert_block_trees", { graph: "work", "convert-fences": false, body: { entries: order } });
+      expect(result.isError, result.text).toBe(false);
+      const [write] = writeRequests();
+      expect(new URL(write.url).searchParams.get("convert-fences")).toBe("false");
+      expect(JSON.parse(write.body).entries.map((e: { blocks: unknown }) => e.blocks)).toEqual(order.map((e) => e.blocks));
+    }
+  });
+
+  it("each changed description names display-type and points to connector_help's section", async () => {
+    const tools = await listTools();
+    for (const name of DESCRIBED_TOOLS) {
+      const description = tools.find((t) => t.name === name).description;
+      expect(description, name).toContain("display-type");
+      expect(description, name).toContain("connector_help's Code, math and quote blocks");
+    }
+    for (const name of FENCE_TOOLS) {
+      const description = tools.find((t) => t.name === name).description;
+      expect(description, name).toContain("convert-fences");
+      expect(description, name).toContain("kept");
+    }
+  });
+
+  it("connector_help has the Code, math and quote blocks section", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(CODE_BLOCKS_HELP);
+    expect(CODE_BLOCKS_HELP.startsWith("Code, math and quote blocks:")).toBe(true);
+  });
+
+  // One assertion per point, so dropping any one of them from the section fails.
+  it.each([
+    ["code", 'display-type: "code"'],
+    ["math", '"math"'],
+    ["quote", '"quote"'],
+    ["lang", "lang is a code block's language"],
+    ["lang only with code", "lang only with code"],
+    ["fence conversion", "whole title is one ``` or $$ fence"],
+    ["convert-fences", "convert-fences=false"],
+    ["verbatim titles", "stored exactly as sent"],
+    ["mermaid", "```mermaid is highlighted code"],
+    ["query fences", "```query fences stay text"],
+    ["kept", "listed under kept"],
+    ["converting an existing block", "update_block with the title and display-type together"],
+    ["the \\# warning", "\\# escapes"],
+    ["quote keeps tag handling", "A quote block keeps tag and link handling"],
+  ])("the section names %s", (_point, phrase) => {
+    expect(CODE_BLOCKS_HELP).toContain(phrase);
+  });
+
+  it("the heading sentence agrees with the section: no heading for a code, math or quote block, and quote keeps tag handling", () => {
+    expect(CONNECTOR_HELP).toContain("A code, math or quote block has no heading: its # lines are kept as given");
+    expect(CONNECTOR_HELP).not.toContain("keeps its title as given, # lines included");
   });
 });
