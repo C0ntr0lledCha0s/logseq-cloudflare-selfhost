@@ -288,12 +288,14 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
     })
     .join(", ");
   const write = token.access === "write";
-  const revoke =
+  // Only an active token can be edited or revoked; the edit routes refuse the others with 409 anyway.
+  const actions =
     status === "active"
-      ? `<form method="post" action="/tokens/${escapeHtml(token.id)}/revoke">
+      ? `<div class="actions"><a class="button" href="/tokens/${escapeHtml(token.id)}/edit">Edit ${name}</a>
+<form method="post" action="/tokens/${escapeHtml(token.id)}/revoke">
   ${csrfField(csrf)}
   <button class="danger">Revoke ${name}</button>
-</form>`
+</form></div>`
       : "";
   const ended = status === "revoked" ? ` on ${utc(token.revokedAt!)}` : "";
   return `<section class="block" id="token-${name}">
@@ -304,8 +306,9 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
   <dt>Graphs</dt><dd>${graphs}</dd>
   <dt>Expires</dt><dd>${utc(token.expiresAt)}</dd>
   <dt>Last used</dt><dd>${token.lastUsedAt === null ? "never" : utc(token.lastUsedAt)}</dd>
+  <dt>Last changed</dt><dd>${token.updatedAt === null ? "never" : utc(token.updatedAt)}</dd>
 </dl>
-${revoke}
+${actions}
 </div>
 </section>`;
 }

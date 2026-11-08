@@ -1924,5 +1924,136 @@ describe("service tokens", () => {
       applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(widen.html)));
       expect(total()).toEqual({ read: 3 + N, written: 3 });
     });
+
+    describe("the /tokens list: Last changed and the Edit link", () => {
+      /** `ms` as the list prints it: `YYYY-MM-DD HH:MM UTC`. */
+      const utcText = (ms: number) => `${new Date(ms).toISOString().slice(0, 10)} ${new Date(ms).toISOString().slice(11, 16)} UTC`;
+      const section = (html: string, name: string) => html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
+      const lastChanged = (html: string, name: string) => /<dt>Last changed<\/dt><dd>([^<]*)<\/dd>/.exec(section(html, name))?.[1];
+      const editLinks = (html: string) => [...html.matchAll(/<a[^>]*href="(\/tokens\/[^"]*\/edit)"[^>]*>([^<]*)<\/a>/g)].map((m) => [m[1], m[2]]);
+
+      it("Last changed shows never before an edit and the edit's UTC time after it; a no-change re-post and a revoke leave it (spec 8.12)", async () => {
+        const h = await twoGraphs();
+        const kinds = ["narrow-graphs", "write-to-read", "shorter-expiry", "confirmed-widening", "no-change", "revoked-only"] as const;
+        const ids = new Map<string, string>();
+        for (const name of kinds) {
+          const t = await stored(name, { graphIds: name === "confirmed-widening" ? [A] : [A, B], access: "write" });
+          ids.set(name, t.id);
+        }
+        let html = (await h.page("/tokens")).html;
+        for (const name of kinds) expect(lastChanged(html, name), name).toBe("never");
+
+        applied(await edit(h, ids.get("narrow-graphs")!, { access: "write" }, [A]));
+        applied(await edit(h, ids.get("write-to-read")!, { access: "read" }, [A, B]));
+        applied(await edit(h, ids.get("shorter-expiry")!, { access: "write", expires_days: "1" }, [A, B]));
+        const widen = await edit(h, ids.get("confirmed-widening")!, { access: "write" }, [A, B]);
+        expect(widen.res.status).toBe(200);
+        applied(await h.page(`/tokens/${ids.get("confirmed-widening")}/edit`, confirmFields(widen.html)));
+        applied(await edit(h, ids.get("no-change")!, { access: "write" }, [B, A]));
+        expect((await h.page(`/tokens/${ids.get("revoked-only")}/revoke`, { csrf: h.csrf })).res.status).toBe(303);
+
+        html = (await h.page("/tokens")).html;
+        for (const name of ["narrow-graphs", "write-to-read", "shorter-expiry", "confirmed-widening"]) {
+          const row = (await tokens().get(ids.get(name)!))!;
+          expect(row.updatedAt, name).not.toBeNull();
+          expect(lastChanged(html, name), name).toBe(utcText(row.updatedAt!));
+        }
+        expect(lastChanged(html, "no-change")).toBe("never");
+        expect(lastChanged(html, "revoked-only")).toBe("never");
+        // Last changed sits right under Last used.
+        expect(section(html, "narrow-graphs")).toMatch(/<dt>Last used<\/dt><dd>[^<]*<\/dd>\s*<dt>Last changed<\/dt>/);
+      });
+
+      it("only the active token among revoked, expired and active has an Edit link, and it opens the edit page; all show Last changed", async () => {
+        const h = await twoGraphs();
+        const now = Date.now();
+        const active = await stored("active");
+        const expired = await stored("expired", { expiresAt: now - DAY });
+        const revoked = await stored("revoked");
+        await tokens().revoke(revoked.id, now - 1000);
+        // Edited, then revoked: keeps its edit time and loses the link.
+        const editedThenRevoked = await stored("edited-revoked");
+        applied(await edit(h, editedThenRevoked.id, { access: "read" }, [A, B]));
+        await tokens().revoke(editedThenRevoked.id, Date.now());
+        // Active but covering a graph that is no longer connected: still active, so still editable.
+        const gone = await stored("gone", { graphIds: ["44444444-4444-4444-4444-444444444444"] });
+        const edited = await stored("edited");
+        applied(await edit(h, edited.id, { access: "read" }, [A]));
+
+        const { res, html } = await h.page("/tokens");
+        expect(res.status).toBe(200);
+        expect(editLinks(html)).toEqual([
+          [`/tokens/${active.id}/edit`, "Edit active"],
+          [`/tokens/${edited.id}/edit`, "Edit edited"],
+          [`/tokens/${gone.id}/edit`, "Edit gone"],
+        ]);
+        for (const [name, row] of [
+          ["active", active],
+          ["expired", expired],
+          ["revoked", revoked],
+          ["edited-revoked", editedThenRevoked],
+          ["gone", gone],
+          ["edited", edited],
+        ] as const) {
+          const stored_ = (await tokens().get(row.id))!;
+          expect(lastChanged(html, name), name).toBe(stored_.updatedAt === null ? "never" : utcText(stored_.updatedAt));
+          const link = section(html, name).includes(`href="/tokens/${row.id}/edit"`);
+          expect(link, name).toBe(["active", "edited", "gone"].includes(name));
+        }
+        expect(lastChanged(html, "edited-revoked")).not.toBe("never");
+        // The owner reaches the edit page by following the link.
+        const [href] = editLinks(html)[0];
+        const opened = await h.page(href);
+        expect(opened.res.status).toBe(200);
+        expect(opened.html).toContain(`action="/tokens/${active.id}/edit"`);
+        expect(html.match(LSCT)).toBeNull();
+      });
+
+      it("the Edit link follows the list's status at the expiry boundary, and escapes the name", async () => {
+        const now = 1_800_000_000_000;
+        const row = (name: string, expiresAt: number, extra: { revokedAt?: number; updatedAt?: number } = {}) => ({
+          id: `id-${name}`,
+          name,
+          ownerId: OWNER_ID,
+          graphIds: [GRAPH_ID],
+          access: "read" as const,
+          createdAt: now - DAY,
+          expiresAt,
+          lastUsedAt: null,
+          revokedAt: extra.revokedAt ?? null,
+          updatedAt: extra.updatedAt ?? null,
+        });
+        const html = await tokenListPage(
+          [row("at-now", now), row("just-before", now + 1, { updatedAt: now - 60_000 }), row("<b>", now + DAY), row("revoked-later", now + DAY, { revokedAt: now })],
+          [],
+          "csrf",
+          now,
+        ).text();
+        expect(editLinks(html)).toEqual([
+          ["/tokens/id-just-before/edit", "Edit just-before"],
+          ["/tokens/id-&#60;b&#62;/edit", "Edit &#60;b&#62;"],
+        ]);
+        expect(lastChanged(html, "at-now")).toBe("never");
+        expect(lastChanged(html, "just-before")).toBe(utcText(now - 60_000));
+        expect(lastChanged(html, "revoked-later")).toBe("never");
+        expect(html).not.toContain("<b>");
+      });
+
+      it("GET /tokens still reads about one service_tokens row per token and writes none, before and after edits", async () => {
+        const m = meterTokens();
+        const h = await twoGraphs({ DB: m.db });
+        const made = [];
+        for (const name of ["a", "b", "c", "d"]) made.push(await stored(name));
+        await tokens().revoke(made[3].id, Date.now());
+        m.measured.length = 0;
+        expect((await h.page("/tokens")).res.status).toBe(200);
+        expect(m.measured.map((x) => [x.read, x.written])).toEqual([[4, 0]]);
+        applied(await edit(h, made[0].id, { access: "read" }, [A]));
+        applied(await edit(h, made[1].id, { access: "write" }, [B]));
+        m.measured.length = 0;
+        expect((await h.page("/tokens")).res.status).toBe(200);
+        expect(m.measured.map((x) => [x.read, x.written])).toEqual([[4, 0]]);
+      });
+    });
   });
 });
