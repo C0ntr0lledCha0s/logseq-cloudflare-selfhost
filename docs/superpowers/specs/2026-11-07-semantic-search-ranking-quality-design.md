@@ -280,3 +280,15 @@ To be filled in by the build:
 After Stage 5 every question keeps the rank it had after Stage 4, so the floor stays at MRR 0.89 (0.90 would sit above the measured 0.896). The keyword columns measure `searchGraph` on the whole phrase, which this design does not change. The keyword leg now contributes to the multi-word questions: for "stock level reporting dashboard" the target is found by both legs (`semantic.test.ts`, "the warehouse question finds its target through both legs").
 
 Review round 2 found that a title holding one word of a question ("Carpooling" for "car", "Fitness plan" for "fitness") took keyword rank 1, which reciprocal rank fusion weights the same as semantic rank 1, so on a graph with such titles the WOF answer fell from rank 1 to rank 3. The fixture now has five such decoy pages, and the WOF question must reach rank 1. The term lists now keep only uuids that at least two terms found (`KEYWORD_TERM_MATCHES`); whole-phrase matches are kept as before. With the decoys the floor's MRR is 0.85, lowered on purpose because the holiday question's decoy is also its nearest block by meaning in the fake embedder; the original pages alone still give 0.90. The rule costs no extra calls, rows or neurons.
+
+## 13. As built
+
+The build follows sections 3 and 4. Where the result differs from the design:
+
+- **Keyword-term filter (section 3.3).** The design merged every term list. Review round 2 found that a title holding one word of a question took keyword rank 1, which reciprocal rank fusion weights the same as semantic rank 1. `mergeKeywordLists` therefore keeps only uuids that at least `KEYWORD_TERM_MATCHES` (2) terms found. Whole-phrase matches are kept as before and come first (`phraseFirst`), so a title matching only one word of a question is left out of the keyword list. The tool description and `SEMANTIC_HELP` say so.
+- **Fixture (section 3.5).** The fixture gained five decoy "Notes for ... later" pages, each holding one word of a question. The recorded floor is hybrid MRR 0.85, lowered on purpose from 0.89; the original pages alone still give 0.90 (section 12).
+- **Short-block weight (section 3.2).** Kept at 0.75, as the design started. The live check (section 9) has not been run, so the weight is unconfirmed on the owner's graph.
+- **Similarity bands (sections 3.7 and 9).** `SEMANTIC_HELP` says to compare similarities within one search rather than against a fixed number, and gives no bands, because the live distribution has not been recorded. The live rows in section 12 are empty for the same reason.
+- **Manifest.** `tools-manifest.json` did not change. It lists each tool's name, method, path and annotations, not its description or arguments, and `update:manifest` rewrote it unchanged.
+- **Cost (section 5).** As designed: no new D1 query, row, vector or neuron. The multi-word keyword leg makes up to 4 `search_graph` calls (3 terms and the phrase).
+- **Contract text.** Updated in the tool description, `SEMANTIC_HELP`, README 11.8 and 11.11.
