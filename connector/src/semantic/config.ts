@@ -23,6 +23,8 @@ export const SHORT_BLOCK_WORDS = 2;
 export const SHORT_BLOCK_WEIGHT = 0.75;
 /** Distinctive terms the keyword leg searches for a multi-word question. */
 export const KEYWORD_TERMS = 3;
+/** Keyword results fetched per distinctive term; the merged list is capped at `KEYWORD_LIMIT`. */
+export const KEYWORD_TERM_LIMIT = 20;
 
 /** Turns texts into vectors of `DIMENSIONS` numbers, one per text, in order. */
 export interface Embedder {

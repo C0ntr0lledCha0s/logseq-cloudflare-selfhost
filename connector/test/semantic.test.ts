@@ -18,7 +18,7 @@ import {
 } from "../src/semantic/config";
 import { documentText, parseFeedPage, toDocument, vectorId } from "../src/semantic/document";
 import { runIndexer } from "../src/semantic/indexer";
-import { STOPWORDS, contentWords, distinctiveTerms, wordCount } from "../src/semantic/ranking";
+import { STOPWORDS, contentWords, distinctiveTerms, mergeKeywordLists, wordCount } from "../src/semantic/ranking";
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
@@ -204,6 +204,21 @@ describe("ranking terms", () => {
     expect(distinctiveTerms("kids dentist")).toEqual(["dentist", "kids"]);
     expect(distinctiveTerms("rego")).toEqual(["rego"]);
     expect(distinctiveTerms("is it the")).toEqual([]);
+  });
+
+  it("mergeKeywordLists: list count decides before entry order; ties follow term order when the lists are swapped or reversed", () => {
+    const r = (uuid: string) => ({ uuid, title: uuid, resource: "blocks" });
+    const lists = (...ids: string[][]) => ids.map((l) => l.map(r));
+    const ids = (merged: { uuid: string }[]) => merged.map((m) => m.uuid);
+    // s is in two lists at rank 2; a and b are each in one list at rank 1.
+    const base = lists(["a", "s"], ["b", "s"], []);
+    expect(ids(mergeKeywordLists(base))).toEqual(["s", "a", "b"]);
+    expect(ids(mergeKeywordLists([base[1], base[0], base[2]]))).toEqual(["s", "b", "a"]);
+    expect(ids(mergeKeywordLists([...base].reverse()))).toEqual(["s", "b", "a"]);
+    // A chain: each list's rank-1 entry is the next list's rank-2 entry.
+    expect(ids(mergeKeywordLists(lists(["a", "b"], ["b", "c"], ["c", "a"])))).toEqual(["a", "b", "c"]);
+    expect(ids(mergeKeywordLists(lists(["c", "a"], ["b", "c"], ["a", "b"])))).toEqual(["c", "a", "b"]);
+    expect(mergeKeywordLists([])).toEqual([]);
   });
 
   it("wordCount counts the stored text on whitespace", () => {
@@ -765,9 +780,9 @@ describe("similarity and ranks", () => {
   });
 
   describe("short blocks (design 2026-11-07 section 3.2)", () => {
-    // Three content words; "stock level reporting" is no block's or page's substring, so the keyword
-    // leg returns nothing and the semantic order alone decides the results.
-    const MULTI = "stock level reporting";
+    // Three content words, none of them in any block's or page's title, so the keyword leg's term
+    // searches return nothing and the semantic order alone decides the results.
+    const MULTI = "inventory level reporting";
     const order = (body: Body) => body.results.map((r) => r.uuid);
 
     function query(q: string): string {
@@ -802,7 +817,7 @@ describe("similarity and ranks", () => {
       const padded = block("Warehouse", page, "  Stock \t  dashboards ", 0.57);
       const target = block("Warehouse", page, "Stock on hand", 0.46);
       await runUntilReady();
-      for (const q of [MULTI, "weekly stock level reporting", "what is the stock level reporting?"]) {
+      for (const q of [MULTI, "weekly inventory level reporting", "what is the inventory level reporting?"]) {
         expect(contentWords(q).length, q).toBeGreaterThanOrEqual(3);
         expect(order(await search({ q: query(q) })), q).toEqual([target, one, padded]);
       }
@@ -869,6 +884,180 @@ describe("similarity and ranks", () => {
       expect(demoting).toEqual(plain);
       expect(demoting.filter((sql) => sql.includes("semantic_"))).toHaveLength(3);
     });
+  });
+});
+
+describe("keyword leg (design 2026-11-07 section 3.3)", () => {
+  interface Hit {
+    uuid: string;
+    text: string;
+    "keyword-rank": number | null;
+    "found-by": string[];
+  }
+
+  async function search(q: string, args: Record<string, unknown> = {}, e: Env = semanticEnv()): Promise<Hit[]> {
+    const result = await callTool(e, "semantic_search", { graph: "work", q, limit: 50, ...args });
+    expect(result.isError, result.text).toBe(false);
+    return JSON.parse(result.text).results;
+  }
+
+  /** Each keyword hit's uuid in keyword-rank order. */
+  function keywordOrder(hits: Hit[]): string[] {
+    return hits
+      .filter((h) => h["keyword-rank"] !== null)
+      .sort((a, b) => a["keyword-rank"]! - b["keyword-rank"]!)
+      .map((h) => h.uuid);
+  }
+
+  const requested = () => work.searchRequests.map((u) => [u.searchParams.get("q"), u.searchParams.get("limit"), u.searchParams.get("types")]);
+
+  // "reporting dashboard stock": the terms are reporting, dashboard, stock (9, 9, 5 characters).
+  const Q3 = "reporting dashboard stock";
+
+  it("a uuid matched by 2 terms at rank 3 beats one matched by 1 term at rank 1, with a best-rank decoy", async () => {
+    const misc = work.addPage("Misc");
+    // searchGraph orders a term's blocks alphabetically, so the prefixes set each rank.
+    const one = work.addBlock(misc, "aa reporting one"); // reporting rank 1
+    const decoy = work.addBlock(misc, "bb reporting decoy"); // reporting rank 2, before x in first appearance
+    const two = work.addBlock(misc, "cc reporting dashboard two"); // reporting rank 3, dashboard rank 3
+    const x = work.addBlock(misc, "ab dashboard x"); // dashboard rank 1
+    const y = work.addBlock(misc, "ac dashboard y"); // dashboard rank 2
+    await runUntilReady();
+    expect(distinctiveTerms(Q3)).toEqual(["reporting", "dashboard", "stock"]);
+    // "stock" matches nothing; an empty term list is not a failure.
+    expect(keywordOrder(await search(Q3))).toEqual([two, one, x, decoy, y]);
+  });
+
+  it("three lists beat two at any rank; a uuid repeated in one list counts once", async () => {
+    const misc = work.addPage("Misc");
+    const three = work.addBlock(misc, "zz reporting dashboard stock"); // last in all three lists
+    const twoFirst = work.addBlock(misc, "aa reporting dashboard"); // reporting 1, dashboard 2
+    // A page and a block sharing one uuid: twice in the stock list, once in the dashboard list.
+    const repeated = work.addPage("Stock dashboard pp");
+    work.addBlock(misc, "pp stock", { uuid: repeated });
+    await runUntilReady();
+    const hits = await search(Q3);
+    expect(keywordOrder(hits)).toEqual([three, twoFirst, repeated]);
+    expect(hits.filter((h) => h.uuid === repeated)).toHaveLength(1);
+  });
+
+  it("sends one request per term with limit=20 and types=blocks,pages, in term order", async () => {
+    work.addBlock(work.addPage("Misc"), "Stock on hand dashboard");
+    await runUntilReady();
+    const cases: [string, string[]][] = [
+      ["stock level reporting dashboard", ["reporting", "dashboard", "stock"]],
+      ["When is the car's warrant of fitness due?", ["warrant", "fitness", "car"]],
+      ["weekly regional sales figures for the northern warehouses", ["warehouses", "regional", "northern"]],
+      ["Stock LEVEL dashboard", ["dashboard", "stock", "level"]],
+    ];
+    for (const [q, terms] of cases) {
+      expect(distinctiveTerms(q), q).toEqual(terms);
+      work.searchRequests = [];
+      await search(q);
+      expect(requested(), q).toEqual(terms.map((t) => [t, "20", "blocks,pages"]));
+    }
+  });
+
+  it("caps the merged list at 50 before blocksFor and before the tag filter", async () => {
+    const misc = work.addPage("Misc");
+    const pad = (i: number) => String(i).padStart(2, "0");
+    // 70 matching blocks; each term answers 20, so 60 distinct uuids reach the merge.
+    const seeded = new Map<string, string>();
+    for (const [term, n] of [["reporting", 24], ["dashboard", 23], ["stock", 23]] as const) {
+      for (let i = 0; i < n; i++) {
+        const text = `${term} item ${pad(i)}`;
+        const tags = text === "reporting item 00" || text === "stock item 19" ? ["cut"] : [];
+        seeded.set(text, work.addBlock(misc, text, { tags }));
+      }
+    }
+    await runUntilReady();
+    const binds: unknown[][] = [];
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!sql.includes("json_each")) return statement;
+            return new Proxy(statement, {
+              get(st, p) {
+                if (p === "bind") return (...args: unknown[]) => (binds.push(args), st.bind(...args));
+                const value = Reflect.get(st, p);
+                return typeof value === "function" ? value.bind(st) : value;
+              },
+            });
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const e = { ...semanticEnv(), DB: db } as Env;
+    const hits = await search(Q3, {}, e);
+    expect(binds).toHaveLength(1);
+    const keywordUuids = JSON.parse(binds[0][2] as string) as string[];
+    expect(keywordUuids).toHaveLength(50);
+    expect(Math.max(...hits.map((h) => h["keyword-rank"] ?? 0))).toBeLessThanOrEqual(50);
+    // Merged order is rank 1 of each term in term order, then rank 2, ...: rank 17's stock block is 51st.
+    expect(keywordUuids.at(-1)).toBe(seeded.get("dashboard item 16"));
+    expect(keywordUuids).not.toContain(seeded.get("stock item 16"));
+    // The tag filter runs after the cap: a tagged block past the cap is not a keyword hit.
+    const tagged = await search(Q3, { tag: "cut" });
+    expect(keywordOrder(tagged)).toEqual([seeded.get("reporting item 00")]);
+    const late = tagged.find((h) => h.uuid === seeded.get("stock item 19"));
+    expect(late?.["keyword-rank"] ?? null).toBeNull();
+  });
+
+  it("a query of 2 content words or fewer sends one whole-phrase request with limit 50", async () => {
+    work.addBlock(work.addPage("Car"), "Is it the WOF due soon");
+    await runUntilReady();
+    for (const q of ["stock reporting", "is it the WOF due", "rego", "is it", "dashboard dashboards Dashboard", "Queenstown"]) {
+      expect(contentWords(q).length, q).toBeLessThan(RANKED_QUERY_WORDS);
+      work.searchRequests = [];
+      await search(q);
+      expect(requested(), q).toEqual([[q, "50", "blocks,pages"]]);
+    }
+  });
+
+  it("a failed term names the term; with two failing, the first in term order", async () => {
+    work.addBlock(work.addPage("Misc"), "Stock on hand dashboard");
+    await runUntilReady();
+    const q = "stock level reporting dashboard"; // terms: reporting, dashboard, stock
+
+    work.failSearchFor = "dashboard";
+    const one = await callTool(semanticEnv(), "semantic_search", { graph: "work", q });
+    expect(one.isError).toBe(true);
+    expect(one.text).toBe('keyword search for "dashboard": sync server error (HTTP 500): search for dashboard failed');
+    expect(logged().at(-1)).toMatch(/^tool semantic_search graph=work status=http-500 ms=\d+$/);
+
+    // dashboard answers 50 ms after stock, so the first failure in time is stock's.
+    work.failSearchFor = ["stock", "dashboard"];
+    work.searchDelays.set("dashboard", 50);
+    const two = await callTool(semanticEnv(), "semantic_search", { graph: "work", q });
+    expect(two.text).toMatch(/^keyword search for "dashboard": /);
+    work.failSearchFor = ["stock"];
+    expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q })).text).toMatch(/^keyword search for "stock": /);
+
+    // Every request failing names the first term; a whole-phrase query keeps today's text.
+    work.failSearchFor = null;
+    work.failStatus = 503;
+    expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q })).text).toMatch(/^keyword search for "reporting": sync server error \(HTTP 503\)/);
+    expect((await callTool(semanticEnv(), "semantic_search", { graph: "work", q: "stock" })).text).toMatch(/^sync server error \(HTTP 503\)/);
+  });
+
+  it("the warehouse question finds its target through both legs", async () => {
+    const page = work.addPage("Warehouse reporting");
+    work.addBlock(page, "Dashboards");
+    work.addBlock(page, "Reports");
+    const target = work.addBlock(page, "Stock on hand dashboard for the Northwind warehouse, refreshed nightly");
+    work.addBlock(page, "Sales by region report, sent to the team every Monday");
+    work.addBlock(page, "Reorder levels reviewed each quarter");
+    await runUntilReady();
+    const hits = await search("stock level reporting dashboard", { limit: 5 });
+    const found = hits.find((h) => h.uuid === target);
+    expect(found).toBeDefined();
+    expect(found!["keyword-rank"]).not.toBeNull();
+    expect([...found!["found-by"]].sort()).toEqual(["keyword", "semantic"]);
+    expect(hits[0].uuid).toBe(target);
   });
 });
 

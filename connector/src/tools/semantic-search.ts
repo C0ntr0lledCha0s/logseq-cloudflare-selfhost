@@ -4,11 +4,19 @@ import {
   DIMENSIONS,
   EMBEDDING_MODEL,
   KEYWORD_LIMIT,
+  KEYWORD_TERM_LIMIT,
+  RANKED_QUERY_WORDS,
   SEMANTIC_TOP_K,
   type SemanticBindings,
 } from "../semantic/config";
 import { BindingError } from "../semantic/indexer";
-import { demoteShortBlocks } from "../semantic/ranking";
+import {
+  type KeywordResult,
+  contentWords,
+  demoteShortBlocks,
+  distinctiveTerms,
+  mergeKeywordLists,
+} from "../semantic/ranking";
 import { reciprocalRankFusion } from "../semantic/rrf";
 import type { SemanticStore, StoredBlock } from "../semantic/store";
 import type { OnSuccess } from "./readable";
@@ -17,7 +25,7 @@ import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
 export const SEMANTIC_HELP =
-  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more words, one- and two-word blocks rank lower by meaning (their similarity is reported unchanged). Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
+  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more words, one- and two-word blocks rank lower by meaning (their similarity is reported unchanged), and title search looks for its three longest words separately rather than the whole phrase, so put the distinctive word in the question. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
 
 /** One hybrid search hit. Keyword-only hits outside the index carry just their title and resource. */
 export interface SearchHit {
@@ -41,27 +49,43 @@ interface SemanticMatch {
   similarity: number;
 }
 
-interface KeywordResult {
-  uuid: string;
-  title: string;
-  resource: string;
-}
-
 export interface HybridSearchDeps {
   access: GraphAccess;
   store: SemanticStore;
   bindings: SemanticBindings;
 }
 
-async function keywordResults(access: GraphAccess, alias: string, graphId: string, pat: string, q: string) {
+async function searchGraph(access: GraphAccess, alias: string, graphId: string, pat: string, q: string, limit: number) {
   const response = await graphFetch(access, alias, pat, {
     method: "GET",
     path: `/api/v1/graphs/${encodeURIComponent(graphId)}/search`,
-    query: { q, types: "blocks,pages", limit: KEYWORD_LIMIT },
+    query: { q, types: "blocks,pages", limit },
   });
   const body = (await response.json()) as { results?: unknown };
   if (!Array.isArray(body.results)) throw new Error("searchGraph returned no results array");
   return body.results as KeywordResult[];
+}
+
+/**
+ * The keyword leg. A query of fewer than `RANKED_QUERY_WORDS` content words is searched as one
+ * phrase. A longer one is searched once per distinctive term, in parallel, and the lists merged; a
+ * failed term fails the call, naming the first failing term in term order.
+ */
+async function keywordResults(access: GraphAccess, alias: string, graphId: string, pat: string, q: string) {
+  if (contentWords(q).length < RANKED_QUERY_WORDS) return searchGraph(access, alias, graphId, pat, q, KEYWORD_LIMIT);
+  const terms = distinctiveTerms(q);
+  const settled = await Promise.allSettled(terms.map((t) => searchGraph(access, alias, graphId, pat, t, KEYWORD_TERM_LIMIT)));
+  const lists: KeywordResult[][] = [];
+  for (const [i, outcome] of settled.entries()) {
+    if (outcome.status === "fulfilled") {
+      lists.push(outcome.value);
+      continue;
+    }
+    const reason: unknown = outcome.reason;
+    const text = `keyword search for "${terms[i]}": ${reason instanceof Error ? reason.message : String(reason)}`;
+    throw reason instanceof ToolError ? new ToolError(text, reason.status) : new Error(text, { cause: reason });
+  }
+  return mergeKeywordLists(lists);
 }
 
 async function semanticMatches(bindings: SemanticBindings, graphId: string, q: string): Promise<SemanticMatch[]> {
@@ -75,8 +99,8 @@ async function semanticMatches(bindings: SemanticBindings, graphId: string, q: s
 }
 
 /**
- * `semantic_search`: nearest blocks by embedding, and `searchGraph` on the same query, merged by
- * reciprocal rank fusion. With `tag`, only indexed blocks carrying that tag (on themselves, an
+ * `semantic_search`: nearest blocks by embedding, and the keyword leg (`searchGraph` on the query, or
+ * on its distinctive terms), merged by reciprocal rank fusion. With `tag`, only indexed blocks carrying that tag (on themselves, an
  * ancestor or their page) are kept, from both sides. With `min_similarity`, semantic hits whose raw
  * similarity is below it are dropped after the deleted-row and tag filters, and counted.
  */
@@ -159,7 +183,7 @@ export function registerSemanticTools(
     "semantic_search",
     {
       description:
-        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). For a query of three or more words, one- and two-word blocks rank lower by meaning; similarity stays raw. min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed.",
+        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). For a query of three or more words, one- and two-word blocks rank lower by meaning (similarity stays raw), and the title search runs once for each of its three longest words, ranking titles that match more of them first; a shorter query is title-searched as one phrase. min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed.",
       inputSchema: z.object({
         graph,
         q: z.string().min(1).max(500).describe("What to look for, in plain words"),

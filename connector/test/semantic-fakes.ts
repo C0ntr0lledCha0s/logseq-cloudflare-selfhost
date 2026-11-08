@@ -173,6 +173,10 @@ export class FakeGraph {
   e2ee = false;
   /** When set, every request to this graph answers this status. */
   failStatus: number | null = null;
+  /** When set, only a search whose q equals this term (or one of these terms) answers 500, after any delay. */
+  failSearchFor: string | readonly string[] | null = null;
+  /** Milliseconds a search for this q waits before it answers, so a test can order answers in time. */
+  searchDelays = new Map<string, number>();
   pages = new Map<string, FakePage>();
   blocks = new Map<string, FakeBlock>();
   log: { t: number; uuids: string[] }[] = [];
@@ -334,7 +338,16 @@ export function fakeSync(graphs: FakeGraph[]): Fetcher {
         return Response.json({ error: "forbidden" }, { status: 403 });
       }
       if (graph.failStatus !== null) return Response.json({ error: "failing" }, { status: graph.failStatus });
-      return match[2] === "search" ? graph.search(url) : graph.feed(url);
+      if (match[2] !== "search") return graph.feed(url);
+      const q = url.searchParams.get("q") ?? "";
+      const delay = graph.searchDelays.get(q);
+      if (delay !== undefined) await new Promise((resolve) => setTimeout(resolve, delay));
+      const failing = graph.failSearchFor;
+      if (failing !== null && (typeof failing === "string" ? failing === q : failing.includes(q))) {
+        graph.searchRequests.push(url);
+        return Response.json({ error: `search for ${q} failed` }, { status: 500 });
+      }
+      return graph.search(url);
     },
   } as unknown as Fetcher;
 }

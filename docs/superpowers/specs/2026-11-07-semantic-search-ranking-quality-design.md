@@ -269,6 +269,8 @@ To be filled in by the build:
 | Offline, current fixture, HEAD `c0e0fd4` | 0.20 | 0.20 | 1.00 | 0.88 |
 | Offline, extended fixture (12 questions), before: ranking code of `86cb347` | 0.17 | 0.17 | 1.00 | 0.85 |
 | Offline, extended fixture, after Stage 4 (short-block rule) | 0.17 | 0.17 | 1.00 | 0.90 (0.896) |
-| Offline, extended fixture, after | | | | |
+| Offline, extended fixture, after Stage 5 (distinctive-term keyword leg) | 0.17 | 0.17 | 1.00 | 0.90 (0.896) |
 | Live, before | | | | |
 | Live, after | | | | |
+
+After Stage 5 every question keeps the rank it had after Stage 4, so the floor stays at MRR 0.89 (0.90 would sit above the measured 0.896). The keyword columns measure `searchGraph` on the whole phrase, which this design does not change. The keyword leg now contributes to the multi-word questions: for "stock level reporting dashboard" the target is found by both legs (`semantic.test.ts`, "the warehouse question finds its target through both legs").

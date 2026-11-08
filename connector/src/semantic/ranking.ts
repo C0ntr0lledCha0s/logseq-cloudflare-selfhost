@@ -1,7 +1,7 @@
 // Query terms for semantic search's ranking (design 2026-11-07, sections 3.2, 3.3 and 3.6). Pure
 // functions, no I/O. The stopword list is shared with the test embedder, so changing it changes the
 // offline eval's baseline.
-import { KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
+import { KEYWORD_LIMIT, KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
 
 /** Words too common to say what a query is about. `test/semantic-fakes.ts` imports this list. */
 export const STOPWORDS: ReadonlySet<string> = new Set(
@@ -60,4 +60,37 @@ export function demoteShortBlocks<T extends { uuid: string; similarity: number }
     return { hit, order: short ? hit.similarity * SHORT_BLOCK_WEIGHT : hit.similarity };
   });
   return weighted.sort((a, b) => b.order - a.order).map((w) => w.hit);
+}
+
+/** One `searchGraph` result, as the keyword leg uses it. */
+export interface KeywordResult {
+  uuid: string;
+  title: string;
+  resource: string;
+}
+
+/**
+ * The term searches' lists merged into one keyword list: uuids in more lists first, then by best
+ * single rank, then by first appearance across the lists in term order. A uuid repeated within one
+ * list counts once. Capped at `KEYWORD_LIMIT`, so the D1 bind list never grows past one search's.
+ */
+export function mergeKeywordLists(lists: KeywordResult[][]): KeywordResult[] {
+  const merged = new Map<string, { result: KeywordResult; lists: number; best: number; at: number }>();
+  lists.forEach((list, l) => {
+    const seen = new Set<string>();
+    list.forEach((result, i) => {
+      if (seen.has(result.uuid)) return;
+      seen.add(result.uuid);
+      const entry = merged.get(result.uuid);
+      if (entry === undefined) merged.set(result.uuid, { result, lists: 1, best: i, at: merged.size });
+      else {
+        entry.lists += 1;
+        entry.best = Math.min(entry.best, i);
+      }
+    });
+  });
+  return [...merged.values()]
+    .sort((a, b) => b.lists - a.lists || a.best - b.best || a.at - b.at)
+    .slice(0, KEYWORD_LIMIT)
+    .map((e) => e.result);
 }
