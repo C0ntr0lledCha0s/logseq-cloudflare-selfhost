@@ -1,6 +1,7 @@
 // Test doubles for semantic search: a deterministic embedder, an in-memory Vectorize index, and a
 // sync server that serves listBlockChanges and searchGraph over an in-memory graph with the same
-// contract as patches/0014 (full listing by UUID, changes since t, epochs, 410, 409).
+// contract as patches/0014 (full listing by UUID, changes since t, epochs, 410, 409), and getBlocks
+// view=signals as patches/0035 answers it.
 import { DIMENSIONS, type Embedder, type VectorIndex } from "../src/semantic/config";
 import { STOPWORDS } from "../src/semantic/ranking";
 
@@ -145,10 +146,20 @@ export class FakeVectorIndex implements VectorIndex {
   }
 }
 
+/** What getBlocks view=signals reports for a block or page (patch 0035). Ages are days before the request. */
+export interface FakeSignals {
+  ageDays?: number | null;
+  referenceCount?: number;
+  status?: string | null;
+  /** Property ident to value titles. */
+  properties?: Record<string, string[]>;
+}
+
 interface FakePage {
   uuid: string;
   title: string;
   tags: string[];
+  signals?: FakeSignals;
 }
 
 interface FakeBlock {
@@ -157,6 +168,7 @@ interface FakeBlock {
   parentId: string | null;
   text: string;
   tags: string[];
+  signals?: FakeSignals;
 }
 
 let uuidCounter = 0;
@@ -182,6 +194,12 @@ export class FakeGraph {
   log: { t: number; uuids: string[] }[] = [];
   feedRequests: URL[] = [];
   searchRequests: URL[] = [];
+  /** Every getBlocks view=signals request, failed ones included. */
+  signalsRequests: URL[] = [];
+  /** When set, a signals request answers this status. */
+  failSignals: number | null = null;
+  /** Property idents the graph declares besides those in some block's or page's signals. */
+  properties = new Set<string>();
 
   constructor(
     readonly graphId: string,
@@ -205,11 +223,18 @@ export class FakeGraph {
     return uuid;
   }
 
-  addBlock(pageId: string, text: string, opts: { parent?: string; tags?: string[]; uuid?: string } = {}): string {
+  addBlock(pageId: string, text: string, opts: { parent?: string; tags?: string[]; uuid?: string; signals?: FakeSignals } = {}): string {
     const uuid = opts.uuid ?? nextUuid();
-    this.blocks.set(uuid, { uuid, pageId, parentId: opts.parent ?? null, text, tags: opts.tags ?? [] });
+    this.blocks.set(uuid, { uuid, pageId, parentId: opts.parent ?? null, text, tags: opts.tags ?? [], signals: opts.signals });
     this.record([uuid]);
     return uuid;
+  }
+
+  /** Sets a block's or page's signals; not a content change, so the change list is untouched. */
+  setSignals(uuid: string, signals: FakeSignals): void {
+    const entity = this.blocks.get(uuid) ?? this.pages.get(uuid);
+    if (!entity) throw new Error(`no block or page ${uuid}`);
+    entity.signals = signals;
   }
 
   edit(uuid: string, text: string): void {
@@ -307,6 +332,57 @@ export class FakeGraph {
     });
   }
 
+  /** Whether some block or page carries this property, or the graph declares it. */
+  private declares(ident: string): boolean {
+    if (this.properties.has(ident)) return true;
+    return [...this.pages.values(), ...this.blocks.values()].some((e) => e.signals?.properties?.[ident] !== undefined);
+  }
+
+  private propertyValues(entity: FakeBlock | FakePage, ident: string): string[] {
+    const own = entity.signals?.properties?.[ident];
+    if (own && own.length > 0) return own;
+    const page = "pageId" in entity ? this.pages.get(entity.pageId) : undefined;
+    const inherited = page?.signals?.properties?.[ident];
+    return inherited && inherited.length > 0 ? inherited : [];
+  }
+
+  /**
+   * getBlocks view=signals (patch 0035): up to 100 UUIDs, no duplicates, unknown ones under missing;
+   * per entity only uuid, updated-at (now minus ageDays, or null), reference-count (stops at 1000),
+   * status and property-values (null without property; else the block's, else its page's, else []).
+   */
+  signals(url: URL): Response {
+    this.signalsRequests.push(url);
+    if (this.failSignals !== null) return Response.json({ error: "signals failing" }, { status: this.failSignals });
+    const raw = url.searchParams.get("ids") ?? "";
+    const ids = raw.split(",").map((id) => id.trim());
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const bad = (error: string) => Response.json({ error }, { status: 400 });
+    if (raw.trim() === "" || !ids.every((id) => uuid.test(id))) return bad("ids must be a comma-separated list of UUIDs");
+    if (ids.length > 100) return bad("at most 100 ids");
+    if (new Set(ids.map((id) => id.toLowerCase())).size !== ids.length) return bad("duplicate id");
+    const property = url.searchParams.get("property");
+    if (property !== null && !this.declares(property)) return bad(`property not found: ${property}`);
+    const now = Date.now();
+    const found = ids.flatMap((id) => {
+      const entity = this.blocks.get(id) ?? this.pages.get(id);
+      return entity ? [entity] : [];
+    });
+    return Response.json({
+      blocks: found.map((entity) => {
+        const s = entity.signals ?? {};
+        return {
+          uuid: entity.uuid,
+          "updated-at": s.ageDays === undefined || s.ageDays === null ? null : now - s.ageDays * 86_400_000,
+          "reference-count": Math.min(1000, s.referenceCount ?? 0),
+          status: s.status ?? null,
+          "property-values": property === null ? null : this.propertyValues(entity, property),
+        };
+      }),
+      missing: ids.filter((id) => !this.blocks.has(id) && !this.pages.has(id)),
+    });
+  }
+
   /** searchGraph: the whole query as a case-insensitive substring of a title; exact match, then pages, then blocks. */
   search(url: URL): Response {
     this.searchRequests.push(url);
@@ -329,15 +405,18 @@ export function fakeSync(graphs: FakeGraph[]): Fetcher {
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const url = new URL(request.url);
-      const match = /^\/api\/v1\/graphs\/([^/]+)\/(block-changes|search)$/.exec(url.pathname);
+      const match = /^\/api\/v1\/graphs\/([^/]+)\/(block-changes|search|blocks)$/.exec(url.pathname);
       const graph = match && graphs.find((g) => g.graphId === decodeURIComponent(match[1]));
-      if (!match || !graph || request.method !== "GET") {
+      // getBlocks is served for view=signals only, so a summary or outline call is a test bug.
+      const unserved = match?.[2] === "blocks" && url.searchParams.get("view") !== "signals";
+      if (!match || !graph || request.method !== "GET" || unserved) {
         return Response.json({ error: `unexpected sync call ${request.method} ${url.pathname}` }, { status: 599 });
       }
       if (request.headers.get("Authorization") !== `Bearer ${graph.token}`) {
         return Response.json({ error: "forbidden" }, { status: 403 });
       }
       if (graph.failStatus !== null) return Response.json({ error: "failing" }, { status: graph.failStatus });
+      if (match[2] === "blocks") return graph.signals(url);
       if (match[2] !== "search") return graph.feed(url);
       const q = url.searchParams.get("q") ?? "";
       const delay = graph.searchDelays.get(q);

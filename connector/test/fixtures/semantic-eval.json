@@ -1,5 +1,5 @@
 {
-  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. A question's top is the rank its first expected block must reach (default 5). baseline is the ranking before the 2026-11-07 ranking changes; floor is the least hybrid recall@5 and MRR the eval accepts, raised by each ranking change. The five \"Notes for ... later\" pages are decoy titles that each hold one word of a question; adding them lowered the floor's MRR from 0.89 to 0.85 (the holiday question's decoy is also its nearest block by meaning), and the original pages alone still give 0.90. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
+  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. A question's top is the rank its first expected block must reach (default 5). baseline is the ranking before the 2026-11-07 ranking changes; floor is the least hybrid recall@5 and MRR the eval accepts, raised by each ranking change. The five \"Notes for ... later\" pages are decoy titles that each hold one word of a question; adding them lowered the floor's MRR from 0.89 to 0.85 (the holiday question's decoy is also its nearest block by meaning), and the original pages alone still give 0.90. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11). memory holds the stale-against-current cases of design 2026-11-08 section 3.7: near-duplicate pairs that only recency, references, a done status or a demoted tag can order. A block or page carries its ranking signals as getBlocks view=signals reports them (age-days counts back from each request, so ages never drift), and a memory question carries the options semantic_search is sent with from Stage 4 of that plan. memory.baseline is its relevance-mode numbers before any ranking code; memory.floor is the least the eval accepts.",
   "pages": [
     {
       "title": "Car",
@@ -76,7 +76,38 @@
     { "title": "Fitness plan", "blocks": [{ "key": "note-fitness", "text": "Notes for fitness later" }] },
     { "title": "Carpooling", "blocks": [{ "key": "note-carpool", "text": "Notes for carpooling later" }] },
     { "title": "Holiday budget ideas", "blocks": [{ "key": "note-holiday", "text": "Notes for holiday later" }] },
-    { "title": "Kids birthday", "blocks": [{ "key": "note-birthday", "text": "Notes for birthday later" }] }
+    { "title": "Kids birthday", "blocks": [{ "key": "note-birthday", "text": "Notes for birthday later" }] },
+    {
+      "title": "Price list",
+      "blocks": [
+        { "key": "pricing-v1", "text": "Starter tier v1: $12 a month", "signals": { "age-days": 400, "reference-count": 0 } },
+        { "key": "pricing-v2", "text": "Starter tier v2: $15 a month", "signals": { "age-days": 10, "reference-count": 3 } }
+      ]
+    },
+    {
+      "title": "Domain renewals",
+      "blocks": [
+        { "key": "domain-done", "text": "Renew the domain name", "signals": { "age-days": 3, "status": "done" } },
+        { "key": "domain-open", "text": "Renew the domain name before it lapses", "signals": { "age-days": 2, "status": "todo" } }
+      ]
+    },
+    {
+      "title": "Office move plan (archived)",
+      "tags": ["Archives"],
+      "signals": { "age-days": 600 },
+      "blocks": [{ "key": "office-archived", "text": "Plan: move to the Queen Street office in April", "signals": { "age-days": 600 } }]
+    },
+    {
+      "title": "Office move plan (current)",
+      "signals": { "age-days": 20 },
+      "blocks": [{ "key": "office-current", "text": "Move to the Queen Street office in June", "signals": { "age-days": 20, "reference-count": 1 } }]
+    },
+    {
+      "title": "Decisions",
+      "blocks": [
+        { "key": "old-decision", "text": "We decided to keep the books in Xero rather than switch to MYOB", "signals": { "age-days": 730 } }
+      ]
+    }
   ],
   "questions": [
     { "q": "When is the car's warrant of fitness due?", "expected": ["wof"], "top": 1 },
@@ -94,5 +125,15 @@
   ],
   "private": ["therapy", "therapy-detail", "bank", "wifi"],
   "baseline": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } },
-  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } }
+  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } },
+  "memory": {
+    "questions": [
+      { "q": "What is the starter tier price?", "expected": ["pricing-v2"], "top": 1, "rank": "memory" },
+      { "q": "Do I still need to renew the domain name?", "expected": ["domain-open"], "top": 1, "rank": "memory" },
+      { "q": "What is the plan for the office move?", "expected": ["office-current"], "top": 1, "rank": "memory", "demote_tags": ["Archives"] },
+      { "q": "Which accounting software did we choose?", "expected": ["old-decision"], "top": 5, "rank": "memory" }
+    ],
+    "baseline": { "keyword": { "recall": 0.0, "mrr": 0.0 }, "hybrid": { "recall": 1.0, "mrr": 0.58 } },
+    "floor": { "keyword": { "recall": 0.0, "mrr": 0.0 }, "hybrid": { "recall": 1.0, "mrr": 0.58 } }
+  }
 }

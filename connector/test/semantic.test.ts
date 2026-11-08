@@ -23,7 +23,7 @@ import { STOPWORDS, contentWords, distinctiveTerms, mergeKeywordLists, phraseFir
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
-import { CraftedEmbedder, FakeEmbedder, FakeGraph, FakeVectorIndex, axis, fakeEmbed, fakeSync, unitAt } from "./semantic-fakes";
+import { CraftedEmbedder, FakeEmbedder, FakeGraph, FakeVectorIndex, axis, fakeEmbed, fakeSync, nextUuid, unitAt } from "./semantic-fakes";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_ID = "11111111-1111-1111-1111-111111111111";
@@ -1134,4 +1134,123 @@ it("fake embeddings put synonyms near each other", () => {
   const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0);
   expect(dot(fakeEmbed("car service"), fakeEmbed("vehicle servicing"))).toBeGreaterThan(0.9);
   expect(dot(fakeEmbed("car service"), fakeEmbed("birthday cake"))).toBe(0);
+});
+
+// The fake's getBlocks view=signals must answer as patch 0035 does, or Stage 4's tests prove nothing.
+describe("fake signals view", () => {
+  const DAY = 86_400_000;
+  const STATUS = "user.property/project-status";
+
+  async function signals(ids: string[], query = "&view=signals", graph: FakeGraph = work) {
+    const path = `/api/v1/graphs/${encodeURIComponent(graph.graphId)}/blocks?ids=${ids.join(",")}${query}`;
+    const res = await fakeSync([work, home]).fetch(`https://sync.internal${path}`, { headers: { Authorization: `Bearer ${graph.token}` } });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  }
+
+  it("answers found ids in request order with only the five fields, and unknown ids under missing", async () => {
+    const page = work.addPage("Pricing");
+    const v1 = work.addBlock(page, "Pricing v1", { signals: { ageDays: 400, referenceCount: 0 } });
+    const v2 = work.addBlock(page, "Pricing v2", { signals: { ageDays: 10, referenceCount: 3, status: "todo" } });
+    const bare = work.addBlock(page, "No signals");
+    work.setSignals(page, { ageDays: null, referenceCount: 7 });
+    const unknown = nextUuid();
+    const before = Date.now();
+    const { status, body } = await signals([v2, unknown, page, v1, bare]);
+    const after = Date.now();
+    expect(status).toBe(200);
+    expect(body.missing).toEqual([unknown]);
+    expect(body.blocks.map((b: { uuid: string }) => b.uuid)).toEqual([v2, page, v1, bare]);
+    for (const b of body.blocks) expect(Object.keys(b).sort()).toEqual(["property-values", "reference-count", "status", "updated-at", "uuid"]);
+    const [two, onPage, one, none] = body.blocks;
+    expect(two["updated-at"]).toBeGreaterThanOrEqual(before - 10 * DAY);
+    expect(two["updated-at"]).toBeLessThanOrEqual(after - 10 * DAY);
+    expect(one["updated-at"]).toBeLessThanOrEqual(after - 400 * DAY);
+    expect(one["updated-at"]).toBeGreaterThanOrEqual(before - 400 * DAY);
+    expect([two["reference-count"], two.status]).toEqual([3, "todo"]);
+    expect(onPage).toEqual({ uuid: page, "updated-at": null, "reference-count": 7, status: null, "property-values": null });
+    expect(none).toEqual({ uuid: bare, "updated-at": null, "reference-count": 0, status: null, "property-values": null });
+    // Reversed and swapped orders come back in the order asked.
+    expect((await signals([bare, v1, page, v2])).body.blocks.map((b: { uuid: string }) => b.uuid)).toEqual([bare, v1, page, v2]);
+    expect((await signals([v1, v2])).body.blocks.map((b: { uuid: string }) => b.uuid)).toEqual([v1, v2]);
+  });
+
+  it("caps reference-count at 1000", async () => {
+    const page = work.addPage("Tags");
+    const ids = [999, 1000, 1001, 5000].map((n) => work.addBlock(page, `refs ${n}`, { signals: { referenceCount: n } }));
+    const { status, body } = await signals(ids);
+    expect(status).toBe(200);
+    expect(body.blocks.map((b: Record<string, number>) => b["reference-count"])).toEqual([999, 1000, 1000, 1000]);
+  });
+
+  it("takes at most 100 ids, refuses a duplicate or a malformed id", async () => {
+    const hundred = Array.from({ length: 100 }, () => nextUuid());
+    const ok = await signals(hundred);
+    expect(ok.status).toBe(200);
+    expect(ok.body.missing).toHaveLength(100);
+    expect(await signals([...hundred, nextUuid()])).toEqual({ status: 400, body: { error: "at most 100 ids" } });
+    const id = nextUuid();
+    expect(await signals([id, id.toUpperCase()])).toEqual({ status: 400, body: { error: "duplicate id" } });
+    expect(await signals(["not-a-uuid"])).toEqual({ status: 400, body: { error: "ids must be a comma-separated list of UUIDs" } });
+    expect(await signals([])).toEqual({ status: 400, body: { error: "ids must be a comma-separated list of UUIDs" } });
+  });
+
+  it("reads property values from the block, else its page, else []", async () => {
+    const office = work.addPage("Office move plan");
+    work.setSignals(office, { properties: { [STATUS]: ["Archived"] } });
+    const inherits = work.addBlock(office, "Move in March");
+    const sibling = work.addBlock(office, "Move in June", { signals: { properties: { [STATUS]: ["Active"] } } });
+    const emptyOwn = work.addBlock(office, "Empty own list", { signals: { properties: { [STATUS]: [] } } });
+    const plain = work.addPage("Plain");
+    const bare = work.addBlock(plain, "Nothing anywhere", { signals: { properties: { "user.property/other": ["x"] } } });
+    const { status, body } = await signals([inherits, sibling, emptyOwn, office, bare, plain], `&view=signals&property=${encodeURIComponent(STATUS)}`);
+    expect(status).toBe(200);
+    expect(body.blocks.map((b: Record<string, unknown>) => b["property-values"])).toEqual([
+      ["Archived"], ["Active"], ["Archived"], ["Archived"], [], [],
+    ]);
+  });
+
+  it("gives property-values null for every entry without property", async () => {
+    const page = work.addPage("Office");
+    work.setSignals(page, { properties: { [STATUS]: ["Archived"] } });
+    const block = work.addBlock(page, "Move", { signals: { properties: { [STATUS]: ["Active"] } } });
+    const { status, body } = await signals([block, page]);
+    expect(status).toBe(200);
+    expect(body.blocks.map((b: Record<string, unknown>) => b["property-values"])).toEqual([null, null]);
+  });
+
+  it("answers 400 property not found for an ident nothing declares, and [] for one only declared", async () => {
+    const page = work.addPage("Office");
+    const block = work.addBlock(page, "Move", { signals: { properties: { [STATUS]: ["Active"] } } });
+    expect(await signals([block], "&view=signals&property=user.property/x")).toEqual({
+      status: 400, body: { error: "property not found: user.property/x" },
+    });
+    // Declared on another graph only: still not found here.
+    home.properties.add("user.property/home-only");
+    expect((await signals([block], "&view=signals&property=user.property/home-only")).status).toBe(400);
+    // Declared with no values anywhere, or declared by a page's own map: found.
+    work.properties.add("user.property/declared");
+    expect((await signals([block], "&view=signals&property=user.property/declared")).body.blocks[0]["property-values"]).toEqual([]);
+    const other = work.addPage("Other");
+    work.setSignals(other, { properties: { "user.property/on-page": ["Yes"] } });
+    expect((await signals([block], "&view=signals&property=user.property/on-page")).body.blocks[0]["property-values"]).toEqual([]);
+  });
+
+  it("answers 599 for any other view, so an accidental call fails loudly", async () => {
+    const block = work.addBlock(work.addPage("P"), "B");
+    for (const query of ["", "&view=summary", "&view=outline", "&view=signal"]) {
+      expect((await signals([block], query)).status, query).toBe(599);
+    }
+    expect(work.signalsRequests).toHaveLength(0);
+  });
+
+  it("records each signals request, and failSignals answers that status", async () => {
+    const block = work.addBlock(work.addPage("P"), "B");
+    await signals([block]);
+    work.failSignals = 500;
+    expect((await signals([block])).status).toBe(500);
+    expect(work.signalsRequests.map((u) => u.searchParams.get("ids"))).toEqual([block, block]);
+    expect(home.signalsRequests).toHaveLength(0);
+    // Other routes are unaffected by failSignals.
+    expect((await fakeSync([work]).fetch(`https://sync.internal/api/v1/graphs/${WORK_ID}/search?q=B`, { headers: { Authorization: `Bearer ${WORK_TOKEN}` } })).status).toBe(200);
+  });
 });

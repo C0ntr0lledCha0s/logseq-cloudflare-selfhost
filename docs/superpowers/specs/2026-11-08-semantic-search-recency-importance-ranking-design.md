@@ -178,6 +178,7 @@ The tool is read-only, so there is no dry run or read-back to add. Its "no silen
   - One "old decision" question in memory mode whose only answer is 2 years old, to show the floor keeps it in the top 5.
 - Each case is run in both modes. The report prints recall@5 and MRR per mode. Relevance mode on the old questions must equal the recorded `baseline` (proof the default is untouched). Memory mode gets its own `baseline` (Stage 1 numbers, before the ranking code) and `floor` (after).
 - Stage 1 records the relevance-mode numbers on the extended fixture before any ranking code changes, and quotes in the PR that the stale-against-current cases fail their `top` in relevance mode.
+- As built (plan Stage 2): ages are `age-days`, which the fake turns into `updated-at` against each request's `Date.now()`, in place of a fixed `now`. The pricing pair sits on a page titled "Price list" with texts "Starter tier v1: $12 a month" and "Starter tier v2: $15 a month", because a page or block containing "pricing" is a keyword hit for the old question "What did we decide about pricing?" and would move the old baseline (with the wording above, the old hybrid MRR drops from 0.85 to 0.81). The office pair sits on pages "Office move plan (archived)" (tagged `Archives`) and "Office move plan (current)"; the archived block reads "Plan: move to the Queen Street office in April", so relevance mode ranks it above the current "Move to the Queen Street office in June" rather than tying. The old decision reads "We decided to keep the books in Xero rather than switch to MYOB" (730 days). In relevance mode the current twin ranks 3rd (pricing) and 2nd (domain, office); the old decision ranks 1st.
 
 ### 3.8 Contract text
 
@@ -300,7 +301,7 @@ To be filled in by the build:
 | Run | Mode | Hybrid recall@5 | Hybrid MRR |
 |---|---|---|---|
 | Offline, current fixture, HEAD `21ee74d` | relevance | 1.00 | 0.85 |
-| Offline, extended fixture, before ranking code | relevance | | |
+| Offline, extended fixture, before ranking code (Stage 2) | relevance | old 12: 1.00; memory 4: 1.00 | old 12: 0.85; memory 4: 0.58 |
 | Offline, extended fixture, after | relevance | | |
 | Offline, extended fixture, after | memory | | |
 | Live, after | relevance and memory | | |

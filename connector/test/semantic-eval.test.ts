@@ -4,6 +4,10 @@
 // this checks the pipeline and the fusion, not the quality of the real model.
 // The fixture's floor is the least hybrid recall@5 and MRR accepted; a ranking change raises it to its
 // new numbers and never lowers it silently. A question's top is the rank its first expected block must reach.
+// The old questions' numbers must equal the recorded baseline exactly: proof the default order is untouched.
+// The memory questions (design 2026-11-08 section 3.7) are stale-against-current pairs with their own
+// baseline (relevance mode, before any ranking code) and floor. Until Stage 4 of that plan they are sent
+// in relevance mode, without their rank options, and their top test is expected to fail.
 // Run: npx vitest run test/semantic-eval.test.ts --silent=false --disableConsoleIntercept   (prints the table)
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -20,11 +24,27 @@ const GRAPH_ID = "44444444-4444-4444-4444-444444444444";
 const TOKEN = "logseq_pat_EvalToken000";
 const K = 5;
 
+/** A block's or page's ranking signals, as getBlocks view=signals reports them. */
+interface FixtureSignals {
+  "age-days"?: number | null;
+  "reference-count"?: number;
+  status?: string | null;
+  properties?: Record<string, string[]>;
+}
+
 interface FixtureBlock {
   key: string;
   text: string;
   tags?: string[];
+  signals?: FixtureSignals;
   children?: FixtureBlock[];
+}
+
+interface FixturePage {
+  title: string;
+  tags?: string[];
+  signals?: FixtureSignals;
+  blocks: FixtureBlock[];
 }
 
 interface Question {
@@ -32,6 +52,11 @@ interface Question {
   expected: string[];
   /** The rank the first expected block must reach; defaults to K. */
   top?: number;
+  /** semantic_search's ranking options; sent from Stage 4 of the 2026-11-08 plan. */
+  rank?: "relevance" | "memory";
+  demote_tags?: string[];
+  demote_property?: { property: string; values: string[] };
+  half_life_days?: number;
 }
 
 interface Measures {
@@ -40,16 +65,24 @@ interface Measures {
 }
 
 const questions = fixture.questions as Question[];
+const baseline = fixture.baseline as Measures;
 const floor = fixture.floor as Measures;
+const memoryQuestions = fixture.memory.questions as Question[];
+const memoryBaseline = fixture.memory.baseline as Measures;
+const memoryFloor = fixture.memory.floor as Measures;
 
 const graph = new FakeGraph(GRAPH_ID, TOKEN);
 const embedder = new FakeEmbedder();
 const index = new FakeVectorIndex();
 const keyToUuid = new Map<string, string>();
 
+function signalsOf(s: FixtureSignals | undefined) {
+  return s && { ageDays: s["age-days"], referenceCount: s["reference-count"], status: s.status, properties: s.properties };
+}
+
 function addBlocks(pageId: string, blocks: FixtureBlock[], parent?: string): void {
   for (const block of blocks) {
-    const uuid = graph.addBlock(pageId, block.text, { parent, tags: block.tags ?? [] });
+    const uuid = graph.addBlock(pageId, block.text, { parent, tags: block.tags ?? [], signals: signalsOf(block.signals) });
     keyToUuid.set(block.key, uuid);
     addBlocks(pageId, block.children ?? [], uuid);
   }
@@ -119,7 +152,11 @@ describe("semantic search evaluation", () => {
     await new GraphStore(env.DB, env.GRAPH_TOKEN_KEY).add({
       alias: "eval", graphId: GRAPH_ID, graphName: "Eval", mode: "read", permission: "read", expiresAt: null, token: TOKEN,
     });
-    for (const page of fixture.pages) addBlocks(graph.addPage(page.title, page.tags ?? []), page.blocks as FixtureBlock[]);
+    for (const page of fixture.pages as FixturePage[]) {
+      const pageId = graph.addPage(page.title, page.tags ?? []);
+      if (page.signals) graph.setSignals(pageId, signalsOf(page.signals)!);
+      addBlocks(pageId, page.blocks);
+    }
     const deps = { env: evalEnv(), graphs: new GraphStore(env.DB, env.GRAPH_TOKEN_KEY), store: new SemanticStore(env.DB) };
     for (let i = 0; i < 5; i++) {
       await runIndexer({ ...deps, bindings: { embedder, index, maxVectors: 1000 } });
@@ -137,11 +174,9 @@ describe("semantic search evaluation", () => {
     keyword: Score;
     hybrid: Score;
   }
-  const rows: Row[] = [];
-  let summary: Measures;
-
-  beforeAll(async () => {
-    for (const { q, expected, top } of questions) {
+  async function measure(asked: Question[]): Promise<Row[]> {
+    const out: Row[] = [];
+    for (const { q, expected, top } of asked) {
       const expectedUuids = expected.map((key) => {
         const uuid = keyToUuid.get(key);
         if (!uuid) throw new Error(`fixture names an unknown block ${key}`);
@@ -149,7 +184,7 @@ describe("semantic search evaluation", () => {
       });
       const hits = await semanticSearch(q);
       const at = hits.findIndex((h) => expectedUuids.includes(h.uuid));
-      rows.push({
+      out.push({
         q,
         top: top ?? K,
         hits,
@@ -158,26 +193,68 @@ describe("semantic search evaluation", () => {
         hybrid: score(hits.map((h) => h.uuid), expectedUuids),
       });
     }
-    summary = {
-      keyword: { recall: mean(rows.map((r) => r.keyword.recall)), mrr: mean(rows.map((r) => r.keyword.reciprocalRank)) },
-      hybrid: { recall: mean(rows.map((r) => r.hybrid.recall)), mrr: mean(rows.map((r) => r.hybrid.reciprocalRank)) },
+    return out;
+  }
+
+  function summarise(of: Row[]): Measures {
+    return {
+      keyword: { recall: mean(of.map((r) => r.keyword.recall)), mrr: mean(of.map((r) => r.keyword.reciprocalRank)) },
+      hybrid: { recall: mean(of.map((r) => r.hybrid.recall)), mrr: mean(of.map((r) => r.hybrid.reciprocalRank)) },
     };
-    console.info(
-      [
-        `semantic eval: ${rows.length} questions, top ${K}`,
-        ...rows.map(
-          (r) =>
-            `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}  top hit: ${(r.hits[0]?.text ?? "(none)").slice(0, 40)} (similarity ${r.hits[0]?.similarity ?? "null"})`,
-        ),
-        `  mean keyword recall@${K}=${summary.keyword.recall.toFixed(2)} MRR=${summary.keyword.mrr.toFixed(2)}`,
-        `  mean hybrid  recall@${K}=${summary.hybrid.recall.toFixed(2)} MRR=${summary.hybrid.mrr.toFixed(2)}`,
-      ].join("\n"),
-    );
+  }
+
+  function table(title: string, of: Row[], m: Measures): string {
+    return [
+      `${title}: ${of.length} questions, top ${K}`,
+      ...of.map(
+        (r) =>
+          `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}  top hit: ${(r.hits[0]?.text ?? "(none)").slice(0, 40)} (similarity ${r.hits[0]?.similarity ?? "null"})`,
+      ),
+      `  mean keyword recall@${K}=${m.keyword.recall.toFixed(2)} MRR=${m.keyword.mrr.toFixed(2)}`,
+      `  mean hybrid  recall@${K}=${m.hybrid.recall.toFixed(2)} MRR=${m.hybrid.mrr.toFixed(2)}`,
+    ].join("\n");
+  }
+
+  let rows: Row[] = [];
+  let summary: Measures;
+  let memoryRows: Row[] = [];
+  let memorySummary: Measures;
+
+  beforeAll(async () => {
+    rows = await measure(questions);
+    summary = summarise(rows);
+    memoryRows = await measure(memoryQuestions);
+    memorySummary = summarise(memoryRows);
+    console.info([table("semantic eval", rows, summary), table("semantic eval, memory questions (relevance mode)", memoryRows, memorySummary)].join("\n"));
+  });
+
+  const twoDp = (m: Measures) => ({
+    keyword: { recall: m.keyword.recall.toFixed(2), mrr: m.keyword.mrr.toFixed(2) },
+    hybrid: { recall: m.hybrid.recall.toFixed(2), mrr: m.hybrid.mrr.toFixed(2) },
+  });
+
+  it("the old questions' relevance-mode numbers equal the recorded baseline exactly", () => {
+    expect(twoDp(summary)).toEqual(twoDp(baseline));
+  });
+
+  it("the memory questions' relevance-mode numbers equal their recorded baseline and meet their floor", () => {
+    expect(twoDp(memorySummary)).toEqual(twoDp(memoryBaseline));
+    expect(memorySummary.hybrid.recall).toBeGreaterThanOrEqual(memoryFloor.hybrid.recall);
+    expect(memorySummary.hybrid.mrr).toBeGreaterThanOrEqual(memoryFloor.hybrid.mrr);
+  });
+
+  // Known to fail until Stage 4 of the 2026-11-08 plan: relevance mode puts each stale, done or
+  // archived twin above its current one (pricing v1 rank 1, v2 rank 3; the done domain task above the
+  // open one; the archived office plan above the current one). Stage 4 sends each question's rank
+  // options and turns this back into it(...).
+  it.fails("each memory question's first expected block reaches its top rank", () => {
+    const missed = memoryRows.filter((r) => r.rank === null || r.rank > r.top);
+    expect(missed.map((r) => `${r.q} rank ${r.rank ?? "none"}, top ${r.top}, rank 1 "${r.hits[0]?.text}"`)).toEqual([]);
   });
 
   it("hybrid beats keyword-only on recall@5 and MRR, and never surfaces a private block by meaning", () => {
     const privateUuids = new Set(fixture.private.map((key) => keyToUuid.get(key)));
-    for (const r of rows) {
+    for (const r of [...rows, ...memoryRows]) {
       for (const hit of r.hits) {
         if (hit["found-by"].includes("semantic")) expect(privateUuids.has(hit.uuid), r.q).toBe(false);
       }
@@ -203,7 +280,7 @@ describe("semantic search evaluation", () => {
   // The short-block rule (design 2026-11-07 section 3.2). Before it, "Dashboards" was rank 1 for
   // "stock level reporting dashboard".
   it("no block of 2 words or fewer is rank 1 for a question of 3 or more content words", () => {
-    const ranked = rows.filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
+    const ranked = [...rows, ...memoryRows].filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
     expect(ranked.length).toBeGreaterThan(0);
     for (const r of ranked) {
       const first = r.hits[0];
