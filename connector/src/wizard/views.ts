@@ -1,4 +1,4 @@
-import { MAX_EXPIRY_DAYS, type ServiceTokenRow, type TokenScope } from "../auth/service-tokens";
+import { MAX_EXPIRY_DAYS, type ServiceTokenAccess, type ServiceTokenRow, type TokenScope } from "../auth/service-tokens";
 import { EXPIRY_WARN_DAYS, type GraphRecord, daysUntilExpiry } from "../graphs";
 import { escapeHtml, htmlPage } from "../html";
 
@@ -273,6 +273,24 @@ function utc(ms: number): string {
   return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
 }
 
+/** The tag the token list shows for each access, and the level an added graph gains on the confirm page. */
+const ACCESS_TAG: Record<ServiceTokenAccess, string> = {
+  read: "read-only",
+  "write-no-delete": "read-write, no deletes",
+  write: "read-write",
+};
+
+/** The three access radios in rank order, shared by the create and edit forms. */
+function accessFields(access: string): string {
+  return `<fieldset><legend>What the token may do</legend>
+  <div class="choices">
+  ${choice("access", "read", access, "Read only", "Search and read pages and blocks.", true)}
+  ${choice("access", "write-no-delete", access, "Read and write, no deletes", "Also create and change pages, blocks and properties on graphs connected read-write, but never delete. A dry run is allowed.")}
+  ${choice("access", "write", access, "Read and write", "Also write to graphs connected read-write, deletes included.")}
+  </div>
+  </fieldset>`;
+}
+
 function tokenStatus(token: ServiceTokenRow, now: number): "active" | "expired" | "revoked" {
   if (token.revokedAt !== null) return "revoked";
   return token.expiresAt <= now ? "expired" : "active";
@@ -287,7 +305,7 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
       return alias === undefined ? `<span class="warning">${escapeHtml(id)} (not connected)</span>` : escapeHtml(alias);
     })
     .join(", ");
-  const write = token.access === "write";
+  const write = token.access !== "read";
   // Only an active token can be edited or revoked; the edit routes refuse the others with 409 anyway.
   const actions =
     status === "active"
@@ -299,7 +317,7 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
       : "";
   const ended = status === "revoked" ? ` on ${utc(token.revokedAt!)}` : "";
   return `<section class="block" id="token-${name}">
-<div class="block-title"><h2>${name}</h2><span class="tag${write ? " write" : ""}">${write ? "read-write" : "read-only"}</span></div>
+<div class="block-title"><h2>${name}</h2><span class="tag${write ? " write" : ""}">${ACCESS_TAG[token.access]}</span></div>
 <div class="children">
 <dl class="props">
   <dt>Status</dt><dd>${status}${ended}</dd>
@@ -360,12 +378,7 @@ ${errorBox(error)}
   ${boxes}
   <small>A token's access never exceeds a graph's own mode.</small>
   </fieldset>
-  <fieldset><legend>What the token may do</legend>
-  <div class="choices">
-  ${choice("access", "read", values.access, "Read only", "Search and read pages and blocks.", true)}
-  ${choice("access", "write", values.access, "Read and write", "Also write to graphs connected read-write.")}
-  </div>
-  </fieldset>
+  ${accessFields(values.access)}
   <label class="field"><span>Expires after (days)</span>
   <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}" required>
   <small>1 to ${MAX_EXPIRY_DAYS} days.</small></label>
@@ -424,22 +437,29 @@ ${errorBox(error)}
   ${gone}
   <small>A token's access never exceeds a graph's own mode.</small>
   </fieldset>
-  <fieldset><legend>What the token may do</legend>
-  <div class="choices">
-  ${choice("access", "read", values.access, "Read only", "Search and read pages and blocks.", true)}
-  ${choice("access", "write", values.access, "Read and write", "Also write to graphs connected read-write.")}
-  </div>
-  </fieldset>
+  ${accessFields(values.access)}
   <label class="field"><span>Shorten expiry to N days from now</span>
   <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}">
   <small>Expires ${utc(token.expiresAt)}. Days count from when this page was opened (${utc(drawn.openedAt)}). Leave blank to keep it. An expiry can only be shortened.</small></label>
-  <p class="hint">Removing graphs, read-only and a shorter expiry apply at once, from the token's next request. Adding a graph or raising to read-write first shows what the token gains, and applies only when you confirm.</p>
+  <p class="hint">Removing graphs, lowering access and a shorter expiry apply at once, from the token's next request. Adding a graph or raising access (to read-write without deletes, or to read-write) first shows what the token gains, and applies only when you confirm.</p>
   <p class="hint">If the token changes in another tab or window after this page was opened, saving is refused; reload and edit again.</p>
   <p class="hint">Editing does not change the token. If it may have leaked, revoke it and issue a new one.</p>
   <div class="actions"><button>Save changes</button><a class="button quiet" href="/tokens">Cancel</a></div>
 </form>`,
   );
 }
+
+/** What a kept graph gains on a raise in access, and loses on a lowering, keyed `before>after`. */
+const RAISED: Record<string, string | undefined> = {
+  "read>write-no-delete": "write, no deletes",
+  "write-no-delete>write": "deletes",
+  "read>write": "read-write",
+};
+const LOWERED: Record<string, string | undefined> = {
+  "write>write-no-delete": "deletes",
+  "write-no-delete>read": "write",
+  "write>read": "read-write",
+};
 
 /**
  * The widening confirm (spec 2026-11-08 §3.5 step 4): what `after` gains and loses against the stored
@@ -462,20 +482,22 @@ export function tokenEditConfirmPage(
     const graph = byId.get(id);
     return graph ? escapeHtml(graph.alias) : `${escapeHtml(id)} (not connected)`;
   };
-  // A graph's own mode still caps the token (scopedResolve), so say what a read-write gain really gives.
+  // A graph's own mode still caps the token (scopedResolve), so say what a write gain really gives.
   const effective = (id: string) =>
-    after.access === "write" && byId.get(id)?.mode === "read" ? `; <em>effective: read only (the graph is read-only)</em>` : "";
+    after.access !== "read" && byId.get(id)?.mode === "read" ? `; <em>effective: read only (the graph is read-only)</em>` : "";
   const had = new Set(token.graphIds);
   const has = new Set(after.graphIds);
   const kept = after.graphIds.filter((id) => had.has(id));
-  const level = after.access === "write" ? "read-write" : "read-only";
+  const move = `${token.access}>${after.access}`;
+  const raised = RAISED[move];
+  const lowered = LOWERED[move];
   const gains = [
-    ...after.graphIds.filter((id) => !had.has(id)).map((id) => `gains ${level} on ${label(id)}${effective(id)}`),
-    ...(token.access === "read" && after.access === "write" ? kept.map((id) => `gains read-write on ${label(id)}${effective(id)}`) : []),
+    ...after.graphIds.filter((id) => !had.has(id)).map((id) => `gains ${ACCESS_TAG[after.access]} on ${label(id)}${effective(id)}`),
+    ...(raised === undefined ? [] : kept.map((id) => `gains ${raised} on ${label(id)}${effective(id)}`)),
   ];
   const losses = [
     ...token.graphIds.filter((id) => !has.has(id)).map((id) => `loses access to ${label(id)}`),
-    ...(token.access === "write" && after.access === "read" ? kept.map((id) => `loses read-write on ${label(id)}`) : []),
+    ...(lowered === undefined ? [] : kept.map((id) => `loses ${lowered} on ${label(id)}`)),
     ...(after.expiresAt < token.expiresAt ? [`expiry shortened to ${utc(after.expiresAt)}`] : []),
   ];
   const items = (lines: string[]) => lines.map((line) => `<li>${line}</li>`).join("");

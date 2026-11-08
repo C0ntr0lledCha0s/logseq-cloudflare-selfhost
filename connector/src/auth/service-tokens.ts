@@ -32,9 +32,9 @@ export function rank(access: ServiceTokenAccess): number {
 /**
  * The access values a token may authenticate with: every MODE_RANK key. Anything else, a value
  * written past the CHECK included, is refused, so an unknown access fails closed rather than acting
- * as write.
+ * as write. The wizard's forms accept the same values.
  */
-function acceptedAccess(access: unknown): access is ServiceTokenAccess {
+export function acceptedAccess(access: unknown): access is ServiceTokenAccess {
   return typeof access === "string" && Object.hasOwn(MODE_RANK, access);
 }
 
