@@ -1816,6 +1816,24 @@ describe("service tokens", () => {
       );
     });
 
+    it("at exactly its expires_at a token is expired for the edit GET and POST, as for verification and the list, and editable a millisecond before", async () => {
+      const h = await twoGraphs();
+      const T = Date.now() + 60_000; // inside the session's lifetime, so the clock can stand at expires_at
+      const t = await stored("ci", { graphIds: [A, B], access: "write", expiresAt: T });
+      const before = await snap();
+      const message = `Service token 'ci' expired on ${day(T)}; it cannot be edited. Issue a new token.`;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        await refused(await h.page(`/tokens/${t.id}/edit`), 409, message, before, "GET at expires_at");
+        await refused(await edit(h, t.id, { access: "read" }, [A]), 409, message, before, "POST at expires_at");
+        clock.mockReturnValue(T - 1);
+        expect((await h.page(`/tokens/${t.id}/edit`)).res.status, "GET 1 ms before").toBe(200);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await snap()).toEqual(before);
+    });
+
     it("a guard miss (the row changed between the load and the UPDATE) answers 409 saying why, and writes nothing", async () => {
       const cases: [string, string, (id: string) => string][] = [
         ["UPDATE service_tokens SET access = 'read' WHERE id = ?", "changed", () => "Service token 'ci' changed since you opened this page; reload and edit again."],
