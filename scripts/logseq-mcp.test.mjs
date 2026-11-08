@@ -486,6 +486,70 @@ test("usage errors exit 2, name LOGSEQ_SERVICE_TOKEN and send nothing", async ()
   }
 });
 
+test("LOGSEQ_TOKEN_FROM_PROXY=1 with no token calls the tool with no Authorization header, for the proxy to add", async () => {
+  // A cloud environment can hold the token as a network secret: its proxy adds the bearer to
+  // requests for the connector's host, so the session never sees the token.
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "work (read-write)")));
+  try {
+    const out = await run(["list_graphs"], {
+      LOGSEQ_TOKEN_FROM_PROXY: "1",
+      NODE_USE_ENV_PROXY: "1",
+      LOGSEQ_MCP_URL: s.url,
+    });
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(out.stdout, "work (read-write)\n");
+    assert.deepEqual(
+      s.requests.map((r) => r.rpc.method),
+      ["initialize", "notifications/initialized", "tools/call"],
+    );
+    for (const r of s.requests) assert.equal(r.headers.authorization, undefined, `${r.rpc.method} sent an Authorization header`);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a token in LOGSEQ_SERVICE_TOKEN is still sent when LOGSEQ_TOKEN_FROM_PROXY=1", async () => {
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "ok")));
+  try {
+    const out = await run(["list_graphs"], {
+      LOGSEQ_SERVICE_TOKEN: TOKEN,
+      LOGSEQ_TOKEN_FROM_PROXY: "1",
+      LOGSEQ_MCP_URL: s.url,
+    });
+    assert.equal(out.status, 0, out.stderr);
+    for (const r of s.requests) assert.equal(r.headers.authorization, `Bearer ${TOKEN}`);
+    assertNoToken(out, "token and proxy flag");
+  } finally {
+    await s.close();
+  }
+});
+
+test("LOGSEQ_TOKEN_FROM_PROXY=1 without NODE_USE_ENV_PROXY=1 exits 2 naming it and sends nothing", async () => {
+  // Node's fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY=1, so the request would bypass the
+  // proxy that adds the token. Values other than "1" do not turn proxy mode on.
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "sent")));
+  try {
+    const cases = [
+      { label: "no NODE_USE_ENV_PROXY", env: { LOGSEQ_TOKEN_FROM_PROXY: "1" }, expect: /NODE_USE_ENV_PROXY=1/ },
+      {
+        label: "NODE_USE_ENV_PROXY=0",
+        env: { LOGSEQ_TOKEN_FROM_PROXY: "1", NODE_USE_ENV_PROXY: "0" },
+        expect: /NODE_USE_ENV_PROXY=1/,
+      },
+      { label: "flag not 1", env: { LOGSEQ_TOKEN_FROM_PROXY: "true", NODE_USE_ENV_PROXY: "1" }, expect: /LOGSEQ_TOKEN_FROM_PROXY=1/ },
+    ];
+    for (const c of cases) {
+      const out = await run(["list_graphs"], { LOGSEQ_MCP_URL: s.url, ...c.env });
+      assert.equal(out.status, 2, `${c.label}: ${out.stderr}`);
+      assert.match(out.stderr, c.expect, c.label);
+      assert.equal(out.stdout, "", c.label);
+    }
+    assert.equal(s.requests.length, 0, "no request was sent");
+  } finally {
+    await s.close();
+  }
+});
+
 test("redact replaces every occurrence of the token and any other token-shaped value", async () => {
   const { redact } = await import("./logseq-mcp.mjs");
   const other = "lsct_" + "z".repeat(43);

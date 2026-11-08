@@ -4,7 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { GraphStore } from "../src/graphs";
 import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
-import { KB_INDEX_MAX_AGE_MS, type KbIndexEntry, kbGroup } from "../src/tools/kb-index";
+import {
+  KB_INDEX_MAX_AGE_MS,
+  KB_INDEX_VERSION,
+  type KbIndexEntry,
+  type KbTitlesRecord,
+  freshTitles,
+  kbGroup,
+  loadTitles,
+} from "../src/tools/kb-index";
+import type { GraphAccess } from "../src/tools/semantic";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_ID = "11111111-1111-1111-1111-111111111111";
@@ -37,6 +46,7 @@ function entry(
   classes: string[],
   refs: number,
   summary?: string,
+  aliases?: string[],
 ): KbIndexEntry {
   return {
     uuid: `00000000-0000-0000-0000-${String(title.length).padStart(12, "0")}`,
@@ -46,18 +56,20 @@ function entry(
     "reference-count": refs,
     "updated-at": DAY,
     ...(summary === undefined ? {} : { summary }),
+    // An entry built without aliases has no key at all, like an answer from a server before patch 0036.
+    ...(aliases === undefined ? {} : { aliases }),
   };
 }
 
 const PAGES: KbIndexEntry[] = [
-  entry("Acme", ["Company"], ["Company", "Organization"], 30, "A client."),
-  entry("Health", ["Area"], ["Area"], 3, "Keeping fit."),
-  entry("Jane Doe", ["BusinessPerson"], ["BusinessPerson", "Person"], 8, "Account lead at Acme."),
-  entry("Kickoff", ["Business Meeting"], ["Business Meeting", "Event"], 2, "First meeting."),
+  entry("Acme", ["Company"], ["Company", "Organization"], 30, "A client.", ["ACME Ltd", "Acme Corp"]),
+  entry("Health", ["Area"], ["Area"], 3, "Keeping fit.", []),
+  entry("Jane Doe", ["BusinessPerson"], ["BusinessPerson", "Person"], 8, "Account lead at Acme.", ["JD"]),
+  entry("Kickoff", ["Business Meeting"], ["Business Meeting", "Event"], 2, "First meeting.", []),
   entry("Loose note", [], [], 0),
-  entry("Roadmap", ["Project"], ["Project"], 12, "Plan for [[Acme]]."),
-  entry("Side project", ["Project"], ["Project"], 1, "x".repeat(400)),
-  entry("Style guide", ["Article"], ["Article", "CreativeWork"], 1, "How we write."),
+  entry("Roadmap", ["Project"], ["Project"], 12, "Plan for [[Acme]].", []),
+  entry("Side project", ["Project"], ["Project"], 1, "x".repeat(400), []),
+  entry("Style guide", ["Article"], ["Article", "CreativeWork"], 1, "How we write.", []),
 ];
 
 /** Serves PAGES in pages of three, like the sync server's listKnowledgeIndex. */
@@ -202,6 +214,40 @@ describe("kb_index", () => {
     expect(headings).toEqual(["## Project", "## Organization", "## Person", "## Area", "## Resource", "## Other"]);
   });
 
+  it("renders the same text as before the cache carried aliases", async () => {
+    // Pasted from what the tool rendered for this fixture before version 2 (stage 3 of the
+    // suggest-links plan): aliases are cached for suggest_links but never shown by kb_index.
+    const result = await callTool("kb_index", { graph: "work" });
+    expect(result.text.replace(/built \S+Z/, "built <T>")).toBe(
+      [
+        "Knowledge index of graph 'work': 8 pages, built <T> (just now). It is rebuilt hourly and when pages are created, renamed or deleted through this connector; pass refresh: true to rebuild it now. Journals, built-in pages and pages tagged private are left out. Read a page with get_page_outline using the UUID in parentheses.",
+        "",
+        "## Project (2)",
+        `- Roadmap [Project] — 12 refs, updated 2026-11-01 — Plan for [[Acme]]. (${PAGES[5].uuid})`,
+        `- Side project [Project] — 1 ref, updated 2026-11-01 — ${"x".repeat(239)}… (${PAGES[6].uuid})`,
+        "",
+        "## Organization (1)",
+        `- Acme [Company] — 30 refs, updated 2026-11-01 — A client. (${PAGES[0].uuid})`,
+        "",
+        "## Person (1)",
+        `- Jane Doe [BusinessPerson] — 8 refs, updated 2026-11-01 — Account lead at Acme. (${PAGES[2].uuid})`,
+        "",
+        "## Area (1)",
+        `- Health [Area] — 3 refs, updated 2026-11-01 — Keeping fit. (${PAGES[1].uuid})`,
+        "",
+        "## Resource (1)",
+        `- Style guide [Article] — 1 ref, updated 2026-11-01 — How we write. (${PAGES[7].uuid})`,
+        "",
+        "## Other (2)",
+        `- Kickoff [Business Meeting] — 2 refs, updated 2026-11-01 — First meeting. (${PAGES[3].uuid})`,
+        `- Loose note — 0 refs, updated 2026-11-01 (${PAGES[4].uuid})`,
+      ].join("\n"),
+    );
+    // The cached render is the same text.
+    const cached = await callTool("kb_index", { graph: "work" });
+    expect(cached.text.replace(/built \S+Z \([^)]*\)/, "")).toBe(result.text.replace(/built \S+Z \([^)]*\)/, ""));
+  });
+
   it("serves later calls from the KV cache until a page is created, renamed or deleted", async () => {
     await callTool("kb_index", { graph: "work" });
     syncRequests = [];
@@ -335,6 +381,179 @@ describe("kb_index", () => {
   });
 });
 
+function access(e: Env = testEnv()): GraphAccess {
+  return { env: e, resolve: (alias) => store().resolve(alias) };
+}
+
+async function kvJson<T>(key: string): Promise<T | null> {
+  return JSON.parse((await env.KB_INDEX_KV.get(key)) ?? "null") as T | null;
+}
+
+/** The titles key PAGES give: uuid, title and aliases per page, `[]` where the server sent none. */
+const TITLES = PAGES.map((p) => [p.uuid, p.title, p.aliases ?? []]);
+
+describe("titles key", () => {
+  it("a rebuild writes the record and the titles key, both version 2 with the same builtAt", async () => {
+    await callTool("kb_index", { graph: "work" });
+    const record = await kvJson<{ graphId: string; builtAt: number; version: number }>("kb-index:work");
+    const titles = await kvJson<KbTitlesRecord>("kb-index-titles:work");
+    expect(record?.version).toBe(KB_INDEX_VERSION);
+    expect(KB_INDEX_VERSION).toBe(2);
+    expect(titles).toEqual({ graphId: WORK_ID, builtAt: record?.builtAt, version: 2, pages: TITLES });
+    // "Loose note" came without an aliases key (a server before patch 0036): the titles key says [].
+    expect(titles?.pages[4]).toEqual([PAGES[4].uuid, "Loose note", []]);
+    // A rebuild on refresh rewrites both, again with one builtAt.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await callTool("kb_index", { graph: "work", refresh: true });
+    const record2 = await kvJson<{ builtAt: number }>("kb-index:work");
+    const titles2 = await kvJson<KbTitlesRecord>("kb-index-titles:work");
+    expect(record2!.builtAt).toBeGreaterThan(record!.builtAt);
+    expect(titles2?.builtAt).toBe(record2?.builtAt);
+  });
+
+  it("a record cached before version 2 rebuilds on first use", async () => {
+    await callTool("kb_index", { graph: "work" });
+    const key = "kb-index:work";
+    const { version: _version, ...record } = (await kvJson<Record<string, unknown>>(key))!;
+    for (const old of [record, { ...record, version: 1 }]) {
+      await env.KB_INDEX_KV.put(key, JSON.stringify({ ...old, builtAt: Date.now() }));
+      syncRequests = [];
+      await callTool("kb_index", { graph: "work" });
+      expect(syncRequests).toHaveLength(3);
+      expect((await kvJson<{ version: number }>(key))?.version).toBe(2);
+    }
+    // A version-2 record is served from the cache.
+    syncRequests = [];
+    await callTool("kb_index", { graph: "work" });
+    expect(syncRequests).toHaveLength(0);
+  });
+
+  describe("freshTitles", () => {
+    const key = "kb-index-titles:work";
+    const now = Date.UTC(2026, 10, 8, 12);
+    const stored = (over: Record<string, unknown> = {}) =>
+      env.KB_INDEX_KV.put(key, JSON.stringify({ graphId: WORK_ID, builtAt: now - 1000, version: 2, pages: TITLES, ...over }));
+
+    it("serves a clean, young key for the same graph with no sync call", async () => {
+      await stored();
+      // A dirty mark from before the build does not make it stale; nor does an age of exactly the maximum.
+      await env.KB_INDEX_KV.put("kb-index-dirty:work", String(now - 1001));
+      expect((await freshTitles(access(), "work", now))?.pages).toEqual(TITLES);
+      expect(await freshTitles(access(), "work", now - 1000 + KB_INDEX_MAX_AGE_MS)).not.toBeNull();
+      expect(syncRequests).toHaveLength(0);
+    });
+
+    it("returns null for a key that is missing", async () => {
+      expect(await freshTitles(access(), "work", now)).toBeNull();
+    });
+
+    it("returns null for a key built for another graph", async () => {
+      await stored({ graphId: NOTES_ID });
+      expect(await freshTitles(access(), "work", now)).toBeNull();
+    });
+
+    it("returns null for a key without version 2", async () => {
+      await stored({ version: undefined });
+      expect(await freshTitles(access(), "work", now)).toBeNull();
+      await stored({ version: 1 });
+      expect(await freshTitles(access(), "work", now)).toBeNull();
+    });
+
+    it("returns null for a key older than the maximum age", async () => {
+      await stored();
+      expect(await freshTitles(access(), "work", now - 1000 + KB_INDEX_MAX_AGE_MS + 1)).toBeNull();
+    });
+
+    it("returns null for a key marked dirty at or after its builtAt", async () => {
+      await stored();
+      for (const at of [now - 1000, now - 500]) {
+        await env.KB_INDEX_KV.put("kb-index-dirty:work", String(at));
+        expect(await freshTitles(access(), "work", now)).toBeNull();
+      }
+    });
+  });
+
+  describe("loadTitles", () => {
+    it("serves a fresh titles key without a rebuild", async () => {
+      await callTool("kb_index", { graph: "work" });
+      syncRequests = [];
+      const titles = await loadTitles(access(), "work", Date.now());
+      expect(titles.pages).toEqual(TITLES);
+      expect(syncRequests).toHaveLength(0);
+    });
+
+    it("rebuilds and rewrites both keys when the titles key is missing beside a fresh record", async () => {
+      await callTool("kb_index", { graph: "work" });
+      await env.KB_INDEX_KV.delete("kb-index-titles:work");
+      syncRequests = [];
+      const titles = await loadTitles(access(), "work", Date.now());
+      expect(syncRequests).toHaveLength(3);
+      expect(titles.pages).toEqual(TITLES);
+      const record = await kvJson<{ builtAt: number }>("kb-index:work");
+      expect(await kvJson<KbTitlesRecord>("kb-index-titles:work")).toEqual(titles);
+      expect(titles.builtAt).toBe(record?.builtAt);
+    });
+
+    it("rebuilds when the titles key is older than the record and stale by the shared rule", async () => {
+      await callTool("kb_index", { graph: "work" });
+      const record = (await kvJson<{ builtAt: number }>("kb-index:work"))!;
+      const titlesKey = "kb-index-titles:work";
+      const titles = (await kvJson<KbTitlesRecord>(titlesKey))!;
+      // A page changed after the titles were built and before the record was (a titles write that
+      // failed): the record is clean, the titles key is dirty.
+      for (const older of [
+        { builtAt: record.builtAt - 2000, dirtyAt: record.builtAt - 1000 },
+        // Or the titles key is past the maximum age while the record is young.
+        { builtAt: record.builtAt - KB_INDEX_MAX_AGE_MS - 60_000, dirtyAt: null },
+      ]) {
+        await env.KB_INDEX_KV.put(titlesKey, JSON.stringify({ ...titles, builtAt: older.builtAt, pages: [] }));
+        if (older.dirtyAt === null) await env.KB_INDEX_KV.delete("kb-index-dirty:work");
+        else await env.KB_INDEX_KV.put("kb-index-dirty:work", String(older.dirtyAt));
+        syncRequests = [];
+        const loaded = await loadTitles(access(), "work", Date.now());
+        expect(syncRequests).toHaveLength(3);
+        expect(loaded.pages).toEqual(TITLES);
+        const rebuilt = (await kvJson<{ builtAt: number }>("kb-index:work"))!;
+        expect((await kvJson<KbTitlesRecord>(titlesKey))?.builtAt).toBe(rebuilt.builtAt);
+        expect(rebuilt.builtAt).toBe(loaded.builtAt);
+      }
+    });
+
+    it("writes the titles key before the record, so a failed titles write leaves no newer record (r1-tests-2)", async () => {
+      await callTool("kb_index", { graph: "work" });
+      const old = (await kvJson<{ builtAt: number }>("kb-index:work"))!;
+      await env.KB_INDEX_KV.put("kb-index-dirty:work", String(Date.now()));
+      const kv = env.KB_INDEX_KV;
+      const order: string[] = [];
+      const failing = {
+        get: kv.get.bind(kv),
+        list: kv.list.bind(kv),
+        delete: kv.delete.bind(kv),
+        put: async (key: string, ...rest: unknown[]) => {
+          order.push(key);
+          if (key.startsWith("kb-index-titles:")) throw new Error("KV put failed: daily write limit");
+          return (kv.put as (...a: unknown[]) => Promise<void>)(key, ...rest);
+        },
+      } as unknown as KVNamespace;
+      await expect(loadTitles(access({ ...testEnv(), KB_INDEX_KV: failing } as Env), "work", Date.now())).rejects.toThrow(
+        "daily write limit",
+      );
+      expect(order).toEqual(["kb-index-titles:work"]);
+      expect((await kvJson<{ builtAt: number }>("kb-index:work"))?.builtAt).toBe(old.builtAt);
+    });
+
+    it("rebuilds when the titles key holds another graph", async () => {
+      await callTool("kb_index", { graph: "work" });
+      const titlesKey = "kb-index-titles:work";
+      await env.KB_INDEX_KV.put(titlesKey, JSON.stringify({ ...(await kvJson<KbTitlesRecord>(titlesKey)), graphId: NOTES_ID }));
+      syncRequests = [];
+      const loaded = await loadTitles(access(), "work", Date.now());
+      expect(syncRequests).toHaveLength(3);
+      expect(loaded.graphId).toBe(WORK_ID);
+    });
+  });
+});
+
 describe("cron", () => {
   it("rebuilds every graph's index, logs each, and fails after trying them all when one fails", async () => {
     syncHandler = (request) =>
@@ -352,6 +571,10 @@ describe("cron", () => {
     expect(record.graphId).toBe(WORK_ID);
     expect(record.pages).toHaveLength(8);
     expect(await env.KB_INDEX_KV.get("kb-index:notes")).toBeNull();
+    // The cron writes the titles key beside the record, with the same builtAt.
+    const titles = JSON.parse((await env.KB_INDEX_KV.get("kb-index-titles:work")) ?? "null");
+    expect(titles).toEqual({ graphId: WORK_ID, builtAt: record.builtAt, version: 2, pages: TITLES });
+    expect(await env.KB_INDEX_KV.get("kb-index-titles:notes")).toBeNull();
     const lines = logged().map((l) => l.replace(/ms=\d+/, "ms=N")).sort();
     expect(lines).toEqual([
       "kb-index graph=notes status=http-401 ms=N",

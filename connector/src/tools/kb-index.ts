@@ -12,6 +12,9 @@ import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.m
 // fixed buckets when it renders. The cache is rebuilt by the hourly cron (src/index.ts), when a
 // page is created, renamed or deleted through this connector, on `refresh: true`, and whenever it
 // is older than two cron periods (so a broken cron never serves an old index silently).
+// Every rebuild also writes a slim titles key beside the record, for suggest_links (design:
+// docs/superpowers/specs/2026-11-08-suggest-links-existing-pages-design.md, section 3.2). Both keys
+// come from one fetch, carry the same builtAt, and are judged by one freshness rule (`isFresh`).
 
 /** One page as the sync server's listKnowledgeIndex returns it. */
 export interface KbIndexEntry {
@@ -24,14 +27,31 @@ export interface KbIndexEntry {
   "reference-count": number;
   "created-at"?: number;
   "updated-at"?: number;
+  /** The titles of the page's aliases, sorted (patch 0036); absent from an older server's answer. */
+  aliases?: string[];
 }
 
+/** The cache format. A record or titles key without this version predates aliases and is rebuilt. */
+export const KB_INDEX_VERSION = 2;
+
 /** What KB_INDEX_KV holds for one alias. `graphId` guards against an alias re-pointed to another graph. */
-interface KbIndexRecord {
+export interface KbIndexRecord {
   graphId: string;
   /** Epoch ms when the build started; writes after it make the record dirty. */
   builtAt: number;
+  version: typeof KB_INDEX_VERSION;
   pages: KbIndexEntry[];
+}
+
+/** One knowledge-index page as suggest_links needs it: its UUID, title and alias titles. */
+export type KbTitlesPage = [uuid: string, title: string, aliases: string[]];
+
+/** The titles key: the record's pages cut to KbTitlesPage, with the record's graphId and builtAt. */
+export interface KbTitlesRecord {
+  graphId: string;
+  builtAt: number;
+  version: typeof KB_INDEX_VERSION;
+  pages: KbTitlesPage[];
 }
 
 /** Pages tagged with these classes (or a class extending one) never reach the index or its cache. */
@@ -58,6 +78,7 @@ const RECORD_TTL_S = 7 * 24 * 60 * 60;
 const DIRTY_TTL_S = 24 * 60 * 60;
 
 const recordKey = (alias: string) => `kb-index:${alias}`;
+const titlesKey = (alias: string) => `kb-index-titles:${alias}`;
 const dirtyKey = (alias: string) => `kb-index-dirty:${alias}`;
 
 /**
@@ -100,16 +121,36 @@ async function fetchIndex(access: GraphAccess, alias: string): Promise<KbIndexRe
     const body = (await response.json()) as { pages: KbIndexEntry[]; "next-cursor"?: string };
     pages.push(...body.pages);
     cursor = body["next-cursor"];
-    if (cursor === undefined) return { graphId: graph.graphId, builtAt, pages };
+    if (cursor === undefined) return { graphId: graph.graphId, builtAt, version: KB_INDEX_VERSION, pages };
   }
   throw new ToolError(`the knowledge index of '${alias}' has more than ${MAX_REQUESTS * PAGE_SIZE} pages`, "too-large");
 }
 
-/** Rebuilds and stores the index of `alias`. */
-export async function rebuildKbIndex(access: GraphAccess, alias: string): Promise<KbIndexRecord> {
+function titlesOf(record: KbIndexRecord): KbTitlesRecord {
+  return {
+    graphId: record.graphId,
+    builtAt: record.builtAt,
+    version: record.version,
+    pages: record.pages.map((p) => [p.uuid, p.title, p.aliases ?? []]),
+  };
+}
+
+/**
+ * Rebuilds and stores the index of `alias`: the titles key, then the record, both from one fetch
+ * with one builtAt. The titles key is written first, so a failed write never leaves a record newer
+ * than its titles.
+ */
+async function rebuild(access: GraphAccess, alias: string): Promise<{ record: KbIndexRecord; titles: KbTitlesRecord }> {
   const record = await fetchIndex(access, alias);
+  const titles = titlesOf(record);
+  await access.env.KB_INDEX_KV.put(titlesKey(alias), JSON.stringify(titles), { expirationTtl: RECORD_TTL_S });
   await access.env.KB_INDEX_KV.put(recordKey(alias), JSON.stringify(record), { expirationTtl: RECORD_TTL_S });
-  return record;
+  return { record, titles };
+}
+
+/** Rebuilds and stores the index of `alias` (the record and the titles key). */
+export async function rebuildKbIndex(access: GraphAccess, alias: string): Promise<KbIndexRecord> {
+  return (await rebuild(access, alias)).record;
 }
 
 /** Records that the pages of `alias` changed, so the next kb_index call rebuilds. */
@@ -117,20 +158,55 @@ export async function markKbIndexDirty(env: Env, alias: string): Promise<void> {
   await env.KB_INDEX_KV.put(dirtyKey(alias), String(Date.now()), { expirationTtl: DIRTY_TTL_S });
 }
 
-/** The cached index of `alias` if it is for the same graph, younger than the max age and clean. */
-async function freshRecord(access: GraphAccess, alias: string, now: number): Promise<KbIndexRecord | null> {
-  const graph = await resolveGraph(access, alias, false);
-  const [record, dirty] = await Promise.all([
-    access.env.KB_INDEX_KV.get<KbIndexRecord>(recordKey(alias), "json"),
-    access.env.KB_INDEX_KV.get(dirtyKey(alias)),
-  ]);
-  if (record === null || record.graphId !== graph.graphId) return null;
-  if (now - record.builtAt > KB_INDEX_MAX_AGE_MS) return null;
-  if (dirty !== null && Number(dirty) >= record.builtAt) return null;
-  return record;
+/**
+ * The one freshness rule for both keys: built for the same graph, in the current format, no older
+ * than the max age, and not marked dirty at or after its builtAt.
+ */
+function isFresh(
+  cached: { graphId: string; builtAt: number; version?: number } | null,
+  graphId: string,
+  dirty: string | null,
+  now: number,
+): boolean {
+  if (cached === null || cached.graphId !== graphId) return false;
+  if (cached.version !== KB_INDEX_VERSION) return false;
+  if (now - cached.builtAt > KB_INDEX_MAX_AGE_MS) return false;
+  if (dirty !== null && Number(dirty) >= cached.builtAt) return false;
+  return true;
 }
 
-function age(ms: number): string {
+/** The cached value under `key` if `isFresh` accepts it: 2 KV reads (the key and the dirty mark). */
+async function freshKey<T extends { graphId: string; builtAt: number; version?: number }>(
+  access: GraphAccess,
+  alias: string,
+  key: string,
+  now: number,
+): Promise<T | null> {
+  const graph = await resolveGraph(access, alias, false);
+  const [cached, dirty] = await Promise.all([
+    access.env.KB_INDEX_KV.get<T>(key, "json"),
+    access.env.KB_INDEX_KV.get(dirtyKey(alias)),
+  ]);
+  return isFresh(cached, graph.graphId, dirty, now) ? cached : null;
+}
+
+/** The cached index of `alias` if it is fresh. */
+function freshRecord(access: GraphAccess, alias: string, now: number): Promise<KbIndexRecord | null> {
+  return freshKey<KbIndexRecord>(access, alias, recordKey(alias), now);
+}
+
+/** The cached titles of `alias` if they are fresh, by the same rule as the record. */
+export function freshTitles(access: GraphAccess, alias: string, now: number): Promise<KbTitlesRecord | null> {
+  return freshKey<KbTitlesRecord>(access, alias, titlesKey(alias), now);
+}
+
+/** The titles of `alias`: the cached key if fresh, else from a rebuild that rewrites both keys. */
+export async function loadTitles(access: GraphAccess, alias: string, now: number): Promise<KbTitlesRecord> {
+  return (await freshTitles(access, alias, now)) ?? (await rebuild(access, alias)).titles;
+}
+
+/** How long ago, for a cache's age: "just now", "23 min ago", "2 h 5 min ago". */
+export function age(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes} min ago`;

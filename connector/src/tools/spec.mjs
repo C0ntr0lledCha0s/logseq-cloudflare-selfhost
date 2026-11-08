@@ -26,6 +26,7 @@ export const HANDWRITTEN_TOOLS = [
   "save_file_from_url",
   "semantic_index_status",
   "semantic_search",
+  "suggest_links",
 ];
 /** Hand-written tools registered only when semantic search is configured (src/semantic/config.ts). */
 export const SEMANTIC_TOOLS = ["semantic_index_status", "semantic_search"];
@@ -100,6 +101,7 @@ export const ANNOTATIONS = Object.freeze({
   search_graph: READ,
   semantic_index_status: READ,
   semantic_search: READ,
+  suggest_links: READ,
   set_block_property: DESTRUCTIVE_IDEMPOTENT,
   update_block: DESTRUCTIVE,
   update_page: DESTRUCTIVE,

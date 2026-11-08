@@ -1,0 +1,299 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+index d99a20c..7ed17ad 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+@@ -177,14 +177,18 @@
+   [db lineage page]
+   (distinct (mapcat lineage (page-tag-ids db page))))
+ 
++(defn excluded-page?
++  "True when the page is tagged with, or with a tag extending, a class whose title is in
++  `excluded-titles` (lower-case)."
++  [db lineage excluded-titles page]
++  (boolean (some #(contains? excluded-titles (string/lower-case (:block/title %)))
++                 (page-classes db lineage page))))
++
+ (defn knowledge-index-pages
+   "User pages for the knowledge index: none tagged with, or with a tag extending, a class whose
+   title is in `excluded-titles` (lower-case)."
+   [db lineage excluded-titles]
+-  (remove (fn [page]
+-            (some #(contains? excluded-titles (string/lower-case (:block/title %)))
+-                  (page-classes db lineage page)))
+-          (user-pages db)))
++  (remove #(excluded-page? db lineage excluded-titles %) (user-pages db)))
+ 
+ ;; Health checks
+ ;; =============
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 9b4d6b1..6214aeb 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -4432,10 +4432,22 @@
+                            (graph-insights/mismatched-choice-values db) limit cursor)
+               :items #(mapv mismatched-choice-response %)))))
+ 
+-(defn- knowledge-index-entry [db {:keys [ref-properties lineage prefix]} page]
++(defn- knowledge-index-aliases
++  "Titles of the page's :block/alias targets, sorted: none hidden or in the Recycle bin (itself or
++  through a parent), and none the index's exclude-tags would leave out. [] when there are none."
++  [db {:keys [lineage excluded]} page]
++  (->> (:block/alias page)
++       (remove entity-util/hidden?)
++       (remove #(graph-insights/excluded-page? db lineage excluded %))
++       (keep :block/title)
++       sort
++       vec))
++
++(defn- knowledge-index-entry [db {:keys [ref-properties lineage prefix] :as options} page]
+   (let [summary (graph-insights/page-summary db page prefix)]
+     (cond-> {:uuid (uuid-string (:block/uuid page))
+              :title (:block/title page)
++             :aliases (knowledge-index-aliases db options page)
+              :tags (mapv tag-response (graph-insights/page-tags db page))
+              :classes (mapv :block/title (graph-insights/page-classes db lineage page))
+              :reference-count (:total (graph-insights/page-usage db page ref-properties))
+@@ -4477,6 +4489,7 @@
+               lineage (graph-insights/class-lineage-fn db)
+               options {:ref-properties (graph-insights/ref-property-idents db)
+                        :lineage lineage
++                       :excluded excluded
+                        :prefix prefix}
+               {:keys [items next-cursor]} (paginate-by (partial title-key db)
+                                                        (graph-insights/knowledge-index-pages db lineage excluded)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 62add43..98c5ec5 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -130,7 +130,7 @@
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+    "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+-   "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
++   "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
+@@ -892,9 +892,11 @@
+                                      :properties {:checks {:type "object"
+                                                            :description "One result per check run, keyed by check name."
+                                                            :additionalProperties {:$ref "#/components/schemas/HealthCheckResult"}}}}
+-               :KnowledgeIndexEntry {:type "object" :required ["uuid" "title" "tags" "classes" "reference-count"]
++               :KnowledgeIndexEntry {:type "object" :required ["uuid" "title" "aliases" "tags" "classes" "reference-count"]
+                                      :properties {:uuid {:type "string"}
+                                                   :title {:type "string"}
++                                                  :aliases {:type "array" :items {:type "string"}
++                                                            :description "Titles of the page's visible alias pages, sorted; [] when it has none."}
+                                                   :tags {:type "array" :items {:$ref "#/components/schemas/TagResponse"}}
+                                                   :classes {:type "array" :items {:type "string"}
+                                                             :description "Titles of the page's tags, each followed by the classes it extends."}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_knowledge_index_aliases_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_knowledge_index_aliases_test.cljs
+new file mode 100644
+index 0000000..da4b542
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_knowledge_index_aliases_test.cljs
+@@ -0,0 +1,192 @@
++(ns logseq.db-sync.semantic-knowledge-index-aliases-test
++  "listKnowledgeIndex lists each entry's aliases: the titles of its visible :block/alias targets,
++  sorted, and [] when there are none. Run through the real handler on a real conn."
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.build :as sqlite-build]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(def sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
++
++(defn- select-sql? [sql]
++  (string/starts-with? (-> sql string/trim string/lower-case) "select"))
++
++(defn- with-memory-sql-async [f]
++  (let [db (new sqlite ":memory:" nil)
++        sql #js {:_db db
++                 :transaction (fn [f] ((.transaction db f)))
++                 :exec (fn [sql-str & args]
++                         (let [^js stmt (.prepare db sql-str)]
++                           (if (select-sql? sql-str)
++                             (.apply (.-all stmt) stmt (to-array args))
++                             (do (.apply (.-run stmt) stmt (to-array args)) nil))))
++                 :close (fn [] (.close db))}]
++    (-> (f sql)
++        (p/finally #(.close sql)))))
++
++(defn- index! [sql conn query]
++  (storage/init-schema! sql)
++  (let [self #js {:sql sql :conn conn :schema-ready true}
++        request (js/Request. (str "http://localhost/semantic/knowledge-index?graph-id=graph-1&limit=200" query)
++                             #js {:method "GET" :headers #js {"content-type" "application/json"}})]
++    (p/let [response (sync-handler/handle-http self request)
++            text (.text response)]
++      {:status (.-status response)
++       :body (js->clj (js/JSON.parse text) :keywordize-keys true)})))
++
++(def ^:private ids
++  (zipmap [:oi :oi-alias :ops :plain :journal-host :class-host :archive :hidden-parent :under-hidden
++           :hidden-alias :recycled-alias :recycled-host :recycled-target :secret :secret-alias
++           :public-host :project-page :property-host]
++          (repeatedly random-uuid)))
++
++(defn- page [k title & {:as extra}]
++  {:page (merge {:block/title title :block/uuid (get ids k) :build/keep-uuid? true} extra)})
++
++(defn- seeded-graph
++  "Operational Intelligence has aliases OI and Ops Intel (added in reverse order) and a hidden and a
++  recycled alias. Secret Plans is tagged Private and has alias Secret Alias; Public Host has Secret
++  Plans as an alias. Recycled Host, in the Recycle bin, aliases Recycled Target, which has OI too."
++  []
++  (let [conn (sqlite-export/create-conn)
++        {:keys [init-tx block-props-tx]}
++        (sqlite-build/build-blocks-tx
++         {:properties {:user.property/status-note {:logseq.property/type :default}}
++          :classes {:user.class/Project {}
++                    :user.class/Private {}}
++          :pages-and-blocks
++          [(page :oi "Operational Intelligence")
++           ;; Ops Intel is created before OI, so the entity ids' order is not the titles' order.
++           (page :ops "Ops Intel")
++           (page :oi-alias "OI")
++           (page :plain "Plain Page")
++           (page :journal-host "Journal Host")
++           (page :class-host "Class Host")
++           (page :property-host "Property Host")
++           (page :archive "Archive" :build/properties {:logseq.property/hide? true})
++           (page :under-hidden "Under Hidden")
++           (page :hidden-alias "Hidden Alias" :build/properties {:logseq.property/hide? true})
++           (page :recycled-alias "Recycled Alias")
++           (page :recycled-host "Recycled Host")
++           (page :recycled-target "Recycled Target")
++           (page :secret "Secret Plans" :build/tags [:user.class/Private])
++           (page :secret-alias "Secret Alias")
++           (page :public-host "Public Host")
++           (page :project-page "Roadmap" :build/tags [:user.class/Project])
++           {:page {:build/journal 20261104}}]})]
++    (d/transact! conn init-tx)
++    (d/transact! conn block-props-tx)
++    (let [db @conn
++          ref (fn [k] [:block/uuid (get ids k)])
++          journal (some (fn [datom]
++                          (let [e (d/entity db (:e datom))]
++                            (when (= 20261104 (:block/journal-day e)) (:db/id e))))
++                        (d/datoms db :avet :block/journal-day))
++          project-class (:db/id (d/entity db :user.class/Project))
++          property (:db/id (d/entity db :user.property/status-note))]
++      (d/transact! conn
++                   [;; Under Hidden sits under a hidden page; Recycled Alias and Recycled Host are in the
++                    ;; Recycle bin.
++                    [:db/add (ref :under-hidden) :block/parent (ref :archive)]
++                    [:db/add (ref :recycled-alias) :logseq.property/deleted-at 5]
++                    [:db/add (ref :recycled-host) :logseq.property/deleted-at 5]
++                    ;; Ops Intel first again, so the answer's order comes from the sort.
++                    [:db/add (ref :oi) :block/alias (ref :ops)]
++                    [:db/add (ref :oi) :block/alias (ref :oi-alias)]
++                    [:db/add (ref :oi) :block/alias (ref :hidden-alias)]
++                    [:db/add (ref :oi) :block/alias (ref :under-hidden)]
++                    [:db/add (ref :oi) :block/alias (ref :recycled-alias)]
++                    [:db/add (ref :recycled-host) :block/alias (ref :recycled-target)]
++                    [:db/add (ref :recycled-target) :block/alias (ref :plain)]
++                    [:db/add (ref :journal-host) :block/alias journal]
++                    [:db/add (ref :class-host) :block/alias project-class]
++                    [:db/add (ref :property-host) :block/alias property]
++                    [:db/add (ref :secret) :block/alias (ref :secret-alias)]
++                    [:db/add (ref :public-host) :block/alias (ref :secret)]]))
++    conn))
++
++(defn- by-title [response]
++  (into {} (map (juxt :title identity)) (get-in response [:body :pages])))
++
++(defn- run [done f]
++  (with-memory-sql-async
++    (fn [sql]
++      (-> (f sql (seeded-graph))
++          (p/catch (fn [error] (is false (str error))))
++          (p/finally done)))))
++
++(deftest lists-visible-aliases-sorted-test
++  (async done
++         (run done (fn [sql conn]
++                 (p/let [response (index! sql conn "&exclude-tags=private")
++                         pages (by-title response)]
++                   (is (= 200 (:status response)) (str (:body response)))
++                   (is (= ["OI" "Ops Intel"] (get-in pages ["Operational Intelligence" :aliases]))
++                       "visible alias titles, sorted")
++                   (is (= [] (get-in pages ["Plain Page" :aliases])) "a page with no aliases lists []")
++                   (is (every? #(vector? (:aliases %)) (get-in response [:body :pages]))
++                       "every entry carries the key")
++                   (is (= ["Project"] (get-in pages ["Class Host" :aliases])) "a class alias target is listed")
++                   (is (= ["status-note"] (get-in pages ["Property Host" :aliases])) "a property alias target is listed")
++                   (is (= 1 (count (get-in pages ["Journal Host" :aliases]))) "a journal alias target is listed")
++                   (is (string? (first (get-in pages ["Journal Host" :aliases])))))))))
++
++(deftest drops-hidden-and-recycled-alias-targets-test
++  (async done
++         (run done (fn [sql conn]
++                 (p/let [response (index! sql conn "")
++                         pages (by-title response)
++                         all-aliases (set (mapcat :aliases (get-in response [:body :pages])))]
++                   (is (not-any? all-aliases ["Hidden Alias" "Under Hidden" "Recycled Alias"])
++                       "hidden, under a hidden parent and recycled alias targets are left out")
++                   (is (not (contains? pages "Recycled Host")) "a recycled page is not an entry")
++                   (is (= ["Plain Page"] (get-in pages ["Recycled Target" :aliases]))
++                       "a page aliased by a recycled page still lists its own visible aliases"))))))
++
++(deftest alias-pages-are-entries-in-their-own-right-test
++  (async done
++         (run done (fn [sql conn]
++                 (p/let [response (index! sql conn "&exclude-tags=private")
++                         pages (by-title response)]
++                   (is (= [] (get-in pages ["OI" :aliases])) "the alias page is an entry, listing no aliases")
++                   (is (contains? pages "Ops Intel")))))))
++
++(deftest classes-and-properties-are-not-entries-test
++  (async done
++         (run done (fn [sql conn]
++                 (p/let [response (index! sql conn "")
++                         pages (by-title response)]
++                   (is (not (contains? pages "Project")) "a user class (tagged Tag) is not an entry")
++                   (is (not (contains? pages "Private")))
++                   (is (not (contains? pages "status-note")) "a user property is not an entry")
++                   (is (contains? pages "Roadmap") "a page tagged with a user class is an entry")
++                   (is (not-any? #(re-find #"^Nov|2026" %) (keys pages)) "journals are not entries"))))))
++
++(deftest exclude-tags-still-applies-test
++  (async done
++         (run done (fn [sql conn]
++                 (p/let [response (index! sql conn "&exclude-tags=private")
++                         pages (by-title response)
++                         unfiltered-response (index! sql conn "")
++                         unfiltered (by-title unfiltered-response)]
++                   (is (not (contains? pages "Secret Plans")) "a page tagged private is not an entry")
++                   (is (= [] (get-in pages ["Secret Alias" :aliases])) "its alias page does not mention it")
++                   (is (= [] (get-in pages ["Public Host" :aliases]))
++                       "a page tagged with an excluded tag is not listed as another page's alias")
++                   (is (not (contains? (set (mapcat :aliases (get-in response [:body :pages]))) "Secret Plans")))
++                   (is (= ["Secret Alias"] (get-in unfiltered ["Secret Plans" :aliases])) "without exclude-tags it is")
++                   (is (= ["Secret Plans"] (get-in unfiltered ["Public Host" :aliases]))))))))
++
++(deftest aliases-are-documented-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        operation (get-in document [:paths "/api/v1/graphs/{graph-id}/knowledge-index" :get])
++        entry (get-in document [:components :schemas :KnowledgeIndexEntry])]
++    (is (string/includes? (:description operation) "aliases"))
++    (is (some #{"aliases"} (:required entry)) "aliases is always present")
++    (is (= {:type "array" :items {:type "string"}} (select-keys (get-in entry [:properties :aliases]) [:type :items])))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 30042a7..aa3c8ec 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -27,6 +27,7 @@
+             [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]
+             [logseq.db-sync.semantic-signals-view-test]
++            [logseq.db-sync.semantic-knowledge-index-aliases-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

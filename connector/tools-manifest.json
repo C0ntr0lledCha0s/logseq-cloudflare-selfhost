@@ -517,6 +517,17 @@
     }
   },
   {
+    "name": "suggest_links",
+    "method": null,
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "update_block",
     "method": "PATCH",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",
