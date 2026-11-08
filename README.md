@@ -884,6 +884,7 @@ Claude addresses every graph by its alias, in each tool's `graph` argument.
 | `401` from `/mcp` with `service token 'x' was revoked`, `expired on YYYY-MM-DD` or `belongs to a previous owner` | The token was revoked at `/tokens`, passed its expiry, or was created under another `OWNER_GITHUB_USER_ID`. Create a new token (11.12) and replace the `LOGSEQ_SERVICE_TOKEN` secret. |
 | `401` from `/mcp` with `Invalid access token` and a service token | The secret isn't a token this connector issued: a typo, a truncated copy, or a token from another deployment. The connector gives no reason for an unknown token. Create a new one. |
 | `graph 'x' is read-only (service token 'y' is read-only)` | The token is read-only. Choose **Edit** beside it at `/tokens` and switch it to read and write (11.12); the wizard asks you to confirm, and the token string stays the same. The graph itself must also be connected read-write. |
+| `service token 'x' may not delete (write, no deletes): <tool> on graph 'y' …` | The token is `write-no-delete`, and the call deletes (a delete tool, `convert_values`, `choices.retire`, or an empty value). Nothing was sent to the sync server; the audit log shows the call as refused. Don't retry: run it with `dry-run=true` where the message offers one to see what it would delete, then delete it yourself in the app, through claude.ai, or from an interactive session on a `write` token. To let the token delete, choose **Edit** at `/tokens` and raise it to read and write, which asks you to confirm (11.12). |
 | `graph 'x' is outside service token 'y''s scope (it covers: …)` | The token wasn't given that graph. Choose **Edit** beside the token at `/tokens` (`/tokens/<id>/edit`) to add the graph: the wizard shows what the token gains and applies it only when you confirm. The token string stays the same. |
 | The `logseq-service` server shows as failed in a local Claude Code session | `.mcp.json` sends `Bearer ${LOGSEQ_SERVICE_TOKEN}`, and the variable is unset on your machine. Ignore it, or export a token. It does not affect the `Logseq` connector. |
 
@@ -944,7 +945,67 @@ A Claude Code cloud session or scheduled task has no browser, so it can't comple
    - **Owner only.** No MCP tool or bearer token can edit a token.
 7. **Revoke.** **Revoke** on the `/tokens` list stops a token at once. Revoked and expired tokens stay listed. To replace a token without editing it, create a new one, replace the secret, then revoke the old one.
 
-What a service token can't do: manage tokens, reach a graph outside its scope, or write when it is read-only. The wizard shows each token's graphs, access, expiry, last use and last change. Last use is updated at most once an hour per token.
+**The three access values.**
+
+| Access | In `list_graphs` | What it may do |
+|---|---|---|
+| `read` (read-only) | `read` | Read. Every write tool is refused before anything reaches the sync server. |
+| `write-no-delete` (read and write, no deletes) | `write-no-delete` | Read, create, insert, move and overwrite. Every call that deletes is refused before anything reaches the sync server, with no sync call, and logged with status `refused` (11.8 lists the calls and gives the message). A dry run is allowed where the operation declares one. An overwrite (new text, a new value, a new tag list) is not a delete: it runs, and the audit log's before-snapshot keeps what it replaced, so you can restore it. |
+| `write` (read and write) | `write` | Everything the graph's own mode allows, deletes included. Use it for the test graph only. |
+
+A token never exceeds a graph's own mode, so on a read-only graph every token is read-only.
+
+**Deletes happen only with your approval.** A `write-no-delete` token refuses every delete outright. It has no way to ask for approval and no way to queue a delete for later. You approve a delete by giving it somewhere else: you delete in the Logseq app; you ask Claude through the claude.ai connector, which asks before any destructive tool; or you answer Claude Code's permission prompt in an interactive session, where the seven delete tools (`delete_page`, `delete_block`, `delete_blocks`, `delete_tag`, `delete_property`, `delete_block_property`, `batch_delete_block_property`) are never in an allow list. A session that hits a refused delete should not retry. It dry-runs where it can, reports what it would delete, and leaves the delete to you. A queue of delete requests to approve later is not built.
+
+**Recipe: cloud worker.** An unattended cloud session or scheduled task that reads and writes your notes and never deletes there.
+
+1. Create a token named `worker` on `notes` with **read and write with no deletes** (step 1).
+2. Add it to the cloud environment as `LOGSEQ_SERVICE_TOKEN`, with `LOGSEQ_MCP_HOST` if your connector isn't at `mcp.example.com`, and allow `mcp.example.com` in the network policy (steps 2 and 3).
+3. In the session, `list_graphs` shows `notes` with mode `write-no-delete`. Inserts, moves and property writes run; `delete_block` answers `service token 'worker' may not delete (write, no deletes): …`, and `get_activity_log` on `notes` shows the refusal.
+
+Whether a write asks first is up to the session's own permission settings. This repo's `.claude/settings.json` allows only the read tools, so a write prompts unless the session runs without prompts or you add the write tools to its allow list. Deletes are refused by the Worker whatever the settings say.
+
+**Recipe: connector dev.** A session that tests the connector's writes and deletes.
+
+1. Create a token named `ci` on `test` only with **read and write**. Never give a `write` token a personal graph: argument-level deletes (`update_property` with `convert_values` or `choices.retire`, an empty value in `set_block_property`) run through tools that aren't delete tools, so no allow list can make them prompt.
+2. Store it as `LOGSEQ_SERVICE_TOKEN` in the dev environment, as for the worker.
+3. `list_graphs` shows `test` with mode `write`. In an interactive session, keep the seven delete tools out of the allow list so each delete prompts.
+
+**Recipe: use from another repo.** Copy `.mcp.json` into the other repo as it is here:
+
+```json
+{
+  "mcpServers": {
+    "logseq-service": {
+      "type": "http",
+      "url": "https://${LOGSEQ_MCP_HOST:-mcp.example.com}/mcp",
+      "headers": { "Authorization": "Bearer ${LOGSEQ_SERVICE_TOKEN}" }
+    }
+  }
+}
+```
+
+and enable the server in that repo's `.claude/settings.json`, listing each tool you want to run without a prompt by name:
+
+```json
+{
+  "enabledMcpjsonServers": ["logseq-service"],
+  "permissions": {
+    "allow": [
+      "mcp__logseq-service__list_graphs",
+      "mcp__logseq-service__search_graph",
+      "mcp__logseq-service__get_page",
+      "mcp__logseq-service__insert_block_tree"
+    ]
+  }
+}
+```
+
+Name tools one by one from `connector/tools-manifest.json`. Leave out the seven delete tools so they always prompt, and never add a server-wide `mcp__logseq-service` rule or a wildcard, which would allow the deletes too. The token in that repo's environment decides which graphs it reaches (`notes` for a worker, `test` for development).
+
+**Rollback.** Before you revert the connector Worker to a version from before `write-no-delete`, revoke every `write-no-delete` token at `/tokens`. The older code treats any access other than `read` as write, so it would give such a token full write, deletes included. Migration 0008 needs no reverse: older code reads `read` and `write` from the rebuilt table.
+
+What a service token can't do: manage tokens, reach a graph outside its scope, write when it is read-only, or delete when it is `write-no-delete`. The wizard shows each token's graphs, access, expiry, last use and last change. Last use is updated at most once an hour per token.
 
 **Cost.** A service-token request reads one D1 row (the token, by its hash) and writes none. The last-use update adds one row read and one row written, at most once an hour per token. Creating a token writes four rows. Applying an edit reads about four rows plus one per connected graph and writes three (the token row, and two for the audit row, which also reads the token row once to check the update wrote). The confirm page, a refused edit and the edit form write nothing. A malformed bearer reads nothing. The limits are the sync server's, as for the claude.ai connector.
 
