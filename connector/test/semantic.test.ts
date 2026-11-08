@@ -10,6 +10,7 @@ import {
   DIMENSIONS,
   PAGES_PER_RUN,
   KEYWORD_TERMS,
+  KEYWORD_TERM_MATCHES,
   PAGE_SIZE,
   RANKED_QUERY_WORDS,
   type SemanticBindings,
@@ -206,15 +207,31 @@ describe("ranking terms", () => {
     expect(distinctiveTerms("is it the")).toEqual([]);
   });
 
-  it("mergeKeywordLists: list count decides before entry order; ties follow term order when the lists are swapped or reversed", () => {
+  it("mergeKeywordLists keeps only uuids in 2 or more lists: list count decides before entry order; ties follow term order when the lists are swapped or reversed", () => {
     const r = (uuid: string) => ({ uuid, title: uuid, resource: "blocks" });
     const lists = (...ids: string[][]) => ids.map((l) => l.map(r));
     const ids = (merged: { uuid: string }[]) => merged.map((m) => m.uuid);
-    // s is in two lists at rank 2; a and b are each in one list at rank 1.
-    const base = lists(["a", "s"], ["b", "s"], []);
-    expect(ids(mergeKeywordLists(base))).toEqual(["s", "a", "b"]);
-    expect(ids(mergeKeywordLists([base[1], base[0], base[2]]))).toEqual(["s", "b", "a"]);
-    expect(ids(mergeKeywordLists([...base].reverse()))).toEqual(["s", "b", "a"]);
+    expect(KEYWORD_TERM_MATCHES).toBe(2);
+    // s is in two lists at rank 2; a and b are each in one list at rank 1, so they are left out.
+    expect(ids(mergeKeywordLists(lists(["a", "s"], ["b", "s"], [])))).toEqual(["s"]);
+    // t and s are each in two lists; t is in all three after the swap.
+    const base = lists(["a", "s", "t"], ["b", "t", "s"], []);
+    expect(ids(mergeKeywordLists(base))).toEqual(["s", "t"]);
+    expect(ids(mergeKeywordLists([base[1], base[0], base[2]]))).toEqual(["t", "s"]);
+    expect(ids(mergeKeywordLists([...base].reverse()))).toEqual(["t", "s"]);
+    expect(ids(mergeKeywordLists(lists(["s", "t"], ["t"], ["t", "s"])))).toEqual(["t", "s"]);
+    // A uuid repeated within one list counts once, so it is still a one-term match.
+    expect(ids(mergeKeywordLists(lists(["a", "a", "s"], ["s"], [])))).toEqual(["s"]);
+    // One term list alone, or none, merges to nothing.
+    expect(ids(mergeKeywordLists(lists(["a", "b"])))).toEqual([]);
+    // Pages and blocks are treated alike.
+    const page = { uuid: "p", title: "p", resource: "pages" };
+    expect(mergeKeywordLists([[page], [page], []])).toEqual([page]);
+    // The merge is capped at 50.
+    const many = Array.from({ length: 60 }, (_, i) => `u${String(i).padStart(2, "0")}`);
+    const capped = ids(mergeKeywordLists(lists(many, many, [])));
+    expect(capped).toHaveLength(50);
+    expect(capped.at(-1)).toBe("u49");
     // A chain: each list's rank-1 entry is the next list's rank-2 entry.
     expect(ids(mergeKeywordLists(lists(["a", "b"], ["b", "c"], ["c", "a"])))).toEqual(["a", "b", "c"]);
     expect(ids(mergeKeywordLists(lists(["c", "a"], ["b", "c"], ["a", "b"])))).toEqual(["c", "a", "b"]);
@@ -926,7 +943,7 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
   // "reporting dashboard stock": the terms are reporting, dashboard, stock (9, 9, 5 characters).
   const Q3 = "reporting dashboard stock";
 
-  it("a uuid matched by 2 terms at rank 3 beats one matched by 1 term at rank 1, with a best-rank decoy", async () => {
+  it("a uuid matched by 2 terms at rank 3 is kept; uuids matched by 1 term are left out, even at rank 1", async () => {
     const misc = work.addPage("Misc");
     // searchGraph orders a term's blocks alphabetically, so the prefixes set each rank.
     const one = work.addBlock(misc, "aa reporting one"); // reporting rank 1
@@ -937,7 +954,24 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
     await runUntilReady();
     expect(distinctiveTerms(Q3)).toEqual(["reporting", "dashboard", "stock"]);
     // "stock" matches nothing; an empty term list is not a failure.
-    expect(keywordOrder(await search(Q3))).toEqual([two, one, x, decoy, y]);
+    const hits = await search(Q3);
+    expect(keywordOrder(hits)).toEqual([two]);
+    for (const single of [one, decoy, x, y]) expect(hits.find((h) => h.uuid === single)?.["keyword-rank"] ?? null).toBeNull();
+  });
+
+  it("a one-term title match does not outrank the best meaning match (the WOF question with decoy titles)", async () => {
+    const car = work.addPage("Car");
+    const wof = work.addBlock(car, "WOF due on 14 March, book it at the garage");
+    for (const title of ["Car insurance", "Carpooling", "Fitness plan"]) work.addBlock(work.addPage(title), `Notes for ${title.toLowerCase()} later`);
+    await runUntilReady();
+    const q = "When is the car's warrant of fitness due?";
+    const hits = await search(q);
+    expect(keywordOrder(hits)).toEqual([]);
+    expect(hits[0].uuid).toBe(wof);
+    // A phrase match is still a keyword hit when only one term matches it.
+    const phrase = work.addBlock(car, "is the car's warrant of fitness due? ask the garage");
+    await runUntilReady();
+    expect(keywordOrder(await search(q))).toEqual([phrase]);
   });
 
   it("three lists beat two at any rank; a uuid repeated in one list counts once", async () => {
@@ -970,18 +1004,18 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
     }
   });
 
-  it("caps the merged list at 50 before blocksFor and before the tag filter", async () => {
+  it("caps the keyword list at 50 before blocksFor, and the tag filter runs on what is kept", async () => {
     const misc = work.addPage("Misc");
     const pad = (i: number) => String(i).padStart(2, "0");
-    // 70 matching blocks; each term answers 20, so 60 distinct uuids reach the merge.
+    // 30 blocks match two terms each and fill every term's 20 results; 25 blocks hold the whole
+    // phrase, sort after them in every term list, and the phrase search answers 20. 20 + 30 = 50,
+    // the most the leg can return.
     const seeded = new Map<string, string>();
-    for (const [term, n] of [["reporting", 24], ["dashboard", 23], ["stock", 23]] as const) {
-      for (let i = 0; i < n; i++) {
-        const text = `${term} item ${pad(i)}`;
-        const tags = text === "reporting item 00" || text === "stock item 19" ? ["cut"] : [];
-        seeded.set(text, work.addBlock(misc, text, { tags }));
-      }
+    const add = (text: string, tags: string[] = []) => seeded.set(text, work.addBlock(misc, text, { tags }));
+    for (const pair of ["reporting dashboard", "dashboard stock", "reporting stock"]) {
+      for (let i = 0; i < 10; i++) add(`a ${pair} ${pad(i)}`, pair === "reporting stock" && i === 9 ? ["cut"] : []);
     }
+    for (let i = 0; i < 25; i++) add(`z ${Q3} ${pad(i)}`, i === 0 || i === 24 ? ["cut"] : []);
     await runUntilReady();
     const binds: unknown[][] = [];
     const db = new Proxy(env.DB, {
@@ -1009,13 +1043,14 @@ describe("keyword leg (design 2026-11-07 section 3.3)", () => {
     const keywordUuids = JSON.parse(binds[0][2] as string) as string[];
     expect(keywordUuids).toHaveLength(50);
     expect(Math.max(...hits.map((h) => h["keyword-rank"] ?? 0))).toBeLessThanOrEqual(50);
-    // Merged order is rank 1 of each term in term order, then rank 2, ...: rank 17's stock block is 51st.
-    expect(keywordUuids.at(-1)).toBe(seeded.get("dashboard item 16"));
-    expect(keywordUuids).not.toContain(seeded.get("stock item 16"));
-    // The tag filter runs after the cap: a tagged block past the cap is not a keyword hit.
+    // The phrase list comes first, then the two-term matches.
+    expect(keywordUuids[0]).toBe(seeded.get(`z ${Q3} 00`));
+    expect(keywordUuids[20]).toBe(seeded.get("a reporting dashboard 00"));
+    expect(keywordUuids).not.toContain(seeded.get(`z ${Q3} 24`));
+    // The tag filter runs on the kept list: the tagged block the phrase search did not return is not a keyword hit.
     const tagged = await search(Q3, { tag: "cut" });
-    expect(keywordOrder(tagged)).toEqual([seeded.get("reporting item 00")]);
-    const late = tagged.find((h) => h.uuid === seeded.get("stock item 19"));
+    expect(keywordOrder(tagged)).toEqual([seeded.get(`z ${Q3} 00`), seeded.get("a reporting stock 09")]);
+    const late = tagged.find((h) => h.uuid === seeded.get(`z ${Q3} 24`));
     expect(late?.["keyword-rank"] ?? null).toBeNull();
   });
 

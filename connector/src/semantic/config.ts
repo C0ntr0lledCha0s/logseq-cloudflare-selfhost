@@ -25,6 +25,8 @@ export const SHORT_BLOCK_WEIGHT = 0.75;
 export const KEYWORD_TERMS = 3;
 /** Keyword results fetched per distinctive term; the merged list is capped at `KEYWORD_LIMIT`. */
 export const KEYWORD_TERM_LIMIT = 20;
+/** A term search's hit joins the keyword list only when this many of the terms found it; one word of a question matches too many unrelated titles. */
+export const KEYWORD_TERM_MATCHES = 2;
 
 /** Turns texts into vectors of `DIMENSIONS` numbers, one per text, in order. */
 export interface Embedder {

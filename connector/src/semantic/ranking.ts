@@ -1,7 +1,7 @@
 // Query terms for semantic search's ranking (design 2026-11-07, sections 3.2, 3.3 and 3.6). Pure
 // functions, no I/O. The stopword list is shared with the test embedder, so changing it changes the
 // offline eval's baseline.
-import { KEYWORD_LIMIT, KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
+import { KEYWORD_LIMIT, KEYWORD_TERM_MATCHES, KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
 
 /** Words too common to say what a query is about. `test/semantic-fakes.ts` imports this list. */
 export const STOPWORDS: ReadonlySet<string> = new Set(
@@ -70,9 +70,11 @@ export interface KeywordResult {
 }
 
 /**
- * The term searches' lists merged into one keyword list: uuids in more lists first, then by best
- * single rank, then by first appearance across the lists in term order. A uuid repeated within one
- * list counts once. Capped at `KEYWORD_LIMIT`, so the D1 bind list never grows past one search's.
+ * The term searches' lists merged into one keyword list: only uuids found by at least
+ * `KEYWORD_TERM_MATCHES` lists, more lists first, then by best single rank, then by first appearance
+ * across the lists in term order. A uuid repeated within one list counts once. A title matching one
+ * word of a question ("Carpooling" for "car") is left out, because at keyword rank 1 it would fuse
+ * level with the best meaning match. Capped at `KEYWORD_LIMIT`, so the D1 bind list never grows past one search's.
  */
 export function mergeKeywordLists(lists: KeywordResult[][]): KeywordResult[] {
   const merged = new Map<string, { result: KeywordResult; lists: number; best: number; at: number }>();
@@ -90,6 +92,7 @@ export function mergeKeywordLists(lists: KeywordResult[][]): KeywordResult[] {
     });
   });
   return [...merged.values()]
+    .filter((e) => e.lists >= KEYWORD_TERM_MATCHES)
     .sort((a, b) => b.lists - a.lists || a.best - b.best || a.at - b.at)
     .slice(0, KEYWORD_LIMIT)
     .map((e) => e.result);

@@ -1,5 +1,5 @@
 {
-  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. A question's top is the rank its first expected block must reach (default 5). baseline is the ranking before the 2026-11-07 ranking changes; floor is the least hybrid recall@5 and MRR the eval accepts, raised by each ranking change. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
+  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. A question's top is the rank its first expected block must reach (default 5). baseline is the ranking before the 2026-11-07 ranking changes; floor is the least hybrid recall@5 and MRR the eval accepts, raised by each ranking change. The five \"Notes for ... later\" pages are decoy titles that each hold one word of a question; adding them lowered the floor's MRR from 0.89 to 0.85 (the holiday question's decoy is also its nearest block by meaning), and the original pages alone still give 0.90. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
   "pages": [
     {
       "title": "Car",
@@ -71,10 +71,15 @@
         { "key": "sales-report", "text": "Sales by region report, sent to the team every Monday" },
         { "key": "reorder", "text": "Reorder levels reviewed each quarter" }
       ]
-    }
+    },
+    { "title": "Car insurance", "blocks": [{ "key": "note-car", "text": "Notes for car insurance later" }] },
+    { "title": "Fitness plan", "blocks": [{ "key": "note-fitness", "text": "Notes for fitness later" }] },
+    { "title": "Carpooling", "blocks": [{ "key": "note-carpool", "text": "Notes for carpooling later" }] },
+    { "title": "Holiday budget ideas", "blocks": [{ "key": "note-holiday", "text": "Notes for holiday later" }] },
+    { "title": "Kids birthday", "blocks": [{ "key": "note-birthday", "text": "Notes for birthday later" }] }
   ],
   "questions": [
-    { "q": "When is the car's warrant of fitness due?", "expected": ["wof"] },
+    { "q": "When is the car's warrant of fitness due?", "expected": ["wof"], "top": 1 },
     { "q": "What did we decide about pricing?", "expected": ["pricing"] },
     { "q": "When does Atlas ship?", "expected": ["launch"] },
     { "q": "Why did the release slip?", "expected": ["launch-why"] },
@@ -89,5 +94,5 @@
   ],
   "private": ["therapy", "therapy-detail", "bank", "wifi"],
   "baseline": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } },
-  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.89 } }
+  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } }
 }

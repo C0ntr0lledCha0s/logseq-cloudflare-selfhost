@@ -270,7 +270,13 @@ To be filled in by the build:
 | Offline, extended fixture (12 questions), before: ranking code of `86cb347` | 0.17 | 0.17 | 1.00 | 0.85 |
 | Offline, extended fixture, after Stage 4 (short-block rule) | 0.17 | 0.17 | 1.00 | 0.90 (0.896) |
 | Offline, extended fixture, after Stage 5 (distinctive-term keyword leg) | 0.17 | 0.17 | 1.00 | 0.90 (0.896) |
+| Offline, fixture with five decoy titles, Stage 5 (`3cf9a63`) | 0.17 | 0.17 | 1.00 | 0.78 |
+| Offline, fixture with five decoy titles, whole-phrase keyword leg only (pre-Stage 5) | 0.17 | 0.17 | 1.00 | 0.84 |
+| Offline, fixture with five decoy titles, after review round 2 (two-term rule) | 0.17 | 0.17 | 1.00 | 0.85 (0.854) |
+| Offline, original pages, after review round 2 | 0.17 | 0.17 | 1.00 | 0.90 |
 | Live, before | | | | |
 | Live, after | | | | |
 
 After Stage 5 every question keeps the rank it had after Stage 4, so the floor stays at MRR 0.89 (0.90 would sit above the measured 0.896). The keyword columns measure `searchGraph` on the whole phrase, which this design does not change. The keyword leg now contributes to the multi-word questions: for "stock level reporting dashboard" the target is found by both legs (`semantic.test.ts`, "the warehouse question finds its target through both legs").
+
+Review round 2 found that a title holding one word of a question ("Carpooling" for "car", "Fitness plan" for "fitness") took keyword rank 1, which reciprocal rank fusion weights the same as semantic rank 1, so on a graph with such titles the WOF answer fell from rank 1 to rank 3. The fixture now has five such decoy pages, and the WOF question must reach rank 1. The term lists now keep only uuids that at least two terms found (`KEYWORD_TERM_MATCHES`); whole-phrase matches are kept as before. With the decoys the floor's MRR is 0.85, lowered on purpose because the holiday question's decoy is also its nearest block by meaning in the fake embedder; the original pages alone still give 0.90. The rule costs no extra calls, rows or neurons.
