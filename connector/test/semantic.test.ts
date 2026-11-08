@@ -1856,3 +1856,250 @@ describe("memory mode (design 2026-11-08 sections 3.3 to 3.6)", () => {
     expect(relevance.statements.filter((sql) => sql.includes("semantic_"))).toHaveLength(3);
   });
 });
+
+describe("updated_after (design 2026-11-08 sections 3.3 and 3.6)", () => {
+  // Crafted vectors as in "memory mode": the query is axis 0, so a block's cosine is the value given
+  // to `block`, and only titles containing "northwind" are keyword hits.
+  const Q = "northwind";
+  const DAY = 86_400_000;
+  let crafted: CraftedEmbedder;
+
+  beforeEach(() => {
+    crafted = new CraftedEmbedder();
+    embedder = crafted;
+    crafted.vectors.set(Q, axis(0));
+  });
+
+  function block(pageTitle: string, pageId: string, text: string, cos: number | null, signals?: FakeSignals, tags?: string[]): string {
+    crafted.vectors.set(documentText({ pageTitle, breadcrumb: [], text }), cos === null ? axis(2) : unitAt(cos));
+    return work.addBlock(pageId, text, { signals, tags });
+  }
+
+  interface Hit {
+    uuid: string;
+    score: number;
+    relevance?: number;
+    "found-by": string[];
+    "semantic-rank": number | null;
+    "keyword-rank": number | null;
+  }
+
+  interface Body {
+    rank?: string;
+    results: Hit[];
+    index: unknown;
+    "before-updated-after"?: number;
+    "below-min-similarity"?: number;
+  }
+
+  async function call(args: Record<string, unknown>) {
+    return callTool(semanticEnv(), "semantic_search", { graph: "work", q: Q, limit: 50, ...args });
+  }
+
+  async function search(args: Record<string, unknown> = {}): Promise<Body> {
+    const result = await call(args);
+    expect(result.isError, `${JSON.stringify(args)}: ${result.text}`).toBe(false);
+    return JSON.parse(result.text);
+  }
+
+  const order = (body: Body) => body.results.map((r) => r.uuid);
+  /** The UTC date `days` ago, as YYYY-MM-DD. */
+  const daysAgo = (days: number) => new Date(Date.now() - days * DAY).toISOString().slice(0, 10);
+
+  it("drops before fusion and renumbers semantic-rank and keyword-rank; before-updated-after counts both legs", async () => {
+    const stock = work.addPage("Stock");
+    const oldMeaning = block("Stock", stock, "Pallet count for aisle four", 0.9, { ageDays: 400 });
+    const newMeaning = block("Stock", stock, "Forklift service due", 0.8, { ageDays: 1 });
+    const oldTitle = work.addPage("Northwind a archive");
+    work.setSignals(oldTitle, { ageDays: 400 });
+    const newTitle = work.addPage("Northwind b current");
+    work.setSignals(newTitle, { ageDays: 1 });
+    await runUntilReady();
+
+    const all = await search();
+    expect(order(all)).toEqual([oldMeaning, oldTitle, newMeaning, newTitle]);
+    expect(all).not.toHaveProperty("before-updated-after");
+
+    const body = await search({ updated_after: daysAgo(30) });
+    expect(Object.keys(body)).toEqual(["results", "index", "before-updated-after"]);
+    expect(body["before-updated-after"]).toBe(2);
+    expect(body.results).toEqual([
+      expect.objectContaining({ uuid: newMeaning, score: 0.01639, "semantic-rank": 1, "keyword-rank": null, "found-by": ["semantic"] }),
+      expect.objectContaining({ uuid: newTitle, score: 0.01639, "semantic-rank": null, "keyword-rank": 1, "found-by": ["keyword"] }),
+    ]);
+  });
+
+  it("counts a dropped hit both searches found once, and keeps one both found at both ranks", async () => {
+    const notes = work.addPage("Notes");
+    const oldBoth = block("Notes", notes, "Northwind alpha plan", 0.9, { ageDays: 400 });
+    const newBoth = block("Notes", notes, "Northwind beta plan", 0.8, { ageDays: 1 });
+    await runUntilReady();
+    const body = await search({ updated_after: daysAgo(30) });
+    expect(body["before-updated-after"]).toBe(1);
+    expect(body.results).toEqual([
+      expect.objectContaining({ uuid: newBoth, score: 0.03279, "semantic-rank": 1, "keyword-rank": 1, "found-by": ["semantic", "keyword"] }),
+    ]);
+    expect(order(await search())).toEqual([oldBoth, newBoth]);
+  });
+
+  it("drops a missing uuid and one with no updated-at; keeps a hit exactly at the boundary, for a date, a Z time and an offset", async () => {
+    const page = work.addPage("Stock");
+    const midnight = Date.parse("2026-11-08T00:00:00Z");
+    const ten = Date.parse("2026-11-08T10:00:00Z");
+    const atMidnight = block("Stock", page, "At midnight", 0.95, { updatedAt: midnight });
+    const beforeMidnight = block("Stock", page, "Just before midnight", 0.94, { updatedAt: midnight - 1 });
+    const atTen = block("Stock", page, "At ten", 0.93, { updatedAt: ten });
+    const beforeTen = block("Stock", page, "Just before ten", 0.92, { updatedAt: ten - 1 });
+    const undated = block("Stock", page, "Never dated", 0.91, { ageDays: null });
+    const gone = block("Stock", page, "Deleted since indexed", 0.9, { ageDays: 0 });
+    await runUntilReady();
+    work.remove(gone, { silently: true });
+
+    const all = await search();
+    expect(order(all)).toEqual([atMidnight, beforeMidnight, atTen, beforeTen, undated, gone]);
+
+    const date = await search({ updated_after: "2026-11-08" });
+    expect(order(date)).toEqual([atMidnight, atTen, beforeTen]);
+    expect(date["before-updated-after"]).toBe(3);
+    expect(date.results.map((r) => r["semantic-rank"])).toEqual([1, 2, 3]);
+
+    for (const at of ["2026-11-08T10:00:00Z", "2026-11-08T10:00:00.000Z", "2026-11-08T23:00:00+13:00", "2026-11-08T05:00:00-05:00"]) {
+      const body = await search({ updated_after: at });
+      expect(order(body), at).toEqual([atTen]);
+      expect(body["before-updated-after"], at).toBe(5);
+    }
+    // A millisecond later drops the hit at the boundary too.
+    const later = await search({ updated_after: "2026-11-08T10:00:00.001Z" });
+    expect(order(later)).toEqual([]);
+    expect(later["before-updated-after"]).toBe(6);
+  });
+
+  it("runs after tag and before min_similarity; neither count includes the other filter's drops", async () => {
+    const trips = work.addPage("Trips");
+    const fresh = block("Trips", trips, "Queenstown itinerary", 0.9, { ageDays: 1 }, ["Travel"]);
+    const oldTagged = block("Trips", trips, "Northwind trip", 0.8, { ageDays: 400 }, ["Travel"]);
+    const oldWeakTagged = block("Trips", trips, "Wanaka hut booking", 0.1, { ageDays: 400 }, ["Travel"]);
+    const weakTagged = block("Trips", trips, "Te Anau ferry", 0.2, { ageDays: 1 }, ["Travel"]);
+    const oldUntagged = block("Trips", trips, "Northwind invoice", 0.85, { ageDays: 400 });
+    const untaggedPage = work.addPage("Northwind archive");
+    work.setSignals(untaggedPage, { ageDays: 400 });
+    await runUntilReady();
+
+    const tagOnly = await search({ tag: "travel" });
+    expect(new Set(order(tagOnly))).toEqual(new Set([fresh, oldTagged, oldWeakTagged, weakTagged]));
+    expect(order(await search())).toContain(oldUntagged);
+
+    const body = await search({ tag: "travel", updated_after: daysAgo(30), min_similarity: 0.5 });
+    expect(order(body)).toEqual([fresh]);
+    // oldTagged (both legs) and oldWeakTagged: not oldUntagged or the page, which the tag removed first.
+    expect(body["before-updated-after"]).toBe(2);
+    // weakTagged only: oldWeakTagged is below 0.5 too, but updated_after removed it first.
+    expect(body["below-min-similarity"]).toBe(1);
+    expect(Object.keys(body)).toEqual(["results", "index", "before-updated-after", "below-min-similarity"]);
+  });
+
+  it("relevance mode with it makes one signals request and keeps score as RRF; without it none; memory mode still makes one", async () => {
+    const stock = work.addPage("Stock");
+    const fresh = block("Stock", stock, "Pallet count for aisle four", 0.9, { ageDays: 1, referenceCount: 31, status: "done" });
+    const stale = block("Stock", stock, "Forklift service due", 0.8, { ageDays: 400 });
+    const title = work.addPage("Northwind warehouse");
+    work.setSignals(title, { ageDays: 2 });
+    await runUntilReady();
+
+    await search();
+    await search({ tag: "stock", min_similarity: 0.5 });
+    await search({ rank: "relevance" });
+    expect(work.signalsRequests).toHaveLength(0);
+
+    const body = await search({ updated_after: daysAgo(30) });
+    expect(work.signalsRequests).toHaveLength(1);
+    const [request] = work.signalsRequests;
+    expect(request.searchParams.get("view")).toBe("signals");
+    expect(request.searchParams.has("property")).toBe(false);
+    expect(request.searchParams.get("ids")?.split(",")).toEqual([fresh, stale, title]);
+    expect(body).not.toHaveProperty("rank");
+    expect(body.results).toEqual([
+      { uuid: fresh, resource: "blocks", page: "Stock", "page-id": stock, breadcrumb: [], text: "Pallet count for aisle four", score: 0.01639, "found-by": ["semantic"], similarity: 0.9, "semantic-rank": 1, "keyword-rank": null },
+      { uuid: title, resource: "pages", text: "Northwind warehouse", score: 0.01639, "found-by": ["keyword"], similarity: null, "semantic-rank": null, "keyword-rank": 1 },
+    ]);
+
+    work.signalsRequests = [];
+    const memory = await search({ rank: "memory", updated_after: daysAgo(30) });
+    expect(work.signalsRequests).toHaveLength(1);
+    expect(Object.keys(memory)).toEqual(["rank", "half-life-days", "results", "index", "before-updated-after"]);
+    expect(memory["before-updated-after"]).toBe(1);
+    expect(new Set(order(memory))).toEqual(new Set([fresh, title]));
+    expect(memory.results.find((r) => r.uuid === fresh)).toMatchObject({ relevance: 0.01639, "semantic-rank": 1 });
+
+    // A failed signals request fails a relevance-mode call that needs it.
+    work.failSignals = 500;
+    expect(await call({ updated_after: daysAgo(30) })).toEqual({ isError: true, text: "ranking signals: sync server error (HTTP 500): signals failing" });
+  });
+
+  it("emptying the semantic leg leaves keyword hits only, ranked from 1; emptying both leaves none, counted", async () => {
+    const stock = work.addPage("Stock");
+    const a = block("Stock", stock, "Pallet count", 0.9, { ageDays: 400 });
+    const b = block("Stock", stock, "Forklift service", 0.8, { ageDays: 400 });
+    const fresh = work.addPage("Northwind warehouse");
+    work.setSignals(fresh, { ageDays: 1 });
+    const old = work.addPage("Northwind yard");
+    work.setSignals(old, { ageDays: 400 });
+    await runUntilReady();
+    expect(new Set(order(await search()))).toEqual(new Set([a, b, fresh, old]));
+
+    const body = await search({ updated_after: daysAgo(30) });
+    expect(body.results).toEqual([expect.objectContaining({ uuid: fresh, "keyword-rank": 1, "semantic-rank": null, score: 0.01639 })]);
+    expect(body["before-updated-after"]).toBe(3);
+
+    const none = await search({ updated_after: new Date(Date.now() - DAY / 2).toISOString() });
+    expect(none.results).toEqual([]);
+    expect(none["before-updated-after"]).toBe(4);
+  });
+
+  it("validation: refuses what isn't YYYY-MM-DD or a full ISO date-time with seconds and a zone, before any call; accepts the rest", async () => {
+    block("Stock", work.addPage("Stock"), "Pallet count", 0.9, { ageDays: 1 });
+    await runUntilReady();
+    crafted.calls = [];
+    index.queries = 0;
+    const refused = [
+      "2026-02-30", // no such day
+      "2027-02-29", // not a leap year
+      "2026-13-01", // no such month
+      "2026-11-8", // unpadded
+      "yesterday",
+      "",
+      "1762560000000", // a bare integer (epoch ms)
+      "2026-11-08T10:00", // no seconds, no zone
+      "2026-11-08T10:00:00", // no zone
+      "2026-11-08T10:00Z", // no seconds
+      "2026-11-08 10:00:00Z", // a space for T
+      "2026-11-08T24:00:00Z",
+      "2026-11-08T10:60:00Z",
+      "2026-11-08T10:00:00+1300", // offset without a colon
+      "2026-02-30T10:00:00Z", // no such day, with a time
+      "Sun, 08 Nov 2026 10:00:00 GMT", // Date.parse accepts it, ISO doesn't
+    ];
+    for (const value of refused) {
+      for (const rank of ["relevance", "memory"]) {
+        expect(await call({ updated_after: value, rank }), value).toEqual({ isError: true, text: "updated_after: not an ISO date" });
+      }
+    }
+    expect(logged().at(-1)).toMatch(/^tool semantic_search graph=work status=refused ms=\d+$/);
+    // Not a string at all: zod refuses it by name.
+    const number = await call({ updated_after: 20261108 });
+    expect(number.isError).toBe(true);
+    expect(number.text).toContain("updated_after");
+    expect(crafted.calls).toEqual([]);
+    expect(index.queries).toBe(0);
+    expect(work.searchRequests).toHaveLength(0);
+    expect(work.signalsRequests).toHaveLength(0);
+
+    for (const value of ["2026-11-08", "2028-02-29", "2026-11-08T10:00:00Z", "2026-11-08T10:00:00.5Z", "2026-11-08T23:00:00+13:00", "2026-11-08T05:00:00-05:00"]) {
+      const body = await search({ updated_after: value });
+      expect(body["before-updated-after"], value).toBeTypeOf("number");
+    }
+    const tool = (await rpc(semanticEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "semantic_search");
+    expect(tool.inputSchema.properties.updated_after).toMatchObject({ type: "string" });
+    expect(tool.inputSchema.required).not.toContain("updated_after");
+  });
+});

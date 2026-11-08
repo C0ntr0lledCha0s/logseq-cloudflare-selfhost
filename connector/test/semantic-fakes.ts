@@ -149,6 +149,8 @@ export class FakeVectorIndex implements VectorIndex {
 /** What getBlocks view=signals reports for a block or page (patch 0035). Ages are days before the request. */
 export interface FakeSignals {
   ageDays?: number | null;
+  /** An exact updated-at in ms, used in place of ageDays when given. */
+  updatedAt?: number;
   referenceCount?: number;
   status?: string | null;
   /** Property ident to value titles. */
@@ -373,7 +375,7 @@ export class FakeGraph {
         const s = entity.signals ?? {};
         return {
           uuid: entity.uuid,
-          "updated-at": s.ageDays === undefined || s.ageDays === null ? null : now - s.ageDays * 86_400_000,
+          "updated-at": s.updatedAt ?? (s.ageDays === undefined || s.ageDays === null ? null : now - s.ageDays * 86_400_000),
           "reference-count": Math.min(1000, s.referenceCount ?? 0),
           status: s.status ?? null,
           "property-values": property === null ? null : this.propertyValues(entity, property),

@@ -32,7 +32,7 @@ import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
 export const SEMANTIC_HELP =
-  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more content words (words of three or more letters other than common ones such as what, did, about; so the pricing question above has two), one- and two-word blocks rank lower by meaning (their similarity is reported unchanged), and title search looks for its three longest words separately as well as the whole phrase, keeping a title only when it holds the whole phrase or at least two of those words (an exact or containing title stays first), so put the distinctive words in the question. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed. rank defaults to \"relevance\", which is the order above and unchanged. For the current state of something (\"what is the starter tier price now?\"), pass rank: \"memory\": each hit's score becomes relevance x recency x importance, where relevance is the relevance-mode score, recency is 0.5 ^ (age in days / half_life_days) floored at 0.5 (1 when the block has no updated-at; half_life_days 1-3650, default 90), and importance is 1 + 0.1 x log2(1 + references from other pages), capped at 1.5, then halved once if the hit is a done or canceled task, carries one of demote_tags (up to 10, on the block, an ancestor or its page, case-insensitive) or has one of demote_property's values ({property: ident, values: 1-10 titles}, on the block, else its page, case-insensitive). So recency runs 0.5 to 1 and importance 0.5 to 1.5. Memory mode re-orders every candidate before applying limit, never drops one, and reports relevance, recency, importance, updated-at, reference-count and demoted-by on each hit, with rank and half-life-days at the top; read relevance beside score to see why a hit moved. Recency is the block's own last edit (an edit to a child does not count). A hit deleted since it was indexed gets recency 1 and importance 1. demote_tags only sees indexed blocks' tags, so a title-only hit outside the index is never demoted by tag (demote_property still applies). Use relevance mode for what was decided back then; memory mode for what holds now. half_life_days, demote_tags and demote_property without rank: \"memory\" are refused, and a failed lookup of the ranking signals fails the call as ranking signals: <reason>.";
+  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. In a question of three or more content words (words of three or more letters other than common ones such as what, did, about; so the pricing question above has two), one- and two-word blocks rank lower by meaning (their similarity is reported unchanged), and title search looks for its three longest words separately as well as the whole phrase, keeping a title only when it holds the whole phrase or at least two of those words (an exact or containing title stays first), so put the distinctive words in the question. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed. rank defaults to \"relevance\", which is the order above and unchanged. For the current state of something (\"what is the starter tier price now?\"), pass rank: \"memory\": each hit's score becomes relevance x recency x importance, where relevance is the relevance-mode score, recency is 0.5 ^ (age in days / half_life_days) floored at 0.5 (1 when the block has no updated-at; half_life_days 1-3650, default 90), and importance is 1 + 0.1 x log2(1 + references from other pages), capped at 1.5, then halved once if the hit is a done or canceled task, carries one of demote_tags (up to 10, on the block, an ancestor or its page, case-insensitive) or has one of demote_property's values ({property: ident, values: 1-10 titles}, on the block, else its page, case-insensitive). So recency runs 0.5 to 1 and importance 0.5 to 1.5. Memory mode re-orders every candidate before applying limit, never drops one, and reports relevance, recency, importance, updated-at, reference-count and demoted-by on each hit, with rank and half-life-days at the top; read relevance beside score to see why a hit moved. Recency is the block's own last edit (an edit to a child does not count). A hit deleted since it was indexed gets recency 1 and importance 1. demote_tags only sees indexed blocks' tags, so a title-only hit outside the index is never demoted by tag (demote_property still applies). Use relevance mode for what was decided back then; memory mode for what holds now. half_life_days, demote_tags and demote_property without rank: \"memory\" are refused, and a failed lookup of the ranking signals fails the call as ranking signals: <reason>. In either rank, updated_after (YYYY-MM-DD, read as midnight UTC, or a full ISO date-time with seconds and Z or an offset, such as 2026-11-08T10:00:00+13:00; anything else is refused as updated_after: not an ISO date) drops every hit last updated before it, including one with no updated-at and one deleted since it was indexed. It runs after tag and before min_similarity, on both searches before they are merged, so semantic-rank and keyword-rank count only what it kept, and before-updated-after says how many hits it dropped (each once, whichever searches found it); it costs one extra request to the sync server, as memory mode does.";
 
 /** One hybrid search hit. Keyword-only hits outside the index carry just their title and resource. */
 export interface SearchHit {
@@ -46,7 +46,7 @@ export interface SearchHit {
   "found-by": string[];
   /** Raw cosine similarity from the index at 3 dp, or null when the semantic leg did not return the hit. */
   similarity: number | null;
-  /** 1-based rank in each leg's list as fused (after the tag filter and min_similarity), or null. */
+  /** 1-based rank in each leg's list as fused (after the tag filter, updated_after and min_similarity), or null. */
   "semantic-rank": number | null;
   "keyword-rank": number | null;
   /** Memory mode only: the RRF score at 5 dp (score is then the product). */
@@ -72,6 +72,7 @@ export interface HybridSearchArgs {
   half_life_days?: number;
   demote_tags?: string[];
   demote_property?: { property: string; values: string[] };
+  updated_after?: string;
 }
 
 export interface HybridSearchResult {
@@ -79,6 +80,7 @@ export interface HybridSearchResult {
   "half-life-days"?: number;
   results: SearchHit[];
   index: { status: string; blocks: number };
+  "before-updated-after"?: number;
   "below-min-similarity"?: number;
 }
 
@@ -158,6 +160,22 @@ function refuseIgnoredOptions(args: HybridSearchArgs): void {
   if (first) throw new ToolError(`${first[0]} needs rank: "memory"`, "refused");
 }
 
+const ISO_DATE = /^(\d{4}-\d{2}-\d{2})(T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d))?$/;
+
+/**
+ * `updated_after` as ms: `YYYY-MM-DD` is midnight UTC; otherwise a full ISO date-time with seconds and
+ * `Z` or an offset. The date part must round-trip, so `2026-02-30` is refused rather than rolled over.
+ */
+function parseUpdatedAfter(value: string): number {
+  const match = ISO_DATE.exec(value);
+  const day = match ? Date.parse(`${match[1]}T00:00:00Z`) : Number.NaN;
+  const at = Date.parse(value);
+  if (!match || Number.isNaN(day) || new Date(day).toISOString().slice(0, 10) !== match[1] || Number.isNaN(at)) {
+    throw new ToolError("updated_after: not an ISO date", "refused");
+  }
+  return at;
+}
+
 /**
  * The keyword leg. A query of fewer than `RANKED_QUERY_WORDS` content words is searched as one
  * phrase. A longer one is searched once per distinctive term and once as the whole phrase, in
@@ -196,12 +214,15 @@ async function semanticMatches(bindings: SemanticBindings, graphId: string, q: s
  * `semantic_search`: nearest blocks by embedding, and the keyword leg (`searchGraph` on the query, or
  * on its distinctive terms), merged by reciprocal rank fusion. With `tag`, only indexed blocks carrying that tag (on themselves, an
  * ancestor or their page) are kept, from both sides. With `min_similarity`, semantic hits whose raw
- * similarity is below it are dropped after the deleted-row and tag filters, and counted. With
+ * similarity is below it are dropped after the deleted-row, tag and `updated_after` filters, and counted. With
+ * `updated_after`, hits updated before it (or with no updated-at) are dropped from both legs after the
+ * tag filter, using the same signals request memory mode makes, and counted once each. With
  * `rank: "memory"`, one `view=signals` request fetches the candidates' ranking signals and the whole
  * fused list is re-ordered by relevance x recency x importance before `limit` is applied.
  */
 export async function hybridSearch(deps: HybridSearchDeps, args: HybridSearchArgs): Promise<HybridSearchResult> {
   refuseIgnoredOptions(args);
+  const cutoff = args.updated_after === undefined ? undefined : parseUpdatedAfter(args.updated_after);
   const memory = args.rank === "memory";
   const graph = await resolveGraph(deps.access, args.graph, false);
   const [vectorMatches, keyword] = await Promise.all([
@@ -215,9 +236,9 @@ export async function hybridSearch(deps: HybridSearchDeps, args: HybridSearchArg
   ]);
   const byVector = new Map(blocks.map((b) => [b.vectorId, b]));
   const byUuid = new Map(blocks.map((b) => [b.uuid, b]));
-  // Memory mode: one signals request for the candidates that survived the deleted-row filter, semantic first.
+  // Memory mode or updated_after: one signals request for the candidates that survived the deleted-row filter, semantic first.
   let signals = new Map<string, RankingSignal>();
-  if (memory) {
+  if (memory || cutoff !== undefined) {
     const candidates = [
       ...new Set([...vectorMatches.flatMap((m) => byVector.get(m.id)?.uuid ?? []), ...keyword.map((k) => k.uuid)]),
     ].slice(0, SIGNALS_LIMIT);
@@ -227,6 +248,11 @@ export async function hybridSearch(deps: HybridSearchDeps, args: HybridSearchArg
   }
   const tag = args.tag?.toLowerCase();
   const allowed = (uuid: string) => tag === undefined || (byUuid.get(uuid)?.tags.includes(tag) ?? false);
+  // updated_after keeps a hit updated at or after the cutoff; a missing uuid or a null updated-at is dropped.
+  const recent = (uuid: string) => {
+    const updatedAt = signals.get(uuid)?.updatedAt;
+    return cutoff === undefined || (updatedAt != null && updatedAt >= cutoff);
+  };
   // A vector whose row is gone was deleted moments ago (Vectorize mutations are asynchronous).
   const semanticHits = vectorMatches
     .flatMap(({ id, similarity }) => {
@@ -234,15 +260,19 @@ export async function hybridSearch(deps: HybridSearchDeps, args: HybridSearchArg
       return uuid === undefined ? [] : [{ uuid, similarity }];
     })
     .filter((h) => allowed(h.uuid));
+  const taggedKeyword = keyword.map((k) => k.uuid).filter(allowed);
+  const recentHits = semanticHits.filter((h) => recent(h.uuid));
+  const keywordUuids = taggedKeyword.filter(recent);
+  // Each hit updated_after dropped counts once, whichever searches found it.
+  const tooOld = new Set([...semanticHits.map((h) => h.uuid), ...taggedKeyword].filter((uuid) => !recent(uuid))).size;
   // The floor compares the raw value, so 0.5996 is below 0.6 although it is reported as 0.600.
   const min = args.min_similarity;
-  const floored = min === undefined ? semanticHits : semanticHits.filter((h) => h.similarity >= min);
+  const floored = min === undefined ? recentHits : recentHits.filter((h) => h.similarity >= min);
   // Short blocks are ordered lower for multi-word questions; reported similarities stay raw.
   const kept = demoteShortBlocks(floored, (uuid) => byUuid.get(uuid)?.text, args.q);
   const similarityOf = new Map<string, number>();
   for (const h of kept) if (!similarityOf.has(h.uuid)) similarityOf.set(h.uuid, h.similarity);
   const semanticUuids = kept.map((h) => h.uuid);
-  const keywordUuids = keyword.map((k) => k.uuid).filter(allowed);
   const keywordByUuid = new Map(keyword.map((k) => [k.uuid, k]));
   const all = reciprocalRankFusion({ semantic: semanticUuids, keyword: keywordUuids });
   const halfLifeDays = args.half_life_days ?? DEFAULT_HALF_LIFE_DAYS;
@@ -288,8 +318,13 @@ export async function hybridSearch(deps: HybridSearchDeps, args: HybridSearchArg
   });
   const index = { status: state?.status ?? "not started", blocks: counts.graph };
   const head: Pick<HybridSearchResult, "rank" | "half-life-days"> = memory ? { rank: "memory", "half-life-days": halfLifeDays } : {};
-  if (min === undefined) return { ...head, results, index };
-  return { ...head, results, index, "below-min-similarity": semanticHits.length - floored.length };
+  return {
+    ...head,
+    results,
+    index,
+    ...(cutoff === undefined ? {} : { "before-updated-after": tooOld }),
+    ...(min === undefined ? {} : { "below-min-similarity": recentHits.length - floored.length }),
+  };
 }
 
 /** A memory-mode hit's factors as reported: relevance at 5 dp, the factors at 3 dp, and the raw signal. */
@@ -316,7 +351,7 @@ export function registerSemanticTools(
     "semantic_search",
     {
       description:
-        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). For a query of three or more content words (words of three or more letters other than common ones such as what, did, about), one- and two-word blocks rank lower by meaning (similarity stays raw), and the title search runs on the whole phrase and once for each of its three longest words: titles containing the phrase come first, then titles matching two or more of the words, more first (a title matching only one of them is left out); a shorter query is title-searched as one phrase only. min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed. rank: \"memory\" (default \"relevance\", unchanged) re-orders all candidates by relevance x recency (0.5 to 1, halving every half_life_days, default 90) x importance (0.5 to 1.5: references from other pages raise it; a done or canceled task, a demote_tags tag or a demote_property value halves it once), then applies limit; it never filters. Each hit then has score (the product), relevance, recency, importance, updated-at, reference-count and demoted-by, and the response has rank and half-life-days. half_life_days, demote_tags and demote_property need rank: \"memory\"; connector_help has the details.",
+        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). For a query of three or more content words (words of three or more letters other than common ones such as what, did, about), one- and two-word blocks rank lower by meaning (similarity stays raw), and the title search runs on the whole phrase and once for each of its three longest words: titles containing the phrase come first, then titles matching two or more of the words, more first (a title matching only one of them is left out); a shorter query is title-searched as one phrase only. min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed. rank: \"memory\" (default \"relevance\", unchanged) re-orders all candidates by relevance x recency (0.5 to 1, halving every half_life_days, default 90) x importance (0.5 to 1.5: references from other pages raise it; a done or canceled task, a demote_tags tag or a demote_property value halves it once), then applies limit; it never filters. Each hit then has score (the product), relevance, recency, importance, updated-at, reference-count and demoted-by, and the response has rank and half-life-days. half_life_days, demote_tags and demote_property need rank: \"memory\". In either rank, updated_after (YYYY-MM-DD or an ISO date-time with seconds and a zone) drops hits last updated before it, or with no updated-at, before ranking, and reports how many in before-updated-after. connector_help has the details.",
       inputSchema: z.object({
         graph,
         q: z.string().min(1).max(500).describe("What to look for, in plain words"),
@@ -355,6 +390,12 @@ export function registerSemanticTools(
           })
           .optional()
           .describe('rank "memory" only: halve the importance of hits whose value of this property (on the block, else its page) is one of these titles'),
+        updated_after: z
+          .string()
+          .optional()
+          .describe(
+            "Drop hits last updated before this, or with no known updated-at, before ranking: YYYY-MM-DD (midnight UTC) or a full ISO date-time with seconds and Z or an offset. Either rank. The response then says how many it dropped in before-updated-after",
+          ),
       }),
       annotations: annotationsFor("semantic_search"),
     },

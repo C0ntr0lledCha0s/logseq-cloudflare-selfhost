@@ -164,6 +164,7 @@ The tool is read-only, so there is no dry run or read-back to add. Its "no silen
 - `half_life_days needs rank: "memory"`; likewise `demote_tags needs rank: "memory"` and `demote_property needs rank: "memory"`. Checked before any call, in argument order.
 - `updated_after: not an ISO date` when `Date.parse` fails or the string isn't `YYYY-MM-DD` or a full ISO date-time.
 - As built (plan Stage 4): an empty `demote_tags` (`[]`) demotes nothing and is accepted in either mode, so a caller that always sends the field isn't refused; `half_life_days` and `demote_property` are refused whenever they are given.
+- As built (plan Stage 5): a full ISO date-time needs seconds and `Z` or a `±hh:mm` offset (fractional seconds are allowed), so `2026-11-08T10:00` is refused; the date part must exist (`2026-02-30` and `2027-02-29` are refused). `before-updated-after` counts each dropped hit once, whichever legs found it, and only hits the `tag` filter kept. In relevance mode `updated_after` makes the same single signals request as memory mode, with no `property`, and `score` stays the RRF score.
 - `ranking signals: <reason>` for a failed signals call, including `ranking signals: property not found: user.property/x`.
 - `before-updated-after: n`, so a filter that empties the list says so.
 
