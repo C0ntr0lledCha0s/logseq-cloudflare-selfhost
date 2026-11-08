@@ -137,6 +137,20 @@ describe("matchLinks: matching", () => {
     expect(hits("Workflow Intelligence is live", [...PAGES].reverse())).toEqual([["Workflow Intelligence", 0]]);
   });
 
+  it("does not suggest a shorter title inside a longer match, so spans never overlap", () => {
+    const INTEL = "00000000-0000-4000-8000-0000000000b1";
+    const titles: KbTitlesPage[] = [...PAGES, [INTEL, "Intelligence", []]];
+    const text = "Workflow Intelligence is live. Operational Intelligence too. Intelligence alone.";
+    const result = match(text, titles);
+    expect(result.suggestions.map((s) => [s.page.title, s.span.start])).toEqual([
+      ["Workflow Intelligence", 0],
+      ["Operational Intelligence", at(text, "Operational")],
+      ["Intelligence", at(text, "Intelligence alone")],
+    ]);
+    const spans = result.suggestions.map((s) => s.span).sort((a, b) => a.start - b.start);
+    for (let k = 1; k < spans.length; k++) expect(spans[k].start).toBeGreaterThanOrEqual(spans[k - 1].end);
+  });
+
   it("joins words across spaces and hyphens, but not across other punctuation or a line break", () => {
     expect(hits("Workflow-Intelligence ships")).toEqual([["Workflow Intelligence", 0]]);
     expect(hits("Workflow  Intelligence ships")).toEqual([["Workflow Intelligence", 0]]);
@@ -348,6 +362,15 @@ describe("matchLinks: already linked", () => {
     const result = match("Ask [[OI]]. Operational Intelligence owns it.");
     expect(result.suggestions).toEqual([]);
     expect(result.alreadyLinked).toEqual(["Operational Intelligence"]);
+  });
+
+  it("lists a page once when it is linked by title, in another case and by alias", () => {
+    const text = "[[Workflow Intelligence]] and [[workflow intelligence]]. Ask [[OI]] or [[Operational Intelligence]].";
+    const result = match(text);
+    expect(result.alreadyLinked).toEqual(["Workflow Intelligence", "Operational Intelligence"]);
+    expect(match("[[Ops Intel]] then [[oi]] then [[OPERATIONAL INTELLIGENCE]]").alreadyLinked).toEqual([
+      "Operational Intelligence",
+    ]);
   });
 
   it("counts a markdown link to a [[page]] as a link", () => {
