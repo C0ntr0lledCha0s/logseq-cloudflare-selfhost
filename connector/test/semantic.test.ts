@@ -7,8 +7,11 @@ import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
 import { ConfigError } from "../src/config";
 import {
+  DEFAULT_HALF_LIFE_DAYS,
   DIMENSIONS,
   PAGES_PER_RUN,
+  REFERENCE_COUNT_CAP,
+  SIGNALS_LIMIT,
   KEYWORD_TERMS,
   KEYWORD_TERM_MATCHES,
   PAGE_SIZE,
@@ -19,7 +22,18 @@ import {
 } from "../src/semantic/config";
 import { documentText, parseFeedPage, toDocument, vectorId } from "../src/semantic/document";
 import { runIndexer } from "../src/semantic/indexer";
-import { STOPWORDS, contentWords, distinctiveTerms, mergeKeywordLists, phraseFirst, wordCount } from "../src/semantic/ranking";
+import {
+  type MemoryOptions,
+  type RankingSignal,
+  STOPWORDS,
+  applyMemoryRanking,
+  contentWords,
+  distinctiveTerms,
+  memoryFactors,
+  mergeKeywordLists,
+  phraseFirst,
+  wordCount,
+} from "../src/semantic/ranking";
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
@@ -1252,5 +1266,185 @@ describe("fake signals view", () => {
     expect(home.signalsRequests).toHaveLength(0);
     // Other routes are unaffected by failSignals.
     expect((await fakeSync([work]).fetch(`https://sync.internal/api/v1/graphs/${WORK_ID}/search?q=B`, { headers: { Authorization: `Bearer ${WORK_TOKEN}` } })).status).toBe(200);
+  });
+});
+
+describe("memory ranking (design 2026-11-08 section 3.4)", () => {
+  // The numbers below are literals, not the config constants, so a changed constant fails a test.
+  const DAY = 86_400_000;
+  const NOW = Date.UTC(2026, 10, 8, 12, 0, 0);
+  const opts = (over: Partial<MemoryOptions> = {}): MemoryOptions => ({
+    now: NOW,
+    halfLifeDays: 90,
+    demoteTags: [],
+    demoteValues: [],
+    ...over,
+  });
+  const signal = (over: Partial<RankingSignal> = {}): RankingSignal => ({
+    updatedAt: NOW,
+    referenceCount: 0,
+    status: null,
+    propertyValues: null,
+    ...over,
+  });
+  const aged = (days: number) => signal({ updatedAt: NOW - days * DAY });
+
+  it("halves recency at one half-life, at 90 and at 30 days", () => {
+    expect(memoryFactors(aged(0), [], opts()).recency).toBe(1);
+    expect(memoryFactors(aged(90), [], opts()).recency).toBeCloseTo(0.5, 12);
+    expect(memoryFactors(aged(45), [], opts()).recency).toBeCloseTo(Math.SQRT1_2, 12);
+    expect(memoryFactors(aged(30), [], opts({ halfLifeDays: 30 })).recency).toBeCloseTo(0.5, 12);
+    expect(memoryFactors(aged(15), [], opts({ halfLifeDays: 30 })).recency).toBeCloseTo(Math.SQRT1_2, 12);
+    // Decoy: the same 15-day-old hit at a 90-day half-life is barely aged.
+    expect(memoryFactors(aged(15), [], opts()).recency).toBeCloseTo(0.5 ** (1 / 6), 12);
+  });
+
+  it("uses a 90-day half-life by default", () => {
+    expect(DEFAULT_HALF_LIFE_DAYS).toBe(90);
+    expect(memoryFactors(aged(45), [], opts({ halfLifeDays: DEFAULT_HALF_LIFE_DAYS })).recency).toBeCloseTo(Math.SQRT1_2, 12);
+  });
+
+  it("floors recency at 0.5, so an old hit found by both legs stays above a fresh one-leg hit", () => {
+    expect(memoryFactors(aged(900), [], opts()).recency).toBe(0.5);
+    expect(memoryFactors(aged(180), [], opts()).recency).toBe(0.5);
+    const ranked = applyMemoryRanking(
+      [
+        { id: "fresh", score: 1 / 62 },
+        { id: "old", score: 2 / 61 },
+      ],
+      (id) => memoryFactors(id === "old" ? aged(900) : aged(0), [], opts()),
+    );
+    expect(ranked.map((r) => r.id)).toEqual(["old", "fresh"]);
+    expect(ranked[0].final).toBeCloseTo(0.01639, 5);
+    expect(ranked[1].final).toBeCloseTo(0.01613, 5);
+  });
+
+  it("gives recency 1 for a null or future updated-at, and for a missing signal", () => {
+    expect(memoryFactors(signal({ updatedAt: null }), [], opts()).recency).toBe(1);
+    expect(memoryFactors(aged(-30), [], opts()).recency).toBe(1);
+    expect(memoryFactors(signal({ updatedAt: NOW + 1 }), [], opts()).recency).toBe(1);
+    expect(memoryFactors(undefined, [], opts())).toEqual({ recency: 1, importance: 1, demotedBy: [] });
+  });
+
+  it("raises importance with references, from exactly 1 at 0 up to 1.5", () => {
+    const importance = (referenceCount: number) => memoryFactors(signal({ referenceCount }), [], opts()).importance;
+    expect(importance(0)).toBe(1);
+    expect(importance(1)).toBeCloseTo(1.1, 12);
+    expect(importance(3)).toBeCloseTo(1.2, 12);
+    expect(importance(7)).toBeCloseTo(1.3, 12);
+    expect(importance(31)).toBeCloseTo(1.5, 12);
+    expect(importance(500)).toBe(1.5);
+    expect(importance(1000)).toBe(1.5);
+    // Equal relevance: three references move a hit above an unreferenced one.
+    const ranked = applyMemoryRanking(
+      [
+        { id: "none", score: 1 / 61 },
+        { id: "three", score: 1 / 61 },
+      ],
+      (id) => memoryFactors(signal({ referenceCount: id === "three" ? 3 : 0 }), [], opts()),
+    );
+    expect(ranked.map((r) => [r.id, Number(r.importance.toFixed(3))])).toEqual([
+      ["three", 1.2],
+      ["none", 1],
+    ]);
+  });
+
+  it("demotes status done and canceled, not todo, doing or none", () => {
+    const factors = (status: string | null) => memoryFactors(signal({ status }), [], opts());
+    expect(factors("done")).toEqual({ recency: 1, importance: 0.5, demotedBy: ["status:done"] });
+    expect(factors("canceled")).toEqual({ recency: 1, importance: 0.5, demotedBy: ["status:canceled"] });
+    for (const status of ["todo", "doing", "now", "later", null]) {
+      expect(factors(status)).toEqual({ recency: 1, importance: 1, demotedBy: [] });
+    }
+  });
+
+  it("matches demote_tags against the stored lowercased tags, case-insensitively and whole", () => {
+    // The stored list holds the page's tag too, lowercased by the indexer.
+    const stored = ["project", "archives"];
+    expect(memoryFactors(signal(), stored, opts({ demoteTags: ["Archives"] }))).toEqual({
+      recency: 1,
+      importance: 0.5,
+      demotedBy: ["tag:Archives"],
+    });
+    expect(memoryFactors(signal(), stored, opts({ demoteTags: ["archive"] })).demotedBy).toEqual([]);
+    expect(memoryFactors(signal(), stored, opts({ demoteTags: ["Archive"] })).importance).toBe(1);
+    expect(memoryFactors(signal(), ["archive-2024"], opts({ demoteTags: ["archive"] })).demotedBy).toEqual([]);
+    // A uuid missing from the signals view is still demoted by its stored tags.
+    expect(memoryFactors(undefined, stored, opts({ demoteTags: ["ARCHIVES"] }))).toEqual({
+      recency: 1,
+      importance: 0.5,
+      demotedBy: ["tag:ARCHIVES"],
+    });
+  });
+
+  it("matches demote_property values case-insensitively against the property values", () => {
+    const withValues = (propertyValues: string[] | null) => signal({ propertyValues });
+    expect(memoryFactors(withValues(["Done"]), [], opts({ demoteValues: ["done"] }))).toEqual({
+      recency: 1,
+      importance: 0.5,
+      demotedBy: ["property:done"],
+    });
+    expect(memoryFactors(withValues(["paused", "done"]), [], opts({ demoteValues: ["DONE"] })).demotedBy).toEqual(["property:DONE"]);
+    expect(memoryFactors(withValues(["Active"]), [], opts({ demoteValues: ["Done"] })).importance).toBe(1);
+    expect(memoryFactors(withValues(["Done soon"]), [], opts({ demoteValues: ["Done"] })).demotedBy).toEqual([]);
+    expect(memoryFactors(withValues([]), [], opts({ demoteValues: ["Done"] })).demotedBy).toEqual([]);
+    expect(memoryFactors(withValues(null), [], opts({ demoteValues: ["Done"] })).demotedBy).toEqual([]);
+    // A tag of the same name is not a property value, and a property value is not a tag.
+    expect(memoryFactors(withValues(null), ["done"], opts({ demoteValues: ["Done"] })).demotedBy).toEqual([]);
+    expect(memoryFactors(withValues(["archives"]), [], opts({ demoteTags: ["Archives"] })).demotedBy).toEqual([]);
+  });
+
+  it("applies the demotion weight once however many rules match, and lists them all in rule order", () => {
+    const factors = memoryFactors(
+      signal({ status: "done", referenceCount: 3, propertyValues: ["Done"] }),
+      ["archives", "old"],
+      opts({ demoteTags: ["Old", "Archives"], demoteValues: ["Done"] }),
+    );
+    expect(factors.importance).toBeCloseTo(0.6, 12);
+    expect(factors.demotedBy).toEqual(["status:done", "tag:Old", "tag:Archives", "property:Done"]);
+    // The same hit undemoted, so the weight is the only difference.
+    expect(memoryFactors(signal({ referenceCount: 3 }), [], opts()).importance).toBeCloseTo(1.2, 12);
+  });
+
+  it("multiplies relevance by both factors and sorts stably, so ties keep RRF order", () => {
+    const fused = [
+      { id: "a", score: 0.04, extra: "kept" },
+      { id: "b", score: 0.02 },
+      { id: "c", score: 0.02 },
+      { id: "d", score: 0.02 },
+      { id: "e", score: 0.02 },
+      { id: "f", score: 0.01 },
+    ];
+    // a halves to 0.02 and ties b to e; f gains the most importance (1.5) and still ends last.
+    const factorsOf = (id: string) =>
+      id === "a" ? memoryFactors(aged(90), [], opts()) : memoryFactors(signal({ referenceCount: id === "f" ? 1000 : 0 }), [], opts());
+    const ranked = applyMemoryRanking(fused, factorsOf);
+    expect(ranked.map((r) => r.id)).toEqual(["a", "b", "c", "d", "e", "f"]);
+    expect(ranked[0]).toMatchObject({ id: "a", extra: "kept", relevance: 0.04, recency: 0.5, importance: 1, demotedBy: [] });
+    expect(ranked[0].final).toBeCloseTo(0.02, 15);
+    expect(ranked[5]).toMatchObject({ relevance: 0.01, importance: 1.5, final: 0.015 });
+    // Reversed and swapped input keeps the given order among the ties.
+    const reversed = applyMemoryRanking([...fused].reverse(), factorsOf);
+    expect(reversed.map((r) => r.id)).toEqual(["e", "d", "c", "b", "a", "f"]);
+    const swapped = applyMemoryRanking([fused[2], fused[0], fused[1], fused[5], fused[4], fused[3]], factorsOf);
+    expect(swapped.map((r) => r.id)).toEqual(["c", "a", "b", "e", "d", "f"]);
+    expect(applyMemoryRanking([], factorsOf)).toEqual([]);
+  });
+
+  it("moves a fresher, lower-relevance hit above a stale one and keeps every hit", () => {
+    const ranked = applyMemoryRanking(
+      [
+        { id: "v1", score: 1 / 61 },
+        { id: "v2", score: 1 / 62 },
+      ],
+      (id) => memoryFactors(id === "v1" ? signal({ updatedAt: NOW - 400 * DAY, status: "done" }) : aged(10), [], opts()),
+    );
+    expect(ranked.map((r) => r.id)).toEqual(["v2", "v1"]);
+    expect(ranked[1]).toMatchObject({ relevance: 1 / 61, recency: 0.5, importance: 0.5, demotedBy: ["status:done"] });
+  });
+
+  it("caps the signals call at the server's 100-id batch and states its 1,000 reference cap", () => {
+    expect(SIGNALS_LIMIT).toBe(100);
+    expect(REFERENCE_COUNT_CAP).toBe(1000);
   });
 });

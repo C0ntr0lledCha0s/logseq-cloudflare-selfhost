@@ -28,6 +28,23 @@ export const KEYWORD_TERM_LIMIT = 20;
 /** A term search's hit joins the keyword list only when this many of the terms found it; one word of a question matches too many unrelated titles. */
 export const KEYWORD_TERM_MATCHES = 2;
 
+// Memory ranking (design 2026-11-08, section 3.4). RRF scores are compressed (rank 1 against rank 50
+// in one leg is 1.8x), so these bound the factors to 0.5 to 1 (recency) and 0.5 to 1.5 (importance).
+/** Recency never falls below this, so an old hit found by both legs still ties a fresh rank-1 one-leg hit. */
+export const RECENCY_FLOOR = 0.5;
+/** Importance gained per doubling of (1 + reference count): 3 references give 1.2, 7 give 1.3. */
+export const REF_WEIGHT = 0.1;
+/** Importance from references stops here (reached at 31 references). */
+export const IMPORTANCE_MAX = 1.5;
+/** Importance is multiplied by this once when any demotion rule matches, however many do. */
+export const DEMOTE_WEIGHT = 0.5;
+/** Age, in days, at which recency halves when `half_life_days` is not given. */
+export const DEFAULT_HALF_LIFE_DAYS = 90;
+/** Uuids sent in the one signals call per query: the server's `getBlocks` batch limit. */
+export const SIGNALS_LIMIT = 100;
+/** The signals view's `reference-count` stops here (patch 0035's `reference-count-cap`). */
+export const REFERENCE_COUNT_CAP = 1000;
+
 /** Turns texts into vectors of `DIMENSIONS` numbers, one per text, in order. */
 export interface Embedder {
   embed(texts: string[]): Promise<number[][]>;

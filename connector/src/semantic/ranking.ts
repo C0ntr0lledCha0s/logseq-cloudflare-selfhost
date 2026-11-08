@@ -1,7 +1,18 @@
 // Query terms for semantic search's ranking (design 2026-11-07, sections 3.2, 3.3 and 3.6). Pure
 // functions, no I/O. The stopword list is shared with the test embedder, so changing it changes the
 // offline eval's baseline.
-import { KEYWORD_LIMIT, KEYWORD_TERM_MATCHES, KEYWORD_TERMS, RANKED_QUERY_WORDS, SHORT_BLOCK_WEIGHT, SHORT_BLOCK_WORDS } from "./config";
+import {
+  DEMOTE_WEIGHT,
+  IMPORTANCE_MAX,
+  KEYWORD_LIMIT,
+  KEYWORD_TERM_MATCHES,
+  KEYWORD_TERMS,
+  RANKED_QUERY_WORDS,
+  RECENCY_FLOOR,
+  REF_WEIGHT,
+  SHORT_BLOCK_WEIGHT,
+  SHORT_BLOCK_WORDS,
+} from "./config";
 
 /** Words too common to say what a query is about. `test/semantic-fakes.ts` imports this list. */
 export const STOPWORDS: ReadonlySet<string> = new Set(
@@ -112,4 +123,77 @@ export function phraseFirst(phrase: KeywordResult[], terms: KeywordResult[]): Ke
     out.push(result);
   }
   return out.slice(0, KEYWORD_LIMIT);
+}
+
+/** One block's entry from `getBlocks` `view=signals` (patch 0035). */
+export interface RankingSignal {
+  /** Last edit in milliseconds, or null. */
+  updatedAt: number | null;
+  referenceCount: number;
+  /** The built-in status's ident name ("done", "canceled", "todo", ...), or null. */
+  status: string | null;
+  /** The `demote_property` value titles on the block, else its page; null when no property was asked for. */
+  propertyValues: string[] | null;
+}
+
+export interface MemoryOptions {
+  now: number;
+  halfLifeDays: number;
+  /** `demote_tags` as the caller gave them. */
+  demoteTags: readonly string[];
+  /** `demote_property.values` as the caller gave them. */
+  demoteValues: readonly string[];
+}
+
+export interface MemoryFactors {
+  recency: number;
+  importance: number;
+  /** Every matching rule, in rule order (status, tags, property), in the caller's spelling. */
+  demotedBy: string[];
+}
+
+const DAY_MS = 86_400_000;
+const DEMOTED_STATUSES: ReadonlySet<string> = new Set(["done", "canceled"]);
+/** A uuid the signals view listed under `missing`: neutral recency and base importance. */
+const NO_SIGNAL: RankingSignal = { updatedAt: null, referenceCount: 0, status: null, propertyValues: null };
+
+/**
+ * Recency and importance for one hit (design 2026-11-08 section 3.4). Recency is 1 for a null or
+ * future updated-at, else `0.5 ^ (age / halfLifeDays)`, floored at `RECENCY_FLOOR`. Importance is
+ * `1 + REF_WEIGHT * log2(1 + references)`, capped at `IMPORTANCE_MAX`, times `DEMOTE_WEIGHT` once
+ * if any demotion rule matches. `storedTags` are the hit's stored tags, which the indexer has
+ * already lowercased; the arguments and property values are lowercased here.
+ */
+export function memoryFactors(signal: RankingSignal | undefined, storedTags: readonly string[], opts: MemoryOptions): MemoryFactors {
+  const s = signal ?? NO_SIGNAL;
+  const recency =
+    s.updatedAt === null || s.updatedAt > opts.now
+      ? 1
+      : Math.max(RECENCY_FLOOR, 0.5 ** ((opts.now - s.updatedAt) / DAY_MS / opts.halfLifeDays));
+  const demotedBy: string[] = [];
+  if (s.status !== null && DEMOTED_STATUSES.has(s.status)) demotedBy.push(`status:${s.status}`);
+  const tags = new Set(storedTags);
+  for (const tag of opts.demoteTags) if (tags.has(tag.toLowerCase())) demotedBy.push(`tag:${tag}`);
+  if (s.propertyValues !== null) {
+    const values = new Set(s.propertyValues.map((v) => v.toLowerCase()));
+    for (const value of opts.demoteValues) if (values.has(value.toLowerCase())) demotedBy.push(`property:${value}`);
+  }
+  const base = Math.min(IMPORTANCE_MAX, 1 + REF_WEIGHT * Math.log2(1 + s.referenceCount));
+  return { recency, importance: demotedBy.length > 0 ? base * DEMOTE_WEIGHT : base, demotedBy };
+}
+
+/**
+ * The fused list re-ordered by `relevance * recency * importance`, where relevance is the RRF
+ * score. Every hit is kept; the sort is stable, so ties keep RRF order. Values are unrounded.
+ */
+export function applyMemoryRanking<T extends { id: string; score: number }>(
+  fused: readonly T[],
+  factorsOf: (id: string) => MemoryFactors,
+): (T & MemoryFactors & { relevance: number; final: number })[] {
+  return fused
+    .map((hit) => {
+      const factors = factorsOf(hit.id);
+      return { ...hit, ...factors, relevance: hit.score, final: hit.score * factors.recency * factors.importance };
+    })
+    .sort((a, b) => b.final - a.final);
 }
