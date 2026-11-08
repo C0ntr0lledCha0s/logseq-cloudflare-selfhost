@@ -26,10 +26,10 @@ index d99a20c..7ed17ad 100644
  ;; Health checks
  ;; =============
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index b2147ee..7415fcc 100644
+index 9b4d6b1..6214aeb 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -4424,10 +4424,22 @@
+@@ -4432,10 +4432,22 @@
                             (graph-insights/mismatched-choice-values db) limit cursor)
                :items #(mapv mismatched-choice-response %)))))
  
@@ -53,7 +53,7 @@ index b2147ee..7415fcc 100644
               :tags (mapv tag-response (graph-insights/page-tags db page))
               :classes (mapv :block/title (graph-insights/page-classes db lineage page))
               :reference-count (:total (graph-insights/page-usage db page ref-properties))
-@@ -4469,6 +4481,7 @@
+@@ -4477,6 +4489,7 @@
                lineage (graph-insights/class-lineage-fn db)
                options {:ref-properties (graph-insights/ref-property-idents db)
                         :lineage lineage
@@ -286,12 +286,12 @@ index 0000000..da4b542
 +    (is (some #{"aliases"} (:required entry)) "aliases is always present")
 +    (is (= {:type "array" :items {:type "string"}} (select-keys (get-in entry [:properties :aliases]) [:type :items])))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 5392ac2..f0fbcb1 100644
+index 30042a7..aa3c8ec 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -26,6 +26,7 @@
-             [logseq.db-sync.semantic-readable-writes-test]
+@@ -27,6 +27,7 @@
              [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]
              [logseq.db-sync.semantic-signals-view-test]
 +            [logseq.db-sync.semantic-knowledge-index-aliases-test]
              [logseq.db-sync.storage-test]
