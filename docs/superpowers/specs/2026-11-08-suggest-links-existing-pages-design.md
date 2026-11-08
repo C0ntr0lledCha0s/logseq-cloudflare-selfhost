@@ -182,7 +182,7 @@ A plain first line, then JSON:
       "also_mentioned": 1 },
     { "span": { "start": 58, "end": 60, "line": 2, "text": "OI" },
       "page": { "uuid": "…", "title": "Operational Intelligence" },
-      "link": "[[OI]]",
+      "link": "[[<uuid of Operational Intelligence>]]",
       "reason": "alias ‘OI’ of Operational Intelligence",
       "also_mentioned": 0 }
   ],
@@ -197,6 +197,10 @@ A plain first line, then JSON:
 ```
 
 `link` keeps the draft's own words: a title match links the page's title as stored (`[[Workflow Intelligence]]`, which Logseq resolves ignoring case), and an alias match links the alias (`[[OI]]`), which Logseq resolves to the target. **(call)** Using the stored title rather than the draft's casing keeps the link pointing at the existing page, not at a new page in a different case.
+
+*As built (review round 2, r2-integrity-1):* a bare `[[Title]]` is resolved on write by `resolve-page-ref!`, which takes the oldest entity with that `:block/name`. A tag, property or journal with the same name as an index page (the app allows a page and a tag to share one) is older in that case, so the link pointed at it, not at the UUID the suggestion named and verify checked. `link` is now `[[<page uuid>]]` for titles and aliases alike, the form the server stores links in, so the written ref is exactly the suggested page; Logseq shows it as the page's title. The draft's own `[[<uuid>]]` links count as already linked. This also closes risk 6 below: a renamed page keeps its UUID.
+
+*As built (review round 2, r2-correctness-1):* a title's characters before its first word and after its last (the `)` of `Alice (Engineering)`, the `.` of `Example Ltd.`, the `?` of `What is OI?`) must appear in the draft next to the words, and the span covers them, so `linked_text` neither doubles them nor links text that lacks them. Two titles with the same words and different end punctuation are different candidates; the one with more of its own punctuation is tried first.
 
 `linked_text` is the dry run: the draft with every non-ambiguous, verified suggestion applied at its span, spliced from the end backwards so offsets stay valid. Claude shows it or diffs it, then writes it with `update_block` or `insert_block_tree`. The tool writes nothing, makes no audit entry and does not mark the index dirty. Suggestions are in draft order; `truncated` is true when more than `limit` were found.
 
@@ -266,6 +270,8 @@ At 200 calls a day: about 200 to 400 Worker requests, about 400 KV reads, about 
 
 *As built (review round 1):* the bench was over budget (about 45 ms at 20,000 pages with a 20,000-character draft), and most of it was `matchLinks`, not the parse, so splitting the key by letter would not have fixed it. The matcher now rules names out by hashed first-word and first-two-word checks (section 3.3 c) and walks `titles` with indexed loops, and `TEXT_LIMIT` is 10,000 characters. The bench (Node v22, 20,000 pages, titles key 1,329 KiB, 10,000-character draft, median of 20 runs) gives `JSON.parse` 4.5 to 5.3 ms, `matchLinks` 4.0 to 4.5 ms, total 8.8 to 9.8 ms; 5,000 pages total about 4 ms. The first, cold run is still over (16 to 21 ms at 20,000 pages), and the parse is now about half the cost, so the margin at 20,000 pages is thin; a smaller titles-key format is the next step if production shows 1102 errors.
 
+*As built (review round 2):* `page` and `exclude` were resolved with three passes over the index per reference (80 ms for 51 references at 20,000 pages, r2-correctness-3). `pageResolver` now resolves them all in one pass, hashing a title only when its length is a reference's, and the bench times it with a UUID and 50 unknown titles: about 1 ms at 20,000 pages. The first, cold call is still over the budget at large graphs; on this machine it is 7 to 10 ms even at 200 pages, so it is the cost of a fresh isolate compiling the matcher more than of the page count. The cold call is left for the backlog with the titles-key format.
+
 ## 6. Safety
 
 - **Read-only.** No write call, no audit entry, no dirty mark. A tool test asserts every request the sync mock sees is a knowledge-index GET or the `getBlocks` read, and the manifest entry has `readOnlyHint: true`.
@@ -281,7 +287,7 @@ At 200 calls a day: about 200 to 400 Worker requests, about 400 KV reads, about 
 3. **Masking heuristics.** A single `$` is not treated as math, so a Logseq inline `$x$` span could be matched. A `>` not at the start of a line is not a quote. Each mask rule has its own test, so a mutation run shows any rule left untested (`docs/solutions/testing/untested-rules-survive-mutation.md`).
 4. **Dictionary-word titles.** Single-word titles of 4 or more letters ("Apollo", "Delta") will match ordinary prose. Once per page, the stoplist and Claude's review of `linked_text` limit the harm; false positives remain likely on graphs with such titles.
 5. **CPU at 20,000 pages.** Measured by the bench, not by vitest (section 5).
-6. **Renamed pages.** `view=signals` has no title, so a page renamed in the app since the cache was built is verified as present under its old title, and the suggested link names the old title. Logseq would then create a new page by that name when the text is written. The window is at most an hour (cron) and closes at once for renames through the connector. A later option is to compare titles with the default `getBlocks` view, at a higher sync cost.
+6. **Renamed pages.** *(Closed in review round 2: links are written as `[[<uuid>]]`.)* `view=signals` has no title, so a page renamed in the app since the cache was built is verified as present under its old title, and the suggested link names the old title. Logseq would then create a new page by that name when the text is written. The window is at most an hour (cron) and closes at once for renames through the connector. A later option is to compare titles with the default `getBlocks` view, at a higher sync cost.
 7. **UTF-16 offsets.** Spans must be JavaScript string indices so `linked_text` splices exactly for macrons and emoji; tests include "Māori Health" and an emoji before a title.
 8. **Class pages.** Section 2 reads the index as excluding tags and properties. If a Stage 1 test shows a user class does reach it, `COMMON_TITLES` covers the common single words, and the help text will say so.
 

@@ -43,7 +43,10 @@ test("--json reports parse and match times on a 500-page fixture, and the tokeni
   assert.equal(out.draftChars, 10_000);
   assert.equal(out.budgetMs, 10);
   assert.ok(out.titlesBytes > 0);
-  for (const k of ["parseMs", "matchMs", "totalMs"]) {
+  // r2-correctness-3: resolving page plus EXCLUDE_LIMIT excludes is timed and counted in the total.
+  assert.equal(out.resolveRefs, 51);
+  assert.equal(out.totalMs, Math.round((out.parseMs + out.resolveMs + out.matchMs) * 1000) / 1000);
+  for (const k of ["parseMs", "resolveMs", "matchMs", "totalMs"]) {
     assert.equal(typeof out[k], "number", k);
     assert.ok(out[k] >= 0, k);
   }
@@ -80,6 +83,7 @@ test("text output names the budget and both medians", { skip }, () => {
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /500 pages/);
   assert.match(run.stdout, /JSON\.parse .* ms/);
+  assert.match(run.stdout, /resolving 51 page refs .* ms/);
   assert.match(run.stdout, /matchLinks .* ms/);
   assert.match(run.stdout, /10 ms budget/);
 });

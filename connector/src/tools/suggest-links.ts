@@ -118,6 +118,7 @@ const TAG_TRAILING = /[.:]+$/;
 const JOINERS = /^[ \t\u00a0\u2010\u2011-]+$/;
 const ALL_DIGITS = /^\p{N}+$/u;
 const WORD_CHAR = /^[\p{L}\p{N}]/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * The ranges no suggestion may touch (spec 3.3 a), and the link text found outside code. One pass
@@ -320,9 +321,12 @@ interface Name {
 }
 
 interface Candidate {
-  /** The words, with each gap between them: one space for joiners, else the name's own characters. */
+  /** The prefix, the words with each gap between them (one space for joiners, else the name's own characters), and the suffix. */
   key: string;
   words: string[];
+  /** The name's characters before its first word and after its last (spaces at its ends trimmed): "(" and ")" of "(Beta) Notes" or "Example Ltd.". The draft must have them, and the span covers them. */
+  prefix: string;
+  suffix: string;
   /** `gaps[k]` comes before `words[k + 1]`: " " for joiners, else the characters the name has there. */
   gaps: string[];
   names: Name[];
@@ -395,21 +399,24 @@ export function matchLinks(
       first = name.slice(lead.start, lead.end).toLowerCase();
       if (!wanted.has(first)) return;
     }
-    tokenised++;
     // A one-word ASCII name is its first word: no regex needed.
     const ws = found === ONE_WORD ? [{ word: first, start: lead.start, end: lead.end }] : wordSpans(name);
     if (found === NON_ASCII && ws.length > 1 && !pairsHash.has(pairHash(wordHash(ws[0].word), wordHash(ws[1].word)))) return;
+    tokenised++;
     const words = ws.map((w) => w.word);
     const gaps: string[] = [];
-    let key = words[0];
+    const prefix = name.slice(0, ws[0].start).trimStart();
+    const suffix = name.slice(ws[ws.length - 1].end).trimEnd();
+    let key = prefix + words[0];
     for (let k = 1; k < ws.length; k++) {
       const gap = name.slice(ws[k - 1].end, ws[k].start);
       gaps.push(JOINERS.test(gap) ? " " : gap);
       key += gaps[k - 1] + words[k];
     }
+    key += suffix;
     let c = byKey.get(key);
     if (!c) {
-      c = { key, words, gaps, names: [], stop: false, pages: [] };
+      c = { key, words, gaps, prefix, suffix, names: [], stop: false, pages: [] };
       byKey.set(key, c);
     }
     c.names.push({ uuid, title, alias, lower: name.toLowerCase(), stop: stoplisted(words, alias !== undefined) });
@@ -443,10 +450,22 @@ export function matchLinks(
     c.pages = pages ? [...pages.values()] : live;
   }
 
+  // A [[UUID]] link (the form `link` takes) names its page exactly; one pass over `titles`, only
+  // when the draft has such a link.
+  const linkedUuids = new Set(linkedLower.filter((l) => UUID.test(l)));
+  const byUuid = new Map<string, Name>();
+  if (linkedUuids.size > 0) {
+    for (let t = 0; t < titles.length; t++) {
+      const [uuid, title] = titles[t];
+      if (linkedUuids.has(uuid.toLowerCase())) byUuid.set(uuid.toLowerCase(), { uuid, title, lower: uuid, stop: false });
+    }
+  }
+
   const linkedPages = new Set<string>();
   const alreadyLinked: string[] = [];
   for (const l of linkedLower) {
-    for (const n of byLower.get(l) ?? []) {
+    const exact = byUuid.get(l);
+    for (const n of exact ? [exact] : (byLower.get(l) ?? [])) {
       if (linkedPages.has(n.uuid)) continue;
       linkedPages.add(n.uuid);
       alreadyLinked.push(n.title);
@@ -460,11 +479,16 @@ export function matchLinks(
     if (list) list.push(c);
     else byFirst.set(c.words[0], [c]);
   }
-  for (const list of byFirst.values()) list.sort((a, b) => b.words.length - a.words.length);
+  // Longest first; among the same words, the one with more of its own punctuation at the ends.
+  for (const list of byFirst.values()) {
+    list.sort((a, b) => b.words.length - a.words.length || b.prefix.length + b.suffix.length - (a.prefix.length + a.suffix.length));
+  }
 
   // A gap the name fills with joiners takes any joiners; one with its own punctuation (Node.js,
   // R&D) takes exactly those characters.
   let glued: ((start: number, end: number) => boolean) | undefined;
+  // Where the last match taken ends, suffix included: a prefix may not reach back into it.
+  let lastEnd = 0;
   const fits = (c: Candidate, i: number): boolean => {
     const { words, gaps } = c;
     for (let k = 0; k < words.length; k++) {
@@ -475,16 +499,22 @@ export function matchLinks(
         if (gaps[k - 1] === " " ? !JOINERS.test(gap) : gap !== gaps[k - 1]) return false;
       }
     }
+    const start = spans[i].start;
+    const end = spans[i + words.length - 1].end;
+    if (c.prefix !== "" && (start - c.prefix.length < lastEnd || text.slice(start - c.prefix.length, start) !== c.prefix)) return false;
+    if (c.suffix !== "" && text.slice(end, end + c.suffix.length) !== c.suffix) return false;
     glued ??= glueCheck(text);
     return !glued(spans[i].start, spans[i + words.length - 1].end);
   };
 
   let line = 1;
   let counted = 0;
-  const spanOf = (from: number, to: number): Span => {
-    const start = spans[from].start;
+  // The span of candidate `c` matched at word `i`, with the name's prefix and suffix.
+  const spanOf = (c: Candidate, i: number): Span => {
+    const start = spans[i].start - c.prefix.length;
+    const end = spans[i + c.words.length - 1].end + c.suffix.length;
     for (; counted < start; counted++) if (text.charCodeAt(counted) === 10) line++;
-    return { start, end: spans[to].end, line, text: text.slice(start, spans[to].end) };
+    return { start, end, line, text: text.slice(start, end) };
   };
 
   const suggestions: Suggestion[] = [];
@@ -500,7 +530,7 @@ export function matchLinks(
       if (ambiguousKeys.has(c.key)) return;
       ambiguousKeys.add(c.key);
       const candidates = c.pages.map((n) => ({ uuid: n.uuid, title: n.title }));
-      ambiguous.push({ span: spanOf(i, i + c.words.length - 1), candidates });
+      ambiguous.push({ span: spanOf(c, i), candidates });
       return;
     }
     const n = c.pages[0];
@@ -514,9 +544,10 @@ export function matchLinks(
       return;
     }
     const suggestion: Suggestion = {
-      span: spanOf(i, i + c.words.length - 1),
+      span: spanOf(c, i),
       page: { uuid: n.uuid, title: n.title },
-      link: `[[${n.alias ?? n.title}]]`,
+      // By UUID: a bare [[Title]] resolves by name to the oldest page, tag or property with it.
+      link: `[[${n.uuid}]]`,
       reason: n.alias === undefined ? "title" : `alias ‘${n.alias}’ of ${n.title}`,
       also_mentioned: 0,
     };
@@ -534,6 +565,7 @@ export function matchLinks(
       }
       emit(c, i);
       taken = c.words.length;
+      lastEnd = spans[i + taken - 1].end + c.suffix.length;
       break;
     }
     i += taken;
@@ -568,15 +600,54 @@ export function resolvePageRef(
   titles: KbTitlesPage[],
   ref: string,
 ): { uuid: string } | { ambiguous: KbTitlesPage[] } | null {
-  const lower = ref.toLowerCase();
-  const byUuid = titles.find((p) => p[0].toLowerCase() === lower);
-  if (byUuid) return { uuid: byUuid[0] };
-  for (const same of [(p: KbTitlesPage) => p[1] === ref, (p: KbTitlesPage) => p[1].toLowerCase() === lower]) {
-    const found = titles.filter(same);
-    if (found.length === 1) return { uuid: found[0][0] };
-    if (found.length > 1) return { ambiguous: found };
+  return pageResolver(titles, [ref])[0];
+}
+
+/**
+ * `resolvePageRef` for many refs: one pass over `titles` that looks each page up in small maps of
+ * the refs, so page plus 50 excludes cost one pass over the index, not three per ref, and build no
+ * map of the whole index (r2-correctness-3).
+ */
+export function pageResolver(
+  titles: KbTitlesPage[],
+  refs: string[],
+): ({ uuid: string } | { ambiguous: KbTitlesPage[] } | null)[] {
+  const lowers = refs.map((r) => r.toLowerCase());
+  const exact = new Map<string, KbTitlesPage[]>();
+  const loose = new Map<string, KbTitlesPage[]>();
+  const uuids = new Map<string, string>();
+  for (const r of refs) exact.set(r, []);
+  for (const l of lowers) loose.set(l, []);
+  // Cheap integer checks first, so most titles are never hashed or lower-cased. Lower-casing never
+  // shortens a string and lengthens it only at İ (U+0130), so a title can equal a ref ignoring case
+  // only when its length is a ref's, or it is shorter and has an İ.
+  const lengths = new Set([...refs, ...lowers].map((r) => r.length));
+  const longest = Math.max(...lengths);
+  // The first two characters of each UUID ref, as one integer: most index UUIDs fail this and are never hashed.
+  const uuidHeads = new Set(lowers.filter((l) => UUID.test(l)).map((l) => l.charCodeAt(0) * 128 + l.charCodeAt(1)));
+  for (let t = 0; t < titles.length; t++) {
+    const p = titles[t];
+    // The server writes UUIDs in lower case (str of a uuid), so the index's need no lower-casing.
+    const u = p[0];
+    if (uuidHeads.has(u.charCodeAt(0) * 128 + u.charCodeAt(1)) && loose.has(u) && !uuids.has(u)) uuids.set(u, u);
+    const title = p[1];
+    const len = title.length;
+    if (lengths.has(len)) {
+      exact.get(title)?.push(p);
+      loose.get(title.toLowerCase())?.push(p);
+    } else if (len < longest && title.includes("\u0130")) {
+      loose.get(title.toLowerCase())?.push(p);
+    }
   }
-  return null;
+  return refs.map((ref, i) => {
+    const uuid = uuids.get(lowers[i]);
+    if (uuid !== undefined) return { uuid };
+    for (const found of [exact.get(ref)!, loose.get(lowers[i])!]) {
+      if (found.length === 1) return { uuid: found[0][0] };
+      if (found.length > 1) return { ambiguous: found };
+    }
+    return null;
+  });
 }
 
 // The tool (spec sections 3.4, 3.5, 3.7, 3.8 and 4). Read-only: it reads the kb_index titles key
@@ -591,16 +662,21 @@ export function thousands(n: number): string {
 
 export const SUGGEST_LINKS_DESCRIPTION =
   `Suggest [[links]] to pages that already exist for draft markdown you are about to write (up to ${thousands(TEXT_LIMIT)} characters; call it once per part of a longer draft). Read-only: it never writes. ` +
-  "Each suggestion gives the matched span (start, end, line, text), the page's title and UUID, the link to write and the reason (its title, or an alias of it). Matching is whole words, ignoring case, longest title first, and once per page (also_mentioned counts the later mentions). Spaces and hyphens between a title's words are interchangeable, but punctuation inside a title (Node.js, R&D Budget) must appear as the title has it. A page the draft already links is listed under already_linked. " +
+  "Each suggestion gives the matched span (start, end, line, text), the page's title and UUID, the link to write and the reason (its title, or an alias of it). The link is [[page UUID]], which names exactly that page and which Logseq shows as its title; a [[Title]] would go to the oldest page, tag or property with that name. Matching is whole words, ignoring case, longest title first, and once per page (also_mentioned counts the later mentions). Spaces and hyphens between a title's words are interchangeable, but a title's other punctuation, inside it or before or after its words (Node.js, R&D Budget, Example Ltd., Alice (Engineering)), must appear as the title has it, and the span covers it. A page the draft already links, as [[Title]] or [[UUID]], is listed under already_linked. " +
   "Text inside [[links]], tags, block refs, macros, markdown links, URLs, inline code, code blocks, math, quotes and property keys is never matched, nor is a word joined into an email address, domain, path or identifier (by @, /, \\, _ or a dot before a letter or digit), nor are short or common titles (skipped_stoplist counts them). " +
   "Only pages in the knowledge index are suggested: no journals, tags, properties or pages tagged private. Two pages sharing a title are listed under ambiguous and never linked: ask which one is meant. " +
   `page names the page being written (UUID or title), and exclude names up to ${EXCLUDE_LIMIT} more pages never to suggest. limit is at most ${MAX_LIMIT} suggestions (default ${DEFAULT_LIMIT}), in draft order; truncated says when there were more. ` +
   "verify (default true) reads the suggested pages back with one getBlocks request and moves any deleted since the index was built to dropped_stale; verify: false skips that and the first line says the UUIDs are unverified. " +
-  "linked_text is the draft with the suggestions applied: show it to the user, then write it with update_block or insert_block_tree.";
+  "linked_text is the draft with the suggestions applied as [[UUID]] links: show the user each suggestion by its span text and page title, then write linked_text with update_block or insert_block_tree.";
 
-/** `ref` as one index page's UUID; null (and a note) when no page has it; refused when several do. */
-function resolveRef(pages: KbTitlesPage[], ref: string, field: string, notes: string[], unknown: string): string | null {
-  const found = resolvePageRef(pages, ref);
+/** `ref` as one index page's UUID, from what `pageResolver` found; null (and a note) when no page has it; refused when several do. */
+function resolveRef(
+  found: ReturnType<typeof pageResolver>[number],
+  ref: string,
+  field: string,
+  notes: string[],
+  unknown: string,
+): string | null {
   if (found === null) {
     notes.push(`${field}: no page ‘${ref}’ in the index${unknown}`);
     return null;
@@ -749,9 +825,13 @@ export function registerSuggestLinksTool(
 
           const notes: string[] = [];
           const excluded = new Set<string>();
+          // One pass over the index for page and every exclude, and none when the call names neither.
+          const refs = page === undefined ? exclude : [page, ...exclude];
+          const found = refs.length > 0 ? pageResolver(titles.pages, refs) : [];
+          const excludeFound = page === undefined ? found : found.slice(1);
           if (page !== undefined) {
             const uuid = resolveRef(
-              titles.pages,
+              found[0],
               page,
               "page",
               notes,
@@ -760,7 +840,7 @@ export function registerSuggestLinksTool(
             if (uuid !== null) excluded.add(uuid);
           }
           exclude.forEach((ref, i) => {
-            const uuid = resolveRef(titles.pages, ref, `exclude[${i}]`, [], "");
+            const uuid = resolveRef(excludeFound[i], ref, `exclude[${i}]`, [], "");
             if (uuid === null) notes.push(`exclude: no page ‘${ref}’ in the index`);
             else excluded.add(uuid);
           });

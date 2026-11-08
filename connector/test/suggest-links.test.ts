@@ -28,6 +28,7 @@ import {
   applyLinks,
   maskRanges,
   matchLinks,
+  pageResolver,
   resolvePageRef,
 } from "../src/tools/suggest-links";
 
@@ -55,6 +56,9 @@ const PAGES: KbTitlesPage[] = [
   [SPRINT_B, "Sprint", []],
   [IST, "İstanbul Office", []],
 ];
+
+/** A suggestion's link: by UUID, so it names exactly the suggested page (r2-integrity-1). */
+const ln = (uuid: string) => `[[${uuid}]]`;
 
 function match(text: string, titles: KbTitlesPage[] = PAGES, exclude: string[] = [], limit = DEFAULT_LIMIT) {
   return matchLinks(text, titles, { exclude: new Set(exclude), limit });
@@ -129,7 +133,7 @@ describe("matchLinks: matching", () => {
       {
         span: { start, end: start + 21, line: 2, text: "workflow intelligence" },
         page: { uuid: WI, title: "Workflow Intelligence" },
-        link: "[[Workflow Intelligence]]",
+        link: ln(WI),
         reason: "title",
         also_mentioned: 0,
       },
@@ -197,7 +201,7 @@ describe("matchLinks: matching", () => {
       ["İstanbul Office", "İstanbul Office"],
     ]);
     for (const s of result.suggestions) expect(text.slice(s.span.start, s.span.end)).toBe(s.span.text);
-    expect(applyLinks(text, result.suggestions)).toBe("İzmir 🚀 then [[Māori Health]] and [[İstanbul Office]]");
+    expect(applyLinks(text, result.suggestions)).toBe(`İzmir 🚀 then ${ln(MH)} and ${ln(IST)}`);
   });
 });
 
@@ -208,7 +212,7 @@ describe("matchLinks: aliases", () => {
       {
         span: { start: 8, end: 10, line: 1, text: "OI" },
         page: { uuid: OPS, title: "Operational Intelligence" },
-        link: "[[OI]]",
+        link: ln(OPS),
         reason: "alias ‘OI’ of Operational Intelligence",
         also_mentioned: 0,
       },
@@ -219,12 +223,12 @@ describe("matchLinks: aliases", () => {
     for (const titles of [PAGES, [...PAGES].reverse()]) {
       const result = match("oi", titles);
       expect(result.ambiguous).toEqual([]);
-      expect(result.suggestions.map((s) => [s.page.uuid, s.link])).toEqual([[OPS, "[[OI]]"]]);
+      expect(result.suggestions.map((s) => [s.page.uuid, s.link])).toEqual([[OPS, ln(OPS)]]);
       // "Ops Intel" is long enough to pass the stoplist, so only the alias rule decides this one.
       const long = match("ops intel", titles);
       expect(long.ambiguous).toEqual([]);
       expect(long.suggestions.map((s) => [s.page.uuid, s.link, s.reason])).toEqual([
-        [OPS, "[[Ops Intel]]", "alias ‘Ops Intel’ of Operational Intelligence"],
+        [OPS, ln(OPS), "alias ‘Ops Intel’ of Operational Intelligence"],
       ]);
     }
   });
@@ -257,7 +261,7 @@ describe("matchLinks: aliases", () => {
       ["00000000-0000-4000-8000-0000000000c2", "Release Checks", ["RC"]],
     ];
     const result = match("QA and RC today", titles);
-    expect(result.suggestions.map((s) => s.link)).toEqual(["[[RC]]"]);
+    expect(result.suggestions.map((s) => s.link)).toEqual([ln("00000000-0000-4000-8000-0000000000c2")]);
     expect(result.skippedStoplist).toBe(1);
   });
 });
@@ -407,7 +411,7 @@ describe("matchLinks: punctuation inside a title (r1-correctness-1)", () => {
       expect(hits(text, TITLES), text).toEqual([[title, start]]);
     }
     const text = "Plan for Mother's Day.";
-    expect(applyLinks(text, match(text, TITLES).suggestions)).toBe("Plan for [[Mother's Day]].");
+    expect(applyLinks(text, match(text, TITLES).suggestions)).toBe(`Plan for ${ln(MOTHERS)}.`);
   });
 
   it("does not match a spelling with other separators in place of the title's punctuation", () => {
@@ -482,6 +486,12 @@ describe("matchLinks: words joined into an address, domain or path (r1-correctne
     ["an identifier with _", "Set acme_api_key for Acme.", "Acme."],
     ["a multi-word title in a path", "See /teams/head of sales/plan for the Head of Sales.", "Head of Sales."],
     ["double-backtick inline code", "Use ``code with `Acme` inside`` here, then Acme.", "Acme."],
+    // r2-tests-1: a one-backtick span closes only at a run of exactly one, not inside a longer run.
+    ["inline code whose text holds a longer backtick run", "Run `a`` Acme `b` then Acme.", "Acme."],
+    // r2-tests-2: a dot before a non-ASCII letter or digit glues too.
+    ["a domain part that starts with a macronised letter", "Docs at acme.ōtaki for Acme.", "Acme."],
+    ["a file name with an accented extension", "Open acme.été for Acme.", "Acme."],
+    ["a name with a non-ASCII digit after the dot", "Use acme.٣ for Acme.", "Acme."],
   ];
   for (const [name, text, outside] of cases) {
     it(`does not match inside ${name}`, () => {
@@ -498,6 +508,9 @@ describe("matchLinks: words joined into an address, domain or path (r1-correctne
       "Talk to Acme's team",
       "Talk to Acme: now",
       "Talk to Acme... now",
+      // A dot before a non-ASCII character that is not a letter or digit ends the sentence (r2-tests-2).
+      "Talk to Acme.” now",
+      "Talk to Acme.— now",
       "Talk to **Acme** now",
       "Acme",
     ]) {
@@ -508,12 +521,15 @@ describe("matchLinks: words joined into an address, domain or path (r1-correctne
   it("linked_text leaves the address, domain and path whole", () => {
     const text = "Email jane@acme.com, see acme.com/pricing and ~/code/react; Acme and React.";
     expect(applyLinks(text, match(text, TITLES).suggestions)).toBe(
-      "Email jane@acme.com, see acme.com/pricing and ~/code/react; [[Acme]] and [[React]].",
+      `Email jane@acme.com, see acme.com/pricing and ~/code/react; ${ln(ACME)} and ${ln("00000000-0000-4000-8000-0000000000f2")}.`,
     );
   });
 
   it("masks double-backtick inline code as one range", () => {
     expect(maskRanges("Use ``code with `Acme` inside`` here").ranges).toEqual([[4, 31]]);
+    // A one-backtick opener skips the `` run and closes at the next single backtick (r2-tests-1).
+    expect(maskRanges("Run `a`` Acme `b` here").ranges).toEqual([[4, 15]]);
+    expect(hits("Run `a`` Acme `b` here", TITLES)).toEqual([]);
     expect(maskRanges("a `b` c").ranges).toEqual([[2, 5]]);
   });
 });
@@ -656,7 +672,7 @@ describe("matchLinks: exclusion, ambiguity and limit", () => {
         ],
       },
     ]);
-    expect(applyLinks(text, result.suggestions)).toBe("Sprint review for [[Workflow Intelligence]]");
+    expect(applyLinks(text, result.suggestions)).toBe(`Sprint review for ${ln(WI)}`);
   });
 
   it("titles equal ignoring case are ambiguous", () => {
@@ -691,13 +707,112 @@ describe("matchLinks: exclusion, ambiguity and limit", () => {
 });
 
 describe("applyLinks", () => {
-  it("replaces exactly the given spans, title matches with the stored title and aliases with the alias", () => {
+  it("replaces exactly the given spans with each page's [[UUID]] link, aliases included", () => {
     const text = "workflow intelligence: ask OI, then the Head of Sales.";
     const result = match(text);
-    const linked = "[[Workflow Intelligence]]: ask [[OI]], then the [[Head of Sales]].";
+    const linked = `${ln(WI)}: ask ${ln(OPS)}, then the ${ln(HOS)}.`;
     expect(applyLinks(text, result.suggestions)).toBe(linked);
     expect(applyLinks(text, [...result.suggestions].reverse())).toBe(linked);
     expect(applyLinks(text, [])).toBe(text);
+  });
+});
+
+describe("matchLinks: punctuation before or after a title (r2-correctness-1)", () => {
+  const ALICE = "00000000-0000-4000-8000-0000000000d1";
+  const LTD = "00000000-0000-4000-8000-0000000000d2";
+  const BETA = "00000000-0000-4000-8000-0000000000d3";
+  const QUESTION = "00000000-0000-4000-8000-0000000000d4";
+  const DRAFT = "00000000-0000-4000-8000-0000000000d5";
+  const ALPHA = "00000000-0000-4000-8000-0000000000d6";
+  const TITLES: KbTitlesPage[] = [
+    [ALICE, "Alice (Engineering)", []],
+    [LTD, "Example Ltd.", []],
+    [BETA, "Logseq Sync (Beta)", []],
+    [QUESTION, "What is OI?", []],
+    [DRAFT, "(Draft) Launch Plan", []],
+    [ALPHA, "Project Alpha", ["PA!"]],
+  ];
+
+  it("spans the whole title, so linked_text replaces it exactly", () => {
+    for (const [text, uuid, spanText, linked] of [
+      ["Ask Alice (Engineering) about it.", ALICE, "Alice (Engineering)", `Ask ${ln(ALICE)} about it.`],
+      ["Example Ltd. announced results", LTD, "Example Ltd.", `${ln(LTD)} announced results`],
+      ["We met Example Ltd.", LTD, "Example Ltd.", `We met ${ln(LTD)}`],
+      ["We moved Logseq Sync (Beta) on", BETA, "Logseq Sync (Beta)", `We moved ${ln(BETA)} on`],
+      ["Read What is OI? Nothing more.", QUESTION, "What is OI?", `Read ${ln(QUESTION)} Nothing more.`],
+      ["See the (Draft) Launch Plan now", DRAFT, "(Draft) Launch Plan", `See the ${ln(DRAFT)} now`],
+      ["Ask PA! now", ALPHA, "PA!", `Ask ${ln(ALPHA)} now`],
+    ]) {
+      const result = match(text, TITLES);
+      expect(result.suggestions.map((s) => [s.page.uuid, s.span.text]), text).toEqual([[uuid, spanText]]);
+      const [s] = result.suggestions;
+      expect(text.slice(s.span.start, s.span.end)).toBe(s.span.text);
+      expect(applyLinks(text, result.suggestions), text).toBe(linked);
+    }
+  });
+
+  it("does not match a draft without the title's leading or trailing characters", () => {
+    for (const text of [
+      "Ask Alice (Engineering team.",
+      "Ask Alice Engineering now.",
+      "Example Ltd announced results",
+      "We moved Logseq Sync (Beta on",
+      "Read What is OI. Nothing more.",
+      "See the Draft) Launch Plan now",
+      "See the Draft Launch Plan now",
+      "Ask PA now",
+    ]) {
+      expect(hits(text, TITLES), text).toEqual([]);
+    }
+  });
+
+  it("prefers the title that has the draft's trailing punctuation over one without it", () => {
+    const BARE = "00000000-0000-4000-8000-0000000000d7";
+    for (const titles of [[...TITLES, [BARE, "Example Ltd", []] as KbTitlesPage], [[BARE, "Example Ltd", []] as KbTitlesPage, ...TITLES]]) {
+      expect(hits("Example Ltd. announced", titles)).toEqual([["Example Ltd.", 0]]);
+      expect(hits("Example Ltd announced", titles)).toEqual([["Example Ltd", 0]]);
+      expect(match("Example Ltd. announced", titles).ambiguous).toEqual([]);
+    }
+  });
+
+  it("never lets a title's prefix reach back into the previous match's suffix", () => {
+    const titles: KbTitlesPage[] = [
+      ["00000000-0000-4000-8000-0000000000d8", "Alpha:", []],
+      ["00000000-0000-4000-8000-0000000000d9", ":Gamma", []],
+    ];
+    const text = "See Alpha:Gamma now";
+    const result = match(text, titles);
+    expect(result.suggestions.map((s) => s.span.text)).toEqual(["Alpha:"]);
+    expect(applyLinks(text, result.suggestions)).toBe("See [[00000000-0000-4000-8000-0000000000d8]]Gamma now");
+    // On its own, the second title matches with its prefix.
+    expect(hits("See :Gamma now", titles)).toEqual([[":Gamma", 4]]);
+  });
+});
+
+describe("matchLinks: links name the page by UUID (r2-integrity-1)", () => {
+  it("writes [[UUID]], which the server stores as a ref to exactly that page, for titles and aliases", () => {
+    // A bare [[Workflow Intelligence]] resolves by name to the oldest entity with it, which can be
+    // a tag or property the knowledge index leaves out; [[UUID]] cannot.
+    const text = "Workflow Intelligence and OI";
+    const result = match(text);
+    expect(result.suggestions.map((s) => [s.page.uuid, s.link])).toEqual([
+      [WI, ln(WI)],
+      [OPS, ln(OPS)],
+    ]);
+    expect(applyLinks(text, result.suggestions)).toBe(`${ln(WI)} and ${ln(OPS)}`);
+  });
+
+  it("counts a [[UUID]] link already in the draft as linking that page, in any case", () => {
+    for (const uuid of [WI, WI.toUpperCase()]) {
+      const result = match(`See [[${uuid}]], then Workflow Intelligence again.`);
+      expect(result.alreadyLinked).toEqual(["Workflow Intelligence"]);
+      expect(result.linkedPages).toEqual([WI]);
+      expect(result.suggestions).toEqual([]);
+    }
+    // A UUID no index page has links nothing in the index.
+    const other = match("See [[00000000-0000-4000-8000-0000000000ff]], then Workflow Intelligence.");
+    expect(other.alreadyLinked).toEqual([]);
+    expect(other.suggestions.map((s) => s.page.uuid)).toEqual([WI]);
   });
 });
 
@@ -736,6 +851,57 @@ describe("resolvePageRef", () => {
     expect(resolvePageRef(titles, "Secret Plans")).toBeNull();
     expect(resolvePageRef(titles, "OI")).toBeNull();
     expect(resolvePageRef(titles, "00000000-0000-4000-8000-0000000000ff")).toBeNull();
+  });
+
+  // r2-correctness-3: page plus EXCLUDE_LIMIT refs on a 20,000-page index took 80 ms when each ref
+  // walked the index three times. Counting reads of index entries makes the bound deterministic.
+  const counted = (pages: KbTitlesPage[]) => {
+    const reads = { n: 0 };
+    const proxy = new Proxy(pages, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) reads.n++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    return { proxy, reads };
+  };
+
+  it("reads each index entry once for an unknown ref, not once per pass", () => {
+    const { proxy, reads } = counted(titles);
+    expect(resolvePageRef(proxy, "Secret Plans")).toBeNull();
+    expect(reads.n).toBe(titles.length);
+  });
+
+  it("resolves page plus EXCLUDE_LIMIT refs with one pass over the index", () => {
+    const pages: KbTitlesPage[] = [];
+    for (let i = 0; i < 2_000; i++) pages.push([`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `Topic ${i}`, []]);
+    const { proxy, reads } = counted(pages);
+    const refs = ["Topic 7", pages[9][0].toUpperCase(), ...Array.from({ length: EXCLUDE_LIMIT - 1 }, (_, i) => `Unknown ${i}`)];
+    const found = pageResolver(proxy, refs);
+    expect(found.slice(0, 2)).toEqual([{ uuid: pages[7][0] }, { uuid: pages[9][0] }]);
+    expect(found.slice(2).every((f) => f === null)).toBe(true);
+    expect(reads.n).toBe(pages.length);
+    // The same answers as resolvePageRef, one ref at a time.
+    const many = [...refs, "topic 3"];
+    expect(pageResolver(pages, many)).toEqual(many.map((ref) => resolvePageRef(pages, ref)));
+    const mixed = ["Sprint", "retro", "head of sales", "Head of Sales", "OI", WI, "Secret Plans"];
+    expect(pageResolver(titles, mixed)).toEqual(mixed.map((ref) => resolvePageRef(titles, ref)));
+  });
+
+  it("resolves every kind of ref: UUID in either case, exact title, title ignoring case, one whose lower case is longer, ambiguous, unknown", () => {
+    // "İstanbul Office" is 15 UTF-16 units; its lower case is 16, so the length check must not skip it.
+    const office = "00000000-0000-4000-8000-0000000000ee";
+    const pages: KbTitlesPage[] = [...titles, [office, "İstanbul Office", []]];
+    const refs = [WI.toUpperCase(), "Head of Sales", "WORKFLOW INTELLIGENCE", "İstanbul Office".toLowerCase(), "Sprint", "retro", "Nope"];
+    expect(pageResolver(pages, refs)).toEqual([
+      { uuid: WI },
+      { uuid: HOS },
+      { uuid: WI },
+      { uuid: office },
+      { ambiguous: [pages[2], pages[3]] },
+      { ambiguous: [pages[6], pages[7]] },
+      null,
+    ]);
   });
 });
 
@@ -789,8 +955,9 @@ describe("matchLinks: cost is bounded by the draft's word pairs (r1-light-1)", (
       ["00000000-0000-4000-8000-0000000000c5", "Ōtautahi Office", []],
     ];
     const result = match("Māori health and language.", titles);
-    // The two Māori titles start with a draft word, so both are tokenised; Ōtautahi Office is not.
-    expect(result.tokenised).toBe(2);
+    // Both Māori titles start with a draft word, but only "māori health" is a pair in the draft, so
+    // only Māori Health is counted as tokenised (r2-tests-3); Ōtautahi Office is not either.
+    expect(result.tokenised).toBe(1);
     expect(result.suggestions.map((s) => s.page.title)).toEqual(["Māori Health"]);
   });
 });
@@ -1034,14 +1201,14 @@ describe("suggest_links tool", () => {
       {
         span: { start: at(text, "Workflow Intelligence"), end: at(text, "Workflow Intelligence") + 21, line: 1, text: "Workflow Intelligence" },
         page: { uuid: WI, title: "Workflow Intelligence" },
-        link: "[[Workflow Intelligence]]",
+        link: ln(WI),
         reason: "title",
         also_mentioned: 1,
       },
       {
         span: { start: at(text, "OI"), end: at(text, "OI") + 2, line: 2, text: "OI" },
         page: { uuid: OPS, title: "Operational Intelligence" },
-        link: "[[OI]]",
+        link: ln(OPS),
         reason: "alias ‘OI’ of Operational Intelligence",
         also_mentioned: 0,
       },
@@ -1053,7 +1220,7 @@ describe("suggest_links tool", () => {
     expect(body.skipped_stoplist).toBe(0);
     expect(body.truncated).toBe(false);
     expect(body.linked_text).toBe(
-      "Notes on [[Workflow Intelligence]].\nAsk [[OI]] and [[Head of Sales]] about workflow intelligence.",
+      `Notes on ${ln(WI)}.\nAsk ${ln(OPS)} and [[Head of Sales]] about workflow intelligence.`,
     );
     expect(summary).toMatch(/^2 link suggestions for graph "work" \(index built \d\d:\d\d UTC, just now\); 1 already linked; 0 dropped as stale$/);
   });
@@ -1090,7 +1257,7 @@ describe("suggest_links tool", () => {
     expect(blockCalls()).toHaveLength(1);
     expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([HOS]);
     expect(body.dropped_stale).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
-    expect(body.linked_text).toBe("Workflow Intelligence met [[Head of Sales]].");
+    expect(body.linked_text).toBe(`Workflow Intelligence met ${ln(HOS)}.`);
     expect(summary).toMatch(/; 1 dropped as stale$/);
   });
 
@@ -1113,7 +1280,7 @@ describe("suggest_links tool", () => {
     expect(body.truncated).toBe(true);
     expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([HOS]);
     expect(body.dropped_stale).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
-    expect(body.linked_text).toBe("Workflow Intelligence, [[Head of Sales]] and Māori Health.");
+    expect(body.linked_text).toBe(`Workflow Intelligence, ${ln(HOS)} and Māori Health.`);
   });
 
   it("a failed verify fails the call, naming getBlocks and the reason", async () => {
@@ -1359,7 +1526,7 @@ describe("suggest_links tool", () => {
       expect(body.related).toHaveLength(RELATED_LIMIT);
       expect(JSON.stringify(body)).not.toContain(SECRET);
       expect(JSON.stringify(body)).not.toContain(JOURNAL);
-      expect(body.linked_text).toBe("Notes on [[Workflow Intelligence]].");
+      expect(body.linked_text).toBe(`Notes on ${ln(WI)}.`);
       expect(summary).toMatch(/; 5 related$/);
     });
 
@@ -1425,7 +1592,7 @@ describe("suggest_links tool", () => {
       expect(idsOf(blockCalls()[0])).toEqual([WI, HOS, MH]);
       expect(relatedOf(body)).toEqual([["Head of Sales", 0.9]]);
       expect(body.dropped_stale).toEqual([{ uuid: MH, title: "Māori Health" }]);
-      expect(body.linked_text).toBe("Notes on [[Workflow Intelligence]].");
+      expect(body.linked_text).toBe(`Notes on ${ln(WI)}.`);
     });
 
     it("verifies related pages when there is no suggestion, and verify: false reads nothing back", async () => {

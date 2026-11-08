@@ -4,7 +4,8 @@
 // runs the connector's real matcher under Node: it bundles connector/src/tools/suggest-links.ts with
 // the esbuild in connector/node_modules (a wrangler dependency; the connector's extensionless
 // imports do not load under Node's type stripping), builds a seeded fixture of example page titles
-// in the titles key's shape, and times JSON.parse of that key plus matchLinks on a draft.
+// in the titles key's shape, and times JSON.parse of that key, resolving page plus EXCLUDE_LIMIT
+// exclude refs (all unknown, the costliest case), and matchLinks on a draft.
 //
 //   node scripts/bench-suggest-links.mjs [--pages 20000] [--runs 20] [--json]
 //
@@ -153,33 +154,42 @@ const median = (xs) => {
 const round = (ms) => Math.round(ms * 1000) / 1000;
 
 export async function bench({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS } = {}) {
-  const { matchLinks } = await loadMatcher();
+  const { matchLinks, pageResolver, EXCLUDE_LIMIT } = await loadMatcher();
   const titles = makeTitles(pages);
   const draft = makeDraft(titles, DRAFT_CHARS);
   // The titles key as kb-index.ts writes it (KbTitlesRecord).
   const key = JSON.stringify({ graphId: "bench", builtAt: 0, version: 2, pages: titles });
+  // page (a UUID) plus EXCLUDE_LIMIT excludes, none in the index, so each one misses every lookup
+  // and the UUID makes every page's UUID a candidate too.
+  const refs = ["ffffffff-ffff-4fff-8fff-ffffffffffff", ...Array.from({ length: EXCLUDE_LIMIT }, (_, i) => `Not A Page ${i}`)];
 
   const once = () => {
     const t0 = performance.now();
     const record = JSON.parse(key);
     const t1 = performance.now();
-    const result = matchLinks(draft, record.pages, { exclude: new Set(), limit: LIMIT });
+    const exclude = new Set();
+    for (const found of pageResolver(record.pages, refs)) if (found && "uuid" in found) exclude.add(found.uuid);
     const t2 = performance.now();
-    return { parse: t1 - t0, match: t2 - t1, result };
+    const result = matchLinks(draft, record.pages, { exclude, limit: LIMIT });
+    const t3 = performance.now();
+    return { parse: t1 - t0, resolve: t2 - t1, match: t3 - t2, result };
   };
   const first = once();
   const parse = [];
+  const resolveTimes = [];
   const match = [];
   let result = first.result;
   for (let i = 0; i < runs; i++) {
     const r = once();
     parse.push(r.parse);
+    resolveTimes.push(r.resolve);
     match.push(r.match);
     result = r.result;
   }
   const parseMs = round(median(parse));
+  const resolveMs = round(median(resolveTimes));
   const matchMs = round(median(match));
-  const totalMs = round(parseMs + matchMs);
+  const totalMs = round(parseMs + resolveMs + matchMs);
   return {
     pages,
     titlesBytes: Buffer.byteLength(key),
@@ -187,9 +197,11 @@ export async function bench({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS } = {})
     runs,
     budgetMs: BUDGET_MS,
     parseMs,
+    resolveRefs: refs.length,
+    resolveMs,
     matchMs,
     totalMs,
-    firstRunMs: round(first.parse + first.match),
+    firstRunMs: round(first.parse + first.resolve + first.match),
     overBudget: isOverBudget(totalMs),
     tokenised: result.tokenised,
     firstWordBound: firstWordBound(titles, draft),
@@ -226,6 +238,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const kb = (r.titlesBytes / 1024).toFixed(0);
     console.log(`suggest_links bench: ${r.pages} pages (titles key ${kb} KiB), ${r.draftChars}-character draft, median of ${r.runs} runs, Node ${r.node}`);
     console.log(`  JSON.parse of the titles key  ${r.parseMs} ms`);
+    console.log(`  resolving ${r.resolveRefs} page refs        ${r.resolveMs} ms (page plus every exclude, none in the index)`);
     console.log(`  matchLinks on the draft       ${r.matchMs} ms (tokenised ${r.tokenised} of a first-word bound of ${r.firstWordBound}; ${r.suggestions} suggestions)`);
     console.log(`  total                         ${r.totalMs} ms against the ${r.budgetMs} ms budget${r.overBudget ? ": OVER BUDGET" : ""} (first run ${r.firstRunMs} ms)`);
   }
