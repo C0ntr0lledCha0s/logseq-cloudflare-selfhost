@@ -16,7 +16,7 @@ import { ToolError, runTool, textResult } from "./common";
 import { type GraphAccess, graphFetch, resolveGraph } from "./semantic";
 
 export const SEMANTIC_HELP =
-  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
+  "For questions about meaning rather than exact words (\"what did we decide about pricing?\"), use semantic_search: it combines meaning-based and title search. Each hit's similarity is its cosine similarity to the query from the @cf/baai/bge-small-en-v1.5 model (higher is closer; null when only title search found it), and semantic-rank and keyword-rank are its place in each search. Judge a match by similarity and keyword-rank rather than score, and compare similarities within one search rather than against a fixed number. Pass min_similarity to drop weak meaning matches; below-min-similarity says how many it dropped. semantic_index_status says how much of a graph is indexed. Blocks tagged #private are never indexed.";
 
 /** One hybrid search hit. Keyword-only hits outside the index carry just their title and resource. */
 export interface SearchHit {
@@ -28,6 +28,16 @@ export interface SearchHit {
   text: string;
   score: number;
   "found-by": string[];
+  /** Raw cosine similarity from the index at 3 dp, or null when the semantic leg did not return the hit. */
+  similarity: number | null;
+  /** 1-based rank in each leg's list as fused (after the tag filter and min_similarity), or null. */
+  "semantic-rank": number | null;
+  "keyword-rank": number | null;
+}
+
+interface SemanticMatch {
+  id: string;
+  similarity: number;
 }
 
 interface KeywordResult {
@@ -53,11 +63,11 @@ async function keywordResults(access: GraphAccess, alias: string, graphId: strin
   return body.results as KeywordResult[];
 }
 
-async function semanticMatches(bindings: SemanticBindings, graphId: string, q: string): Promise<string[]> {
+async function semanticMatches(bindings: SemanticBindings, graphId: string, q: string): Promise<SemanticMatch[]> {
   try {
     const [vector] = await bindings.embedder.embed([q]);
     const { matches } = await bindings.index.query(vector, { topK: SEMANTIC_TOP_K, namespace: graphId });
-    return matches.map((m) => m.id);
+    return matches.map((m) => ({ id: m.id, similarity: m.score }));
   } catch (error) {
     throw new BindingError("semantic query", error);
   }
@@ -66,19 +76,20 @@ async function semanticMatches(bindings: SemanticBindings, graphId: string, q: s
 /**
  * `semantic_search`: nearest blocks by embedding, and `searchGraph` on the same query, merged by
  * reciprocal rank fusion. With `tag`, only indexed blocks carrying that tag (on themselves, an
- * ancestor or their page) are kept, from both sides.
+ * ancestor or their page) are kept, from both sides. With `min_similarity`, semantic hits whose raw
+ * similarity is below it are dropped after the deleted-row and tag filters, and counted.
  */
 export async function hybridSearch(
   deps: HybridSearchDeps,
-  args: { graph: string; q: string; limit: number; tag?: string },
-): Promise<{ results: SearchHit[]; index: { status: string; blocks: number } }> {
+  args: { graph: string; q: string; limit: number; tag?: string; min_similarity?: number },
+): Promise<{ results: SearchHit[]; index: { status: string; blocks: number }; "below-min-similarity"?: number }> {
   const graph = await resolveGraph(deps.access, args.graph, false);
-  const [vectorIds, keyword] = await Promise.all([
+  const [vectorMatches, keyword] = await Promise.all([
     semanticMatches(deps.bindings, graph.graphId, args.q),
     keywordResults(deps.access, args.graph, graph.graphId, graph.pat, args.q),
   ]);
   const [blocks, state, counts] = await Promise.all([
-    deps.store.blocksFor(graph.graphId, vectorIds, keyword.map((k) => k.uuid)),
+    deps.store.blocksFor(graph.graphId, vectorMatches.map((m) => m.id), keyword.map((k) => k.uuid)),
     deps.store.state(graph.graphId),
     deps.store.counts(graph.graphId),
   ]);
@@ -87,13 +98,30 @@ export async function hybridSearch(
   const tag = args.tag?.toLowerCase();
   const allowed = (uuid: string) => tag === undefined || (byUuid.get(uuid)?.tags.includes(tag) ?? false);
   // A vector whose row is gone was deleted moments ago (Vectorize mutations are asynchronous).
-  const semanticUuids = vectorIds.flatMap((id) => byVector.get(id)?.uuid ?? []).filter(allowed);
+  const semanticHits = vectorMatches
+    .flatMap(({ id, similarity }) => {
+      const uuid = byVector.get(id)?.uuid;
+      return uuid === undefined ? [] : [{ uuid, similarity }];
+    })
+    .filter((h) => allowed(h.uuid));
+  // The floor compares the raw value, so 0.5996 is below 0.6 although it is reported as 0.600.
+  const min = args.min_similarity;
+  const kept = min === undefined ? semanticHits : semanticHits.filter((h) => h.similarity >= min);
+  const similarityOf = new Map<string, number>();
+  for (const h of kept) if (!similarityOf.has(h.uuid)) similarityOf.set(h.uuid, h.similarity);
+  const semanticUuids = kept.map((h) => h.uuid);
   const keywordUuids = keyword.map((k) => k.uuid).filter(allowed);
   const keywordByUuid = new Map(keyword.map((k) => [k.uuid, k]));
   const fused = reciprocalRankFusion({ semantic: semanticUuids, keyword: keywordUuids }).slice(0, args.limit);
   const results = fused.map(({ id, score, ranks }): SearchHit => {
     const stored: StoredBlock | undefined = byUuid.get(id);
     const foundBy = Object.keys(ranks);
+    const similarity = similarityOf.get(id);
+    const legs = {
+      similarity: similarity === undefined ? null : Number(similarity.toFixed(3)),
+      "semantic-rank": ranks.semantic ?? null,
+      "keyword-rank": ranks.keyword ?? null,
+    };
     if (stored) {
       return {
         uuid: id,
@@ -104,13 +132,16 @@ export async function hybridSearch(
         text: stored.text,
         score: Number(score.toFixed(5)),
         "found-by": foundBy,
+        ...legs,
       };
     }
     const hit = keywordByUuid.get(id);
     if (!hit) throw new Error("fused a result from neither list");
-    return { uuid: id, resource: hit.resource, text: hit.title, score: Number(score.toFixed(5)), "found-by": foundBy };
+    return { uuid: id, resource: hit.resource, text: hit.title, score: Number(score.toFixed(5)), "found-by": foundBy, ...legs };
   });
-  return { results, index: { status: state?.status ?? "not started", blocks: counts.graph } };
+  const index = { status: state?.status ?? "not started", blocks: counts.graph };
+  if (min === undefined) return { results, index };
+  return { results, index, "below-min-similarity": semanticHits.length - kept.length };
 }
 
 /** `semantic_search` and `semantic_index_status`; registered only when semantic search is configured. */
@@ -125,12 +156,20 @@ export function registerSemanticTools(
     "semantic_search",
     {
       description:
-        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, and which search found it. Blocks tagged #private (or under a #private block or page) are not indexed.",
+        "Search a graph by meaning and by title at once: the blocks nearest the query by embedding, merged with search_graph's title matches (reciprocal rank fusion). Use it for questions and topics rather than exact words. Each hit has its page, breadcrumb and text, which search found it, its similarity (cosine, 0 to 1, null for a title-only match) and its semantic-rank and keyword-rank (null when that search did not return it). min_similarity drops meaning matches below that similarity and reports how many in below-min-similarity. Blocks tagged #private (or under a #private block or page) are not indexed.",
       inputSchema: z.object({
         graph,
         q: z.string().min(1).max(500).describe("What to look for, in plain words"),
         limit: z.number().int().min(1).max(50).default(10).describe("Results to return (1-50, default 10)"),
         tag: z.string().min(1).optional().describe("Only indexed blocks with this tag (on the block, an ancestor or its page)"),
+        min_similarity: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe(
+            "Drop meaning matches whose cosine similarity is below this (0 to 1, no default). Title-only matches are kept. The response then says how many were dropped in below-min-similarity",
+          ),
       }),
       annotations: annotationsFor("semantic_search"),
     },

@@ -65,6 +65,36 @@ export class FakeEmbedder implements Embedder {
   }
 }
 
+/**
+ * A FakeEmbedder that answers mapped texts with crafted vectors, for tests that need exact cosines.
+ * The indexer embeds a block's document (`Page > text`), so map keys are documents and query strings;
+ * any other text falls back to fakeEmbed.
+ */
+export class CraftedEmbedder extends FakeEmbedder {
+  vectors = new Map<string, number[]>();
+
+  override async embed(texts: string[]): Promise<number[][]> {
+    if (this.failWith) throw this.failWith;
+    this.calls.push(texts);
+    return texts.map((t) => this.vectors.get(t) ?? fakeEmbed(t));
+  }
+}
+
+/** A unit vector whose dot product with `axis(0)` is exactly `cos` (0 to 1). */
+export function unitAt(cos: number): number[] {
+  const vector = new Array<number>(DIMENSIONS).fill(0);
+  vector[0] = cos;
+  vector[1] = Math.sqrt(1 - cos * cos);
+  return vector;
+}
+
+/** The unit vector along dimension `i`. */
+export function axis(i: number): number[] {
+  const vector = new Array<number>(DIMENSIONS).fill(0);
+  vector[i] = 1;
+  return vector;
+}
+
 interface StoredVector {
   values: number[];
   namespace?: string;

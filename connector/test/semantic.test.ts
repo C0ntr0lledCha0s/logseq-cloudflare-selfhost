@@ -22,7 +22,7 @@ import { STOPWORDS, contentWords, distinctiveTerms, wordCount } from "../src/sem
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
-import { FakeEmbedder, FakeGraph, FakeVectorIndex, fakeEmbed, fakeSync } from "./semantic-fakes";
+import { CraftedEmbedder, FakeEmbedder, FakeGraph, FakeVectorIndex, axis, fakeEmbed, fakeSync, unitAt } from "./semantic-fakes";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_ID = "11111111-1111-1111-1111-111111111111";
@@ -628,6 +628,141 @@ describe("tools", () => {
     work.addBlock(page, "one");
     work.addBlock(page, "two");
   }
+});
+
+describe("similarity and ranks", () => {
+  // Crafted vectors: the query is axis 0, so a block's cosine is exactly the value given to `block`.
+  // A block given null is orthogonal to the query and never comes back by meaning.
+  const Q = "northwind";
+  let crafted: CraftedEmbedder;
+
+  beforeEach(() => {
+    crafted = new CraftedEmbedder();
+    embedder = crafted;
+    crafted.vectors.set(Q, axis(0));
+  });
+
+  function block(pageTitle: string, pageId: string, text: string, cos: number | null): string {
+    crafted.vectors.set(documentText({ pageTitle, breadcrumb: [], text }), cos === null ? axis(2) : unitAt(cos));
+    return work.addBlock(pageId, text);
+  }
+
+  interface Body {
+    results: { uuid: string; text: string; similarity: number | null; "semantic-rank": number | null; "keyword-rank": number | null; "found-by": string[] }[];
+    index: unknown;
+    "below-min-similarity"?: number;
+  }
+
+  async function search(args: Record<string, unknown> = {}): Promise<Body> {
+    const result = await callTool(semanticEnv(), "semantic_search", { graph: "work", q: Q, limit: 50, ...args });
+    expect(result.isError, result.text).toBe(false);
+    return JSON.parse(result.text);
+  }
+
+  function hit(body: Body, uuid: string) {
+    const found = body.results.find((r) => r.uuid === uuid);
+    expect(found, uuid).toBeDefined();
+    return found!;
+  }
+
+  it("similarity is the index's cosine at 3 dp, with the semantic rank", async () => {
+    const stock = work.addPage("Stock");
+    const top = block("Stock", stock, "Pallet count for aisle four", 0.8125);
+    const second = block("Stock", stock, "Forklift service due", 0.5);
+    await runUntilReady();
+    const body = await search();
+    expect(hit(body, top)).toMatchObject({ similarity: 0.813, "semantic-rank": 1, "found-by": ["semantic"] });
+    expect(hit(body, second)).toMatchObject({ similarity: 0.5, "semantic-rank": 2 });
+  });
+
+  it("keyword-rank is null for a semantic-only hit; similarity and semantic-rank are null for a keyword-only hit", async () => {
+    const page = work.addPage("Northwind warehouse");
+    const meaning = block("Stock", work.addPage("Stock"), "Pallet count for aisle four", 0.7);
+    await runUntilReady();
+    const body = await search();
+    expect(hit(body, page)).toMatchObject({ similarity: null, "semantic-rank": null, "keyword-rank": 1, "found-by": ["keyword"] });
+    expect(hit(body, meaning)).toMatchObject({ similarity: 0.7, "semantic-rank": 1, "keyword-rank": null, "found-by": ["semantic"] });
+  });
+
+  it("an indexed keyword hit outside the semantic top 50 has null similarity, from one Vectorize query", async () => {
+    const filler = work.addPage("Filler");
+    for (let i = 0; i < 51; i++) block("Filler", filler, `filler line ${i}`, 0.9);
+    const target = block("Accounts", work.addPage("Accounts"), "Northwind invoice", 0.1);
+    await runUntilReady();
+    expect((await rows()).map((r) => r.block_uuid)).toContain(target);
+    index.queries = 0;
+    crafted.calls = [];
+    work.searchRequests = [];
+    const body = await search();
+    expect(hit(body, target)).toMatchObject({ similarity: null, "semantic-rank": null, "keyword-rank": 1, "found-by": ["keyword"] });
+    expect(index.queries).toBe(1);
+    expect(crafted.calls).toEqual([[Q]]);
+    expect(work.searchRequests).toHaveLength(1);
+  });
+
+  it("ranks are after the tag filter", async () => {
+    const trips = work.addPage("Trips", ["travel"]);
+    block("Office", work.addPage("Office"), "Office hours", 0.9);
+    const ferry = block("Trips", trips, "Ferry times", 0.8);
+    await runUntilReady();
+    const body = await search({ tag: "travel" });
+    expect(body.results.map((r) => r.uuid)).toEqual([ferry]);
+    expect(hit(body, ferry)).toMatchObject({ similarity: 0.8, "semantic-rank": 1 });
+  });
+
+  it("min_similarity drops below the value on the raw cosine, keeps one at it and keeps keyword-only hits", async () => {
+    const stock = work.addPage("Stock");
+    const kept = block("Stock", stock, "Pallet count for aisle four", 0.6);
+    const dropped = block("Stock", stock, "Forklift service due", 0.5996);
+    const decoy = block("Stock", stock, "Northwind decoy", null);
+    await runUntilReady();
+
+    const without = await search();
+    expect(without).not.toHaveProperty("below-min-similarity");
+    expect(hit(without, dropped)).toMatchObject({ similarity: 0.6, "semantic-rank": 2 });
+
+    const body = await search({ min_similarity: 0.6 });
+    expect(body["below-min-similarity"]).toBe(1);
+    expect(body.results.map((r) => r.uuid).sort()).toEqual([kept, decoy].sort());
+    expect(hit(body, kept)).toMatchObject({ similarity: 0.6, "semantic-rank": 1 });
+    expect(hit(body, decoy)).toMatchObject({ similarity: null, "semantic-rank": null, "keyword-rank": 1 });
+  });
+
+  it("min_similarity 0 drops nothing and reports 0; tag-filtered and deleted rows are not counted", async () => {
+    const trips = work.addPage("Trips", ["travel"]);
+    const a = block("Trips", trips, "Ferry times", 0.3);
+    const c = block("Trips", trips, "Hostel booking", 0.1);
+    block("Office", work.addPage("Office"), "Office hours", 0.2);
+    const gone = block("Gone", work.addPage("Gone"), "Old note", 0.05);
+    await runUntilReady();
+    await env.DB.prepare("DELETE FROM semantic_blocks WHERE block_uuid = ?").bind(gone).run();
+
+    const zero = await search({ tag: "travel", min_similarity: 0 });
+    expect(zero["below-min-similarity"]).toBe(0);
+    expect(zero.results.map((r) => r.uuid)).toEqual([a, c]);
+
+    const tagged = await search({ tag: "travel", min_similarity: 0.25 });
+    expect(tagged.results.map((r) => r.uuid)).toEqual([a]);
+    expect(tagged["below-min-similarity"]).toBe(1);
+
+    const untagged = await search({ min_similarity: 0.25 });
+    expect(untagged.results.map((r) => r.uuid)).toEqual([a]);
+    expect(untagged["below-min-similarity"]).toBe(2);
+  });
+
+  it("zod refuses min_similarity outside 0 to 1, and the schema says so", async () => {
+    block("Stock", work.addPage("Stock"), "Pallet count", 0.7);
+    await runUntilReady();
+    for (const value of [-0.1, 1.1]) {
+      const result = await callTool(semanticEnv(), "semantic_search", { graph: "work", q: Q, min_similarity: value });
+      expect(result.isError, String(value)).toBe(true);
+      expect(result.text, String(value)).toContain("min_similarity");
+    }
+    expect((await search({ min_similarity: 1 }))["below-min-similarity"]).toBe(1);
+    const tool = (await rpc(semanticEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "semantic_search");
+    expect(tool.inputSchema.properties.min_similarity).toMatchObject({ type: "number", minimum: 0, maximum: 1 });
+    expect(tool.inputSchema.required).not.toContain("min_similarity");
+  });
 });
 
 it("fake embeddings put synonyms near each other", () => {

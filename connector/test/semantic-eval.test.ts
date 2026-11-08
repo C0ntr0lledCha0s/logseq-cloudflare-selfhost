@@ -69,6 +69,7 @@ interface Hit {
   uuid: string;
   text: string;
   "found-by": string[];
+  similarity: number | null;
 }
 
 async function semanticSearch(q: string): Promise<Hit[]> {
@@ -166,7 +167,7 @@ describe("semantic search evaluation", () => {
         `semantic eval: ${rows.length} questions, top ${K}`,
         ...rows.map(
           (r) =>
-            `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}  top hit: ${(r.hits[0]?.text ?? "(none)").slice(0, 40)}`,
+            `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}  top hit: ${(r.hits[0]?.text ?? "(none)").slice(0, 40)} (similarity ${r.hits[0]?.similarity ?? "null"})`,
         ),
         `  mean keyword recall@${K}=${summary.keyword.recall.toFixed(2)} MRR=${summary.keyword.mrr.toFixed(2)}`,
         `  mean hybrid  recall@${K}=${summary.hybrid.recall.toFixed(2)} MRR=${summary.hybrid.mrr.toFixed(2)}`,
