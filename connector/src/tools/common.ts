@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "@modelcontextprotocol/server";
+import type { ServiceTokenAccess } from "../auth/service-tokens";
 import type { GraphStore, ResolvedGraph } from "../graphs";
 import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN } from "./spec.mjs";
@@ -105,10 +106,11 @@ export function withCallGraphs<T>(fn: () => Promise<T>): Promise<T> {
 /**
  * Who a request acts for. OAuth reaches every connected graph at its own mode; a service token
  * reaches only the graphs whose ids it lists, and `access: "read"` lowers each to read-only.
+ * `write-no-delete` cannot arrive yet: verifyServiceToken refuses it until its deletes are enforced.
  */
 export type RequestScope =
   | { kind: "oauth" }
-  | { kind: "service"; name: string; graphIds: ReadonlySet<string>; access: "read" | "write" };
+  | { kind: "service"; name: string; graphIds: ReadonlySet<string>; access: ServiceTokenAccess };
 
 /** The scope of the MCP request being served; `mcpHandler` runs every request inside `requestScope.run`. */
 export const requestScope = new AsyncLocalStorage<RequestScope>();

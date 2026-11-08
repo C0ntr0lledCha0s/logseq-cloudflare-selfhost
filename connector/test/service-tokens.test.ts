@@ -5,6 +5,9 @@ import committedManifest from "../tools-manifest.json";
 import {
   generateServiceToken,
   hashServiceToken,
+  MODE_RANK,
+  rank,
+  type ServiceTokenAccess,
   ServiceTokenStore,
   TOKEN_PATTERN,
   type TokenScope,
@@ -97,6 +100,16 @@ beforeEach(async () => {
 });
 
 const GRAPH_IDS_CHECK = "json_valid(graph_ids) AND json_type(graph_ids) = 'array'";
+/** The access CHECK as the latest migration (0008) left it; the 0006 block runs against that table. */
+const ACCESS_CHECK = "access = 'read' OR access = 'write-no-delete' OR access = 'write'";
+/** Migration 0008's statements' [rows read, rows written] with two rows, measured from D1 meta (the header quotes it). */
+const MIGRATION_0008_COST: [number, number][] = [
+  [1, 4], // CREATE TABLE service_tokens_new
+  [2, 6], // INSERT ... SELECT: each row and its primary-key and name index entries
+  [27, 0], // DROP TABLE service_tokens
+  [86, 12], // ALTER TABLE ... RENAME: schema rows rewritten
+  [6, 3], // CREATE UNIQUE INDEX service_tokens_hash
+];
 
 describe("migration 0006", () => {
   it("applies after 0005 and creates service_tokens with a unique service_tokens_hash index", async () => {
@@ -119,9 +132,9 @@ describe("migration 0006", () => {
   });
 
   it.each([
-    ["access 'admin'", { access: "admin" }, "access = 'read' OR access = 'write'"],
-    ["access ''", { access: "" }, "access = 'read' OR access = 'write'"],
-    ["access 'READ'", { access: "READ" }, "access = 'read' OR access = 'write'"],
+    ["access 'admin'", { access: "admin" }, ACCESS_CHECK],
+    ["access ''", { access: "" }, ACCESS_CHECK],
+    ["access 'READ'", { access: "READ" }, ACCESS_CHECK],
     ["graph_ids '{}'", { graph_ids: "{}" }, GRAPH_IDS_CHECK],
     ["graph_ids 'x'", { graph_ids: "x" }, GRAPH_IDS_CHECK],
     ["graph_ids '\"work\"'", { graph_ids: '"work"' }, GRAPH_IDS_CHECK],
@@ -372,11 +385,169 @@ describe("migration 0007", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// Migration 0008: service_tokens rebuilt so access may also be 'write-no-delete'.
+// ---------------------------------------------------------------------------------------------
+
+const COLUMNS_0007 = "id, name, token_hash, owner_id, graph_ids, access, created_at, expires_at, last_used_at, revoked_at, updated_at";
+
+/** Rows as a deployed 0007 table could hold them: every nullable column set, and one left null. */
+const ROWS_0007: Record<string, unknown>[] = [
+  { id: "id-read", name: "ci", token_hash: "a".repeat(64), owner_id: OWNER, graph_ids: JSON.stringify([WORK]), access: "read", created_at: T0, expires_at: T0 + 90 * DAY, last_used_at: T0 + 5, revoked_at: T0 + 6, updated_at: T0 + 4 },
+  { id: "id-write", name: "nightly", token_hash: "b".repeat(64), owner_id: OWNER, graph_ids: JSON.stringify([NOTES, WORK]), access: "write", created_at: T0 + 1, expires_at: T0 + 30 * DAY, last_used_at: T0 + 7, revoked_at: T0 + 8, updated_at: T0 + 9 },
+];
+const ROW_UNUSED = { id: "id-unused", name: "backup", token_hash: "c".repeat(64), owner_id: OWNER, graph_ids: "[]", access: "write", created_at: T0, expires_at: T0 + 1, last_used_at: null, revoked_at: null, updated_at: null };
+
+/** Rebuilds service_tokens as 0006 and 0007 left it (not as 0008 does), holding `rows`. */
+async function rebuildAs0007(rows: Record<string, unknown>[]) {
+  await env.DB.exec("DROP TABLE service_tokens");
+  for (const query of [...migration("0006_"), ...migration("0007_")]) await env.DB.prepare(query).run();
+  const cols = COLUMNS_0007.split(", ");
+  for (const row of rows) {
+    await env.DB.prepare(`INSERT INTO service_tokens (${COLUMNS_0007}) VALUES (${cols.map(() => "?").join(", ")})`)
+      .bind(...cols.map((c) => row[c] ?? null))
+      .run();
+  }
+}
+
+/** Applies 0008 to the table as it stands, statement by statement, and returns each statement's D1 cost. */
+async function apply0008(): Promise<[number, number][]> {
+  const cost: [number, number][] = [];
+  for (const query of migration("0008_")) {
+    const { meta } = await env.DB.prepare(query).run();
+    cost.push([meta.rows_read, meta.rows_written]);
+  }
+  return cost;
+}
+
+interface ColumnInfo {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: unknown;
+  pk: number;
+}
+
+async function tableInfo(): Promise<ColumnInfo[]> {
+  return (await env.DB.prepare("PRAGMA table_info(service_tokens)").all<ColumnInfo>()).results;
+}
+
+/** Each index as (origin, unique, columns), plus its name unless SQLite named it (autoindex names follow the table). */
+async function indexes(): Promise<{ name: string; origin: string; unique: number; columns: string[] }[]> {
+  const list = (await env.DB.prepare("PRAGMA index_list(service_tokens)").all<{ name: string; origin: string; unique: number }>()).results;
+  const out = [];
+  for (const index of list) {
+    const columns = (await env.DB.prepare(`PRAGMA index_info(${index.name})`).all<{ name: string }>()).results.map((c) => c.name);
+    out.push({ name: index.name.startsWith("sqlite_autoindex_") ? "(auto)" : index.name, origin: index.origin, unique: index.unique, columns });
+  }
+  return out.sort((a, b) => a.columns.join().localeCompare(b.columns.join()));
+}
+
+const ACCESS_CHECK_0008 = "access = 'read' OR access = 'write-no-delete' OR access = 'write'";
+
+describe("migration 0008", () => {
+  it("applies right after 0007", async () => {
+    const applied = (await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{ name: string }>()).results.map(
+      (r) => r.name,
+    );
+    expect(applied.indexOf("0008_service_token_write_no_delete.sql")).toBe(applied.indexOf("0007_service_token_updated_at.sql") + 1);
+  });
+
+  it("keeps every value of every read and write row, updated_at, last_used_at and revoked_at included", async () => {
+    await rebuildAs0007([...ROWS_0007, ROW_UNUSED]);
+    const before = (await env.DB.prepare(`SELECT ${COLUMNS_0007} FROM service_tokens ORDER BY id`).all()).results;
+    expect(before).toHaveLength(3);
+    await apply0008();
+    const after = (await env.DB.prepare("SELECT * FROM service_tokens ORDER BY id").all()).results;
+    expect(after).toEqual(before);
+    // The column order of SELECT * is unchanged, so toRow and PUBLIC_COLUMNS see the same row.
+    expect(after.map((r) => Object.keys(r))).toEqual(before.map(() => COLUMNS_0007.split(", ")));
+    const s = new ServiceTokenStore(env.DB);
+    expect(await s.get("id-read")).toMatchObject({ access: "read", lastUsedAt: T0 + 5, revokedAt: T0 + 6, updatedAt: T0 + 4 });
+    expect(await s.get("id-write")).toMatchObject({ access: "write", graphIds: [NOTES, WORK], lastUsedAt: T0 + 7, revokedAt: T0 + 8, updatedAt: T0 + 9 });
+    expect((await s.findByHash("b".repeat(64)))?.id).toBe("id-write");
+  });
+
+  it("keeps the same columns in the same order, and the same indexes, as 0006 plus 0007", async () => {
+    await rebuildAs0007([]);
+    const columnsBefore = await tableInfo();
+    const indexesBefore = await indexes();
+    await apply0008();
+    expect(await tableInfo()).toEqual(columnsBefore);
+    expect(columnsBefore.map((c) => c.name).join(", ")).toBe(COLUMNS_0007);
+    expect(await indexes()).toEqual(indexesBefore);
+    expect(indexesBefore).toEqual([
+      { name: "(auto)", origin: "pk", unique: 1, columns: ["id"] },
+      { name: "(auto)", origin: "u", unique: 1, columns: ["name"] },
+      { name: "service_tokens_hash", origin: "c", unique: 1, columns: ["token_hash"] },
+    ]);
+  });
+
+  it("takes write-no-delete beside read and write, and its CHECK refuses anything else", async () => {
+    await rawInsert({ access: "read", token_hash: "1".repeat(64) });
+    await rawInsert({ access: "write-no-delete", token_hash: "2".repeat(64) });
+    await rawInsert({ access: "write", token_hash: "3".repeat(64) });
+    expect((await allColumns()).map((r) => r.access).sort()).toEqual(["read", "write", "write-no-delete"]);
+    for (const access of ["delete", "", "Write-No-Delete", "write-no-deletes", "write no delete", "write-no-delete ", "no-delete", "1"]) {
+      await expect(rawInsert({ access, token_hash: "4".repeat(64) }), access).rejects.toThrow(`CHECK constraint failed: ${ACCESS_CHECK_0008}`);
+    }
+    expect(await allColumns()).toHaveLength(3);
+  });
+
+  it("refuses a duplicate token_hash and a duplicate name after the rebuild", async () => {
+    await rebuildAs0007(ROWS_0007);
+    await apply0008();
+    await expect(rawInsert({ name: "other", token_hash: "a".repeat(64) })).rejects.toThrow("UNIQUE constraint failed: service_tokens.token_hash");
+    await expect(rawInsert({ name: "ci", token_hash: "f".repeat(64) })).rejects.toThrow("UNIQUE constraint failed: service_tokens.name");
+    expect(await allColumns()).toHaveLength(2);
+  });
+
+  it("cost: measured from D1 meta with two rows, as the migration's header records", async () => {
+    await rebuildAs0007(ROWS_0007);
+    // CREATE, INSERT ... SELECT, DROP, RENAME, CREATE UNIQUE INDEX.
+    expect(await apply0008()).toEqual(MIGRATION_0008_COST);
+  });
+});
+
+describe("ServiceTokenAccess and rank", () => {
+  it("ranks read < write-no-delete < write, and MODE_RANK has exactly those keys", () => {
+    expect(Object.keys(MODE_RANK)).toEqual(["read", "write-no-delete", "write"]);
+    expect(rank("read")).toBeLessThan(rank("write-no-delete"));
+    expect(rank("write-no-delete")).toBeLessThan(rank("write"));
+  });
+
+  it("an unknown access has no rank: it throws rather than ranking as anything", () => {
+    for (const access of ["delete", "", "WRITE", "toString", "__proto__", "constructor", "hasOwnProperty"]) {
+      expect(() => rank(access as ServiceTokenAccess), access).toThrow(`unknown service token access '${access}'`);
+    }
+  });
+
+  it("the store round-trips write-no-delete through create, get, list and update; findByHash still reads 1 and writes 0", async () => {
+    const s = new ServiceTokenStore(env.DB);
+    const { id, token } = await s.create(newToken("worker", { access: "write-no-delete" }));
+    expect((await s.get(id))?.access).toBe("write-no-delete");
+    expect((await s.list()).map((r) => [r.name, r.access])).toEqual([["worker", "write-no-delete"]]);
+    const m = metered();
+    expect((await new ServiceTokenStore(m.db).findByHash(await hashServiceToken(token)))?.access).toBe("write-no-delete");
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([[1, 0]]);
+    // Replace-style edits through the guarded UPDATE: down to write-no-delete, up to write, and back.
+    const base = { graphIds: [WORK], expiresAt: T0 + 90 * DAY };
+    expect(await s.update(id, { ...base, access: "write-no-delete" }, { ...base, access: "write" }, T0 + 1)).toBe(true);
+    expect(await s.update(id, { ...base, access: "write" }, { ...base, access: "write-no-delete" }, T0 + 2)).toBe(true);
+    expect(await s.update(id, { ...base, access: "write-no-delete" }, { ...base, access: "read" }, T0 + 3)).toBe(true);
+    expect(await s.update(id, { ...base, access: "read" }, { ...base, access: "write-no-delete" }, T0 + 4)).toBe(true);
+    // A re-send of the stored values still applies.
+    expect(await s.update(id, { ...base, access: "write-no-delete" }, { ...base, access: "write-no-delete" }, T0 + 5)).toBe(true);
+    expect(await s.get(id)).toMatchObject({ access: "write-no-delete", updatedAt: T0 + 5 });
+  });
+});
+
 describe("ServiceTokenStore.update", () => {
   const NOW = T0 + DAY;
   const ARCHIVE_ID = "33333333-3333-3333-3333-333333333333";
 
-  function scope(row: { graphIds: string[]; access: "read" | "write"; expiresAt: number }): TokenScope {
+  function scope(row: { graphIds: string[]; access: ServiceTokenAccess; expiresAt: number }): TokenScope {
     return { graphIds: [...row.graphIds], access: row.access, expiresAt: row.expiresAt };
   }
 
@@ -1345,4 +1516,67 @@ describe("HTTP", () => {
       [expect.stringMatching(/^SELECT .* FROM service_tokens WHERE token_hash = \?$/), 1, 0],
     ]);
   });
+
+  it("write-no-delete cannot authenticate yet: the generic 401 at /mcp, 1 read, no touch and no sync call (Stage 3 flips this)", async () => {
+    const { id, token } = await makeToken("worker", { access: "write-no-delete" });
+    for (const [method, params] of [
+      ["tools/list", {}],
+      ["tools/call", { name: "get_page", arguments: { graph: "work", "page-id": PAGE } }],
+      ["tools/call", { name: "update_block", arguments: { graph: "work", "block-id": B1, body: { title: "x" } } }],
+      ["tools/call", { name: "delete_block", arguments: { graph: "work", "block-id": B1 } }],
+    ] as const) {
+      const m = meter(/service_tokens/);
+      const res = await post(token, method, params, { e: httpEnv({ DB: m.db }) });
+      expect(res.status, method).toBe(401);
+      expect(res.json, method).toEqual(GENERIC);
+      expect(m.measured.map((x) => [x.sql.split(" ")[0], x.rowsRead, x.rowsWritten])).toEqual([["SELECT", 1, 0]]);
+      expectNoToken(res, token);
+    }
+    expect(await lastUsed(id)).toBeNull();
+    expect(httpSync).toEqual([]);
+    expect((await env.DB.prepare("SELECT count(*) AS n FROM audit_log").all<{ n: number }>()).results[0].n).toBe(0);
+  });
+
+  it("what already authenticates still does: read and write tokens, after migration 0008's rebuild and after an edit", async () => {
+    const read = await makeToken("ci", { access: "read" });
+    const write = await makeToken("nightly", { access: "write" });
+    const edited = await makeToken("backup", { access: "write-no-delete" });
+    const row = (await new ServiceTokenStore(env.DB).get(edited.id))!;
+    const scopeOf = (access: ServiceTokenAccess) => ({ graphIds: row.graphIds, access, expiresAt: row.expiresAt });
+    // Edited up to write: the access it now holds is accepted.
+    expect(await new ServiceTokenStore(env.DB).update(edited.id, scopeOf("write-no-delete"), scopeOf("write"), Date.now())).toBe(true);
+    // The rows go through the rebuild as a deploy would run it.
+    const kept = (await env.DB.prepare(`SELECT ${COLUMNS_0007} FROM service_tokens`).all()).results;
+    await rebuildAs0007(kept);
+    await apply0008();
+    for (const [t, access] of [[read, "read"], [write, "write"], [edited, "write"]] as const) {
+      const res = await post(t.token, "tools/list");
+      expect(res.status, access).toBe(200);
+      expect(await lastUsed(t.id), access).not.toBeNull();
+    }
+    expect((await httpCall(write.token, "update_block", { graph: "work", "block-id": B1, body: { title: "x" } })).isError).toBe(false);
+    expect((await httpCall(read.token, "get_page", { graph: "work", "page-id": PAGE })).isError).toBe(false);
+    // And an edit back down to write-no-delete shuts it out again on the next request.
+    expect(await new ServiceTokenStore(env.DB).update(edited.id, scopeOf("write"), scopeOf("write-no-delete"), Date.now())).toBe(true);
+    expect((await post(edited.token, "tools/list")).json).toEqual(GENERIC);
+  });
+
+  it.each(["delete", "", "admin", "READ", "write ", "toString", "__proto__"])(
+    "unknown access %j (the CHECK bypassed) fails closed: the generic 401, not write",
+    async (access) => {
+      const { id, token } = await makeToken("ci", { access: "write" });
+      await env.DB.exec("PRAGMA ignore_check_constraints = ON");
+      try {
+        await env.DB.prepare("UPDATE service_tokens SET access = ? WHERE id = ?").bind(access, id).run();
+      } finally {
+        await env.DB.exec("PRAGMA ignore_check_constraints = OFF");
+      }
+      expect((await env.DB.prepare("SELECT access FROM service_tokens WHERE id = ?").bind(id).all()).results[0].access).toBe(access);
+      const res = await post(token, "tools/call", { name: "update_block", arguments: { graph: "work", "block-id": B1, body: { title: "x" } } });
+      expect(res.status).toBe(401);
+      expect(res.json).toEqual(GENERIC);
+      expect(await lastUsed(id)).toBeNull();
+      expect(httpSync).toEqual([]);
+    },
+  );
 });
