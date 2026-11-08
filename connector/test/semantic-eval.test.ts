@@ -5,9 +5,9 @@
 // The fixture's floor is the least hybrid recall@5 and MRR accepted; a ranking change raises it to its
 // new numbers and never lowers it silently. A question's top is the rank its first expected block must reach.
 // The old questions' numbers must equal the recorded baseline exactly: proof the default order is untouched.
-// The memory questions (design 2026-11-08 section 3.7) are stale-against-current pairs with their own
-// baseline (relevance mode, before any ranking code) and floor. Until Stage 4 of that plan they are sent
-// in relevance mode, without their rank options, and their top test is expected to fail.
+// The memory questions (design 2026-11-08 section 3.7) are stale-against-current pairs, run in both modes:
+// in relevance mode (without their rank options) they must equal their own baseline, recorded before any
+// ranking code; sent with their rank options they must meet their floor, and each must reach its top.
 // Run: npx vitest run test/semantic-eval.test.ts --silent=false --disableConsoleIntercept   (prints the table)
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -52,7 +52,7 @@ interface Question {
   expected: string[];
   /** The rank the first expected block must reach; defaults to K. */
   top?: number;
-  /** semantic_search's ranking options; sent from Stage 4 of the 2026-11-08 plan. */
+  /** semantic_search's ranking options, sent when the question is asked in its own mode. */
   rank?: "relevance" | "memory";
   demote_tags?: string[];
   demote_property?: { property: string; values: string[] };
@@ -105,12 +105,14 @@ interface Hit {
   similarity: number | null;
 }
 
-async function semanticSearch(q: string): Promise<Hit[]> {
+type RankOptions = Pick<Question, "rank" | "demote_tags" | "demote_property" | "half_life_days">;
+
+async function semanticSearch(q: string, options: RankOptions = {}): Promise<Hit[]> {
   const e = evalEnv();
   const request = new Request("https://mcp.example.com/mcp", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "semantic_search", arguments: { graph: "eval", q, limit: K } } }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "semantic_search", arguments: { graph: "eval", q, limit: K, ...options } } }),
   });
   const ctx = createExecutionContext();
   const res = await mcpHandler(e, ctx)(request, e, ctx);
@@ -174,15 +176,16 @@ describe("semantic search evaluation", () => {
     keyword: Score;
     hybrid: Score;
   }
-  async function measure(asked: Question[]): Promise<Row[]> {
+  /** Each question in relevance mode, or with its own rank options when `withOptions` is set. */
+  async function measure(asked: Question[], withOptions = false): Promise<Row[]> {
     const out: Row[] = [];
-    for (const { q, expected, top } of asked) {
+    for (const { q, expected, top, ...options } of asked) {
       const expectedUuids = expected.map((key) => {
         const uuid = keyToUuid.get(key);
         if (!uuid) throw new Error(`fixture names an unknown block ${key}`);
         return uuid;
       });
-      const hits = await semanticSearch(q);
+      const hits = await semanticSearch(q, withOptions ? options : {});
       const at = hits.findIndex((h) => expectedUuids.includes(h.uuid));
       out.push({
         q,
@@ -219,13 +222,23 @@ describe("semantic search evaluation", () => {
   let summary: Measures;
   let memoryRows: Row[] = [];
   let memorySummary: Measures;
+  let memoryRelevanceRows: Row[] = [];
+  let memoryRelevanceSummary: Measures;
 
   beforeAll(async () => {
     rows = await measure(questions);
     summary = summarise(rows);
-    memoryRows = await measure(memoryQuestions);
+    memoryRelevanceRows = await measure(memoryQuestions);
+    memoryRelevanceSummary = summarise(memoryRelevanceRows);
+    memoryRows = await measure(memoryQuestions, true);
     memorySummary = summarise(memoryRows);
-    console.info([table("semantic eval", rows, summary), table("semantic eval, memory questions (relevance mode)", memoryRows, memorySummary)].join("\n"));
+    console.info(
+      [
+        table("semantic eval", rows, summary),
+        table("semantic eval, memory questions (relevance mode)", memoryRelevanceRows, memoryRelevanceSummary),
+        table("semantic eval, memory questions (memory mode)", memoryRows, memorySummary),
+      ].join("\n"),
+    );
   });
 
   const twoDp = (m: Measures) => ({
@@ -237,24 +250,26 @@ describe("semantic search evaluation", () => {
     expect(twoDp(summary)).toEqual(twoDp(baseline));
   });
 
-  it("the memory questions' relevance-mode numbers equal their recorded baseline and meet their floor", () => {
-    expect(twoDp(memorySummary)).toEqual(twoDp(memoryBaseline));
+  it("the memory questions' relevance-mode numbers equal their recorded baseline", () => {
+    expect(twoDp(memoryRelevanceSummary)).toEqual(twoDp(memoryBaseline));
+  });
+
+  it("the memory questions in memory mode meet their floor", () => {
     expect(memorySummary.hybrid.recall).toBeGreaterThanOrEqual(memoryFloor.hybrid.recall);
     expect(memorySummary.hybrid.mrr).toBeGreaterThanOrEqual(memoryFloor.hybrid.mrr);
   });
 
-  // Known to fail until Stage 4 of the 2026-11-08 plan: relevance mode puts each stale, done or
-  // archived twin above its current one (pricing v1 rank 1, v2 rank 3; the done domain task above the
-  // open one; the archived office plan above the current one). Stage 4 sends each question's rank
-  // options and turns this back into it(...).
-  it.fails("each memory question's first expected block reaches its top rank", () => {
+  // In relevance mode each stale, done or archived twin ranks above its current one (pricing v1 rank 1,
+  // v2 rank 3; the done domain task above the open one; the archived office plan above the current one).
+  // Memory mode, with each question's options, puts the current one first and keeps the old decision in the top 5.
+  it("each memory question's first expected block reaches its top rank in memory mode", () => {
     const missed = memoryRows.filter((r) => r.rank === null || r.rank > r.top);
     expect(missed.map((r) => `${r.q} rank ${r.rank ?? "none"}, top ${r.top}, rank 1 "${r.hits[0]?.text}"`)).toEqual([]);
   });
 
   it("hybrid beats keyword-only on recall@5 and MRR, and never surfaces a private block by meaning", () => {
     const privateUuids = new Set(fixture.private.map((key) => keyToUuid.get(key)));
-    for (const r of [...rows, ...memoryRows]) {
+    for (const r of [...rows, ...memoryRelevanceRows, ...memoryRows]) {
       for (const hit of r.hits) {
         if (hit["found-by"].includes("semantic")) expect(privateUuids.has(hit.uuid), r.q).toBe(false);
       }
@@ -280,7 +295,7 @@ describe("semantic search evaluation", () => {
   // The short-block rule (design 2026-11-07 section 3.2). Before it, "Dashboards" was rank 1 for
   // "stock level reporting dashboard".
   it("no block of 2 words or fewer is rank 1 for a question of 3 or more content words", () => {
-    const ranked = [...rows, ...memoryRows].filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
+    const ranked = [...rows, ...memoryRelevanceRows, ...memoryRows].filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
     expect(ranked.length).toBeGreaterThan(0);
     for (const r of ranked) {
       const first = r.hits[0];

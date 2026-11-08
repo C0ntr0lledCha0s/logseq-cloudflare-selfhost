@@ -106,6 +106,8 @@ The existing `tag` argument stays the cheap pre-filter, and it runs first.
 5. `demoteShortBlocks`, then RRF over everything (unchanged). Ranks stay "as fused after the filters", as documented now.
 6. **Memory re-rank**, in memory mode only: `applyMemoryRanking` over the whole fused list (not the first `limit`), then a stable re-sort by final score, then `slice(limit)`. A hit that is 11th by relevance and first by memory comes back at `limit` 10.
 
+As built (plan Stage 4): the semantic candidates are the vector matches that still have a stored row, in vector order and before the `tag` filter, then the keyword candidates in keyword order; repeats are sent once, and no request is made when both lists are empty.
+
 A signals call that fails fails the whole call: `ranking signals: <reason>` (CLAUDE.md, errors name the entry and reason), the same way a failed keyword search is named. The search never falls back to relevance order without saying so.
 
 A uuid under `missing` (deleted since it was indexed) gets `updated-at: null` and `reference-count: 0`, so neutral recency and base importance. It is not dropped, which matches what relevance mode does with it today, except that `updated_after` drops it, because its updated-at is unknown. The help text says so.
@@ -161,6 +163,7 @@ The tool is read-only, so there is no dry run or read-back to add. Its "no silen
 
 - `half_life_days needs rank: "memory"`; likewise `demote_tags needs rank: "memory"` and `demote_property needs rank: "memory"`. Checked before any call, in argument order.
 - `updated_after: not an ISO date` when `Date.parse` fails or the string isn't `YYYY-MM-DD` or a full ISO date-time.
+- As built (plan Stage 4): an empty `demote_tags` (`[]`) demotes nothing and is accepted in either mode, so a caller that always sends the field isn't refused; `half_life_days` and `demote_property` are refused whenever they are given.
 - `ranking signals: <reason>` for a failed signals call, including `ranking signals: property not found: user.property/x`.
 - `before-updated-after: n`, so a filter that empties the list says so.
 
@@ -302,8 +305,8 @@ To be filled in by the build:
 |---|---|---|---|
 | Offline, current fixture, HEAD `21ee74d` | relevance | 1.00 | 0.85 |
 | Offline, extended fixture, before ranking code (Stage 2) | relevance | old 12: 1.00; memory 4: 1.00 | old 12: 0.85; memory 4: 0.58 |
-| Offline, extended fixture, after | relevance | | |
-| Offline, extended fixture, after | memory | | |
+| Offline, extended fixture, after (Stage 4) | relevance | old 12: 1.00; memory 4: 1.00 | old 12: 0.85; memory 4: 0.58 |
+| Offline, extended fixture, after (Stage 4) | memory | memory 4: 1.00 | memory 4: 0.875 (pricing, domain and office current twins rank 1; the old decision ranks 2) |
 | Live, after | relevance and memory | | |
 
 ## 10. Out of scope

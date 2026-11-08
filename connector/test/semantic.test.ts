@@ -37,7 +37,18 @@ import {
 import { reciprocalRankFusion } from "../src/semantic/rrf";
 import { SemanticStore } from "../src/semantic/store";
 import { type OpenApiSpec, SEMANTIC_TOOLS, graphOperations } from "../src/tools/spec.mjs";
-import { CraftedEmbedder, FakeEmbedder, FakeGraph, FakeVectorIndex, axis, fakeEmbed, fakeSync, nextUuid, unitAt } from "./semantic-fakes";
+import {
+  CraftedEmbedder,
+  FakeEmbedder,
+  FakeGraph,
+  type FakeSignals,
+  FakeVectorIndex,
+  axis,
+  fakeEmbed,
+  fakeSync,
+  nextUuid,
+  unitAt,
+} from "./semantic-fakes";
 
 const ORIGIN = "https://mcp.example.com";
 const WORK_ID = "11111111-1111-1111-1111-111111111111";
@@ -1446,5 +1457,402 @@ describe("memory ranking (design 2026-11-08 section 3.4)", () => {
   it("caps the signals call at the server's 100-id batch and states its 1,000 reference cap", () => {
     expect(SIGNALS_LIMIT).toBe(100);
     expect(REFERENCE_COUNT_CAP).toBe(1000);
+  });
+});
+
+describe("memory mode (design 2026-11-08 sections 3.3 to 3.6)", () => {
+  // Crafted vectors as in "similarity and ranks": the query is axis 0, so a block's cosine is the
+  // value given to `block`. No block or page title contains the query unless a test says so, so the
+  // keyword leg is empty and RRF scores are 1/(60 + semantic rank).
+  const Q = "northwind";
+  const DAY = 86_400_000;
+  const STATUS = "user.property/project-status";
+  let crafted: CraftedEmbedder;
+
+  beforeEach(() => {
+    crafted = new CraftedEmbedder();
+    embedder = crafted;
+    crafted.vectors.set(Q, axis(0));
+  });
+
+  function block(pageTitle: string, pageId: string, text: string, cos: number | null, signals?: FakeSignals): string {
+    crafted.vectors.set(documentText({ pageTitle, breadcrumb: [], text }), cos === null ? axis(2) : unitAt(cos));
+    return work.addBlock(pageId, text, { signals });
+  }
+
+  interface MemoryHit {
+    uuid: string;
+    text: string;
+    score: number;
+    relevance?: number;
+    recency?: number;
+    importance?: number;
+    "updated-at"?: string | null;
+    "reference-count"?: number;
+    "demoted-by"?: string[];
+    "found-by": string[];
+    "semantic-rank": number | null;
+    "keyword-rank": number | null;
+  }
+
+  interface MemoryBody {
+    rank?: string;
+    "half-life-days"?: number;
+    results: MemoryHit[];
+    index: unknown;
+  }
+
+  async function call(args: Record<string, unknown>) {
+    return callTool(semanticEnv(), "semantic_search", { graph: "work", q: Q, limit: 50, ...args });
+  }
+
+  async function search(args: Record<string, unknown> = {}): Promise<MemoryBody> {
+    const result = await call(args);
+    expect(result.isError, result.text).toBe(false);
+    return JSON.parse(result.text);
+  }
+
+  const order = (body: MemoryBody) => body.results.map((r) => r.uuid);
+  const idsSent = (graph: FakeGraph = work) => graph.signalsRequests.map((u) => u.searchParams.get("ids")?.split(","));
+
+  it("relevance mode makes no signals request and its JSON is unchanged", async () => {
+    const stock = work.addPage("Stock");
+    const fresh = block("Stock", stock, "Pallet count for aisle four", 0.9, { ageDays: 0, referenceCount: 31 });
+    const stale = block("Stock", stock, "Forklift service due", 0.8, { ageDays: 900, status: "done" });
+    const page = work.addPage("Northwind warehouse");
+    work.setSignals(page, { ageDays: 5, referenceCount: 2 });
+    await runUntilReady();
+    const plain = await call({});
+    const explicit = await call({ rank: "relevance" });
+    expect(explicit.text).toBe(plain.text);
+    // The exact output relevance mode gave before memory ranking existed.
+    expect(JSON.parse(plain.text)).toEqual({
+      results: [
+        { uuid: fresh, resource: "blocks", page: "Stock", "page-id": stock, breadcrumb: [], text: "Pallet count for aisle four", score: 0.01639, "found-by": ["semantic"], similarity: 0.9, "semantic-rank": 1, "keyword-rank": null },
+        { uuid: page, resource: "pages", text: "Northwind warehouse", score: 0.01639, "found-by": ["keyword"], similarity: null, "semantic-rank": null, "keyword-rank": 1 },
+        { uuid: stale, resource: "blocks", page: "Stock", "page-id": stock, breadcrumb: [], text: "Forklift service due", score: 0.01613, "found-by": ["semantic"], similarity: 0.8, "semantic-rank": 2, "keyword-rank": null },
+      ],
+      index: { status: "ready", blocks: 2 },
+    });
+    expect(work.signalsRequests).toHaveLength(0);
+    // rank is a declared argument whose default is relevance.
+    const tool = (await rpc(semanticEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "semantic_search");
+    expect(tool.inputSchema.properties.rank).toMatchObject({ enum: ["relevance", "memory"], default: "relevance" });
+    expect(tool.inputSchema.required).not.toContain("rank");
+  });
+
+  it("memory mode makes exactly one signals request with the de-duplicated union, semantic first, in either leg order", async () => {
+    // Two spellings of the query: the keyword leg lowercases both, but each has its own vector, and
+    // the two semantic candidates swap places between them.
+    const LOWER = Q;
+    const UPPER = "Northwind";
+    crafted.vectors.set(UPPER, axis(4));
+    const vec = (at0: number, at4: number) => {
+      const v = new Array<number>(DIMENSIONS).fill(0);
+      v[0] = at0;
+      v[4] = at4;
+      v[5] = Math.sqrt(1 - at0 * at0 - at4 * at4);
+      return v;
+    };
+    const notes = work.addPage("Notes");
+    const doc = (text: string) => documentText({ pageTitle: "Notes", breadcrumb: [], text });
+    // "Northwind alpha plan" is found by both legs; the page and "Northwind invoice" by title only.
+    crafted.vectors.set(doc("Northwind alpha plan"), vec(0.7, 0.6));
+    crafted.vectors.set(doc("Quarterly stock count"), vec(0.9, 0.3));
+    crafted.vectors.set(doc("Northwind invoice"), axis(2));
+    const both = work.addBlock(notes, "Northwind alpha plan");
+    const meaning = work.addBlock(notes, "Quarterly stock count");
+    const titled = work.addPage("Northwind contacts");
+    const invoice = work.addBlock(notes, "Northwind invoice");
+    await runUntilReady();
+    const body = await search({ q: LOWER, rank: "memory" });
+    expect(work.signalsRequests).toHaveLength(1);
+    const [request] = work.signalsRequests;
+    expect(request.searchParams.get("view")).toBe("signals");
+    expect(request.searchParams.has("property")).toBe(false);
+    // Semantic order (meaning, both), then keyword order (page, then blocks by title) without repeats.
+    expect(idsSent()).toEqual([[meaning, both, titled, invoice]]);
+    expect(new Set(order(body))).toEqual(new Set([meaning, both, titled, invoice]));
+
+    // The other spelling swaps the semantic order, and the request follows it.
+    work.signalsRequests = [];
+    await search({ q: UPPER, rank: "memory" });
+    expect(idsSent()).toEqual([[both, meaning, titled, invoice]]);
+  });
+
+  it("sends at most 100 ids, the 50 semantic candidates first, when the keyword leg returns more than asked", async () => {
+    const filler = work.addPage("Filler");
+    const semantic: string[] = [];
+    for (let i = 0; i < 50; i++) semantic.push(block("Filler", filler, `filler line ${i}`, 0.99 - i * 0.01));
+    const titles = Array.from({ length: 60 }, (_, i) => work.addPage(`Northwind page ${String(i).padStart(2, "0")}`));
+    await runUntilReady();
+    // A sync server that ignores the limit: 60 keyword hits.
+    const search60 = work.search.bind(work);
+    work.search = (url: URL) => {
+      const wide = new URL(url);
+      wide.searchParams.set("limit", "1000");
+      return search60(wide);
+    };
+    const body = await search({ rank: "memory" });
+    expect(work.signalsRequests).toHaveLength(1);
+    const [ids] = idsSent();
+    expect(ids).toHaveLength(100);
+    expect(ids!.slice(0, 50)).toEqual(semantic);
+    expect(ids!.slice(50)).toEqual(titles.slice(0, 50));
+    expect(work.signalsRequests).toHaveLength(1);
+    expect(body.results).toHaveLength(50);
+  });
+
+  it("makes no signals request when neither leg found anything", async () => {
+    block("Stock", work.addPage("Stock"), "Pallet count", null);
+    await runUntilReady();
+    const body = await search({ rank: "memory" });
+    expect(body.results).toEqual([]);
+    expect(body.rank).toBe("memory");
+    expect(work.signalsRequests).toHaveLength(0);
+  });
+
+  it("slices after the re-rank: a hit 11th by relevance and 1st by memory is returned at limit 10", async () => {
+    const page = work.addPage("Stock");
+    const stale = Array.from({ length: 10 }, (_, i) => block("Stock", page, `Stale stock note ${i}`, 0.9 - i * 0.005, { ageDays: 900 }));
+    const fresh = block("Stock", page, "Fresh stock note", 0.8, { ageDays: 0, referenceCount: 31 });
+    await runUntilReady();
+    const relevance = await search({ limit: 10 });
+    expect(order(relevance)).toEqual(stale);
+    const memory = await search({ rank: "memory", limit: 10 });
+    expect(memory.results).toHaveLength(10);
+    expect(memory.results[0]).toMatchObject({ uuid: fresh, "semantic-rank": 11, relevance: 0.01408, recency: 1, importance: 1.5, score: 0.02113 });
+    expect(order(memory).slice(1)).toEqual(stale.slice(0, 9));
+  });
+
+  it("reports score as the product, relevance, the factors, updated-at, reference-count and demoted-by, with rank and half-life-days", async () => {
+    const page = work.addPage("Stock");
+    const aged = block("Stock", page, "Pallet count for aisle four", 0.9, { ageDays: 45, referenceCount: 3, status: "done" });
+    const undated = block("Stock", page, "Forklift service due", 0.8, { ageDays: null, referenceCount: 1500 });
+    const titled = work.addPage("Northwind warehouse");
+    work.setSignals(titled, { ageDays: 0 });
+    await runUntilReady();
+    const before = Date.now();
+    const body = await search({ rank: "memory" });
+    const after = Date.now();
+    expect(Object.keys(body)).toEqual(["rank", "half-life-days", "results", "index"]);
+    expect(body).toMatchObject({ rank: "memory", "half-life-days": 90 });
+    const byUuid = new Map(body.results.map((r) => [r.uuid, r]));
+    // 1/61 x 0.5^(45/90) x 1.2 x 0.5 = 0.0069551.
+    expect(byUuid.get(aged)).toMatchObject({
+      score: 0.00696, relevance: 0.01639, recency: 0.707, importance: 0.6, "reference-count": 3, "demoted-by": ["status:done"], "semantic-rank": 1,
+    });
+    const stamp = Date.parse(byUuid.get(aged)!["updated-at"]!);
+    expect(new Date(stamp).toISOString()).toBe(byUuid.get(aged)!["updated-at"]);
+    expect(stamp).toBeGreaterThanOrEqual(before - 45 * DAY);
+    expect(stamp).toBeLessThanOrEqual(after - 45 * DAY);
+    // 1/62 x 1 x 1.5, the reference count as the server capped it.
+    expect(byUuid.get(undated)).toMatchObject({
+      score: 0.02419, relevance: 0.01613, recency: 1, importance: 1.5, "updated-at": null, "reference-count": 1000, "demoted-by": [],
+    });
+    expect(byUuid.get(titled)).toMatchObject({ score: 0.01639, relevance: 0.01639, recency: 1, importance: 1, "reference-count": 0, "demoted-by": [] });
+    expect(order(body)).toEqual([undated, titled, aged]);
+    for (const hit of body.results) {
+      expect(Object.keys(hit).slice(-6)).toEqual(["relevance", "recency", "importance", "updated-at", "reference-count", "demoted-by"]);
+    }
+
+    // half_life_days 30: 45 days is 1.5 half-lives, floored at 0.5.
+    const short = await search({ rank: "memory", half_life_days: 30 });
+    expect(short["half-life-days"]).toBe(30);
+    expect(short.results.find((r) => r.uuid === aged)).toMatchObject({ recency: 0.5, score: 0.00492 });
+    // half_life_days 3650: barely aged.
+    const long = await search({ rank: "memory", half_life_days: 3650 });
+    expect(long.results.find((r) => r.uuid === aged)).toMatchObject({ recency: 0.991 });
+  });
+
+  it("gives a uuid the signals view lists as missing neutral factors and keeps it", async () => {
+    const page = work.addPage("Stock");
+    const gone = block("Stock", page, "Pallet count for aisle four", 0.9, { ageDays: 900, referenceCount: 7, status: "done" });
+    const kept = block("Stock", page, "Forklift service due", 0.8, { ageDays: 900 });
+    await runUntilReady();
+    work.remove(gone, { silently: true });
+    const body = await search({ rank: "memory" });
+    expect(idsSent()).toEqual([[gone, kept]]);
+    expect(order(body)).toEqual([gone, kept]);
+    expect(body.results[0]).toMatchObject({
+      score: 0.01639, relevance: 0.01639, recency: 1, importance: 1, "updated-at": null, "reference-count": 0, "demoted-by": [],
+    });
+    expect(body.results[1]).toMatchObject({ recency: 0.5, importance: 1 });
+  });
+
+  it("sends demote_property as property and demotes by its values; demote_tags demotes by a page tag, read from the index", async () => {
+    const archived = work.addPage("Old office", ["Archives"]);
+    const current = work.addPage("New office");
+    const tagged = block("Old office", archived, "Queen Street lease", 0.9, { ageDays: 0 });
+    const valued = block("New office", current, "Fit-out quote", 0.85, { ageDays: 0, properties: { [STATUS]: ["Archived"] } });
+    const plain = block("New office", current, "Desk layout", 0.8, { ageDays: 0, properties: { [STATUS]: ["Active"] } });
+    await runUntilReady();
+
+    const undemoted = await search({ rank: "memory" });
+    expect(order(undemoted)).toEqual([tagged, valued, plain]);
+    expect(work.signalsRequests).toHaveLength(1);
+    expect(work.signalsRequests[0].searchParams.has("property")).toBe(false);
+
+    work.signalsRequests = [];
+    const property = await search({ rank: "memory", demote_property: { property: STATUS, values: ["archived", "Paused"] } });
+    expect(work.signalsRequests).toHaveLength(1);
+    expect(work.signalsRequests[0].searchParams.get("property")).toBe(STATUS);
+    expect(order(property)).toEqual([tagged, plain, valued]);
+    expect(property.results.find((r) => r.uuid === valued)).toMatchObject({ importance: 0.5, "demoted-by": ["property:archived"] });
+    expect(property.results.find((r) => r.uuid === plain)?.["demoted-by"]).toEqual([]);
+
+    const tags = await search({ rank: "memory", demote_tags: ["ARCHIVES"] });
+    expect(order(tags)).toEqual([valued, plain, tagged]);
+    expect(tags.results.find((r) => r.uuid === tagged)).toMatchObject({ importance: 0.5, "demoted-by": ["tag:ARCHIVES"] });
+
+    // Both: each demoted once, the undemoted block first.
+    const both = await search({ rank: "memory", demote_tags: ["archives"], demote_property: { property: STATUS, values: ["Archived"] } });
+    expect(order(both)).toEqual([plain, tagged, valued]);
+
+    // The tag comes from the index's stored tags, so a block the signals view no longer finds is still demoted.
+    work.remove(tagged, { silently: true });
+    const missing = await search({ rank: "memory", demote_tags: ["archives"] });
+    expect(missing.results.find((r) => r.uuid === tagged)).toMatchObject({ "updated-at": null, importance: 0.5, "demoted-by": ["tag:archives"] });
+  });
+
+  it("refuses half_life_days, demote_tags and demote_property without rank memory, in argument order, before any call", async () => {
+    block("Stock", work.addPage("Stock"), "Pallet count", 0.9);
+    await runUntilReady();
+    crafted.calls = [];
+    index.queries = 0;
+    const property = { property: STATUS, values: ["Archived"] };
+    const cases: [Record<string, unknown>, string][] = [
+      [{ half_life_days: 30 }, 'half_life_days needs rank: "memory"'],
+      [{ demote_tags: ["Archives"] }, 'demote_tags needs rank: "memory"'],
+      [{ demote_property: property }, 'demote_property needs rank: "memory"'],
+      [{ half_life_days: 30, demote_tags: ["Archives"], demote_property: property }, 'half_life_days needs rank: "memory"'],
+      [{ demote_property: property, demote_tags: ["Archives"] }, 'demote_tags needs rank: "memory"'],
+      [{ demote_property: property, half_life_days: 30 }, 'half_life_days needs rank: "memory"'],
+    ];
+    for (const [args, message] of cases) {
+      for (const rank of [undefined, "relevance"]) {
+        const result = await call(rank === undefined ? args : { ...args, rank });
+        expect(result, JSON.stringify(args)).toEqual({ isError: true, text: message });
+      }
+    }
+    expect(logged().at(-1)).toMatch(/^tool semantic_search graph=work status=refused ms=\d+$/);
+    expect(crafted.calls).toEqual([]);
+    expect(index.queries).toBe(0);
+    expect(work.searchRequests).toHaveLength(0);
+    expect(work.signalsRequests).toHaveLength(0);
+  });
+
+  it("still answers what worked before: no options, rank relevance, an empty demote_tags, and every option in memory mode", async () => {
+    const page = work.addPage("Stock");
+    const top = block("Stock", page, "Pallet count", 0.9, { ageDays: 0 });
+    await runUntilReady();
+    for (const args of [{}, { rank: "relevance" }, { demote_tags: [] }, { rank: "relevance", demote_tags: [] }]) {
+      const body = await search(args);
+      expect(order(body), JSON.stringify(args)).toEqual([top]);
+      expect(body, JSON.stringify(args)).not.toHaveProperty("rank");
+    }
+    expect(work.signalsRequests).toHaveLength(0);
+    work.properties.add(STATUS);
+    const all = await search({
+      rank: "memory", half_life_days: 30, demote_tags: [], demote_property: { property: STATUS, values: ["Archived"] },
+    });
+    expect(order(all)).toEqual([top]);
+  });
+
+  it("zod refuses half_life_days, demote_tags and demote_property out of range, and accepts their bounds", async () => {
+    const page = work.addPage("Stock");
+    block("Stock", page, "Pallet count", 0.9, { properties: { [STATUS]: ["Active"] } });
+    await runUntilReady();
+    const tags = (n: number) => Array.from({ length: n }, (_, i) => `tag${i}`);
+    const values = (n: number) => Array.from({ length: n }, (_, i) => `value${i}`);
+    const refused: [string, Record<string, unknown>][] = [
+      ["half_life_days", { half_life_days: 0 }],
+      ["half_life_days", { half_life_days: 3651 }],
+      ["half_life_days", { half_life_days: 1.5 }],
+      ["demote_tags", { demote_tags: tags(11) }],
+      ["demote_tags", { demote_tags: [""] }],
+      ["demote_property", { demote_property: { property: STATUS, values: [] } }],
+      ["demote_property", { demote_property: { property: STATUS, values: values(11) } }],
+      ["demote_property", { demote_property: { property: STATUS, values: [""] } }],
+      ["demote_property", { demote_property: { property: "", values: ["x"] } }],
+      ["rank", { rank: "recency" }],
+    ];
+    for (const [name, args] of refused) {
+      const result = await call({ rank: "memory", ...args });
+      expect(result.isError, JSON.stringify(args)).toBe(true);
+      expect(result.text, JSON.stringify(args)).toContain(name);
+    }
+    expect(work.signalsRequests).toHaveLength(0);
+    for (const args of [
+      { half_life_days: 1 },
+      { half_life_days: 3650 },
+      { demote_tags: tags(10) },
+      { demote_property: { property: STATUS, values: values(10) } },
+      { demote_property: { property: STATUS, values: ["x"] } },
+    ]) {
+      expect((await search({ rank: "memory", ...args })).rank, JSON.stringify(args)).toBe("memory");
+    }
+    const tool = (await rpc(semanticEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "semantic_search");
+    expect(tool.inputSchema.properties.half_life_days).toMatchObject({ type: "integer", minimum: 1, maximum: 3650 });
+    expect(tool.inputSchema.properties.demote_tags).toMatchObject({ type: "array", maxItems: 10 });
+    expect(tool.inputSchema.properties.demote_property.properties.values).toMatchObject({ minItems: 1, maxItems: 10 });
+  });
+
+  it("fails the call when the signals request fails, naming it and keeping the sync status", async () => {
+    block("Stock", work.addPage("Stock"), "Pallet count", 0.9);
+    await runUntilReady();
+    work.failSignals = 500;
+    expect(await call({ rank: "memory" })).toEqual({ isError: true, text: "ranking signals: sync server error (HTTP 500): signals failing" });
+    expect(logged().at(-1)).toMatch(/^tool semantic_search graph=work status=http-500 ms=\d+$/);
+    work.failSignals = null;
+    expect(await call({ rank: "memory", demote_property: { property: "user.property/x", values: ["Done"] } })).toEqual({
+      isError: true,
+      text: "ranking signals: property not found: user.property/x",
+    });
+    expect(logged().at(-1)).toMatch(/^tool semantic_search graph=work status=http-400 ms=\d+$/);
+    // Relevance mode never asks, so a failing signals view doesn't touch it.
+    work.failSignals = 500;
+    expect((await call({})).isError).toBe(false);
+    expect(work.signalsRequests).toHaveLength(2);
+  });
+
+  it("costs one embedding, one Vectorize query, the same searches and D1 statements, and one signals request", async () => {
+    const page = work.addPage("Stock");
+    block("Stock", page, "Pallet count for aisle four", 0.9, { ageDays: 10 });
+    work.addPage("Northwind warehouse");
+    await runUntilReady();
+    const statements: string[] = [];
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") return (sql: string) => (statements.push(sql), target.prepare(sql));
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const measure = async (args: Record<string, unknown>) => {
+      statements.length = 0;
+      crafted.calls = [];
+      index.queries = 0;
+      work.searchRequests = [];
+      work.signalsRequests = [];
+      const result = await callTool({ ...semanticEnv(), DB: db } as Env, "semantic_search", { graph: "work", q: Q, ...args });
+      expect(result.isError, result.text).toBe(false);
+      return {
+        statements: [...statements],
+        embeddings: crafted.calls.length,
+        queries: index.queries,
+        searches: work.searchRequests.map((u) => u.search),
+        signals: work.signalsRequests.length,
+      };
+    };
+    const relevance = await measure({});
+    work.properties.add("user.property/x");
+    const memory = await measure({
+      rank: "memory", half_life_days: 30, demote_tags: ["x"], demote_property: { property: "user.property/x", values: ["y"] },
+    });
+    expect(relevance).toMatchObject({ embeddings: 1, queries: 1, signals: 0 });
+    expect(relevance.searches).toHaveLength(1);
+    expect(memory).toEqual({ ...relevance, signals: 1 });
+    expect(relevance.statements.filter((sql) => sql.includes("semantic_"))).toHaveLength(3);
   });
 });
