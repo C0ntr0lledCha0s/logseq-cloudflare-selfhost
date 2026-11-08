@@ -24,15 +24,40 @@ export const STOPWORDS: ReadonlySet<string> = new Set(
 /** Shorter words than this are dropped from a query's content words. */
 const MIN_WORD_LENGTH = 3;
 
+/** A word's characters: letters and digits in any script. `contentWords` and `wordSpans` share it. */
+const WORD_CHARS = String.raw`\p{L}\p{N}`;
+const NON_WORD_RUN = new RegExp(`[^${WORD_CHARS}]+`, "u");
+const WORD_RUN = new RegExp(`[${WORD_CHARS}]+`, "gu");
+
 /**
  * A query's content words: lowercased, split on runs of non-alphanumerics, without stopwords or
  * words under 3 characters, de-duplicated (exact words only), in first-appearance order. Both
  * ranking rules count these, so they always agree on whether a query is "multi-word".
  */
 export function contentWords(q: string): string[] {
-  const words = q.toLowerCase().split(/[^\p{L}\p{N}]+/u);
+  const words = q.toLowerCase().split(NON_WORD_RUN);
   const kept = words.filter((w) => w.length >= MIN_WORD_LENGTH && !STOPWORDS.has(w));
   return [...new Set(kept)];
+}
+
+/**
+ * Each word of `text` with its place: the same words `contentWords` splits on, lower-cased, with
+ * `start` and `end` as UTF-16 offsets into `text` itself. Offsets are taken before lower-casing,
+ * because lower-casing can change a string's length (`İ` becomes two code units).
+ */
+export function wordSpans(text: string): { word: string; start: number; end: number }[] {
+  const spans: { word: string; start: number; end: number }[] = [];
+  for (const m of text.matchAll(WORD_RUN)) {
+    spans.push({ word: m[0].toLowerCase(), start: m.index, end: m.index + m[0].length });
+  }
+  return spans;
+}
+
+const FIRST_WORD = new RegExp(`[${WORD_CHARS}]+`, "u");
+
+/** The first of `wordSpans(text)`'s words, without tokenising the rest; undefined when there is none. */
+export function firstWord(text: string): string | undefined {
+  return FIRST_WORD.exec(text)?.[0].toLowerCase();
 }
 
 /**

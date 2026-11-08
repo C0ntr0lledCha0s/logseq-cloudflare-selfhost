@@ -108,6 +108,8 @@ It matches `/[\p{L}\p{N}]+/gu`, the same character class `contentWords` splits o
 
 **c. Candidate map, sized by the draft.** The draft's distinct lower-case words form a Set. For each title and alias, the first word is found with a cheap scan (no regex); only if it is in the Set is the title tokenised with `wordSpans` and added to a map keyed by its first word. Matching cost then grows with the draft and the titles that could match it, not with the graph. Titles that tokenise to nothing (all punctuation or emoji) are skipped. An exported counter records how many titles were tokenised, so a test can assert the bound (section 8).
 
+*As built (Stage 2):* the counter is `MatchResult.tokenised`, not module state. The first-word scan is a loop over ASCII names; a name with a non-ASCII character before its first word ends uses one regex (`firstWord` in `ranking.ts`, the same character class). The first words of the draft's `[[link]]` texts also join the Set, so a link to an alias finds its page.
+
 **d. Stoplist** (an exported constant; each rule has its own test). A title or alias is never suggested if:
 
 1. every word in it is in `STOPWORDS`;
@@ -117,11 +119,17 @@ It matches `/[\p{L}\p{N}]+/gu`, the same character class `contentWords` splits o
 
 Multi-word titles that contain a stopword, such as "Head of Sales", still match. The number skipped this way is returned as `skipped_stoplist` (a count, not a list).
 
+*As built (Stage 2, call):* rule 2 applies to page titles, not aliases. An alias is a short name the owner chose for the page, and section 3.7's own example suggests `[[OI]]`, which rule 2 would stop. `skipped_stoplist` counts the distinct stoplisted titles and aliases the draft mentions outside masks.
+
 **e. Matching.** Leftmost-longest over the unmasked words: at each word position the longest candidate wins, by word count and then by characters, so "Workflow Intelligence" beats "Workflow". A match must cover consecutive words with no masked range and no line break between them, and the characters between its words must be only spaces, hyphens or similar joiners. Because tokens are whole words, "Workflows" does not match "Workflow". Matching ignores case.
+
+*As built (Stage 2):* candidates are grouped by their lower-cased words, so two candidates that match at the same position with the same word count have the same words and are one candidate; the character tie-break never decides. The joiners are space, tab, no-break space, `-`, U+2010 and U+2011. A match whose span holds an excluded or already-linked page still takes the span, so a shorter title inside it is not suggested instead.
 
 **f. Once per page (issue).** Only the first unmasked mention of each page is suggested; later mentions are counted in `also_mentioned`. This is the plain-text form of the issue's "once per parent chain" rule; a draft has no block tree to walk. **(call)** Claude can call the tool once per block if it wants per-block links.
 
 **g. Exclusions and ambiguity.** The excluded pages (section 3.5) and already-linked pages are dropped. When two or more pages have titles that are equal ignoring case, the span gives an `ambiguous` entry listing every UUID and title, and no single link; `linked_text` leaves it unlinked. Claude must choose; the tool never guesses.
+
+*As built (Stage 2):* "equal" is equal words (ignoring case and joiners), the same grouping matching uses. Each ambiguous span is listed once. The alias-page rule (section 3.2) runs before exclusion, so excluding a page never promotes its standalone alias page. Excluded pages are removed before ambiguity is judged: if one of two "Sprint" pages is excluded, the other is suggested. A link in the draft counts as already linked when its text equals a title or alias ignoring case only (so `#Workflow-Intelligence` does not link "Workflow Intelligence").
 
 ### 3.4 Verify: read back stale UUIDs (panel)
 
