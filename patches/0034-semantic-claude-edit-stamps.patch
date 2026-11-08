@@ -1,8 +1,75 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/storage.cljs b/deps/db-sync/src/logseq/db_sync/storage.cljs
+index d5aef35..8ccfc2e 100644
+--- a/deps/db-sync/src/logseq/db_sync/storage.cljs
++++ b/deps/db-sync/src/logseq/db_sync/storage.cljs
+@@ -205,6 +205,38 @@
+              (fn [tx-report]
+                (append-tx-for-tx-report sql tx-report))))
+ 
++(defn- schema-drift
++  "The built-in attributes whose schema in `db` differs from db-schema/schema, as the app's
++  frontend.worker.db.fix/check-and-fix-schema! finds them, each as the map that restores it."
++  [db]
++  (let [schema (:schema db)]
++    (keep (fn [[k v]]
++            (let [current (dissoc (get schema k) :db/ident)
++                  current (cond-> current
++                            (= :db.cardinality/one (:db/cardinality current)) (dissoc :db/cardinality)
++                            (and (:db/index current) (nil? (:db/index v))) (dissoc :db/index))]
++              (when-not (or (= k :db/ident) (= v current))
++                (assoc v :db/ident k))))
++          db-schema/schema)))
++
++(defn repair-schema!
++  "Restores the built-in attributes' schema on an opened `conn`, as the app does on every open. A
++  graph uploaded from the app keeps the app's stored schema, where the upload's re-added datoms can
++  leave a many attribute (:block/closed-value-property) at cardinality one. Compares in memory and
++  transacts (one logged tx) only when something differs. Skipped while a snapshot upload is still
++  importing rows, since the graph is incomplete then. The upload's reset clears that flag, so an
++  open between the upload's requests can still meet a partly imported graph: a repair that fails
++  there is skipped, and the open answers as it would without the repair. The next open after the
++  upload finishes repairs."
++  [sql conn]
++  (when-not (= "true" (str (get-meta sql :snapshot-uploading?)))
++    (when-let [diffs (seq (schema-drift @conn))]
++      (try
++        (d/transact! conn (vec diffs))
++        (catch :default e
++          (js/console.warn "schema repair skipped:" (ex-message e))))))
++  conn)
++
+ (defn open-conn
+   [sql]
+   (init-schema! sql)
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index f65a3a1..4b4cc11 100644
+index f65a3a1..e54885f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -152,15 +152,19 @@
+@@ -39,7 +39,7 @@
+     (storage/init-schema! (.-sql self))
+     (set! (.-schema-ready self) true))
+   (when-not (.-conn self)
+-    (set! (.-conn self) (storage/open-conn (.-sql self))))
++    (set! (.-conn self) (storage/repair-schema! (.-sql self) (storage/open-conn (.-sql self)))))
+   (.-conn self))
+ 
+ (defn- uuid-string [value]
+@@ -58,6 +58,14 @@
+ (defn- tag? [entity]
+   (ldb/class? entity))
+ 
++(defn- choice-owners
++  "The properties `value` is a choice of, read from its datoms. :block/closed-value-property is
++  cardinality many, but a graph uploaded from the app can hold it as one in its stored schema until
++  the open repairs it, and an entity read then walks the owner's attributes instead."
++  [db value]
++  (when-let [id (:db/id value)]
++    (map #(d/entity db (:v %)) (d/datoms db :eavt id :block/closed-value-property))))
++
+ (defn- property? [entity]
+   (ldb/property? entity))
+ 
+@@ -152,15 +160,19 @@
                     :title (db-property/property-value-content value)}
              (:db/ident value) (assoc :ident (entity-ident value)))))
  
@@ -28,7 +95,7 @@ index f65a3a1..4b4cc11 100644
  
  ;; A many value's entities are listed by :block/order, then by db id. Blocks, property entities and
  ;; pages under the Library or a namespace parent have an order key (a string); plain and journal
-@@ -1134,9 +1138,12 @@
+@@ -1134,9 +1146,12 @@
           (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
           (into {}))))
  
@@ -42,7 +109,7 @@ index f65a3a1..4b4cc11 100644
    [db properties e2ee? scope]
    (if-not (and (map? properties) (seq properties))
      {:error "properties must be a non-empty object"}
-@@ -1148,6 +1155,8 @@
+@@ -1148,6 +1163,8 @@
                                   (prepare-property-value db (:db/ident property) value e2ee? scope))]
                    (cond
                      (not (property? property)) (reduced {:error (str "property not found: " selector)})
@@ -51,7 +118,7 @@ index f65a3a1..4b4cc11 100644
                      (nil? value) (reduced {:error (str selector ": missing property value")})
                      (:error prepared) (reduced {:error (str selector ": " (or (::refusal prepared) (:error prepared)))})
                      :else (update result :properties conj [(:db/ident property) (:value prepared)]))))
-@@ -1322,12 +1331,211 @@
+@@ -1322,12 +1339,211 @@
                     (and (contains? enabled (search-type entity))
                          (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))))
  
@@ -90,9 +157,9 @@ index f65a3a1..4b4cc11 100644
 +  (let [choice (d/entity db [:block/uuid editedby-choice-uuid])
 +        property (d/entity db editedby-ident)]
 +    (cond
-+      (and choice (not (contains? (set (map :db/ident (:block/closed-value-property choice))) editedby-ident)))
++      (and choice (not (contains? (set (map :db/ident (choice-owners db choice))) editedby-ident)))
 +      (str "edit stamps: the claude choice's UUID (" editedby-choice-uuid ") is held by "
-+           (if-let [owner (first (:block/closed-value-property choice))]
++           (if-let [owner (first (choice-owners db choice))]
 +             (str "a choice of " (:block/title owner) " (" (entity-ident owner) ")")
 +             (str "a " (block-kind choice)))
 +           ", not by editedBy; turn off \"Mark Claude's edits\" for this graph")
@@ -266,7 +333,7 @@ index f65a3a1..4b4cc11 100644
  
  (defn- created-by-tx [before after datoms creator]
    (let [targets (into #{}
-@@ -1361,7 +1569,12 @@
+@@ -1361,7 +1577,12 @@
      (apply mutate conn args)
      (let [result (volatile! nil)
            metadata (volatile! nil)
@@ -279,7 +346,7 @@ index f65a3a1..4b4cc11 100644
        ;; Keep identity scoped to synchronous work on an isolated connection.
        ;; The author and operation reach storage in the same transaction.
        (ldb/batch-transact-with-temp-conn!
-@@ -1369,9 +1582,21 @@
+@@ -1369,9 +1590,21 @@
         (fn [tx-conn tx-data]
           (vreset! result (apply mutate tx-conn args))
           (when-let [authorship (seq (created-by-tx before @tx-conn @tx-data creator))]
@@ -303,7 +370,7 @@ index f65a3a1..4b4cc11 100644
                        (vreset! metadata (:tx-meta report))))
         :transform-tx-meta (fn [_] @metadata))
        @result)))
-@@ -2221,7 +2446,7 @@
+@@ -2221,7 +2454,7 @@
              (when-let [reason (cond
                                  (nil? block) "block not found"
                                  (nil? property-ident) "property not found"
@@ -312,7 +379,7 @@ index f65a3a1..4b4cc11 100644
                (str "entry " index ": " reason)))
            (map-indexed vector resolved))))
  
-@@ -2244,6 +2469,8 @@
+@@ -2244,6 +2477,8 @@
        (cond
          (nil? block) (http/bad-request "block not found")
          (nil? property-ident) (http/bad-request "property not found")
@@ -321,7 +388,7 @@ index f65a3a1..4b4cc11 100644
          (not (contains? body :value)) (http/bad-request "missing property value")
          (:error prepared) (http/bad-request (:error prepared))
          :else
-@@ -2258,8 +2485,12 @@
+@@ -2258,8 +2493,12 @@
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
            property-ident (resolve-property-ident db (:property-id path-params))]
@@ -335,7 +402,7 @@ index f65a3a1..4b4cc11 100644
          (refusing-labels
           #(do
              (atomic-write! conn creator false :remove-block-property
-@@ -2733,7 +2964,8 @@
+@@ -2733,7 +2972,8 @@
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
                (p/catch (fn [error]
@@ -345,7 +412,25 @@ index f65a3a1..4b4cc11 100644
  
      :semantic/assets-get
      (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
-@@ -4437,6 +4669,17 @@
+@@ -3447,7 +3687,7 @@
+             targets (call-choices db property (when (:ok choices) choices))
+             datoms (d/datoms db :avet property-ident)
+             own? (fn [value] (= (:db/id property) (:db/id (:logseq.property/created-from-property value))))
+-            choice? (fn [value] (some #(= (:db/id property) (:db/id %)) (:block/closed-value-property value)))
++            choice? (fn [value] (some #(= (:db/id property) (:db/id %)) (choice-owners db value)))
+             [values other] (reduce (fn [[values other] {:keys [e v]}]
+                                      (let [value (d/entity db v)]
+                                        (cond
+@@ -4095,7 +4335,7 @@
+    "mismatched-choice-values"])
+ 
+ (defn- mismatched-choice-response [{:keys [holder property value reason]}]
+-  (let [value-property (first (:block/closed-value-property value))]
++  (let [value-property (first (choice-owners (d/entity-db value) value))]
+     (assoc (holder-response holder)
+            :property (entity-ident property)
+            :property-title (:block/title property)
+@@ -4437,6 +4677,17 @@
      (= :semantic/block-changes handler) (handle-block-changes context)
      :else (http/not-found)))
  
@@ -363,7 +448,7 @@ index f65a3a1..4b4cc11 100644
  (defn handle [{:keys [^js self route ^js url] :as context}]
    (let [conn (ensure-conn! self)
          handler (:handler route)
-@@ -4454,9 +4697,10 @@
+@@ -4454,9 +4705,10 @@
          context (assoc context :conn conn :db db :handler handler :e2ee? e2ee?
                         :path-params (:path-params route)
                         :creator (request-creator (:request context) e2ee?))]
@@ -380,12 +465,25 @@ index f65a3a1..4b4cc11 100644
 +            (dispatch-handle context handler)
 +            result))
 +        (dispatch-handle context handler)))))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs
+index f44dbd7..058072e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs
+@@ -53,7 +53,7 @@
+   (ensure-schema! self)
+   (when-not (.-conn self)
+     (set! (.-conn self)
+-          (storage/open-conn (.-sql self)))))
++          (storage/repair-schema! (.-sql self) (storage/open-conn (.-sql self))))))
+ 
+ (defn t-now [^js self]
+   (ensure-schema! self)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 new file mode 100644
-index 0000000..122055e
+index 0000000..1f1233f
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
-@@ -0,0 +1,1720 @@
+@@ -0,0 +1,1722 @@
 +(ns logseq.db-sync.semantic-edit-stamps-test
 +  "Claude edit stamps (patch 0034), stage 1: the flag and the schema. A write whose request carries
 +  x-logseq-edit-stamp: claude, from a real actor on a graph that isn't E2EE, creates two hidden
@@ -483,7 +581,9 @@ index 0000000..122055e
 +(defn- owners
 +  "The idents of the properties the closed value `choice` belongs to (the attribute is many)."
 +  [choice]
-+  (set (map :db/ident (:block/closed-value-property choice))))
++  (if-let [db (some-> choice d/entity-db)]
++    (set (map #(:db/ident (d/entity db (:v %))) (d/datoms db :eavt (:db/id choice) :block/closed-value-property)))
++    #{}))
 +
 +(defn- holders-of
 +  "The entities holding a value of the property `ident` (read from :eavt, since the attribute may
@@ -2106,15 +2206,437 @@ index 0000000..122055e
 +          (testing "unstamped and decoy-valued blocks are absent"
 +            (doseq [k [:unstamped :decoy :no-time]]
 +              (is (not-any? #{(ids k)} (concat day week)) (name k)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
+new file mode 100644
+index 0000000..abfe15b
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
+@@ -0,0 +1,415 @@
++(ns logseq.db-sync.semantic-uploaded-graph-schema-test
++  "A graph first synced from the app arrives through the snapshot upload, and its stored datascript
++  schema is the app's, not db-schema/schema: frontend.worker.sync.upload/<prepare-upload-temp-sqlite!
++  makes a temp conn with the client's schema and re-adds every datom with {:initial-db? true}, so the
++  built-in property entity's [eid :db/cardinality :db.cardinality/one] datom overwrites
++  :block/closed-value-property's cardinality many. storage/open-conn restores that schema as stored.
++  The app repairs it on every open (frontend.worker.db.fix/check-and-fix-schema!); the server must
++  too, and must read a choice's owners from datoms rather than as an entity set. Each graph here is
++  built through the real path: a client conn, the upload's temp conn on a real SQLite kvs table, the
++  real sync-handler import of its rows, and the handler opening the graph itself."
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.checksum :as sync-checksum]
++            [logseq.db-sync.snapshot :as snapshot]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.frontend.schema :as db-schema]
++            [logseq.db.sqlite.create-graph :as sqlite-create-graph]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(def ^:private by-ident :user.property/claude-editedBy)
++(def ^:private at-ident :user.property/claude-editedAt)
++(def ^:private choice-uuid #uuid "3072a652-18e8-4dcb-bb37-e1aa38c8e3e9")
++
++(def ^:private actor
++  (js/encodeURIComponent
++   (js/JSON.stringify #js {"sub" "6f2c1a90-5b1e-4c7a-9d3e-2a1b0c9d8e7f"
++                           "cognito:username" "Owner" "email" "owner@example.com"})))
++(def ^:private signed [["x-logseq-sync-actor" actor]])
++(def ^:private stamped (conj signed ["x-logseq-edit-stamp" "claude"]))
++
++(defn- memory-sql []
++  (let [db (new sqlite3 ":memory:" nil)]
++    #js {:transaction (fn [f] ((.transaction db f)))
++         :exec (fn [sql-str & args]
++                 (let [stmt (.prepare db sql-str)]
++                   (if (string/starts-with? (-> sql-str string/trim string/lower-case) "select")
++                     (.apply (.-all stmt) stmt (to-array args))
++                     (do (.apply (.-run stmt) stmt (to-array args)) nil))))}))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body & [headers]]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          js-headers (js/Headers. #js {"content-type" "application/json"})
++          _ (doseq [[k v] headers] (.append js-headers k v))
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method :headers js-headers}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (try (js->clj (js/JSON.parse text) :keywordize-keys true) (catch :default _ text)))}))
++
++(defn- upload-rows
++  "The kvs rows the app uploads for `client`, made as <prepare-upload-temp-sqlite! makes them."
++  [client]
++  (let [sql (memory-sql)
++        _ (storage/init-schema! sql)
++        temp (d/conn-from-datoms [] (d/schema @client) {:storage (storage/new-sqlite-storage sql)})]
++    (d/transact! temp (mapv (fn [datom] [:db/add (:e datom) (:a datom) (:v datom)]) (d/datoms @client :eavt))
++                 {:initial-db? true})
++    (mapv (fn [row] [(aget row "addr") (aget row "content") (aget row "addresses")])
++          (.exec sql "select addr, content, addresses from kvs order by addr"))))
++
++(defn- uploaded-graph
++  "A server whose graph arrived through the snapshot upload of a fresh app graph, imported by the real
++  handler and not yet opened. `client-setup` runs on the client conn before the upload."
++  [& [client-setup]]
++  (let [client (d/create-conn db-schema/schema)
++        _ (d/transact! client (sqlite-create-graph/build-db-initial-data "{}"))
++        _ (when client-setup (client-setup client))
++        sql (memory-sql)
++        self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}]
++    (#'sync-handler/import-snapshot! self (upload-rows client) true)
++    {:client client :sql sql :self self}))
++
++(defn- seeded-graph
++  "A server graph created on the server itself (never uploaded), not yet opened."
++  []
++  (let [sql (memory-sql)
++        conn (storage/open-conn sql)]
++    (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
++    {:sql sql :self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}}))
++
++(defn- open!
++  "Opens the graph the way a request does (a read through the real handler) and returns its conn."
++  [self]
++  (p/let [response (request! self "GET" "/semantic/pages" nil)]
++    (is (= 200 (:status response)) (str (:body response)))
++    (.-conn self)))
++
++(defn- schema-drift
++  "The built-in attributes whose schema in `db` differs from db-schema/schema, compared as the app's
++  frontend.worker.db.fix/check-and-fix-schema! compares them."
++  [db]
++  (let [schema (:schema db)]
++    (sort (keep (fn [[k v]]
++                  (let [current (dissoc (get schema k) :db/ident)
++                        current (cond-> current
++                                  (= :db.cardinality/one (:db/cardinality current)) (dissoc :db/cardinality)
++                                  (and (:db/index current) (nil? (:db/index v))) (dissoc :db/index))]
++                    (when-not (or (= k :db/ident) (= v current)) k)))
++                db-schema/schema))))
++
++(defn- cardinality [db attr] (get-in (d/schema db) [attr :db/cardinality]))
++
++(defn- owner-idents
++  "The idents of the properties `choice-id` is a choice of, read from datoms (the attribute is many);
++  nil when there is no such entity."
++  [db choice-id]
++  (when choice-id
++    (set (map #(:db/ident (d/entity db (:v %))) (d/datoms db :eavt choice-id :block/closed-value-property)))))
++
++(defn- tx-log-t [sql] (storage/get-t sql))
++
++(defn- stale-schema!
++  "Puts :block/closed-value-property back at cardinality one in the open conn's schema: a conn whose
++  schema still drifts. A choice's owners must read the same whatever the schema says."
++  [conn]
++  (d/reset-schema! conn (assoc-in (d/schema @conn) [:block/closed-value-property :db/cardinality]
++                                  :db.cardinality/one)))
++
++(defn- with-uploaded
++  "Runs `run` on an uploaded graph the handler has opened. With `stale?`, runs it a second time on
++  a fresh uploaded graph whose open conn's schema drifts again (see stale-schema!)."
++  [done run & {:keys [client-setup stale?]}]
++  (-> (p/doseq [stale (if stale? [false true] [false])]
++        (p/let [graph (uploaded-graph client-setup)
++                conn (open! (:self graph))]
++          (when stale (stale-schema! conn))
++          (testing (if stale "on a conn whose schema still drifts" "on the opened conn")
++            (run (assoc graph :conn conn)))))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(defn- notes-page!
++  "A page (Notes unless `title` is given) with one block, written unflagged through the real handler;
++  returns [page-uuid block-uuid]."
++  [self & [title]]
++  (p/let [page (request! self "POST" "/semantic/pages" {:title (or title "Notes")} signed)
++          page-id (get-in page [:body :uuid])
++          a (str (random-uuid))
++          tree (request! self "POST" "/semantic/block-trees" {:target-id page-id :blocks [{:uuid a :title "A"}]} signed)]
++    (is (= 201 (:status page)) (str (:body page)))
++    (is (= 201 (:status tree)) (str (:body tree)))
++    [page-id a]))
++
++(defn- stamps
++  "The editedBy choice's UUID and whether claudeEditedAt is set, on block `block-uuid` (a string)."
++  [db block-uuid]
++  (when-let [block (some->> block-uuid uuid (vector :block/uuid) (d/entity db))]
++    {:by (some->> (first (d/datoms db :eavt (:db/id block) by-ident)) :v (d/entity db) :block/uuid)
++     :at? (some? (first (d/datoms db :eavt (:db/id block) at-ident)))}))
++
++;; ---------------------------------------------------------------------------------------------
++;; The schema after open
++
++(deftest uploaded-graph-schema-matches-db-schema-after-open-test
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn sql]}]
++        (is (= :db.cardinality/many (cardinality @conn :block/closed-value-property))
++            "the handler's open repairs the uploaded graph's choice owners to cardinality many")
++        (is (empty? (schema-drift @conn)) "every built-in attribute's schema is db-schema/schema's")
++        (testing "the repair is stored: a fresh open of the same SQLite reads it back"
++          (let [fresh (storage/open-conn sql)]
++            (is (= :db.cardinality/many (cardinality @fresh :block/closed-value-property)))
++            (is (empty? (schema-drift @fresh)))))))))
++
++(deftest sync-open-repairs-the-uploaded-schema-test
++  ;; The sync handler opens the conn on its own (its ensure-conn!), e.g. for a checksum or a pull.
++  (async done
++    (-> (p/let [{:keys [self]} (uploaded-graph)
++                _ (sync-handler/current-checksum self)
++                conn (.-conn self)]
++          (is (some? conn))
++          (is (= :db.cardinality/many (cardinality @conn :block/closed-value-property)))
++          (is (empty? (schema-drift @conn))))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(deftest any-drifted-built-in-attribute-is-repaired-test
++  ;; Class sweep: the drift isn't only :block/closed-value-property's. A client whose stored schema
++  ;; has another built-in many attribute (here :block/alias) at cardinality one is repaired too.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [client conn]}]
++        (is (= :db.cardinality/one (cardinality @client :block/alias)) "the client's schema has drifted")
++        (is (= :db.cardinality/many (cardinality @conn :block/alias)))
++        (is (= :db.cardinality/many (cardinality @conn :block/closed-value-property)))
++        (is (empty? (schema-drift @conn))))
++      :client-setup
++      (fn [client]
++        (d/transact! client [[:db/add (d/entid @client :block/alias) :db/cardinality :db.cardinality/one]]
++                     {:initial-db? true})))))
++
++(deftest open-writes-nothing-when-the-schema-matches-test
++  ;; Guards for the repair: a graph that never drifted opens without a write, and a repaired graph
++  ;; isn't repaired again on the next open.
++  (async done
++    (-> (p/let [{:keys [sql self]} (seeded-graph)
++                t-before (tx-log-t sql)
++                conn (open! self)
++                _ (is (empty? (schema-drift @conn)))
++                _ (is (= t-before (tx-log-t sql)) "a server-created graph opens without a write")
++                {uploaded-sql :sql uploaded-self :self} (uploaded-graph)
++                _ (open! uploaded-self)
++                t-repaired (tx-log-t uploaded-sql)
++                again #js {:sql uploaded-sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}
++                reopened (open! again)]
++          (is (empty? (schema-drift @reopened)))
++          (is (= t-repaired (tx-log-t uploaded-sql)) "a repaired graph opens again without a write"))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(deftest repair-leaves-db-ident-alone-test
++  ;; Guard copied from the app's check-and-fix-schema!: :db/ident is datascript's own attribute and
++  ;; is never re-transacted, whatever its schema entry holds.
++  (async done
++    (-> (p/let [{:keys [sql self]} (seeded-graph)
++                conn (open! self)
++                _ (d/reset-schema! conn (assoc-in (d/schema @conn) [:db/ident :db/doc] "changed"))
++                t-before (tx-log-t sql)]
++          (storage/repair-schema! sql conn)
++          (is (= t-before (tx-log-t sql)) "no repair tx for :db/ident"))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(defn- upload-request!
++  "One POST /sync/graph-1/snapshot/upload through the real sync handler, as the app sends it."
++  [self rows reset? finished? checksum]
++  (let [body (#'sync-handler/frame-bytes (snapshot/encode-rows rows))
++        url (str "http://localhost/sync/graph-1/snapshot/upload?graph-id=graph-1&reset=" reset?
++                 "&finished=" finished? (when finished? (str "&checksum=" checksum)))]
++    (p/let [response (sync-handler/handle {:self self
++                                           :request (js/Request. url #js {:method "POST" :body body})
++                                           :url (js/URL. url)
++                                           :route {:handler :sync/snapshot-upload}})
++            text (.text response)]
++      {:status (.-status response) :body text})))
++
++;; Before the fix the open between the two requests threw
++;;   "No protocol method INode.node-conj defined for type null"
++;; because the upload's reset clears the :snapshot-uploading? flag, so the repair transacted over
++;; the partly imported rows; at the base the same open succeeded.
++(deftest open-between-upload-requests-succeeds-and-writes-nothing-test
++  ;; The app uploads a graph in several requests. Another request can open the graph between them;
++  ;; that open must answer as it did before the repair existed, write nothing, and leave the upload
++  ;; to finish. The first open after the upload has finished repairs the schema.
++  (async done
++    (let [client (d/create-conn db-schema/schema)
++          _ (d/transact! client (sqlite-create-graph/build-db-initial-data "{}"))
++          checksum (sync-checksum/recompute-checksum @client)
++          rows (upload-rows client)
++          [part1 part2] (split-at (quot (* 3 (count rows)) 4) rows)
++          sql (memory-sql)
++          self #js {:sql sql :conn nil :schema-ready false :env #js {"DB" nil "TIMEZONE" "UTC"}}]
++      (-> (p/with-redefs [sync-handler/<set-graph-ready-for-use! (fn [& _] (p/resolved true))]
++            (p/let [first-part (upload-request! self part1 true false nil)
++                    t-before (tx-log-t sql)
++                    opened (try (sync-handler/current-checksum self) :opened
++                                (catch :default e (str "open failed: " (ex-message e))))
++                    t-after-open (tx-log-t sql)
++                    _ (set! (.-conn self) nil)
++                    second-part (upload-request! self part2 false true checksum)
++                    after #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}
++                    _ (sync-handler/current-checksum after)]
++              (is (= 200 (:status first-part)) (str first-part))
++              (is (= :opened opened) "an open between the upload's requests answers")
++              (is (= t-before t-after-open) "an open during the upload writes nothing")
++              (is (= 200 (:status second-part)) (str second-part))
++              (is (= :db.cardinality/many (cardinality @(.-conn after) :block/closed-value-property))
++                  "the first open after the upload finishes repairs")))
++          (p/catch #(is false (str % (some-> % .-stack))))
++          (p/finally done)))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Edit stamps on an uploaded graph
++
++(deftest flagged-writes-after-the-first-succeed-on-an-uploaded-graph-test
++  ;; Every flagged write after the one that creates the claude choice (a createPage): a block tree, an
++  ;; edit of a block written before, a second page. Each block it writes carries both stamps.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [[_ a] (notes-page! self)
++                created (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                page-id (get-in created [:body :uuid])
++                child (str (random-uuid))
++                tree (request! self "POST" "/semantic/block-trees"
++                               {:target-id page-id :blocks [{:uuid child :title "N"}]} stamped)
++                edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)
++                second-page (request! self "POST" "/semantic/pages" {:title "Stamp Test 2"} stamped)]
++          (is (= 201 (:status created)) (str (:body created)))
++          (is (= 201 (:status tree)) (str (:body tree)))
++          (is (= 200 (:status edited)) (str (:body edited)))
++          (is (= 201 (:status second-page)) (str (:body second-page)))
++          (is (= #{by-ident} (owner-idents @conn (:db/id (d/entity @conn [:block/uuid choice-uuid])))))
++          (is (= {:by choice-uuid :at? true} (stamps @conn child)) "the block tree's block carries both stamps")
++          (is (= {:by choice-uuid :at? true} (stamps @conn a)) "the edited block carries both stamps")
++          (is (= "A edited" (:block/title (d/entity @conn [:block/uuid (uuid a)]))))
++          (is (some? (d/entity @conn [:block/uuid (uuid (get-in second-page [:body :uuid] (str (random-uuid))))]))
++              "the second page is written (pages are not stamped)")))
++      :stale? true)))
++
++(deftest a-real-choice-conflict-still-refuses-on-an-uploaded-graph-test
++  ;; The check must still fire, naming the owner, when something else really holds the claude
++  ;; choice's UUID: another property's choice, or a plain block.
++  (async done
++    (-> (p/doseq [[label setup expected]
++                  [["another property's choice"
++                    (fn [conn _page]
++                      (let [mood (outliner-property/upsert-property!
++                                  conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                  {:property-name "mood"})]
++                        (outliner-property/upsert-closed-value! conn (:db/ident mood) {:id choice-uuid :value "claude"})))
++                    (fn [conn]
++                      (let [mood (first (owner-idents @conn (:db/id (d/entity @conn [:block/uuid choice-uuid]))))]
++                        (str "edit stamps: the claude choice's UUID (" choice-uuid ") is held by a choice of mood ("
++                             (subs (str mood) 1) "), not by editedBy; turn off \"Mark Claude's edits\" for this graph")))]
++                   ["a plain block"
++                    (fn [conn page]
++                      (let [page-id (:db/id (d/entity @conn [:block/uuid (uuid page)]))]
++                        (d/transact! conn [{:block/uuid choice-uuid :block/title "claude" :block/order "a9"
++                                            :block/page page-id :block/parent page-id
++                                            :block/created-at 1 :block/updated-at 1}])))
++                    (constantly (str "edit stamps: the claude choice's UUID (" choice-uuid ") is held by a block,"
++                                     " not by editedBy; turn off \"Mark Claude's edits\" for this graph"))]]]
++          (p/let [{:keys [self]} (uploaded-graph)
++                  conn (open! self)
++                  [page a] (notes-page! self)
++                  _ (setup conn page)
++                  max-tx (:max-tx @conn)
++                  response (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)
++                  ;; The same refusal on a conn whose schema still drifts.
++                  {stale-self :self} (uploaded-graph)
++                  stale-conn (open! stale-self)
++                  _ (stale-schema! stale-conn)
++                  [stale-page stale-a] (notes-page! stale-self)
++                  _ (setup stale-conn stale-page)
++                  stale-response (request! stale-self "PATCH" (str "/semantic/blocks/" stale-a) {:title "A edited"} stamped)]
++            (testing (str label ", on a conn whose schema still drifts")
++              (is (= 409 (:status stale-response)) (pr-str stale-response))
++              (is (= (expected stale-conn) (get-in stale-response [:body :error]))))
++            (testing label
++              (is (= 409 (:status response)) (pr-str response))
++              (is (= (expected conn) (get-in response [:body :error])))
++              (is (= max-tx (:max-tx @conn)) "nothing is transacted"))))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The other reads of a choice's owners
++
++(deftest convert-values-skips-the-propertys-own-choices-on-an-uploaded-graph-test
++  ;; convert_values leaves holders of the property's own choices alone and converts the text values.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [[_ b0] (notes-page! self)
++                [_ b1] (notes-page! self "Notes 2")
++                phase (:db/ident (outliner-property/upsert-property!
++                                  conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                  {:property-name "phase"}))
++                text (request! self "PUT" (str "/semantic/blocks/" b1 "/properties/" (js/encodeURIComponent (subs (str phase) 1)))
++                               {:value "Done"} signed)
++                active (random-uuid)
++                done-id (random-uuid)
++                _ (outliner-property/upsert-closed-value! conn phase {:id active :value "Active"})
++                _ (outliner-property/upsert-closed-value! conn phase {:id done-id :value "Done"})
++                _ (d/transact! conn [[:db/add [:block/uuid (uuid b0)] phase [:block/uuid active]]])
++                converted (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent (subs (str phase) 1)))
++                                    {:convert_values true} signed)
++                value-of (fn [id] (:block/uuid (get (d/entity @conn [:block/uuid (uuid id)]) phase)))]
++          (is (= 200 (:status text)) (str (:body text)))
++          (is (= 200 (:status converted)) (str (:body converted)))
++          (is (= {:values 1 :holders 1 :deleted 1 :referenced 0} (get-in converted [:body :converted])))
++          (is (= [active done-id] [(value-of b0) (value-of b1)])
++              "b0 keeps its Active choice and b1's text Done becomes the Done choice")
++          (is (= #{phase} (owner-idents @conn (:db/id (d/entity @conn [:block/uuid active]))))
++              "the Active choice is not deleted as if it were a text value")))
++      :stale? true)))
++
++(deftest health-names-the-choices-owner-on-an-uploaded-graph-test
++  ;; mismatched-choice-values names the property a misplaced choice belongs to.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [[_ b0] (notes-page! self)
++                property! (fn [title]
++                            (:db/ident (outliner-property/upsert-property!
++                                        conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                        {:property-name title})))
++                project (property! "project-status")
++                relationship (property! "relationship")
++                project-active (random-uuid)
++                _ (outliner-property/upsert-closed-value! conn project {:id project-active :value "active"})
++                _ (outliner-property/upsert-closed-value! conn relationship {:id (random-uuid) :value "friend"})
++                _ (d/transact! conn [[:db/add [:block/uuid (uuid b0)] relationship [:block/uuid project-active]]])
++                health (request! self "GET" "/semantic/health?checks=mismatched-choice-values" nil)
++                check (get-in health [:body :checks :mismatched-choice-values])]
++          (is (= 200 (:status health)) (str (:body health)))
++          (is (= [{:uuid b0
++                   :property (subs (str relationship) 1)
++                   :value "active"
++                   :value-uuid (str project-active)
++                   :value-property (subs (str project) 1)
++                   :reason "another-propertys-choice"}]
++                 (map #(select-keys % [:uuid :property :value :value-uuid :value-property :reason]) (:items check)))
++              "the misplaced choice names project-status as its owner")))
++      :stale? true)))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index f2e1e92..07f3b43 100644
+index f2e1e92..7517a78 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -24,6 +24,7 @@
+@@ -24,6 +24,8 @@
              [logseq.db-sync.semantic-promote-page-to-tag-test]
              [logseq.db-sync.semantic-private-tags-test]
              [logseq.db-sync.semantic-readable-writes-test]
 +            [logseq.db-sync.semantic-edit-stamps-test]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test]
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]
              [logseq.db-sync.worker-allowed-users-test]

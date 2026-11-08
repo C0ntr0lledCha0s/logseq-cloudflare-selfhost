@@ -7,6 +7,7 @@ import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
 import { tokenListPage } from "../src/wizard/views";
 import { SyncError, inspectToken, syncFetch } from "../src/sync";
+import committedManifest from "../tools-manifest.json";
 
 const ORIGIN = "https://mcp.example.com";
 const OWNER_ID = 1001;
@@ -772,8 +773,11 @@ describe("service tokens", () => {
     return { res, html, token: found[0]! };
   }
 
-  /** Every statement on service_tokens through its own `meta`; other statements go to the real binding. */
-  function meterTokens(alter: (sql: string, result: D1Result) => D1Result = (_s, r) => r) {
+  const REAL = Symbol("real statement");
+  const SQL = Symbol("sql");
+
+  /** Every statement on service_tokens (or matching `metered`) through its own `meta`, batched or not; others go to the real binding. */
+  function meterTokens(alter: (sql: string, result: D1Result) => D1Result = (_s, r) => r, metered = /service_tokens/) {
     const measured: { sql: string; read: number; written: number }[] = [];
     const record = <T extends D1Result>(sql: string, result: T): T => {
       measured.push({ sql, read: result.meta.rows_read, written: result.meta.rows_written });
@@ -781,6 +785,8 @@ describe("service tokens", () => {
     };
     const statement = (stmt: D1PreparedStatement, sql: string): D1PreparedStatement =>
       ({
+        [REAL]: stmt,
+        [SQL]: sql,
         bind: (...values: unknown[]) => statement(stmt.bind(...values), sql),
         run: async () => record(sql, await stmt.run()),
         all: async () => record(sql, await stmt.all()),
@@ -794,7 +800,15 @@ describe("service tokens", () => {
     const db = new Proxy(env.DB, {
       get(target, prop) {
         if (prop === "prepare") {
-          return (sql: string) => (/service_tokens/.test(sql) ? statement(target.prepare(sql), sql) : target.prepare(sql));
+          return (sql: string) => (metered.test(sql) ? statement(target.prepare(sql), sql) : target.prepare(sql));
+        }
+        if (prop === "batch") {
+          // A batch runs the real statements, then meters each metered one from its own result.
+          return async (statements: D1PreparedStatement[]) => {
+            const wrapped = statements as unknown as Record<symbol, unknown>[];
+            const results = await target.batch(wrapped.map((s) => (s[REAL] ?? s) as D1PreparedStatement));
+            return results.map((result, i) => (wrapped[i][SQL] === undefined ? result : record(wrapped[i][SQL] as string, result)));
+          };
         }
         const value = Reflect.get(target, prop);
         return typeof value === "function" ? value.bind(target) : value;
@@ -1040,6 +1054,7 @@ describe("service tokens", () => {
       expiresAt,
       lastUsedAt: null,
       revokedAt: null,
+      updatedAt: null,
     });
     const html = await tokenListPage([row("at-now", now), row("just-before", now + 1)], [], "csrf", now).text();
     const section = (name: string) => html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
@@ -1130,5 +1145,1171 @@ describe("service tokens", () => {
       expect(await rawRows(), field).toEqual([]);
       await env.DB.exec("DELETE FROM graphs");
     }
+  });
+
+  describe("edit a token's graphs, mode and expiry", () => {
+    const A = GRAPH_ID;
+    const B = OTHER_GRAPH_ID;
+    const PAGE_ID = "66666666-6666-4666-8666-666666666666";
+    const C = "77777777-7777-4777-8777-777777777777";
+    const THIRD = { ...OTHER_RECORD, alias: "third", graphId: C, graphName: "Third", mode: "write" as const, permission: "both" as const, token: "logseq_pat_ThirdToken789" };
+    const NOT_ROTATION = "Editing does not change the token. If it may have leaked, revoke it and issue a new one.";
+    const CHANGED =
+      "This token changed since you opened this page, or the page was not the one the wizard sent. The changes below are against its current values; check them and confirm again.";
+    const EFFECTIVE = "effective: read only (the graph is read-only)";
+    const RANGE = "expires_days: a whole number of days from 1 to 365.";
+    const NOT_CONNECTED = "graph: a chosen graph is not connected. Reload the page and choose again.";
+    const ACCESS = "access: choose read-only or read-write.";
+    const extension = (expiresAt: number) =>
+      `expires_days: that would extend the expiry past ${day(expiresAt)}. A token's expiry can only be shortened; issue a new token instead.`;
+    const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    /** `ms` as the confirm page prints it: `YYYY-MM-DD HH:MM UTC`. */
+    const minute = (ms: number) => `${day(ms)} ${new Date(ms).toISOString().slice(11, 16)} UTC`;
+    const HOUR = 3_600_000;
+
+    beforeEach(async () => {
+      await env.DB.exec("DELETE FROM audit_log");
+    });
+
+    /** The edit form as the browser posts it; `graphs` are repeated `graph` fields. */
+    function editForm(h: Harness, fields: Record<string, string> = {}, graphs: string[] = [A]): string[][] {
+      const base: Record<string, string> = { csrf: h.csrf, access: "read", ...fields };
+      return [...Object.entries(base), ...graphs.map((id) => ["graph", id])];
+    }
+
+    /** The stored scope as JSON, as the edit page's hidden `base` carries it; undefined for an unknown id. */
+    async function baseOf(id: string): Promise<string | undefined> {
+      const row = await tokens().get(id);
+      return row ? JSON.stringify({ graphIds: row.graphIds, access: row.access, expiresAt: row.expiresAt }) : undefined;
+    }
+
+    /**
+     * Posts the edit form as a page drawn just now would: with the stored scope as `base` and the
+     * current time as `opened_at`, unless `fields` sets them.
+     */
+    async function edit(h: Harness, id: string, fields: Record<string, string> = {}, graphs: string[] = [A]) {
+      const base = await baseOf(id);
+      const drawn: Record<string, string> = { opened_at: String(Date.now()), ...(base === undefined ? {} : { base }) };
+      return h.page(`/tokens/${id}/edit`, editForm(h, { ...drawn, ...fields }, graphs));
+    }
+
+    /** The refusal a page shows (its error box, or a message page's paragraph), with entities decoded. */
+    function shown(html: string): string {
+      const raw = /<p class="error" role="alert">([^<]*)<\/p>/.exec(html)?.[1] ?? /<\/h1>\s*<p>([^<]*)<\/p>/.exec(html)?.[1] ?? "";
+      return raw.replace(/&#(\d+);/g, (_m, code: string) => String.fromCharCode(Number(code)));
+    }
+
+    async function auditRows(): Promise<Record<string, unknown>[]> {
+      return (await env.DB.prepare("SELECT * FROM audit_log ORDER BY id").all<Record<string, unknown>>()).results;
+    }
+
+    /** Every service_tokens row and every audit_log row, to show a refusal wrote nothing. */
+    async function snap() {
+      return { rows: await rawRows(), audit: await auditRows() };
+    }
+
+    /** A token stored directly: the owner's, read-write on both graphs, 30 days left, unless `scope` says otherwise. */
+    async function stored(
+      name: string,
+      scope: { graphIds?: string[]; access?: "read" | "write"; expiresAt?: number; ownerId?: number } = {},
+    ) {
+      return tokens().create({
+        name,
+        ownerId: scope.ownerId ?? OWNER_ID,
+        graphIds: scope.graphIds ?? [A, B],
+        access: scope.access ?? "write",
+        createdAt: Date.now() - 10 * DAY,
+        expiresAt: scope.expiresAt ?? Date.now() + 30 * DAY,
+      });
+    }
+
+    async function refused(
+      page: { res: Response; html: string },
+      status: number,
+      message: string,
+      before: Awaited<ReturnType<typeof snap>>,
+      label = message,
+    ) {
+      expect(page.res.status, label).toBe(status);
+      expect(shown(page.html), label).toBe(message);
+      expect(page.html.match(LSCT), label).toBeNull();
+      expect(await snap(), label).toEqual(before);
+    }
+
+    const decode = (raw: string) => raw.replace(/&#(\d+);/g, (_m, code: string) => String.fromCharCode(Number(code)));
+
+    /** The edit form's hidden fields in page order, entities decoded: what the browser re-posts on Confirm. */
+    function confirmFields(html: string): string[][] {
+      const form = /<form[^>]*action="\/tokens\/[^"]+\/edit"[^>]*>([\s\S]*?)<\/form>/.exec(html)?.[1] ?? "";
+      return [...form.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)].map((m) => [m[1], decode(m[2])]);
+    }
+
+    /** The confirm page's gains and losses as plain text, in page order. */
+    function changes(html: string): { gains: string[]; losses: string[] } {
+      const list = (cls: string) => {
+        const ul = new RegExp(`<ul class="${cls}">([\\s\\S]*?)</ul>`).exec(html)?.[1] ?? "";
+        return [...ul.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((m) => decode(m[1].replace(/<[^>]+>/g, "")).trim());
+      };
+      return { gains: list("gains"), losses: list("losses") };
+    }
+
+    /** A 200 confirm page with no write. */
+    async function confirmShown(page: { res: Response; html: string }, before: Awaited<ReturnType<typeof snap>>, label = "") {
+      expect(page.res.status, `${label} ${shown(page.html)}`).toBe(200);
+      expect(page.html, label).toContain("<title>Confirm token changes");
+      expect(page.html.match(LSCT), label).toBeNull();
+      expect(await snap(), label).toEqual(before);
+    }
+
+    function applied(page: { res: Response; html: string }, label = "") {
+      expect(page.res.status, `${label} ${shown(page.html)}`).toBe(303);
+      expect(page.res.headers.get("Location"), label).toBe("/tokens");
+      expect(page.res.headers.get("Cache-Control"), label).toBe("no-store");
+    }
+
+    /** A sync server that answers the token checks as before and every API call with an empty page. */
+    function answerPages() {
+      const tokenSync = syncHandler;
+      syncHandler = (request) =>
+        new URL(request.url).pathname === "/api/v1/graphs"
+          ? tokenSync(request)
+          : Response.json({ uuid: PAGE_ID, kind: "page", title: "Notes", markdown: "", "block-count": 0, truncated: false, blocks: [], missing: [] });
+    }
+
+    it("the next /mcp call after a narrowing refuses the removed graph, and a write after write-to-read (spec 8.1)", async () => {
+      const h = await twoGraphs();
+      answerPages();
+      const { token } = await create(h, { name: "ci", access: "write" }, [A, B]);
+      const id = (await rawRows())[0].id as string;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return {
+          isError: res.json.result.isError === true,
+          text: res.json.result.content.map((c: { text: string }) => c.text).join("\n"),
+        };
+      };
+      const read = await call("get_page", { graph: "other", "page-id": PAGE_ID });
+      expect(read.isError, read.text).toBe(false);
+      applied(await edit(h, id, { access: "write" }, [A]));
+      expect(await call("get_page", { graph: "other", "page-id": PAGE_ID })).toEqual({
+        isError: true,
+        text: "graph 'other' is outside service token 'ci''s scope (it covers: my-work-graph)",
+      });
+      const write = { graph: "my-work-graph", "block-id": PAGE_ID, body: { title: "x" } };
+      expect((await call("update_block", write)).text).not.toContain("is read-only");
+      applied(await edit(h, id, { access: "read" }, [A]));
+      expect(await call("update_block", write)).toEqual({
+        isError: true,
+        text: "graph 'my-work-graph' is read-only (service token 'ci' is read-only)",
+      });
+      assertNoToken();
+    });
+
+    it("GET shows the name, ticks the current graphs and access, leaves the shorten field blank, and re-posting it unchanged writes nothing", async () => {
+      const h = await twoGraphs();
+      const gone = "44444444-4444-4444-4444-444444444444";
+      const t = await stored("nightly", { graphIds: [A, gone], access: "write" });
+      const row = (await tokens().get(t.id))!;
+      const { res, html } = await h.page(`/tokens/${t.id}/edit`);
+      expect(res.status).toBe(200);
+      expect(html).toContain("nightly");
+      expect(html).toContain(`action="/tokens/${t.id}/edit"`);
+      expect(html).toMatch(new RegExp(`<input type="checkbox" name="graph" value="${A}" checked`));
+      expect(html).toMatch(new RegExp(`<input type="checkbox" name="graph" value="${B}">`));
+      expect(html).toContain(`${gone} (not connected`);
+      expect(html).toMatch(/<input type="radio" name="access" value="write" checked/);
+      expect(html).not.toMatch(/<input type="radio" name="access" value="read"[^>]* checked/);
+      expect(html).toMatch(/<input[^>]*name="expires_days" value=""/);
+      expect(html).toContain(day(row.expiresAt));
+      expect(html.match(LSCT)).toBeNull();
+      expect(html).not.toContain(t.token.slice(5));
+      // The page's own fields, re-posted: the unconnected graph has no box, so dropping it is the only change.
+      const before = await snap();
+      const drawn = confirmFields(html);
+      applied(await h.page(`/tokens/${t.id}/edit`, [...drawn, ["access", "write"], ["expires_days", ""], ["graph", A]]));
+      expect((await tokens().get(t.id))!.graphIds).toEqual([A]);
+      expect((await auditRows()).length).toBe(before.audit.length + 1);
+      // And re-posting the same form again (a double submit) is no change.
+      const after = await snap();
+      applied(await h.page(`/tokens/${t.id}/edit`, [...drawn, ["access", "write"], ["expires_days", ""], ["graph", A]]));
+      expect(await snap()).toEqual(after);
+    });
+
+    it("a narrowing applies in one POST: 303 to /tokens, updated_at set, expiry kept, one token_edit row each (spec 8.4)", async () => {
+      const h = await twoGraphs();
+      type Access = "read" | "write";
+      const cases: [string, string[], Access, string[], Access, string[]][] = [
+        ["remove-second", [A, B], "write", [A], "write", [A]],
+        ["remove-first", [A, B], "read", [B], "read", [B]],
+        ["reversed-pair", [B, A], "read", [A], "read", [A]],
+        ["write-to-read", [A], "write", [A], "read", [A]],
+        ["both-at-once", [A, B], "write", [B], "read", [B]],
+      ];
+      for (const [name, graphIds, access, form, next, want] of cases) {
+        const t = await stored(name, { graphIds, access });
+        const was = (await tokens().get(t.id))!;
+        const t0 = Date.now();
+        applied(await edit(h, t.id, { access: next }, form), name);
+        const row = (await tokens().get(t.id))!;
+        expect(row, name).toMatchObject({ graphIds: want, access: next, expiresAt: was.expiresAt, revokedAt: null });
+        expect(row.updatedAt, name).toBeGreaterThanOrEqual(t0);
+        expect(row.updatedAt, name).toBeLessThanOrEqual(Date.now());
+        expect((await auditRows()).filter((r) => r.alias === `service:${name}`), name).toHaveLength(1);
+      }
+      // A chain: two narrowings in a row each apply, the second guarded on what the first stored.
+      const t = await stored("chain", { graphIds: [A, B], access: "write" });
+      applied(await edit(h, t.id, { access: "read" }, [A, B]));
+      applied(await edit(h, t.id, { access: "read" }, [B]));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [B], access: "read" });
+      const chain = (await auditRows()).filter((r) => r.alias === "service:chain").map((r) => JSON.parse(r.before as string).data);
+      expect(chain.map((d) => [d.before.graphIds, d.before.access, d.after.graphIds, d.after.access])).toEqual([
+        [[A, B], "write", [A, B], "read"],
+        [[A, B], "read", [B], "read"],
+      ]);
+    });
+
+    it("a widening (an added graph, a swap, read to write, a narrowing with a raise) shows the confirm page and writes nothing; re-posting its fields applies it, and a re-send changes nothing (spec 8.2)", async () => {
+      const h = await twoGraphs();
+      type Access = "read" | "write";
+      const shorter = expect.stringMatching(new RegExp(`^expiry shortened to ${day(Date.now() + 5 * DAY)} \\d{2}:\\d{2} UTC$`));
+      // label, stored graphs and access, form graphs and access, extra fields, gains, losses
+      const cases: [string, string[], Access, string[], Access, Record<string, string>, string[], unknown[]][] = [
+        ["add-graph", [A], "read", [A, B], "read", {}, ["gains read-only on other"], []],
+        ["add-graph-first", [A], "read", [B, A], "read", {}, ["gains read-only on other"], []],
+        ["read-to-write", [A], "read", [A], "write", {}, ["gains read-write on my-work-graph"], []],
+        ["swap", [A], "read", [B], "read", {}, ["gains read-only on other"], ["loses access to my-work-graph"]],
+        ["swap-reversed", [B], "read", [A], "read", {}, ["gains read-only on my-work-graph"], ["loses access to other"]],
+        ["narrow-and-raise", [A, B], "read", [A], "write", {}, ["gains read-write on my-work-graph"], ["loses access to other"]],
+        ["add-and-drop-write", [A], "write", [A, B], "read", {}, ["gains read-only on other"], ["loses read-write on my-work-graph"]],
+        ["swap-shorter-expiry", [A], "read", [B], "read", { expires_days: "5" }, ["gains read-only on other"], ["loses access to my-work-graph", shorter]],
+      ];
+      for (const [name, graphIds, access, form, next, extra, gains, losses] of cases) {
+        const t = await stored(name, { graphIds, access });
+        const before = await snap();
+        const first = await edit(h, t.id, { access: next, ...extra }, form);
+        await confirmShown(first, before, name);
+        expect(changes(first.html), name).toEqual({ gains, losses });
+        expect(first.html, name).not.toContain(CHANGED);
+        applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), name);
+        const row = (await tokens().get(t.id))!;
+        expect(row, name).toMatchObject({ graphIds: form, access: next, revokedAt: null });
+        expect(row.updatedAt, name).not.toBeNull();
+        expect((await auditRows()).filter((r) => r.alias === `service:${name}`), name).toHaveLength(1);
+        const after = await snap();
+        applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), `${name} re-sent`);
+        expect(await snap(), `${name} re-sent`).toEqual(after);
+      }
+    });
+
+    it("chains: two confirmed widenings in a row each guard on what the one before stored; replaying the first page afterwards is stale, so it is refused 409 and writes nothing", async () => {
+      const h = await twoGraphs();
+      const t = await stored("chain", { graphIds: [A], access: "read" });
+      const first = await edit(h, t.id, { access: "read" }, [A, B]);
+      expect(first.res.status).toBe(200);
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)));
+      const second = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(second.res.status).toBe(200);
+      expect(JSON.parse(decode(hidden(second.html, "base")!))).toMatchObject({ graphIds: [A, B], access: "read" });
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(second.html)));
+      // The first page's base is stale now. Its fields would only drop write, but a page drawn before the
+      // second widening must not undo it.
+      const before = await snap();
+      await refused(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), 409, "Service token 'chain' changed since you opened this page; reload and edit again.", before);
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], access: "write" });
+      const chain = (await auditRows()).map((r) => JSON.parse(r.before as string).data);
+      expect(chain.map((d) => [d.before.graphIds, d.before.access, d.after.graphIds, d.after.access])).toEqual([
+        [[A], "read", [A, B], "read"],
+        [[A, B], "read", [A, B], "write"],
+      ]);
+    });
+
+    it("a stale edit form (opened before another tab widened the token) is refused 409 for a narrowing, a shorter expiry or a widening, and writes nothing; a reloaded form applies", async () => {
+      const h = await twoGraphs();
+      await store().add({ ...THIRD });
+      const t = await stored("cloud", { graphIds: [A], access: "write" });
+      const path = `/tokens/${t.id}/edit`;
+      const tab1 = await h.page(path);
+      expect(tab1.res.status).toBe(200);
+      // Tab 2 adds B and confirms.
+      const tab2 = await h.page(path);
+      const widen = await h.page(path, [...confirmFields(tab2.html), ["access", "write"], ["expires_days", ""], ["graph", A], ["graph", B]]);
+      expect(widen.res.status, shown(widen.html)).toBe(200);
+      applied(await h.page(path, confirmFields(widen.html)));
+      expect((await tokens().get(t.id))!.graphIds).toEqual([A, B]);
+      const before = await snap();
+      const STALE = "Service token 'cloud' changed since you opened this page; reload and edit again.";
+      // Tab 1's own hidden fields (csrf, base, opened_at) with what the owner then chose there.
+      const drawn = confirmFields(tab1.html);
+      const cases: [string, string[][]][] = [
+        ["only a shorter expiry", [["access", "write"], ["expires_days", "7"], ["graph", A]]],
+        ["the old page saved as drawn", [["access", "write"], ["expires_days", ""], ["graph", A]]],
+        ["write to read, keeping B", [["access", "read"], ["expires_days", ""], ["graph", A], ["graph", B]]],
+        ["a widening (adds third)", [["access", "write"], ["expires_days", ""], ["graph", A], ["graph", C]]],
+        // A field error on a stale page is not drawn again with the current scope as its base, which would let it apply.
+        ["a field error", [["access", "admin"], ["expires_days", ""], ["graph", A]]],
+      ];
+      for (const [label, fields] of cases) await refused(await h.page(path, [...drawn, ...fields]), 409, STALE, before, label);
+      // A form with no base, or one that is not JSON, cannot show what it was drawn from: refused the same way.
+      const bare = [["csrf", h.csrf], ["access", "read"], ["expires_days", ""], ["graph", A], ["graph", B]];
+      await refused(await h.page(path, bare), 409, STALE, before, "no base");
+      await refused(await h.page(path, [...bare, ["base", "not json"]]), 409, STALE, before, "base not JSON");
+      // A stale page that asks for exactly what is stored changes nothing, so it is the usual redirect.
+      applied(await h.page(path, [...drawn, ["access", "write"], ["expires_days", ""], ["graph", A], ["graph", B]]), "already stored");
+      expect(await snap()).toEqual(before);
+      // The edit page carries the stored scope it was drawn from, and a reloaded page applies.
+      const row = (await tokens().get(t.id))!;
+      const fresh = await h.page(path);
+      expect(decode(hidden(fresh.html, "base")!)).toBe(JSON.stringify({ graphIds: [A, B], access: "write", expiresAt: row.expiresAt }));
+      const openedAt = Number(hidden(fresh.html, "opened_at"));
+      expect(openedAt).toBeGreaterThanOrEqual(row.updatedAt!);
+      applied(await h.page(path, [...confirmFields(fresh.html), ["access", "read"], ["expires_days", "7"], ["graph", A], ["graph", B]]));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], access: "read", expiresAt: openedAt + 7 * DAY });
+    });
+
+    it("a confirm stores the expiry its page showed, even confirmed hours later and past the stored expiry's time of day", async () => {
+      const h = await twoGraphs();
+      const T = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        const cases: [string, number][] = [
+          ["well-before", T + 30 * DAY],
+          ["an-hour-after-it", T + 5 * DAY + HOUR],
+        ];
+        for (const [name, expiresAt] of cases) {
+          clock.mockReturnValue(T);
+          const t = await stored(name, { graphIds: [A], access: "read", expiresAt });
+          const page = await edit(h, t.id, { access: "read", expires_days: "5" }, [A, B]);
+          expect(page.res.status, name).toBe(200);
+          expect(changes(page.html).losses, name).toEqual([`expiry shortened to ${minute(T + 5 * DAY)}`]);
+          clock.mockReturnValue(T + 3 * HOUR);
+          applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(page.html)), name);
+          expect((await tokens().get(t.id))!, name).toMatchObject({ graphIds: [A, B], expiresAt: T + 5 * DAY });
+        }
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("a double-submitted edit answers 303 both times and applies once, with one audit row: a shorter expiry, and a confirmed widening with one", async () => {
+      const h = await twoGraphs();
+      const T = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        const t = await stored("ci", { graphIds: [A, B], access: "write", expiresAt: T + 30 * DAY });
+        const form = editForm(h, { access: "write", expires_days: "7", opened_at: String(T), base: (await baseOf(t.id))! }, [A]);
+        applied(await h.page(`/tokens/${t.id}/edit`, form), "first");
+        clock.mockReturnValue(T + 1000);
+        const after = await snap();
+        applied(await h.page(`/tokens/${t.id}/edit`, form), "second");
+        expect(await snap()).toEqual(after);
+        expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A], access: "write", expiresAt: T + 7 * DAY });
+        expect((await auditRows()).filter((r) => r.alias === "service:ci")).toHaveLength(1);
+
+        clock.mockReturnValue(T);
+        const u = await stored("nightly", { graphIds: [A], access: "read", expiresAt: T + 30 * DAY });
+        const page = await edit(h, u.id, { access: "read", expires_days: "7" }, [A, B]);
+        expect(page.res.status).toBe(200);
+        clock.mockReturnValue(T + 1000);
+        applied(await h.page(`/tokens/${u.id}/edit`, confirmFields(page.html)), "confirm");
+        clock.mockReturnValue(T + 2000);
+        applied(await h.page(`/tokens/${u.id}/edit`, confirmFields(page.html)), "confirm again");
+        expect((await tokens().get(u.id))!).toMatchObject({ graphIds: [A, B], access: "read", expiresAt: T + 7 * DAY });
+        expect((await auditRows()).filter((r) => r.alias === "service:nightly")).toHaveLength(1);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("expires_at and opened_at are checked before any write, each refusal naming its field; a valid one applies exactly", async () => {
+      const h = await twoGraphs();
+      const T = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        const t = await stored("ci", { graphIds: [A], access: "write", expiresAt: T + 30 * DAY });
+        const path = `/tokens/${t.id}/edit`;
+        const before = await snap();
+        const at = (value: string, extra: Record<string, string> = {}) => edit(h, t.id, { access: "write", expires_at: value, ...extra }, [A]);
+        const AT_FORMAT = "expires_at: a whole number of milliseconds since 1970. Reload the page and edit again.";
+        await refused(await at(String(T + 30 * DAY + 1)), 400, `expires_at: that would extend the expiry past ${day(T + 30 * DAY)}. A token's expiry can only be shortened; issue a new token instead.`, before, "later");
+        await refused(await at(String(T)), 400, "expires_at: that expiry has already passed. Reload the page and edit again.", before, "now");
+        for (const bad of ["soon", "1.5", "-1", "1e12", "0x10", "1000000000000000"]) await refused(await at(bad), 400, AT_FORMAT, before, bad);
+        await refused(await at(String(T + DAY), { expires_days: "1" }), 400, "expires_at: send expires_days or expires_at, not both.", before, "both");
+
+        const base = (await baseOf(t.id))!;
+        const days = (count: string, opened?: string) =>
+          h.page(path, editForm(h, { access: "write", expires_days: count, base, ...(opened === undefined ? {} : { opened_at: opened }) }, [A]));
+        const OPENED = "opened_at: missing, or not a time this page could have been opened. Reload the page and edit again.";
+        for (const [label, opened] of [["missing", undefined], ["empty", ""], ["not a number", "yesterday"], ["in the future", String(T + 1)], ["too long", "1000000000000000"]] as const) {
+          await refused(await days("7", opened), 400, OPENED, before, label);
+        }
+        const passed = "expires_days: that expiry has already passed. Reload the page and edit again.";
+        await refused(await days("1", String(T - 2 * DAY)), 400, passed, before, "a day ago");
+        await refused(await days("1", String(T - DAY)), 400, passed, before, "exactly now");
+
+        // A day count from a page opened a day ago counts from then; an absolute expiry applies exactly.
+        applied(await days("1", String(T - DAY + 1)), "a millisecond to spare");
+        expect((await tokens().get(t.id))!.expiresAt).toBe(T + 1);
+        applied(await at(String(T + 1)), "the stored value is no change");
+        clock.mockReturnValue(T - HOUR);
+        applied(await edit(h, t.id, { access: "write", expires_at: String(T - 1) }, [A]), "absolute");
+        expect((await tokens().get(t.id))!.expiresAt).toBe(T - 1);
+        expect(await auditRows()).toHaveLength(2);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("the edit and its audit row commit together: when the audit insert fails the token is unchanged and the answer is 500 saying nothing was changed", async () => {
+      // The token_edit insert names a table that does not exist, so it fails when it runs, after the UPDATE.
+      const db = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop === "prepare") {
+            return (sql: string) => target.prepare(sql.includes("token_edit") ? sql.replace("INSERT INTO audit_log", "INSERT INTO audit_log_unavailable") : sql);
+          }
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const h = await twoGraphs({ DB: db });
+      const NOT_EDITED = /^Service token '([a-z-]+)' was not edited: the change and its audit row are written together, and the write failed \(.*no such table: audit_log_unavailable.*\); nothing was changed\. Try again\.$/;
+      const cases: [string, Record<string, string>, string[]][] = [
+        ["narrowing", { access: "write" }, [A]],
+        ["write-to-read", { access: "read" }, [A, B]],
+        ["shorter-expiry", { access: "write", expires_days: "7" }, [A, B]],
+      ];
+      const threw = (error: Error) => ({ res: new Response(null, { status: 599 }), html: `threw: ${error.message}` });
+      for (const [name, fields, graphs] of cases) {
+        const t = await stored(name, { graphIds: [A, B], access: "write" });
+        const before = await snap();
+        const page = await edit(h, t.id, fields, graphs).catch(threw);
+        expect(await snap(), name).toEqual(before);
+        expect(page.res.status, `${name} ${page.html.slice(0, 200)}`).toBe(500);
+        expect(shown(page.html), name).toMatch(NOT_EDITED);
+      }
+      // A confirmed widening as well.
+      const t = await stored("widening", { graphIds: [A], access: "read" });
+      const page = await edit(h, t.id, { access: "read" }, [A, B]);
+      expect(page.res.status).toBe(200);
+      const before = await snap();
+      const confirmed = await h.page(`/tokens/${t.id}/edit`, confirmFields(page.html)).catch(threw);
+      expect(await snap()).toEqual(before);
+      expect(confirmed.res.status).toBe(500);
+      expect(shown(confirmed.html)).toMatch(NOT_EDITED);
+      assertNoToken();
+    });
+
+    it("after a confirmed widening the next /mcp call reaches the added graph, and a write works after a confirmed read to write (spec 8.1, 8.2)", async () => {
+      const h = await twoGraphs();
+      answerPages();
+      await store().add({ ...THIRD });
+      const { token } = await create(h, { name: "ci", access: "read" }, [A]);
+      const id = (await rawRows())[0].id as string;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return {
+          isError: res.json.result.isError === true,
+          text: res.json.result.content.map((c: { text: string }) => c.text).join("\n"),
+        };
+      };
+      const read = { graph: "third", "page-id": PAGE_ID };
+      const outside = { isError: true, text: "graph 'third' is outside service token 'ci''s scope (it covers: my-work-graph)" };
+      expect(await call("get_page", read)).toEqual(outside);
+      const add = await edit(h, id, { access: "read" }, [A, C]);
+      expect(add.res.status).toBe(200);
+      expect(await call("get_page", read)).toEqual(outside);
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(add.html)));
+      expect((await call("get_page", read)).isError).toBe(false);
+      const write = { graph: "third", "block-id": PAGE_ID, body: { title: "x" } };
+      const readOnly = { isError: true, text: "graph 'third' is read-only (service token 'ci' is read-only)" };
+      expect(await call("update_block", write)).toEqual(readOnly);
+      const raise = await edit(h, id, { access: "write" }, [A, C]);
+      expect(changes(raise.html).gains).toEqual(["gains read-write on my-work-graph", "gains read-write on third"]);
+      expect(await call("update_block", write)).toEqual(readOnly);
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(raise.html)));
+      expect((await call("update_block", write)).text).not.toContain("is read-only");
+      assertNoToken();
+    });
+
+    it("the confirm page names gains and losses by alias, says an edit is not a rotation, and re-posts the form with confirm=1, base and the CSRF token; it holds no token", async () => {
+      const h = await twoGraphs();
+      await store().add({ ...THIRD });
+      const gone = "44444444-4444-4444-4444-444444444444";
+      const t = await stored("ci", { graphIds: [A, B, gone], access: "read" });
+      const row = (await tokens().get(t.id))!;
+      const before = await snap();
+      const T = Date.now();
+      const page = await edit(h, t.id, { access: "write", expires_days: " 7 ", opened_at: String(T) }, [C, A]);
+      await confirmShown(page, before);
+      expect(page.html).toContain(`<span class="alias">ci</span>`);
+      expect(changes(page.html)).toEqual({
+        gains: ["gains read-write on third", "gains read-write on my-work-graph"],
+        losses: ["loses access to other", `loses access to ${gone} (not connected)`, expect.stringMatching(/^expiry shortened to /)],
+      });
+      expect(page.html).toContain(NOT_ROTATION);
+      expect(page.html).not.toContain(CHANGED);
+      expect(page.html).toContain(`action="/tokens/${t.id}/edit"`);
+      expect(page.html).toContain(`href="/tokens/${t.id}/edit"`);
+      expect(confirmFields(page.html)).toEqual([
+        ["csrf", h.csrf],
+        ["access", "write"],
+        ["expires_at", String(T + 7 * DAY)],
+        ["graph", C],
+        ["graph", A],
+        ["confirm", "1"],
+        ["base", JSON.stringify({ graphIds: [A, B, gone], access: "read", expiresAt: row.expiresAt })],
+      ]);
+      expect(page.html).not.toContain(t.token.slice(5));
+      expect(page.html).not.toContain((await rawRows())[0].token_hash as string);
+    });
+
+    it("a forged confirm (confirm=1 with no base, a base that is not JSON or not the stored values) or a confirm other than 1 shows the confirm page and writes nothing", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "read" });
+      const row = (await tokens().get(t.id))!;
+      const good = { graphIds: [A, B], access: "read", expiresAt: row.expiresAt };
+      const base = (value: unknown) => ({ confirm: "1", base: JSON.stringify(value) });
+      const before = await snap();
+      // label, fields, whether the changed-since line shows
+      const cases: [string, Record<string, string>, boolean][] = [
+        ["no base", { confirm: "1" }, true],
+        ["empty base", { confirm: "1", base: "" }, true],
+        ["not json", { confirm: "1", base: "not json" }, true],
+        ["null", base(null), true],
+        ["a number", base(42), true],
+        ["a string", base("read"), true],
+        ["an array", base([good]), true],
+        ["no expiresAt", base({ graphIds: [A, B], access: "read" }), true],
+        ["expiresAt as a string", base({ ...good, expiresAt: String(row.expiresAt) }), true],
+        ["expiresAt a millisecond later", base({ ...good, expiresAt: row.expiresAt + 1 }), true],
+        ["graphs reordered", base({ ...good, graphIds: [B, A] }), true],
+        ["one graph missing", base({ ...good, graphIds: [A] }), true],
+        ["graphs as a string", base({ ...good, graphIds: A }), true],
+        ["graphs as JSON text", base({ ...good, graphIds: JSON.stringify([A, B]) }), true],
+        ["access raised", base({ ...good, access: "write" }), true],
+        ["no access", base({ graphIds: [A, B], expiresAt: row.expiresAt }), true],
+        ["confirm=true", { confirm: "true", base: JSON.stringify(good) }, false],
+        ["confirm empty", { confirm: "", base: JSON.stringify(good) }, false],
+        ["no confirm", { base: JSON.stringify(good) }, false],
+      ];
+      for (const [label, fields, stale] of cases) {
+        const page =
+          "base" in fields
+            ? await edit(h, t.id, { access: "write", ...fields }, [A, B])
+            : await h.page(`/tokens/${t.id}/edit`, editForm(h, { access: "write", ...fields }, [A, B]));
+        await confirmShown(page, before, label);
+        expect(page.html.includes(CHANGED), label).toBe(stale);
+        expect(decode(hidden(page.html, "base") ?? ""), label).toBe(JSON.stringify(good));
+      }
+      // The control: the stored values as base, in any key order and with an extra key, apply.
+      const reordered = { expiresAt: row.expiresAt, access: "read", graphIds: [A, B], note: "ignored" };
+      applied(await edit(h, t.id, { access: "write", ...base(reordered) }, [A, B]));
+      expect((await tokens().get(t.id))!.access).toBe("write");
+    });
+
+    it("a stale confirm (the token changed after the confirm page) shows the page again with a changed-since line and the current values, and writes nothing (spec 8.3)", async () => {
+      const h = await twoGraphs();
+      // The expiry was shortened in another tab.
+      const t = await stored("ci", { graphIds: [A], access: "write" });
+      const first = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(first.res.status).toBe(200);
+      applied(await edit(h, t.id, { access: "write", expires_days: "10" }, [A]));
+      const shortened = (await tokens().get(t.id))!;
+      let before = await snap();
+      const again = await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html));
+      await confirmShown(again, before, "expiry");
+      expect(again.html).toContain(CHANGED);
+      expect(decode(hidden(again.html, "base")!)).toBe(JSON.stringify({ graphIds: [A], access: "write", expiresAt: shortened.expiresAt }));
+      expect(changes(again.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`], losses: [] });
+      // Confirming the page shown now applies it and keeps the shorter expiry.
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(again.html)));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], access: "write", expiresAt: shortened.expiresAt });
+
+      // A graph was removed in another tab: the re-post now adds it back and raises, against the current row.
+      const u = await stored("nightly", { graphIds: [A, B], access: "read" });
+      const raise = await edit(h, u.id, { access: "write" }, [A, B]);
+      expect(changes(raise.html).gains).toEqual([`gains read-write on my-work-graph`, `gains read-write on other; ${EFFECTIVE}`]);
+      applied(await edit(h, u.id, { access: "read" }, [A]));
+      before = await snap();
+      const stale = await h.page(`/tokens/${u.id}/edit`, confirmFields(raise.html));
+      await confirmShown(stale, before, "graphs");
+      expect(stale.html).toContain(CHANGED);
+      expect(changes(stale.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`, "gains read-write on my-work-graph"], losses: [] });
+      expect((await tokens().get(u.id))!).toMatchObject({ graphIds: [A], access: "read" });
+    });
+
+    it("a confirming POST that carries a graph the page did not show applies exactly what it carries, and the audit row names both added graphs", async () => {
+      const h = await twoGraphs();
+      await store().add({ ...THIRD });
+      const t = await stored("ci", { graphIds: [A], access: "read" });
+      const page = await edit(h, t.id, { access: "read" }, [A, B]);
+      expect(changes(page.html).gains).toEqual(["gains read-only on other"]);
+      // The POST is the owner's own CSRF-checked form, so the gains are recomputed from it, not from the page.
+      applied(await h.page(`/tokens/${t.id}/edit`, [...confirmFields(page.html), ["graph", C]]));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B, C], access: "read" });
+      const [audit] = await auditRows();
+      expect(JSON.parse(audit.before as string).data).toMatchObject({ added: [B, C], removed: [] });
+    });
+
+    it("widening a read-write token to a read-only graph says effective read only, and after confirming a write there is refused with the plain message (spec 8.9)", async () => {
+      const h = await twoGraphs();
+      answerPages();
+      const { token } = await create(h, { name: "ci", access: "write" }, [A]);
+      const id = (await rawRows())[0].id as string;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return {
+          isError: res.json.result.isError === true,
+          text: res.json.result.content.map((c: { text: string }) => c.text).join("\n"),
+        };
+      };
+      const page = await edit(h, id, { access: "write" }, [A, B]);
+      expect(page.res.status).toBe(200);
+      expect(changes(page.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`], losses: [] });
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(page.html)));
+      expect(await call("update_block", { graph: "other", "block-id": PAGE_ID, body: { title: "x" } })).toEqual({
+        isError: true,
+        text: "graph 'other' is read-only",
+      });
+      expect((await call("get_page", { graph: "other", "page-id": PAGE_ID })).isError).toBe(false);
+      expect((await call("update_block", { graph: "my-work-graph", "block-id": PAGE_ID, body: { title: "x" } })).text).not.toContain("is read-only");
+      assertNoToken();
+    });
+
+    it("confirm fields do not hold back what already applies at once from a current page: a narrowing, a shorter expiry, or no change with confirm=1; a stale or unreadable base refuses it 409", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      const stale = JSON.stringify({ graphIds: [B], access: "read", expiresAt: 1 });
+      applied(await edit(h, t.id, { access: "read", confirm: "1" }, [A, B]), "write to read");
+      applied(await edit(h, t.id, { access: "read", confirm: "1" }, [B]), "remove a graph");
+      applied(await edit(h, t.id, { access: "read", confirm: "1", expires_days: "5" }, [B]), "shorter expiry");
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [B], access: "read" });
+      expect(await auditRows()).toHaveLength(3);
+      const before = await snap();
+      applied(await edit(h, t.id, { access: "read", confirm: "1", base: stale }, [B]), "no change");
+      expect(await snap()).toEqual(before);
+      for (const base of [stale, "not json"]) {
+        await refused(
+          await edit(h, t.id, { access: "read", confirm: "1", base, expires_days: "2" }, [B]),
+          409,
+          "Service token 'ci' changed since you opened this page; reload and edit again.",
+          before,
+          base,
+        );
+      }
+    });
+
+    it("expiry: shorter applies, the exact stored expiry is no change, an extension is refused naming the date, blank keeps it, and out-of-range days get the range message (spec 8.5)", async () => {
+      const h = await twoGraphs();
+      const T = Date.now();
+      const t = await stored("ci", { graphIds: [A], access: "write", expiresAt: T + 30 * DAY });
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        const before = await snap();
+        // Exactly the stored expiry, blank, spaces and an omitted field: nothing else changed, so no change.
+        for (const days of ["30", " 30 ", "", " "]) applied(await edit(h, t.id, { access: "write", expires_days: days }, [A]), days);
+        applied(await edit(h, t.id, { access: "write" }, [A]), "omitted");
+        expect(await snap()).toEqual(before);
+        // An extension, by a day or by a millisecond, is refused naming the stored date; with a narrowing too.
+        await refused(await edit(h, t.id, { access: "write", expires_days: "31" }, [A]), 400, extension(T + 30 * DAY), before, "31");
+        await refused(await edit(h, t.id, { access: "read", expires_days: "365" }, [A]), 400, extension(T + 30 * DAY), before, "365");
+        clock.mockReturnValue(T + 1);
+        await refused(await edit(h, t.id, { access: "write", expires_days: "30" }, [A]), 400, extension(T + 30 * DAY), before, "1 ms");
+        clock.mockReturnValue(T);
+        for (const days of ["0", "366", "1.5", "-1", "ninety", "1e1", "0x1"]) {
+          await refused(await edit(h, t.id, { access: "write", expires_days: days }, [A]), 400, RANGE, before, days);
+        }
+        // Shorter applies (padding trimmed); then blank with a narrowing keeps the shorter expiry.
+        applied(await edit(h, t.id, { access: "write", expires_days: " 10 " }, [A]));
+        expect((await tokens().get(t.id))!).toMatchObject({ expiresAt: T + 10 * DAY, access: "write" });
+        applied(await edit(h, t.id, { access: "read", expires_days: "" }, [A]));
+        expect((await tokens().get(t.id))!).toMatchObject({ expiresAt: T + 10 * DAY, access: "read" });
+        applied(await edit(h, t.id, { access: "read", expires_days: "1" }, [A]));
+        expect((await tokens().get(t.id))!.expiresAt).toBe(T + DAY);
+        expect(await auditRows()).toHaveLength(3);
+        // The same day count from a page opened a second later would move the expiry later, so it is refused and writes nothing.
+        clock.mockReturnValue(T + 1000);
+        const now = await snap();
+        await refused(await edit(h, t.id, { access: "read", expires_days: "1" }, [A]), 400, extension(T + DAY), now, "re-send");
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("refusals: 404 unknown, 409 revoked, expired and previous owner on GET and POST, 400 field errors, 403 CSRF, 503 audit_log missing; each writes nothing (spec 8.6)", async () => {
+      const h = await twoGraphs();
+      const other = await harness();
+      const ci = await stored("ci");
+      const old = await stored("old");
+      const revokedAt = Date.now() - 1000;
+      await tokens().revoke(old.id, revokedAt);
+      const lapsedAt = Date.now() - DAY;
+      const lapsed = await stored("lapsed", { expiresAt: lapsedAt });
+      const inherited = await stored("inherited", { ownerId: 2002, graphIds: [B] });
+      const before = await snap();
+      const dead: [string, number, string][] = [
+        [crypto.randomUUID(), 404, "No service token has that id."],
+        [old.id, 409, `Service token 'old' was revoked on ${day(revokedAt)}; it cannot be edited. Issue a new token.`],
+        [lapsed.id, 409, `Service token 'lapsed' expired on ${day(lapsedAt)}; it cannot be edited. Issue a new token.`],
+        [inherited.id, 409, "Service token 'inherited' belongs to a previous owner; it cannot be edited."],
+      ];
+      for (const [id, status, message] of dead) {
+        for (const [method, page] of [
+          ["GET", await h.page(`/tokens/${id}/edit`)],
+          ["POST", await edit(h, id, { access: "read" }, [A])],
+        ] as const) {
+          await refused(page, status, message, before, `${method} ${message}`);
+          expect(page.html, message).not.toContain(B);
+          expect(page.html, message).not.toContain('name="graph"');
+        }
+      }
+      const fields: [Record<string, string>, string[], string][] = [
+        [{ access: "read" }, [], "graph: choose at least one graph."],
+        [{ access: "read" }, ["33333333-3333-3333-3333-333333333333"], NOT_CONNECTED],
+        [{ access: "read" }, [A, "my-work-graph"], NOT_CONNECTED],
+        [{ access: "admin" }, [A], ACCESS],
+        [{ access: "" }, [A], ACCESS],
+        [{ access: "read", expires_days: "0" }, [A], RANGE],
+      ];
+      for (const [f, graphs, message] of fields) {
+        await refused(await edit(h, ci.id, f, graphs), 400, message, before, JSON.stringify([f, graphs]));
+      }
+      // CSRF: none, another session's, and a JSON body.
+      const path = `/tokens/${ci.id}/edit`;
+      const form = editForm(h, { access: "read" }, [A]).filter(([k]) => k !== "csrf");
+      expect((await h.page(path, form)).res.status).toBe(403);
+      expect((await h.page(path, [["csrf", other.csrf], ...form])).res.status).toBe(403);
+      expect((await h.call(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+      expect(await snap()).toEqual(before);
+      // audit_log missing: the probe answers "no such table", so nothing is changed.
+      const missing = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop === "prepare") {
+            return (sql: string) => {
+              if (!sql.includes("audit_log")) return target.prepare(sql);
+              const fail = () => Promise.reject(new Error("D1_ERROR: no such table: audit_log: SQLITE_ERROR"));
+              return { bind() { return this; }, run: fail, all: fail };
+            };
+          }
+          const value = Reflect.get(target, prop);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const h2 = await harness({ DB: missing });
+      await refused(await edit(h2, ci.id, { access: "read" }, [A]), 503, "audit log is missing (apply migration 0004); nothing was changed.", before);
+      assertNoToken();
+    });
+
+    it("owner only: no session, another account's session and an lsct_ bearer are sent to /login; no MCP tool reads or edits tokens (spec 8.7)", async () => {
+      const h = await twoGraphs();
+      const { id, token } = await stored("ci");
+      const intruder = (await createSession(env, 2002)).split(";")[0];
+      const before = await snap();
+      for (const method of ["GET", "POST"]) {
+        for (const headers of [{}, { Cookie: intruder }, { Authorization: `Bearer ${token}` }] as Record<string, string>[]) {
+          const res = await bare(h, `/tokens/${id}/edit`, method, headers);
+          expect(res.status, `${method} ${Object.keys(headers)}`).toBe(302);
+          expect(res.headers.get("Location")).toBe("/login");
+        }
+      }
+      expect(await snap()).toEqual(before);
+      expect(committedManifest.map((t: { name: string }) => t.name).filter((name: string) => /token/.test(name))).toEqual([]);
+    });
+
+    it("an edit is not a rotation: the same lsct_ string still authenticates and token_hash is unchanged (spec 8.8)", async () => {
+      const h = await twoGraphs();
+      const { token } = await create(h, { name: "ci", access: "write" }, [A, B]);
+      const [row] = await rawRows();
+      expect(row.token_hash).toBe(await hashServiceToken(token));
+      applied(await edit(h, row.id as string, { access: "read", expires_days: "7" }, [A]));
+      const [after] = await rawRows();
+      expect(after.token_hash).toBe(row.token_hash);
+      expect(after.updated_at).not.toBeNull();
+      const init = await mcp(h, token, "initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+      });
+      expect(init.status).toBe(200);
+      expect(init.json.result.serverInfo).toBeTruthy();
+      expect((await mcp(h, token, "tools/list")).status).toBe(200);
+    });
+
+    it("the same graphs reordered or repeated, with nothing else changed, is no change; with a change the stored order follows the form and has no duplicate", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      const before = await snap();
+      for (const graphs of [[A, B], [B, A], [A, A, B], [B, A, B, A]]) {
+        applied(await edit(h, t.id, { access: "write" }, graphs), JSON.stringify(graphs));
+      }
+      expect(await snap()).toEqual(before);
+      expect((await tokens().get(t.id))!.updatedAt).toBeNull();
+      applied(await edit(h, t.id, { access: "read" }, [B, A]));
+      expect((await tokens().get(t.id))!.graphIds).toEqual([B, A]);
+      applied(await edit(h, t.id, { access: "read" }, [B, B]));
+      expect((await tokens().get(t.id))!.graphIds).toEqual([B]);
+      expect(await auditRows()).toHaveLength(2);
+      // A re-send of the last narrowing is now no change.
+      const after = await snap();
+      applied(await edit(h, t.id, { access: "read" }, [B, B]));
+      expect(await snap()).toEqual(after);
+    });
+
+    it("the audit row: token_edit, graph_id NULL, service:<name>, wizard, before and after in before.data; no token or hash in any column or body (spec 8.10)", async () => {
+      const h = await twoGraphs();
+      const { token, html: createPage } = await create(h, { name: "ci", access: "write" }, [A, B]);
+      const [row] = await rawRows();
+      const hash = row.token_hash as string;
+      applied(await edit(h, row.id as string, { access: "read" }, [A]));
+      const audit = await auditRows();
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({
+        graph_id: null,
+        alias: "service:ci",
+        tool: "token_edit",
+        kind: "write",
+        status: "ok",
+        client: "wizard",
+        session: `github:${OWNER_ID}`,
+        targets: null,
+        addressed: null,
+        pages: null,
+      });
+      const expiresAt = row.expires_at as number;
+      expect(JSON.parse(audit[0].before as string)).toEqual({
+        source: "service_tokens",
+        data: {
+          before: { graphIds: [A, B], access: "write", expiresAt },
+          after: { graphIds: [A], access: "read", expiresAt },
+          added: [],
+          removed: [B],
+        },
+      });
+      for (const [column, value] of Object.entries(audit[0])) {
+        expect(String(value), column).not.toContain(token.slice(5));
+        expect(String(value), column).not.toContain(hash);
+      }
+      for (const [column, value] of Object.entries((await rawRows())[0])) {
+        expect(String(value), column).not.toContain(token.slice(5));
+      }
+      await h.page(`/tokens/${row.id}/edit`);
+      await h.page("/tokens");
+      const bodies = transcript.filter((text) => text !== createPage).join("\n");
+      expect(bodies).not.toContain(token.slice(5));
+      expect(bodies).not.toContain(hash);
+    });
+
+    it("a disconnect between the GET and the POST answers 409 revoked and keeps the old graphs (spec 8.11)", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      expect((await h.page(`/tokens/${t.id}/edit`)).res.status).toBe(200);
+      expect((await h.page("/graphs/other/disconnect", { csrf: h.csrf })).res.status).toBe(200);
+      const revoked = (await tokens().get(t.id))!;
+      expect(revoked.revokedAt).not.toBeNull();
+      const before = await snap();
+      await refused(
+        await edit(h, t.id, { access: "write" }, [A]),
+        409,
+        `Service token 'ci' was revoked on ${day(revoked.revokedAt!)}; it cannot be edited. Issue a new token.`,
+        before,
+      );
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], revokedAt: revoked.revokedAt, updatedAt: null });
+    });
+
+    it("a token that expires between the GET and the POST is refused 409 expired", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      expect((await h.page(`/tokens/${t.id}/edit`)).res.status).toBe(200);
+      const lapsedAt = Date.now() - 1;
+      await env.DB.prepare("UPDATE service_tokens SET expires_at = ? WHERE id = ?").bind(lapsedAt, t.id).run();
+      const before = await snap();
+      await refused(
+        await edit(h, t.id, { access: "read" }, [A]),
+        409,
+        `Service token 'ci' expired on ${day(lapsedAt)}; it cannot be edited. Issue a new token.`,
+        before,
+      );
+    });
+
+    it("at exactly its expires_at a token is expired for the edit GET and POST, as for verification and the list, and editable a millisecond before", async () => {
+      const h = await twoGraphs();
+      const T = Date.now() + 60_000; // inside the session's lifetime, so the clock can stand at expires_at
+      const t = await stored("ci", { graphIds: [A, B], access: "write", expiresAt: T });
+      const before = await snap();
+      const message = `Service token 'ci' expired on ${day(T)}; it cannot be edited. Issue a new token.`;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(T);
+      try {
+        await refused(await h.page(`/tokens/${t.id}/edit`), 409, message, before, "GET at expires_at");
+        await refused(await edit(h, t.id, { access: "read" }, [A]), 409, message, before, "POST at expires_at");
+        clock.mockReturnValue(T - 1);
+        expect((await h.page(`/tokens/${t.id}/edit`)).res.status, "GET 1 ms before").toBe(200);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await snap()).toEqual(before);
+    });
+
+    it("a guard miss (the row changed between the load and the UPDATE) answers 409 saying why, and writes nothing", async () => {
+      const cases: [string, string, (id: string) => string][] = [
+        ["UPDATE service_tokens SET access = 'read' WHERE id = ?", "changed", () => "Service token 'ci' changed since you opened this page; reload and edit again."],
+        ["UPDATE service_tokens SET graph_ids = '[\"" + B + "\",\"" + A + "\"]' WHERE id = ?", "reordered", () => "Service token 'ci' changed since you opened this page; reload and edit again."],
+        ["UPDATE service_tokens SET revoked_at = 1800000000000 WHERE id = ?", "revoked", () => `Service token 'ci' was revoked on ${day(1_800_000_000_000)}; it cannot be edited. Issue a new token.`],
+      ];
+      for (const [interloper, label, message] of cases) {
+        await env.DB.exec("DELETE FROM service_tokens");
+        const t = await stored("ci", { graphIds: [A, B], access: "write" });
+        let ran = false;
+        let armed = false;
+        // Once armed, runs the interloper once, just before the edit's UPDATE (in a batch or on its own).
+        const interlope = async () => {
+          if (!armed || ran) return;
+          ran = true;
+          await env.DB.prepare(interloper).bind(t.id).run();
+        };
+        const db = new Proxy(env.DB, {
+          get(inner, prop) {
+            if (prop === "prepare") {
+              return (sql: string) => {
+                if (!/UPDATE service_tokens\s+SET graph_ids/.test(sql)) return inner.prepare(sql);
+                return {
+                  bind: (...values: unknown[]) => ({
+                    run: async () => {
+                      await interlope();
+                      return inner.prepare(sql).bind(...values).run();
+                    },
+                    [REAL]: inner.prepare(sql).bind(...values),
+                  }),
+                };
+              };
+            }
+            if (prop === "batch") {
+              return async (statements: Record<symbol, unknown>[]) => {
+                await interlope();
+                return inner.batch(statements.map((s) => (s[REAL] ?? s) as D1PreparedStatement));
+              };
+            }
+            const value = Reflect.get(inner, prop);
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        });
+        const h = await twoGraphs({ DB: db });
+        armed = true;
+        const page = await edit(h, t.id, { access: "write" }, [A]);
+        expect(ran, label).toBe(true);
+        expect(page.res.status, label).toBe(409);
+        expect(shown(page.html), label).toBe(message(t.id));
+        const row = (await tokens().get(t.id))!;
+        expect(row.updatedAt, label).toBeNull();
+        expect(row.graphIds, label).toHaveLength(2);
+        expect(await auditRows(), label).toEqual([]);
+        await env.DB.exec("DELETE FROM graphs");
+      }
+    });
+
+    it("read-back: a stored row that differs from the form (test DB wrapper) revokes the token and answers 500 naming the field; the edit's audit row, written with the UPDATE, records what was asked (spec 8.14)", async () => {
+      let tamper: (row: Record<string, unknown>) => Record<string, unknown> | null = (r) => r;
+      let updated = false;
+      const m = meterTokens((sql, result) => {
+        if (/SET graph_ids/.test(sql)) updated = true;
+        if (!updated || !/FROM service_tokens WHERE id = \?/.test(sql)) return result;
+        return { ...result, results: result.results.map((r) => tamper(r as Record<string, unknown>)).filter((r) => r !== null) } as D1Result;
+      });
+      const h = await twoGraphs({ DB: m.db });
+      const tamperings: [string, (row: Record<string, unknown>) => Record<string, unknown> | null][] = [
+        ["access", (r) => ({ ...r, access: "write" })],
+        ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([B, A]) })],
+        ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([A]) })],
+        ["graph", (r) => ({ ...r, graph_ids: JSON.stringify([A, A]) })],
+        ["expires_days", (r) => ({ ...r, expires_at: (r.expires_at as number) + 1 })],
+        ["name", (r) => ({ ...r, name: "other-name" })],
+        ["token", () => null],
+      ];
+      for (const [i, [field, change]] of tamperings.entries()) {
+        const t = await stored(`rb-${i}`, { graphIds: [A, B], access: "write" });
+        tamper = change;
+        updated = false;
+        const page = await edit(h, t.id, { access: "read" }, [A, B]);
+        expect(updated, field).toBe(true);
+        expect(page.res.status, field).toBe(500);
+        expect(shown(page.html), field).toBe(`${field}: the stored token did not match the form, so it was revoked. Issue a new token.`);
+        expect((await tokens().get(t.id))!.revokedAt, field).not.toBeNull();
+        const audit = (await auditRows()).filter((r) => r.alias === `service:rb-${i}`);
+        expect(audit, field).toHaveLength(1);
+        expect(JSON.parse(audit[0].before as string).data.after, field).toMatchObject({ graphIds: [A, B], access: "read" });
+      }
+    });
+
+    it("cost: an applied narrowing reads about 4 + N rows and writes 3; a refusal writes none; a widening's first POST reads 1 + N and writes none, and its confirm costs what a narrowing does", async () => {
+      // Every statement the edit routes run: the token row, the graph list and the audit log.
+      const m = meterTokens(undefined, /service_tokens|audit_log|FROM graphs ORDER BY/);
+      const h = await twoGraphs({ DB: m.db });
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      const total = () => ({
+        read: m.measured.reduce((n, x) => n + x.read, 0),
+        written: m.measured.reduce((n, x) => n + x.written, 0),
+      });
+      const N = 2;
+      m.measured.length = 0;
+      expect((await h.page(`/tokens/${t.id}/edit`)).res.status).toBe(200);
+      expect(total()).toEqual({ read: 1 + N, written: 0 });
+      m.measured.length = 0;
+      applied(await edit(h, t.id, { access: "read" }, [A, B]));
+      expect(total()).toEqual({ read: 4 + N, written: 3 });
+      // The batch: the guarded UPDATE reads and writes its row; the audit INSERT writes the row and its
+      // (graph_id, at) index entry and reads the token row once, to insert only when the UPDATE wrote.
+      expect(m.measured.filter((x) => /SET graph_ids|token_edit/.test(x.sql)).map((x) => [x.read, x.written])).toEqual([
+        [1, 1],
+        [1, 2],
+      ]);
+      for (const [fields, graphs] of [
+        [{ access: "admin" }, [A]],
+        [{ access: "read", expires_days: "365" }, [A]],
+      ] as [Record<string, string>, string[]][]) {
+        m.measured.length = 0;
+        expect((await edit(h, t.id, fields, graphs)).res.status).toBe(400);
+        expect(total().written, JSON.stringify(fields)).toBe(0);
+        expect(total().read, JSON.stringify(fields)).toBeLessThanOrEqual(1 + N);
+      }
+      m.measured.length = 0;
+      const widen = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(widen.res.status).toBe(200);
+      expect(total()).toEqual({ read: 1 + N, written: 0 });
+      m.measured.length = 0;
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(widen.html)));
+      expect(total()).toEqual({ read: 4 + N, written: 3 });
+    });
+
+    describe("the /tokens list: Last changed and the Edit link", () => {
+      /** `ms` as the list prints it: `YYYY-MM-DD HH:MM UTC`. */
+      const utcText = (ms: number) => `${new Date(ms).toISOString().slice(0, 10)} ${new Date(ms).toISOString().slice(11, 16)} UTC`;
+      const section = (html: string, name: string) => html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
+      const lastChanged = (html: string, name: string) => /<dt>Last changed<\/dt><dd>([^<]*)<\/dd>/.exec(section(html, name))?.[1];
+      const editLinks = (html: string) => [...html.matchAll(/<a[^>]*href="(\/tokens\/[^"]*\/edit)"[^>]*>([^<]*)<\/a>/g)].map((m) => [m[1], m[2]]);
+
+      it("Last changed shows never before an edit and the edit's UTC time after it; a no-change re-post and a revoke leave it (spec 8.12)", async () => {
+        const h = await twoGraphs();
+        const kinds = ["narrow-graphs", "write-to-read", "shorter-expiry", "confirmed-widening", "no-change", "revoked-only"] as const;
+        const ids = new Map<string, string>();
+        for (const name of kinds) {
+          const t = await stored(name, { graphIds: name === "confirmed-widening" ? [A] : [A, B], access: "write" });
+          ids.set(name, t.id);
+        }
+        let html = (await h.page("/tokens")).html;
+        for (const name of kinds) expect(lastChanged(html, name), name).toBe("never");
+
+        applied(await edit(h, ids.get("narrow-graphs")!, { access: "write" }, [A]));
+        applied(await edit(h, ids.get("write-to-read")!, { access: "read" }, [A, B]));
+        applied(await edit(h, ids.get("shorter-expiry")!, { access: "write", expires_days: "1" }, [A, B]));
+        const widen = await edit(h, ids.get("confirmed-widening")!, { access: "write" }, [A, B]);
+        expect(widen.res.status).toBe(200);
+        applied(await h.page(`/tokens/${ids.get("confirmed-widening")}/edit`, confirmFields(widen.html)));
+        applied(await edit(h, ids.get("no-change")!, { access: "write" }, [B, A]));
+        expect((await h.page(`/tokens/${ids.get("revoked-only")}/revoke`, { csrf: h.csrf })).res.status).toBe(303);
+
+        html = (await h.page("/tokens")).html;
+        for (const name of ["narrow-graphs", "write-to-read", "shorter-expiry", "confirmed-widening"]) {
+          const row = (await tokens().get(ids.get(name)!))!;
+          expect(row.updatedAt, name).not.toBeNull();
+          expect(lastChanged(html, name), name).toBe(utcText(row.updatedAt!));
+        }
+        expect(lastChanged(html, "no-change")).toBe("never");
+        expect(lastChanged(html, "revoked-only")).toBe("never");
+        // Last changed sits right under Last used.
+        expect(section(html, "narrow-graphs")).toMatch(/<dt>Last used<\/dt><dd>[^<]*<\/dd>\s*<dt>Last changed<\/dt>/);
+      });
+
+      it("only the active token among revoked, expired and active has an Edit link, and it opens the edit page; all show Last changed", async () => {
+        const h = await twoGraphs();
+        const now = Date.now();
+        const active = await stored("active");
+        const expired = await stored("expired", { expiresAt: now - DAY });
+        const revoked = await stored("revoked");
+        await tokens().revoke(revoked.id, now - 1000);
+        // Edited, then revoked: keeps its edit time and loses the link.
+        const editedThenRevoked = await stored("edited-revoked");
+        applied(await edit(h, editedThenRevoked.id, { access: "read" }, [A, B]));
+        await tokens().revoke(editedThenRevoked.id, Date.now());
+        // Active but covering a graph that is no longer connected: still active, so still editable.
+        const gone = await stored("gone", { graphIds: ["44444444-4444-4444-4444-444444444444"] });
+        const edited = await stored("edited");
+        applied(await edit(h, edited.id, { access: "read" }, [A]));
+
+        const { res, html } = await h.page("/tokens");
+        expect(res.status).toBe(200);
+        expect(editLinks(html)).toEqual([
+          [`/tokens/${active.id}/edit`, "Edit active"],
+          [`/tokens/${edited.id}/edit`, "Edit edited"],
+          [`/tokens/${gone.id}/edit`, "Edit gone"],
+        ]);
+        for (const [name, row] of [
+          ["active", active],
+          ["expired", expired],
+          ["revoked", revoked],
+          ["edited-revoked", editedThenRevoked],
+          ["gone", gone],
+          ["edited", edited],
+        ] as const) {
+          const stored_ = (await tokens().get(row.id))!;
+          expect(lastChanged(html, name), name).toBe(stored_.updatedAt === null ? "never" : utcText(stored_.updatedAt));
+          const link = section(html, name).includes(`href="/tokens/${row.id}/edit"`);
+          expect(link, name).toBe(["active", "edited", "gone"].includes(name));
+        }
+        expect(lastChanged(html, "edited-revoked")).not.toBe("never");
+        // The owner reaches the edit page by following the link.
+        const [href] = editLinks(html)[0];
+        const opened = await h.page(href);
+        expect(opened.res.status).toBe(200);
+        expect(opened.html).toContain(`action="/tokens/${active.id}/edit"`);
+        expect(html.match(LSCT)).toBeNull();
+      });
+
+      it("the Edit link follows the list's status at the expiry boundary, and escapes the name", async () => {
+        const now = 1_800_000_000_000;
+        const row = (name: string, expiresAt: number, extra: { revokedAt?: number; updatedAt?: number } = {}) => ({
+          id: `id-${name}`,
+          name,
+          ownerId: OWNER_ID,
+          graphIds: [GRAPH_ID],
+          access: "read" as const,
+          createdAt: now - DAY,
+          expiresAt,
+          lastUsedAt: null,
+          revokedAt: extra.revokedAt ?? null,
+          updatedAt: extra.updatedAt ?? null,
+        });
+        const html = await tokenListPage(
+          [row("at-now", now), row("just-before", now + 1, { updatedAt: now - 60_000 }), row("<b>", now + DAY), row("revoked-later", now + DAY, { revokedAt: now })],
+          [],
+          "csrf",
+          now,
+        ).text();
+        expect(editLinks(html)).toEqual([
+          ["/tokens/id-just-before/edit", "Edit just-before"],
+          ["/tokens/id-&#60;b&#62;/edit", "Edit &#60;b&#62;"],
+        ]);
+        expect(lastChanged(html, "at-now")).toBe("never");
+        expect(lastChanged(html, "just-before")).toBe(utcText(now - 60_000));
+        expect(lastChanged(html, "revoked-later")).toBe("never");
+        expect(html).not.toContain("<b>");
+      });
+
+      it("GET /tokens still reads about one service_tokens row per token and writes none, before and after edits", async () => {
+        const m = meterTokens();
+        const h = await twoGraphs({ DB: m.db });
+        const made = [];
+        for (const name of ["a", "b", "c", "d"]) made.push(await stored(name));
+        await tokens().revoke(made[3].id, Date.now());
+        m.measured.length = 0;
+        expect((await h.page("/tokens")).res.status).toBe(200);
+        expect(m.measured.map((x) => [x.read, x.written])).toEqual([[4, 0]]);
+        applied(await edit(h, made[0].id, { access: "read" }, [A]));
+        applied(await edit(h, made[1].id, { access: "write" }, [B]));
+        m.measured.length = 0;
+        expect((await h.page("/tokens")).res.status).toBe(200);
+        expect(m.measured.map((x) => [x.read, x.written])).toEqual([[4, 0]]);
+      });
+    });
   });
 });

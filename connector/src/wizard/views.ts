@@ -1,4 +1,4 @@
-import { MAX_EXPIRY_DAYS, type ServiceTokenRow } from "../auth/service-tokens";
+import { MAX_EXPIRY_DAYS, type ServiceTokenRow, type TokenScope } from "../auth/service-tokens";
 import { EXPIRY_WARN_DAYS, type GraphRecord, daysUntilExpiry } from "../graphs";
 import { escapeHtml, htmlPage } from "../html";
 
@@ -288,12 +288,14 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
     })
     .join(", ");
   const write = token.access === "write";
-  const revoke =
+  // Only an active token can be edited or revoked; the edit routes refuse the others with 409 anyway.
+  const actions =
     status === "active"
-      ? `<form method="post" action="/tokens/${escapeHtml(token.id)}/revoke">
+      ? `<div class="actions"><a class="button" href="/tokens/${escapeHtml(token.id)}/edit">Edit ${name}</a>
+<form method="post" action="/tokens/${escapeHtml(token.id)}/revoke">
   ${csrfField(csrf)}
   <button class="danger">Revoke ${name}</button>
-</form>`
+</form></div>`
       : "";
   const ended = status === "revoked" ? ` on ${utc(token.revokedAt!)}` : "";
   return `<section class="block" id="token-${name}">
@@ -304,8 +306,9 @@ function tokenSection(token: ServiceTokenRow, aliases: ReadonlyMap<string, strin
   <dt>Graphs</dt><dd>${graphs}</dd>
   <dt>Expires</dt><dd>${utc(token.expiresAt)}</dd>
   <dt>Last used</dt><dd>${token.lastUsedAt === null ? "never" : utc(token.lastUsedAt)}</dd>
+  <dt>Last changed</dt><dd>${token.updatedAt === null ? "never" : utc(token.updatedAt)}</dd>
 </dl>
-${revoke}
+${actions}
 </div>
 </section>`;
 }
@@ -329,17 +332,20 @@ ${list}
   );
 }
 
+/** A box per connected graph, with its own mode, ticked when its id is in `ticked`. */
+function graphBoxes(graphs: GraphRecord[], ticked: readonly string[]): string {
+  if (graphs.length === 0) return `<p class="hint">No graphs are connected. <a href="/graphs/new">Connect a graph</a> first.</p>`;
+  return graphs
+    .map((graph) => {
+      const mode = graph.mode === "write" ? "read-write" : "read-only";
+      return `<label class="check"><input type="checkbox" name="graph" value="${escapeHtml(graph.graphId)}"${checked(ticked.includes(graph.graphId))}> ${escapeHtml(graph.alias)} <small>(${mode})</small></label>`;
+    })
+    .join("\n  ");
+}
+
 /** GET /tokens/new, and the same form again after a refusal. */
 export function newTokenPage(csrf: string, graphs: GraphRecord[], values: TokenFormValues, status = 200, error?: string): Response {
-  const boxes =
-    graphs.length === 0
-      ? `<p class="hint">No graphs are connected. <a href="/graphs/new">Connect a graph</a> first.</p>`
-      : graphs
-          .map((graph) => {
-            const mode = graph.mode === "write" ? "read-write" : "read-only";
-            return `<label class="check"><input type="checkbox" name="graph" value="${escapeHtml(graph.graphId)}"${checked(values.graphIds.includes(graph.graphId))}> ${escapeHtml(graph.alias)} <small>(${mode})</small></label>`;
-          })
-          .join("\n  ");
+  const boxes = graphBoxes(graphs, values.graphIds);
   return page(
     status,
     "New service token",
@@ -364,6 +370,137 @@ ${errorBox(error)}
   <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}" required>
   <small>1 to ${MAX_EXPIRY_DAYS} days.</small></label>
   <div class="actions"><button>Create token</button><a class="button quiet" href="/tokens">Cancel</a></div>
+</form>`,
+  );
+}
+
+/** Fields the edit form shows: the stored scope on GET, the valid submitted values after a refusal. Never a token. */
+export interface TokenEditValues {
+  graphIds: string[];
+  access: string;
+  expiresDays: string;
+}
+
+/**
+ * What an edit page was drawn from, posted back as hidden fields: `base`, the stored scope as JSON,
+ * which the route compares with the row so a stale page cannot write; and `openedAt`, the time the
+ * page was drawn, from which a day count is counted so a double submit asks for the same expiry.
+ */
+export interface TokenEditDrawn {
+  base: string;
+  openedAt: number;
+}
+
+/**
+ * GET /tokens/:id/edit, and the same form again after a refusal (spec 2026-11-08 §3.4). The name is
+ * shown, not edited. A graph the token lists that is no longer connected has no box, so saving drops it.
+ */
+export function editTokenPage(
+  csrf: string,
+  token: ServiceTokenRow,
+  graphs: GraphRecord[],
+  values: TokenEditValues,
+  drawn: TokenEditDrawn,
+  status = 200,
+  error?: string,
+): Response {
+  const name = escapeHtml(token.name);
+  const connected = new Set(graphs.map((graph) => graph.graphId));
+  const gone = token.graphIds
+    .filter((id) => !connected.has(id))
+    .map((id) => `<p class="hint"><span class="warning">${escapeHtml(id)} (not connected; saving removes it)</span></p>`)
+    .join("\n  ");
+  return page(
+    status,
+    "Edit service token",
+    `<h1>Edit <span class="alias">${name}</span></h1>
+${errorBox(error)}
+<form class="card" method="post" action="/tokens/${escapeHtml(token.id)}/edit">
+  ${csrfField(csrf)}
+  <input type="hidden" name="base" value="${escapeHtml(drawn.base)}">
+  <input type="hidden" name="opened_at" value="${drawn.openedAt}">
+  <fieldset><legend>Graphs</legend>
+  ${graphBoxes(graphs, values.graphIds)}
+  ${gone}
+  <small>A token's access never exceeds a graph's own mode.</small>
+  </fieldset>
+  <fieldset><legend>What the token may do</legend>
+  <div class="choices">
+  ${choice("access", "read", values.access, "Read only", "Search and read pages and blocks.", true)}
+  ${choice("access", "write", values.access, "Read and write", "Also write to graphs connected read-write.")}
+  </div>
+  </fieldset>
+  <label class="field"><span>Shorten expiry to N days from now</span>
+  <input type="number" name="expires_days" value="${escapeHtml(values.expiresDays)}" min="1" max="${MAX_EXPIRY_DAYS}">
+  <small>Expires ${utc(token.expiresAt)}. Days count from when this page was opened (${utc(drawn.openedAt)}). Leave blank to keep it. An expiry can only be shortened.</small></label>
+  <p class="hint">Removing graphs, read-only and a shorter expiry apply at once, from the token's next request. Adding a graph or raising to read-write first shows what the token gains, and applies only when you confirm.</p>
+  <p class="hint">If the token changes in another tab or window after this page was opened, saving is refused; reload and edit again.</p>
+  <p class="hint">Editing does not change the token. If it may have leaked, revoke it and issue a new one.</p>
+  <div class="actions"><button>Save changes</button><a class="button quiet" href="/tokens">Cancel</a></div>
+</form>`,
+  );
+}
+
+/**
+ * The widening confirm (spec 2026-11-08 §3.5 step 4): what `after` gains and loses against the stored
+ * `token`, by current alias, and the same fields again as hidden inputs with `confirm=1` and `base`
+ * (the stored before-values as JSON). A shortened expiry goes back as `expires_at`, the absolute time
+ * the page shows, so the confirm stores exactly that rather than recounting days. `stale` adds the line
+ * saying the token changed since the page the owner confirmed was drawn. Writes nothing; the route
+ * applies only a re-post whose base matches.
+ */
+export function tokenEditConfirmPage(
+  csrf: string,
+  token: ServiceTokenRow,
+  graphs: GraphRecord[],
+  after: TokenScope,
+  base: string,
+  stale: boolean,
+): Response {
+  const byId = new Map(graphs.map((graph) => [graph.graphId, graph]));
+  const label = (id: string) => {
+    const graph = byId.get(id);
+    return graph ? escapeHtml(graph.alias) : `${escapeHtml(id)} (not connected)`;
+  };
+  // A graph's own mode still caps the token (scopedResolve), so say what a read-write gain really gives.
+  const effective = (id: string) =>
+    after.access === "write" && byId.get(id)?.mode === "read" ? `; <em>effective: read only (the graph is read-only)</em>` : "";
+  const had = new Set(token.graphIds);
+  const has = new Set(after.graphIds);
+  const kept = after.graphIds.filter((id) => had.has(id));
+  const level = after.access === "write" ? "read-write" : "read-only";
+  const gains = [
+    ...after.graphIds.filter((id) => !had.has(id)).map((id) => `gains ${level} on ${label(id)}${effective(id)}`),
+    ...(token.access === "read" && after.access === "write" ? kept.map((id) => `gains read-write on ${label(id)}${effective(id)}`) : []),
+  ];
+  const losses = [
+    ...token.graphIds.filter((id) => !has.has(id)).map((id) => `loses access to ${label(id)}`),
+    ...(token.access === "write" && after.access === "read" ? kept.map((id) => `loses read-write on ${label(id)}`) : []),
+    ...(after.expiresAt < token.expiresAt ? [`expiry shortened to ${utc(after.expiresAt)}`] : []),
+  ];
+  const items = (lines: string[]) => lines.map((line) => `<li>${line}</li>`).join("");
+  const name = escapeHtml(token.name);
+  const action = `/tokens/${escapeHtml(token.id)}/edit`;
+  const hidden = (field: string, value: string) => `<input type="hidden" name="${field}" value="${escapeHtml(value)}">`;
+  return page(
+    200,
+    "Confirm token changes",
+    `<h1>Confirm changes to <span class="alias">${name}</span></h1>
+${stale ? `<p class="error" role="alert">This token changed since you opened this page, or the page was not the one the wizard sent. The changes below are against its current values; check them and confirm again.</p>` : ""}
+<p class="lede">This edit widens what the token can do. Nothing changes until you confirm.</p>
+<h2>The token gains</h2>
+<ul class="gains">${items(gains)}</ul>
+${losses.length > 0 ? `<h2>The token loses</h2>\n<ul class="losses">${items(losses)}</ul>` : ""}
+<p class="hint">A token's access never exceeds a graph's own mode. Changes apply from the token's next request.</p>
+<p class="callout">Editing does not change the token. If it may have leaked, revoke it and issue a new one.</p>
+<form class="card" method="post" action="${action}">
+  ${csrfField(csrf)}
+  ${hidden("access", after.access)}
+  ${hidden("expires_at", after.expiresAt === token.expiresAt ? "" : String(after.expiresAt))}
+  ${after.graphIds.map((id) => hidden("graph", id)).join("\n  ")}
+  ${hidden("confirm", "1")}
+  ${hidden("base", base)}
+  <div class="actions"><button>Confirm changes</button><a class="button quiet" href="${action}">Edit again</a><a class="button quiet" href="/tokens">Cancel</a></div>
 </form>`,
   );
 }
