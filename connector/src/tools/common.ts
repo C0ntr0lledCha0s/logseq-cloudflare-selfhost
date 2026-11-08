@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "@modelcontextprotocol/server";
-import { type ServiceTokenAccess, rank } from "../auth/service-tokens";
+import { type ServiceTokenAccess, rank } from "../auth/access";
 import type { GraphMode, GraphStore, ResolvedGraph } from "../graphs";
 import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN } from "./spec.mjs";
