@@ -251,6 +251,59 @@ describe("set_block_property and batch_set_block_property", () => {
   });
 });
 
+describe("a tags list or placeholder that sets nothing (review r1-integrity-1)", () => {
+  // A tags list replaces the target's user tags and keeps the built-in type tags it holds, so a list of
+  // only type tags (["Page"], ["logseq.class/Journal"]) removes every user tag with nothing in its
+  // place, as [] does. The empty placeholder ident stores the value the outliner uses for a removed one.
+  const set = (propertyId: string, value: unknown) =>
+    deleteReason("set_block_property", { graph: "notes", "block-id": "b1", "property-id": propertyId, body: { value } });
+  const batch = (propertyId: string, value: unknown) =>
+    deleteReason("batch_set_block_property", {
+      graph: "notes",
+      body: { isResetExistingValues: true, entries: [{ "block-id": "b1", "property-id": "Venue", value: "Hall" }, { "block-id": "b2", "property-id": propertyId, value }] },
+    });
+  const TAGS_IDS = ["block/tags", ":block/tags", "Tags", "tags", "logseq.property/tags"];
+  const TYPE_ONLY: unknown[] = [
+    ["Page"],
+    ["page"],
+    ["Journal"],
+    ["Tag", "Page"],
+    ["Property"],
+    ["Asset"],
+    ["Whiteboard"],
+    ["PDF Annotation"],
+    ["logseq.class/Page"],
+    ["logseq.class/Journal"],
+    "Page",
+  ];
+
+  it("refuses a tags list of only built-in type tags, under every name for Tags", () => {
+    for (const id of TAGS_IDS) {
+      for (const value of TYPE_ONLY) {
+        expect(set(id, value), `${id} ${JSON.stringify(value)}`).toBe("with an empty value removes the property");
+        expect(batch(id, value), `${id} ${JSON.stringify(value)}`).toBe("entry 1: an empty value removes the property");
+      }
+    }
+  });
+
+  it("allows a tags list holding a user tag, and a type tag name on another property", () => {
+    for (const id of TAGS_IDS) {
+      expect(set(id, ["Page", "Food"])).toBeNull();
+      expect(set(id, ["Person"])).toBeNull();
+      expect(set(id, "Food")).toBeNull();
+    }
+    expect(set("Venue", ["Page"])).toBeNull();
+    expect(set("Venue", "Journal")).toBeNull();
+  });
+
+  it("refuses the empty placeholder ident on any property", () => {
+    for (const value of ["logseq.property/empty-placeholder", ["logseq.property/empty-placeholder"], ":logseq.property/empty-placeholder"]) {
+      expect(set("Venue", value), JSON.stringify(value)).toBe("with an empty value removes the property");
+      expect(batch("Venue", value), JSON.stringify(value)).toBe("entry 1: an empty value removes the property");
+    }
+  });
+});
+
 describe("dry runs", () => {
   /** The write operations that declare `dry-run`, by where, read from the vendored openapi. */
   function declared(): Record<string, "query" | "body"> {

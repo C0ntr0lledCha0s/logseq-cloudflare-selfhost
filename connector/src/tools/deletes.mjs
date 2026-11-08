@@ -51,13 +51,50 @@ function bodyOf(args) {
   return record(args.body);
 }
 
+/** The ident the outliner stores for a removed value; setting it removes the value. */
+const EMPTY_PLACEHOLDER = new Set(["logseq.property/empty-placeholder", ":logseq.property/empty-placeholder"]);
+
+/** Names the Tags property goes by in a property-id (title, ident or attribute), lower-cased. */
+const TAGS_PROPERTY = new Set(["tags", "block/tags", ":block/tags", "logseq.property/tags"]);
+
 /**
- * A value that sets nothing: "", null, or a list holding nothing but "".
- * @param {unknown} value
+ * The built-in type tags a tags list keeps rather than sets (Page, Tag, Journal, Property, Asset,
+ * Whiteboard, PDF Annotation), by title or ident, lower-cased. A tags list replaces only user tags, so a
+ * list of nothing but these removes every user tag with nothing in its place, as [] does (review
+ * r1-integrity-1; patches/0027 set-prepared-tags!).
  */
-function isEmptyValue(value) {
-  if (value === "" || value === null) return true;
-  return Array.isArray(value) && value.every((item) => item === "");
+const TYPE_TAGS = new Set(
+  ["page", "tag", "journal", "property", "asset", "whiteboard", "pdf annotation", "pdf-annotation"].flatMap((t) => [
+    t,
+    `logseq.class/${t.replace(" ", "-")}`,
+    `:logseq.class/${t.replace(" ", "-")}`,
+  ]),
+);
+
+/** @param {unknown} item */
+function isPlaceholder(item) {
+  return typeof item === "string" && EMPTY_PLACEHOLDER.has(item.trim());
+}
+
+/** @param {unknown} item */
+function isTypeTag(item) {
+  return typeof item === "string" && TYPE_TAGS.has(item.trim().toLowerCase());
+}
+
+/**
+ * A value that sets nothing: "", null, the empty placeholder ident, a list holding nothing but those,
+ * and, for the Tags property, a tag or list holding nothing but built-in type tags.
+ * @param {unknown} value
+ * @param {unknown} [propertyId]
+ */
+function isEmptyValue(value, propertyId) {
+  const empty = (/** @type {unknown} */ item) => item === "" || isPlaceholder(item);
+  if (value === null || empty(value)) return true;
+  if (Array.isArray(value) && value.every(empty)) return true;
+  const tags = typeof propertyId === "string" && TAGS_PROPERTY.has(propertyId.trim().toLowerCase());
+  if (!tags) return false;
+  const items = Array.isArray(value) ? value : [value];
+  return items.length > 0 && items.every((item) => empty(item) || isTypeTag(item));
 }
 
 const EMPTY_VALUE = "an empty value removes the property";
@@ -86,7 +123,7 @@ export const DELETE_RULES = Object.freeze({
   set_block_property: {
     when: (args) => {
       const body = bodyOf(args);
-      return body && Object.hasOwn(body, "value") && isEmptyValue(body.value) ? `with ${EMPTY_VALUE}` : null;
+      return body && Object.hasOwn(body, "value") && isEmptyValue(body.value, args["property-id"]) ? `with ${EMPTY_VALUE}` : null;
     },
   },
   batch_set_block_property: {
@@ -95,7 +132,7 @@ export const DELETE_RULES = Object.freeze({
       if (!Array.isArray(entries)) return null;
       const index = entries.findIndex((entry) => {
         const e = record(entry);
-        return e !== undefined && Object.hasOwn(e, "value") && isEmptyValue(e.value);
+        return e !== undefined && Object.hasOwn(e, "value") && isEmptyValue(e.value, e["property-id"]);
       });
       return index === -1 ? null : `entry ${index}: ${EMPTY_VALUE}`;
     },
