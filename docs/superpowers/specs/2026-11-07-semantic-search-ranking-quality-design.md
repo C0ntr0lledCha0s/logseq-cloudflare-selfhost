@@ -267,7 +267,7 @@ To be filled in by the build:
 | Run | Keyword recall@5 | Keyword MRR | Hybrid recall@5 | Hybrid MRR |
 |---|---|---|---|---|
 | Offline, current fixture, HEAD `c0e0fd4` | 0.20 | 0.20 | 1.00 | 0.88 |
-| Offline, extended fixture, before | | | | |
+| Offline, extended fixture (12 questions), before: ranking code of `86cb347` | 0.17 | 0.17 | 1.00 | 0.85 |
 | Offline, extended fixture, after | | | | |
 | Live, before | | | | |
 | Live, after | | | | |

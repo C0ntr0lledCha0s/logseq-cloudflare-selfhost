@@ -1,5 +1,5 @@
 {
-  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
+  "description": "A small graph and questions phrased as a person asks them, with the blocks that answer each. A question's top is the rank its first expected block must reach (default 5). baseline is the ranking before the 2026-11-07 ranking changes; floor is the least hybrid recall@5 and MRR the eval accepts, raised by each ranking change. Used by test/semantic-eval.test.ts (offline, fake embedder) and as the question list for a live check (design §11).",
   "pages": [
     {
       "title": "Car",
@@ -61,6 +61,16 @@
         { "key": "podcast", "text": "Podcast episode about compound interest and saving money" },
         { "key": "recipe", "text": "Lemon and garlic chicken recipe from the Sunday paper" }
       ]
+    },
+    {
+      "title": "Warehouse reporting",
+      "blocks": [
+        { "key": "dashboards", "text": "Dashboards" },
+        { "key": "reports", "text": "Reports" },
+        { "key": "stock-dashboard", "text": "Stock on hand dashboard for the Northwind warehouse, refreshed nightly" },
+        { "key": "sales-report", "text": "Sales by region report, sent to the team every Monday" },
+        { "key": "reorder", "text": "Reorder levels reviewed each quarter" }
+      ]
     }
   ],
   "questions": [
@@ -73,7 +83,11 @@
     { "q": "kids dentist", "expected": ["dentist"] },
     { "q": "Queenstown", "expected": ["flights"] },
     { "q": "How much is the holiday going to cost?", "expected": ["trip-budget"] },
-    { "q": "rego", "expected": ["rego"] }
+    { "q": "rego", "expected": ["rego"] },
+    { "q": "stock level reporting dashboard", "expected": ["stock-dashboard"], "top": 3 },
+    { "q": "weekly sales report for the regions", "expected": ["sales-report"] }
   ],
-  "private": ["therapy", "therapy-detail", "bank", "wifi"]
+  "private": ["therapy", "therapy-detail", "bank", "wifi"],
+  "baseline": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } },
+  "floor": { "keyword": { "recall": 0.17, "mrr": 0.17 }, "hybrid": { "recall": 1.0, "mrr": 0.85 } }
 }

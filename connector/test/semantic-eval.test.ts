@@ -2,14 +2,17 @@
 // graph is indexed by the real indexer; keyword-only is searchGraph's behaviour (the whole query as a
 // substring of a title); hybrid is the semantic_search tool. The embedder is a deterministic fake, so
 // this checks the pipeline and the fusion, not the quality of the real model.
-// Run: npx vitest run test/semantic-eval.test.ts   (the table is printed to the console)
+// The fixture's floor is the least hybrid recall@5 and MRR accepted; a ranking change raises it to its
+// new numbers and never lowers it silently. A question's top is the rank its first expected block must reach.
+// Run: npx vitest run test/semantic-eval.test.ts --silent=false --disableConsoleIntercept   (prints the table)
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import fixture from "./fixtures/semantic-eval.json";
 import { GraphStore } from "../src/graphs";
 import { mcpHandler } from "../src/mcp";
-import { DIMENSIONS } from "../src/semantic/config";
+import { DIMENSIONS, RANKED_QUERY_WORDS, SHORT_BLOCK_WORDS } from "../src/semantic/config";
 import { runIndexer } from "../src/semantic/indexer";
+import { contentWords, wordCount } from "../src/semantic/ranking";
 import { SemanticStore } from "../src/semantic/store";
 import { FakeEmbedder, FakeGraph, FakeVectorIndex, fakeSync } from "./semantic-fakes";
 
@@ -23,6 +26,21 @@ interface FixtureBlock {
   tags?: string[];
   children?: FixtureBlock[];
 }
+
+interface Question {
+  q: string;
+  expected: string[];
+  /** The rank the first expected block must reach; defaults to K. */
+  top?: number;
+}
+
+interface Measures {
+  keyword: { recall: number; mrr: number };
+  hybrid: { recall: number; mrr: number };
+}
+
+const questions = fixture.questions as Question[];
+const floor = fixture.floor as Measures;
 
 const graph = new FakeGraph(GRAPH_ID, TOKEN);
 const embedder = new FakeEmbedder();
@@ -47,7 +65,13 @@ function evalEnv(): Env {
   return { ...env, SYNC: fakeSync([graph]), AI: ai, VECTORIZE: index as unknown as Vectorize, SEMANTIC_MAX_VECTORS: "1000" } as Env;
 }
 
-async function semanticSearch(q: string): Promise<{ uuid: string; "found-by": string[] }[]> {
+interface Hit {
+  uuid: string;
+  text: string;
+  "found-by": string[];
+}
+
+async function semanticSearch(q: string): Promise<Hit[]> {
   const e = evalEnv();
   const request = new Request("https://mcp.example.com/mcp", {
     method: "POST",
@@ -103,22 +127,37 @@ describe("semantic search evaluation", () => {
     expect((await deps.store.state(GRAPH_ID))?.status).toBe("ready");
   });
 
-  it("hybrid beats keyword-only on recall@5 and MRR, and never surfaces a private block by meaning", async () => {
-    const privateUuids = new Set(fixture.private.map((key) => keyToUuid.get(key)));
-    const rows: { q: string; keyword: Score; hybrid: Score }[] = [];
-    for (const { q, expected } of fixture.questions) {
+  interface Row {
+    q: string;
+    top: number;
+    hits: Hit[];
+    /** 1-based rank of the first expected block in the hybrid results, or null when it is not in the top K. */
+    rank: number | null;
+    keyword: Score;
+    hybrid: Score;
+  }
+  const rows: Row[] = [];
+  let summary: Measures;
+
+  beforeAll(async () => {
+    for (const { q, expected, top } of questions) {
       const expectedUuids = expected.map((key) => {
         const uuid = keyToUuid.get(key);
         if (!uuid) throw new Error(`fixture names an unknown block ${key}`);
         return uuid;
       });
-      const hybrid = await semanticSearch(q);
-      for (const hit of hybrid) {
-        if (hit["found-by"].includes("semantic")) expect(privateUuids.has(hit.uuid), q).toBe(false);
-      }
-      rows.push({ q, keyword: score(await keywordSearch(q), expectedUuids), hybrid: score(hybrid.map((h) => h.uuid), expectedUuids) });
+      const hits = await semanticSearch(q);
+      const at = hits.findIndex((h) => expectedUuids.includes(h.uuid));
+      rows.push({
+        q,
+        top: top ?? K,
+        hits,
+        rank: at === -1 ? null : at + 1,
+        keyword: score(await keywordSearch(q), expectedUuids),
+        hybrid: score(hits.map((h) => h.uuid), expectedUuids),
+      });
     }
-    const summary = {
+    summary = {
       keyword: { recall: mean(rows.map((r) => r.keyword.recall)), mrr: mean(rows.map((r) => r.keyword.reciprocalRank)) },
       hybrid: { recall: mean(rows.map((r) => r.hybrid.recall)), mrr: mean(rows.map((r) => r.hybrid.reciprocalRank)) },
     };
@@ -127,15 +166,48 @@ describe("semantic search evaluation", () => {
         `semantic eval: ${rows.length} questions, top ${K}`,
         ...rows.map(
           (r) =>
-            `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}`,
+            `  ${r.q.padEnd(44)} keyword recall=${r.keyword.recall.toFixed(2)} rr=${r.keyword.reciprocalRank.toFixed(2)}  hybrid recall=${r.hybrid.recall.toFixed(2)} rr=${r.hybrid.reciprocalRank.toFixed(2)}  top hit: ${(r.hits[0]?.text ?? "(none)").slice(0, 40)}`,
         ),
         `  mean keyword recall@${K}=${summary.keyword.recall.toFixed(2)} MRR=${summary.keyword.mrr.toFixed(2)}`,
         `  mean hybrid  recall@${K}=${summary.hybrid.recall.toFixed(2)} MRR=${summary.hybrid.mrr.toFixed(2)}`,
       ].join("\n"),
     );
+  });
+
+  it("hybrid beats keyword-only on recall@5 and MRR, and never surfaces a private block by meaning", () => {
+    const privateUuids = new Set(fixture.private.map((key) => keyToUuid.get(key)));
+    for (const r of rows) {
+      for (const hit of r.hits) {
+        if (hit["found-by"].includes("semantic")) expect(privateUuids.has(hit.uuid), r.q).toBe(false);
+      }
+    }
     expect(summary.hybrid.recall).toBeGreaterThan(summary.keyword.recall);
     expect(summary.hybrid.mrr).toBeGreaterThan(summary.keyword.mrr);
     // Hybrid keeps what keyword search already finds.
     for (const r of rows) expect(r.hybrid.recall, r.q).toBeGreaterThanOrEqual(r.keyword.recall);
+  });
+
+  it("each question's first expected block reaches its top rank", () => {
+    for (const r of rows) {
+      expect(r.rank, r.q).not.toBeNull();
+      expect(r.rank, r.q).toBeLessThanOrEqual(r.top);
+    }
+  });
+
+  it("hybrid recall@5 and MRR stay at or above the fixture's floor", () => {
+    expect(summary.hybrid.recall).toBeGreaterThanOrEqual(floor.hybrid.recall);
+    expect(summary.hybrid.mrr).toBeGreaterThanOrEqual(floor.hybrid.mrr);
+  });
+
+  // Known to fail until Stage 4 (the short-block rule, design 2026-11-07 section 3.2): on the unchanged
+  // ranking, "Dashboards" is rank 1 for "stock level reporting dashboard". Stage 4 makes this it(...).
+  it.fails("no block of 2 words or fewer is rank 1 for a question of 3 or more content words", () => {
+    const ranked = rows.filter((r) => contentWords(r.q).length >= RANKED_QUERY_WORDS);
+    expect(ranked.length).toBeGreaterThan(0);
+    for (const r of ranked) {
+      const first = r.hits[0];
+      expect(first, r.q).toBeDefined();
+      expect(wordCount(first.text), `${r.q}: rank 1 is "${first.text}"`).toBeGreaterThan(SHORT_BLOCK_WORDS);
+    }
   });
 });

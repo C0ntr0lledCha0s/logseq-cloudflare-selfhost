@@ -17,6 +17,8 @@ export const SEMANTIC_TOP_K = 50;
 export const KEYWORD_LIMIT = 50;
 /** Content words a query needs before the ranking rules for multi-word questions apply. */
 export const RANKED_QUERY_WORDS = 3;
+/** Blocks of this many words or fewer are "short" for multi-word questions. */
+export const SHORT_BLOCK_WORDS = 2;
 /** Distinctive terms the keyword leg searches for a multi-word question. */
 export const KEYWORD_TERMS = 3;
 
