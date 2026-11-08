@@ -1,0 +1,1037 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 7415fcc..776527b 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -76,6 +76,10 @@
+            :order (:block/order block)}
+     (:block/parent block) (assoc :parent-id (uuid-string (:block/uuid (:block/parent block))))
+     (:block/page block) (assoc :page-id (uuid-string (:block/uuid (:block/page block))))
++    ;; A code, math or quote block (patch 0037): its type by name, and a code block's language.
++    (:logseq.property.node/display-type block)
++    (assoc :display-type (name (:logseq.property.node/display-type block)))
++    (:logseq.property.code/lang block) (assoc :lang (:logseq.property.code/lang block))
+     (seq (:block/children block)) (assoc :children (mapv block-response (:block/children block)))))
+ 
+ (defn- tag-response [entity]
+@@ -360,6 +364,7 @@
+ (def ^:private page-block-pull-keys
+   [:db/id :block/uuid :block/title :block/order
+    :logseq.property/hide? :logseq.property/deleted-at
++   :logseq.property.node/display-type :logseq.property.code/lang
+    {:block/parent [:db/id :block/uuid]}
+    {:block/page [:db/id :block/uuid]}])
+ 
+@@ -938,6 +943,64 @@
+       (let [resolved (resolve-ref-entity db property-ident value)]
+         (or (class-refusal db property value resolved) resolved)))))
+ 
++;; Code, math and quote blocks (patch 0037). A block's type is the keyword in display-type, and the
++;; app keeps a class tag in step with it (its client pipeline, which never runs for a server write).
++;; JSON can't carry a keyword, so display-type takes one of these names as text; no other keyword is
++;; ever built from a request. A code block's language is lang, which needs a final type of code.
++(def ^:private display-type-ident :logseq.property.node/display-type)
++(def ^:private lang-ident :logseq.property.code/lang)
++(def ^:private display-type-order [:code :math :quote])
++(def ^:private display-type-values (set display-type-order))
++(def ^:private display-type-classes
++  (into {} (map (juxt identity ldb/get-class-ident-by-display-type)) display-type-order))
++
++(defn- display-class?
++  "Whether the entity with db id `id` is Code-block, Math-block or Quote-block."
++  [db id]
++  (contains? ldb/node-display-type-classes (:db/ident (d/entity db id))))
++
++(defn- parse-display-type
++  "The display type `value` names (\"code\" or \":code\", trimmed, any case), or nil."
++  [value]
++  (when (string? value)
++    (let [text (string/lower-case (string/trim value))]
++      (display-type-values (keyword (cond-> text (string/starts-with? text ":") (subs 1)))))))
++
++(defn- valid-lang?
++  "A code block's language: 1 to 40 characters with no whitespace, case kept (any CodeMirror mode)."
++  [value]
++  (and (string? value) (<= 1 (count value) 40) (not (re-find #"\s" value))))
++
++(def ^:private kind-articles
++  {"page" "a page" "tag" "a tag" "property" "a property" "asset" "an asset"})
++
++(defn- scope-kind
++  "What the target of a property value for `scope` (see prepare-property-value) is: the kind of the
++  entity it names, \"page\" for a page a batch insert creates, else \"block\" (a new block)."
++  [db scope]
++  (cond
++    (:db/id scope) (block-kind (d/entity db (:db/id scope)))
++    (contains? scope ::held-tags) "page"
++    :else "block"))
++
++(defn- display-value
++  "prepare-property-value for display-type and lang: {:value v}, or {:error reason ::entry? true}
++  for a caller to name the entry. Both apply to blocks only. Whether lang's block is code is judged
++  by the caller on the call's final state (lang-error)."
++  [db property-ident value scope]
++  (let [label (if (= display-type-ident property-ident) "display-type" "lang")
++        kind (scope-kind db scope)
++        refuse (fn [reason] {:error (str label ": " reason) ::entry? true})]
++    (cond
++      (not= "block" kind) {:error (str label " applies to blocks, not " (kind-articles kind)) ::entry? true}
++      (= display-type-ident property-ident)
++      (if-let [kw (parse-display-type value)]
++        {:value kw}
++        (refuse (str (pr-str (if (string? value) value (str value))) " is not one of "
++                     (string/join ", " (map name display-type-order)))))
++      (valid-lang? value) {:value value}
++      :else (refuse "must be 1 to 40 characters with no spaces"))))
++
+ (defn- type-refusal
+   "Why `property`'s type refuses `value`, as the outliner's own validator would when writing it,
+   or nil. `checked` is what the validator sees: the raw value for a property that stores it as is
+@@ -961,6 +1024,10 @@
+                                 (empty? (:block/_closed-value-property property)))]
+       (some (fn [[value id]]
+               (cond
++                ;; Only display-type takes a keyword as text (display-value).
++                (= :keyword (:logseq.property/type property))
++                "takes a keyword; only display-type can be set as text"
++
+                 (not= :db.type/ref (:db/valueType property))
+                 (type-refusal db property value value)
+ 
+@@ -995,7 +1062,8 @@
+   re-sending Asset), which set-prepared-tags! skips as a no-op. The outliner's other exception,
+   Asset on an asset, is covered by that: an asset entity must hold Asset to be valid. A page a batch
+   insert creates has no :db/id yet; its scope's ::held-tags names the tags create! gives it (Journal
+-  for a journal day), so a new journal may be sent Journal too."
++  for a journal day), so a new journal may be sent Journal too. Code-block, Math-block and
++  Quote-block are refused the same way, pointing to display-type (patch 0037)."
+   [db scope values]
+   (let [target (some->> (:db/id scope) (d/entity db))
+         held (into (set (map :db/id (:block/tags target))) (::held-tags scope))]
+@@ -1011,9 +1079,15 @@
+       (some (fn [id]
+               (let [tag (d/entity db id)
+                     ident (:db/ident tag)]
+-                (when (and (contains? (disj ldb/private-tags :logseq.class/Page) ident)
+-                           (not (contains? held id)))
+-                  (str (:block/title tag) " is a built-in tag Logseq sets itself and can't be set as a value"))))
++                (when-not (contains? held id)
++                  (cond
++                    (contains? (disj ldb/private-tags :logseq.class/Page) ident)
++                    (str (:block/title tag) " is a built-in tag Logseq sets itself and can't be set as a value")
++                    ;; One way to write a block's type (patch 0037), so tag and type can't drift. A held
++                    ;; one is a no-op, as a held private tag is.
++                    (contains? ldb/node-display-type-classes ident)
++                    (str (:block/title tag) ": set it with display-type "
++                         (name (ldb/get-display-type-by-class-ident ident)) ", not as a tag")))))
+             values))))
+ 
+ (defn- prepare-property-value
+@@ -1023,6 +1097,9 @@
+   [db property-ident value e2ee? scope]
+   (let [property (d/entity db property-ident)]
+     (cond
++      (contains? #{display-type-ident lang-ident} property-ident)
++      (display-value db property-ident value scope)
++
+       (not= :db.type/ref (:db/valueType property))
+       (if-let [refused (when (some? value) (refused-by-type db property [value] [value]))]
+         (refusal property refused)
+@@ -1063,21 +1140,137 @@
+   list replaces the block's user tags, as the app's tag editor does: only the user tags it leaves out
+   are removed, and the private tags the block holds (ldb/private-tags: Page, Tag, Journal, Property,
+   Asset and the like), which the outliner refuses to remove, are kept. So sending a page's or tag's
+-  own tags back is a no-op, and a list without them (or []) sets its user tags, not a server error."
++  own tags back is a no-op, and a list without them (or []) sets its user tags, not a server error.
++  The display classes (Code-block, Math-block, Quote-block) are kept the same way, and never added
++  here: only set-display-type! writes them, with the type (patch 0037)."
+   [conn block-id value reset-existing-values?]
+   (let [ids (if (coll? value) value [value])
+         held #(set (map :db/id (:block/tags (d/entity @conn block-id))))
+-        private? #(contains? ldb/private-tags (:db/ident (d/entity @conn %)))]
++        kept? #(or (contains? ldb/private-tags (:db/ident (d/entity @conn %))) (display-class? @conn %))]
+     (when (and reset-existing-values? (coll? value))
+-      (doseq [id (remove (some-fn (set ids) private?) (held))]
++      (doseq [id (remove (some-fn (set ids) kept?) (held))]
+         (outliner-property/delete-property-value! conn block-id :block/tags id)))
+-    (doseq [id ids :when (not (contains? (held) id))]
++    (doseq [id ids :when (not (or (contains? (held) id) (display-class? @conn id)))]
+       (if (coll? value)
+         (outliner-property/batch-set-property! conn [block-id] :block/tags id {:entity-id? true})
+         (outliner-property/set-block-property! conn block-id :block/tags id)))))
+ 
++(defn- set-display-type!
++  "Makes block `block-id` a `type` (:code, :math or :quote) block as the app's client pipeline would
++  (add-missing-properties-to-typed-display-blocks, which returns early for a server write): the
++  keyword, the matching class tag and neither of the other two, no lang unless code, and no heading,
++  which a typed block doesn't render. Inside the caller's transaction."
++  [conn block-id type]
++  (let [block (d/entity @conn block-id)
++        class (display-type-classes type)]
++    (when (not= type (display-type-ident block))
++      (outliner-property/set-block-property! conn block-id display-type-ident type))
++    (doseq [tag (:block/tags block)
++            :when (and (contains? ldb/node-display-type-classes (:db/ident tag)) (not= class (:db/ident tag)))]
++      (outliner-property/delete-property-value! conn block-id :block/tags (:db/id tag)))
++    (when-not (some #(= class (:db/ident %)) (:block/tags block))
++      (outliner-property/set-block-property! conn block-id :block/tags class))
++    (when (and (not= :code type) (some? (lang-ident block)))
++      (outliner-property/remove-block-property! conn block-id lang-ident))
++    (when (some? (:logseq.property/heading block))
++      (outliner-property/remove-block-property! conn block-id :logseq.property/heading))))
++
++(defn- clear-display-type!
++  "Makes block `block-id` a text block again: no display type, class tag or lang."
++  [conn block-id]
++  (let [block (d/entity @conn block-id)]
++    (when (some? (display-type-ident block))
++      (outliner-property/remove-block-property! conn block-id display-type-ident))
++    (doseq [tag (:block/tags block) :when (contains? ldb/node-display-type-classes (:db/ident tag))]
++      (outliner-property/delete-property-value! conn block-id :block/tags (:db/id tag)))
++    (when (some? (lang-ident block))
++      (outliner-property/remove-block-property! conn block-id lang-ident))))
++
++(defn- read-back-display
++  "Why block `block-id` in `db` doesn't hold what a display write stored, or nil. `property-ident`
++  and `value` are the write (`value` nil for a delete of the type)."
++  [db block-id property-ident value]
++  (let [block (d/entity db block-id)
++        held (set (keep #(ldb/node-display-type-classes (:db/ident %)) (:block/tags block)))
++        stored-type (display-type-ident block)
++        lang (lang-ident block)]
++    (cond
++      (and (= display-type-ident property-ident) (nil? value))
++      (cond
++        (some? stored-type) "display-type was not removed"
++        (seq held) "its display class tag was not removed"
++        (some? lang) "lang was not removed")
++
++      (= display-type-ident property-ident)
++      (cond
++        (not= value stored-type) (str "display-type is not " (name value))
++        (not= #{(display-type-classes value)} held)
++        (str "its display class tag is not " (:block/title (d/entity db (display-type-classes value))))
++        (and (not= :code value) (some? lang)) "lang was not removed"
++        (some? (:logseq.property/heading block)) "heading was not removed")
++
++      (= lang-ident property-ident)
++      (when (not= value lang) (str "lang is not " value)))))
++
++(declare unverified!)
++
++(defn- read-back-display!
++  "Throws, answered as a 500, when the display write of entry `index` didn't read back."
++  [db index block-id property-ident value]
++  (when (contains? #{display-type-ident lang-ident} property-ident)
++    (when-let [problem (read-back-display db block-id property-ident value)]
++      (unverified! [(str "entry " index ": " problem)]))))
++
++(defn- lang-error
++  "Why a lang write in `writes` ({:block :property-ident :prepared}, in request order) can't be
++  applied: lang needs display-type code, judged on each block's type once every write has applied,
++  as *final-tags* judges tags; else nil."
++  [writes]
++  (let [final (reduce (fn [types {:keys [block property-ident prepared]}]
++                        (cond-> types
++                          (and (= display-type-ident property-ident) (contains? prepared :value))
++                          (assoc (:db/id block) (:value prepared))))
++                      {} writes)]
++    (some (fn [[index {:keys [block property-ident prepared]}]]
++            (when (and (= lang-ident property-ident) (contains? prepared :value)
++                       (not= :code (get final (:db/id block) (display-type-ident block))))
++              (str "entry " index ": lang needs display-type code")))
++          (map-indexed vector writes))))
++
++(def ^:private escape-warning
++  "title holds \\# escapes from earlier writes; to store it verbatim, call update_block with the title and display-type together")
++
++(defn- display-warnings
++  "Warnings for `writes` (as lang-error takes them; `prefix?` names each entry): a block whose stored
++  title holds \\# escapes the server added earlier becomes code or math, which shows them. The
++  server can't tell its backslashes from the user's, so it keeps them."
++  [writes prefix?]
++  (:warnings
++   (reduce (fn [{:keys [types] :as result} [index {:keys [block property-ident prepared]}]]
++             (if (= display-type-ident property-ident)
++               (let [before (get types (:db/id block) (display-type-ident block))
++                     after (:value prepared)]
++                 (cond-> (assoc-in result [:types (:db/id block)] after)
++                   (and (contains? #{:code :math} after) (not (contains? #{:code :math} before))
++                        (string/includes? (str (:block/title block)) "\\#"))
++                   (update :warnings (fnil conj []) (str (when prefix? (str "entry " index ": ")) escape-warning))))
++               result))
++           {:types {}} (map-indexed vector writes))))
++
++(defn- answering-unverified
++  "Calls `write`, answering 500 when a read-back found it didn't store what was asked; other errors
++  propagate."
++  [write]
++  (try (write)
++       (catch :default error
++         (if-let [message (::unverified (ex-data error))]
++           (http/error-response message 500)
++           (throw error)))))
++
+ (defn- set-prepared-property! [conn block-id property-ident value reset-existing-values?]
+   (cond
++    (= display-type-ident property-ident)
++    (set-display-type! conn block-id value)
+     (= :block/tags property-ident)
+     (set-prepared-tags! conn block-id value reset-existing-values?)
+     (coll? value)
+@@ -1089,6 +1282,14 @@
+     :else
+     (outliner-property/set-block-property! conn block-id property-ident value)))
+ 
++(defn- remove-prepared-property!
++  "Removes `property-ident` from `block-id`; removing display-type also removes its class tag and
++  lang (patch 0037)."
++  [conn block-id property-ident]
++  (if (= display-type-ident property-ident)
++    (clear-display-type! conn block-id)
++    (outliner-property/remove-block-property! conn block-id property-ident)))
++
+ ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
+ ;; property UUID, ident or title. They are resolved before anything is written.
+ (defn- property-selector
+@@ -1128,12 +1329,13 @@
+ (defn- final-tags
+   "*final-tags* for a batch's tag writes, [[db-id tag-ids replace?] ...] in request order, applied
+   as set-prepared-tags! applies them: a write adds its tags, and one that replaces (a list under
+-  reset) first drops the user tags the entity holds and keeps the private ones."
++  reset) first drops the user tags the entity holds and keeps the private ones and the display
++  classes."
+   [db writes]
+-  (let [private? #(contains? ldb/private-tags (:db/ident (d/entity db %)))]
++  (let [kept? #(or (contains? ldb/private-tags (:db/ident (d/entity db %))) (display-class? db %))]
+     (->> (reduce (fn [result [id ids replace?]]
+                    (let [held (get result id (set (map :db/id (:block/tags (d/entity db id)))))]
+-                     (assoc result id (into (if replace? (set (filter private? held)) held) ids))))
++                     (assoc result id (into (if replace? (set (filter kept? held)) held) ids))))
+                  {} writes)
+          (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
+          (into {}))))
+@@ -2465,22 +2667,29 @@
+             block (find-entity db (:block-id path-params))
+             property-ident (resolve-property-ident db (:property-id path-params))
+             prepared (when (and block property-ident)
+-                       (prepare-property-value db property-ident (:value body) e2ee? block))]
++                       (prepare-property-value db property-ident (:value body) e2ee? block))
++            writes [{:block block :property-ident property-ident :prepared prepared}]]
+       (cond
+         (nil? block) (http/bad-request "block not found")
+         (nil? property-ident) (http/bad-request "property not found")
+         (stamp-property-refusal property-ident)
+         (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
+         (not (contains? body :value)) (http/bad-request "missing property value")
+-        (:error prepared) (http/bad-request (:error prepared))
++        (:error prepared) (http/bad-request (cond->> (:error prepared) (::entry? prepared) (str "entry 0: ")))
++        (lang-error writes) (http/bad-request (lang-error writes))
+         :else
+-        (refusing-labels
+-         #(do (authored-write! conn creator
+-                               (fn [actor-conn]
+-                                 (check-labels! @actor-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
+-                                 (set-prepared-property! actor-conn (:db/id block) property-ident (:value prepared) true)))
+-              (broadcast-change! self)
+-              (http/json-response nil (with-context-or-unavailable {:updated true} (fn [] (target-context @conn block e2ee?))))))))
++        (answering-unverified
++         #(refusing-labels
++           (fn []
++             ;; One transaction, so a display type's several datoms land together or not at all.
++             (atomic-write! conn creator false :set-block-property
++                            (fn [tx-conn]
++                              (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                              (set-prepared-property! tx-conn (:db/id block) property-ident (:value prepared) true)
++                              (read-back-display! @tx-conn 0 (:db/id block) property-ident (:value prepared))))
++             (broadcast-change! self)
++             (http/json-response nil (cond-> (with-context-or-unavailable {:updated true} (fn [] (target-context @conn block e2ee?)))
++                                       (display-warnings writes false) (assoc :warnings (display-warnings writes false)))))))))
+ 
+     :semantic/blocks-delete-property
+     (let [block (find-entity db (:block-id path-params))
+@@ -2491,14 +2700,16 @@
+         (stamp-property-refusal property-ident)
+         (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
+         :else
+-        (refusing-labels
+-         #(do
++        (answering-unverified
++         #(refusing-labels
++           (fn []
+             (atomic-write! conn creator false :remove-block-property
+                            (fn [tx-conn]
+                              (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
+-                             (outliner-property/remove-block-property! tx-conn (:db/id block) property-ident)))
++                             (remove-prepared-property! tx-conn (:db/id block) property-ident)
++                             (read-back-display! @tx-conn 0 (:db/id block) property-ident nil)))
+             (broadcast-change! self)
+-            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?))))))))
++            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?)))))))))
+ 
+     :semantic/blocks-batch-set-property
+     (p/let [body (body-clj request)
+@@ -2539,18 +2750,22 @@
+                                           (cond-> replace? (update :replaced conj (:db/id block)))))))
+                                 {:entries [] :added {} :replaced #{}}
+                                 entries))))]
+-      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
++      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved) (lang-error resolved))]
+         (http/bad-request error)
+-        (refusing-labels
+-         #(do (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
+-             (fn [temp-conn]
+-               (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
+-               (doseq [{:keys [block property-ident prepared]} resolved]
+-                 (set-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)
+-                                         (true? (:isResetExistingValues body))))))
+-            (broadcast-change! self)
+-            (http/json-response nil (with-context-or-unavailable {:updated (count resolved)}
+-                                      (fn [] (affected-context @conn (map :block resolved) e2ee?))))))))
++        (answering-unverified
++         #(refusing-labels
++           (fn []
++             (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-set-property}
++               (fn [temp-conn]
++                 (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
++                 (doseq [[index {:keys [block property-ident prepared]}] (map-indexed vector resolved)]
++                   (set-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)
++                                           (true? (:isResetExistingValues body)))
++                   (read-back-display! @temp-conn index (:db/id block) property-ident (:value prepared)))))
++             (broadcast-change! self)
++             (http/json-response nil (cond-> (with-context-or-unavailable {:updated (count resolved)}
++                                               (fn [] (affected-context @conn (map :block resolved) e2ee?)))
++                                       (display-warnings resolved true) (assoc :warnings (display-warnings resolved true)))))))))
+ 
+     :semantic/blocks-batch-delete-property
+     (p/let [body (body-clj request)
+@@ -2561,16 +2776,18 @@
+                                 :property-ident (resolve-property-ident db property-id)}) entries))]
+       (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
+         (http/bad-request error)
+-        (refusing-labels
+-         #(do
+-          (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
+-           (fn [temp-conn]
+-             (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
+-             (doseq [{:keys [block property-ident]} resolved]
+-               (outliner-property/remove-block-property! temp-conn (:db/id block) property-ident))))
+-          (broadcast-change! self)
+-          (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
+-                                    (fn [] (affected-context @conn (map :block resolved) e2ee?))))))))))
++        (answering-unverified
++         #(refusing-labels
++           (fn []
++             (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
++               (fn [temp-conn]
++                 (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
++                 (doseq [[index {:keys [block property-ident]}] (map-indexed vector resolved)]
++                   (remove-prepared-property! temp-conn (:db/id block) property-ident)
++                   (read-back-display! @temp-conn index (:db/id block) property-ident nil))))
++             (broadcast-change! self)
++             (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
++                                       (fn [] (affected-context @conn (map :block resolved) e2ee?)))))))))))
+ 
+ (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
+          unverified!)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 98c5ec5..3ad352a 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -113,6 +113,16 @@
+        " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
+        " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
+ 
++(def ^:private display-type-note
++  "How the property operations write a block's type (patch 0037), shared by every one that sets it."
++  (str "A code, math or quote block: set logseq.property.node/display-type (or \"Node Display Type\") to \"code\", \"math\" or \"quote\" (\":code\" also works; trimmed, any case); anything else is refused, as is any other keyword property given text (only display-type can be set as text)."
++       " Setting it adds the matching class tag (Code, Math or Quote), removes the other two, removes lang unless the type is code, and removes the block's heading."
++       " logseq.property.code/lang is a code block's language (1 to 40 characters with no spaces, such as python or mermaid; case kept) and needs the block's type to be code once the call has applied."
++       " Both apply to blocks only: a page, tag, property or asset is refused."
++       " Code, Math and Quote can't be set as tags (use display-type); a block that holds one keeps it, and re-sending it is a no-op."
++       " A text block whose stored title holds \\# escapes from earlier writes keeps them when it becomes code or math, and the response carries a warning: to store the title verbatim, call updateBlock with the title and display-type together."
++       " Every write is read back in its transaction; one that didn't store what was asked fails the whole call."))
++
+ (def ^:private today-note
+   "Today is the date in the time zone the server is configured with (its TIMEZONE setting, an IANA zone such as Pacific/Auckland), or in UTC when none is set.")
+ 
+@@ -145,10 +155,10 @@
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order. Each moved block is named under affected with where it was (from) and is (to): page and breadcrumb. Pass dry-run=true to move them in a throwaway copy of the graph instead and get the same answer with dry-run: true, changing nothing."]
+    "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+    "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+-   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like) are kept. " value-notes)]
+-   "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted. Answers the block's page, breadcrumb and snippet (target)."]
+-   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
+-   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
++   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept. " value-notes " " display-type-note)]
++   "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Answers the block's page, breadcrumb and snippet (target)."]
++   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link. " display-type-note " lang is judged on each block's type once every entry has applied, so lang may come before display-type for the same block; warnings name their entry.")]
++   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too."]
+    "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
+@@ -737,13 +747,17 @@
+    :PropertyWriteResponse {:type "object"
+                            :properties (merge {:updated {:type "boolean"}
+                                                :deleted {:type "boolean"}
+-                                               :target {:$ref "#/components/schemas/BlockContext"}}
++                                               :target {:$ref "#/components/schemas/BlockContext"}
++                                               :warnings {:type "array" :items {:type "string"}
++                                                          :description "What the write stored but the caller may not expect, such as \\# escapes kept in a title that became code or math."}}
+                                               context-unavailable)}
+    :BatchPropertyWriteResponse {:type "object"
+                                 :properties (merge {:updated {:type "integer"}
+                                                     :deleted {:type "integer"}
+                                                     :affected {:type "array" :items {:$ref "#/components/schemas/BlockContext"}
+-                                                               :description "Each entry's block, in entry order."}}
++                                                               :description "Each entry's block, in entry order."}
++                                                    :warnings {:type "array" :items {:type "string"}
++                                                               :description "What the write stored but the caller may not expect, each naming its entry."}}
+                                                    context-unavailable)}
+    :UpdatedBlockResponse {:allOf [{:$ref "#/components/schemas/BlockResponse"}
+                                   {:type "object" :properties (merge {:target {:$ref "#/components/schemas/BlockContext"}} context-unavailable)}]}))
+@@ -833,6 +847,10 @@
+                                             :order {:type "string"}
+                                             :parent-id {:type "string"}
+                                             :page-id {:type "string"}
++                                            :display-type {:type "string" :enum ["code" "math" "quote"]
++                                                           :description "A code, math or quote block's type; absent on a text block."}
++                                            :lang {:type "string"
++                                                   :description "A code block's language, when set."}
+                                             :escaped {:type "array" :items {:type "string"}
+                                                       :description "On writes: inline tags stored escaped as text because no tag has that name, as written (#15, #Unknown)."}
+                                             :children {:type "array"
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
+new file mode 100644
+index 0000000..a72fac2
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
+@@ -0,0 +1,499 @@
++(ns logseq.db-sync.semantic-display-type-test
++  "Code, math and quote blocks through the property paths (patch 0037, stage 1). The block type
++  lives in :logseq.property.node/display-type, a keyword property, and JSON can't carry a keyword,
++  so set_block_property and batch_set_block_property refused every value with `should be a Clojure
++  keyword`. They now take \"code\", \"math\" and \"quote\" (also \":code\", trimmed, any case) and
++  write them as the app's client pipeline does: the keyword, the matching class tag (Code-block,
++  Math-block, Quote-block) and none of the other two, lang only on code, and no heading. lang
++  (:logseq.property.code/lang) is 1 to 40 characters with no spaces and needs a final type of code.
++  Both apply to blocks only. The three classes can't be written as tags (one way in, so tag and
++  type can't drift), a held one is a no-op, and a reset tag list keeps it. Deleting the type removes
++  its tag and lang. Every write reads back inside its transaction. Reads report both fields."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.semantic :as semantic]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.page :as outliner-page]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(def ^:private actor
++  (js/encodeURIComponent
++   (js/JSON.stringify #js {"sub" "6f2c1a90-5b1e-4c7a-9d3e-2a1b0c9d8e7f"
++                           "cognito:username" "Owner" "email" "owner@example.com"})))
++
++(def ^:private stamped [["x-logseq-sync-actor" actor] ["x-logseq-edit-stamp" "claude"]])
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body & {:keys [headers]}]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          js-headers (js/Headers. #js {"content-type" "application/json"})
++          _ (doseq [[k v] headers] (.append js-headers k v))
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method :headers js-headers}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(def ^:private type-ident "logseq.property.node/display-type")
++(def ^:private lang-ident "logseq.property.code/lang")
++(def ^:private classes
++  {:code :logseq.class/Code-block :math :logseq.class/Math-block :quote :logseq.class/Quote-block})
++
++(defn- put! [self id property value & opts]
++  (apply request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent property))
++         {:value value} opts))
++
++(defn- delete! [self id property]
++  (request! self "DELETE" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent property)) nil))
++
++(defn- batch-set! [self entries & {:keys [reset? headers]}]
++  (request! self "POST" "/semantic/block-properties/batch-set"
++            (cond-> {:entries (mapv (fn [[id property value]]
++                                      {:block-id (str id) :property-id property :value value})
++                                    entries)}
++              reset? (assoc :isResetExistingValues true))
++            :headers headers))
++
++(defn- batch-delete! [self entries]
++  (request! self "POST" "/semantic/block-properties/batch-delete"
++            {:entries (mapv (fn [[id property]] {:block-id (str id) :property-id property}) entries)}))
++
++(defn- state
++  "What a block holds of its type: the keyword, the display classes among its tags, lang, heading."
++  [conn id]
++  (let [e (d/entity @conn [:block/uuid id])]
++    {:type (:logseq.property.node/display-type e)
++     :classes (set (keep #(#{:logseq.class/Code-block :logseq.class/Math-block :logseq.class/Quote-block}
++                           (:db/ident %))
++                         (:block/tags e)))
++     :lang (:logseq.property.code/lang e)
++     :heading (:logseq.property/heading e)}))
++
++(defn- typed [type & [lang]]
++  {:type type :classes (if type #{(classes type)} #{}) :lang lang :heading nil})
++
++(def ^:private plain (typed nil))
++
++(defn- snapshot [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- with-graph
++  "A page Display with `n` blocks made by the outliner, as the app makes them. `titles` gives the
++  first blocks' titles (the rest are \"placeholder\")."
++  [done n run & {:keys [titles]}]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ page-id] (outliner-page/create! conn "Display" {})
++              ids (vec (repeatedly n random-uuid))
++              _ (when (seq ids)
++                  (outliner-core/insert-blocks! conn (map-indexed (fn [i id]
++                                                                    {:block/uuid id
++                                                                     :block/title (get titles i "placeholder")})
++                                                                  ids)
++                                                (d/entity @conn [:block/uuid page-id])
++                                                {:sibling? false :keep-uuid? true :bottom? true}))
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true
++                        :env #js {"TIMEZONE" "UTC"}}]
++        (run {:conn conn :self self :page-id page-id :ids ids}))
++      (p/catch #(is false (str "unexpected error: " % (some-> % .-stack))))
++      (p/finally done)))
++
++(defn- ok? [response label]
++  (is (= 200 (:status response)) (str label ": " (pr-str (:body response)))))
++
++(defn- refused? [response expected label]
++  (is (= 400 (:status response)) (str label ": " (pr-str (:body response))))
++  (is (= expected (get-in response [:body :error])) label))
++
++;; Before the fix every value was refused by the outliner's keyword check:
++;;   expected: (= 200 (:status response))  actual: 400
++;;   {:error "Node Display Type: \"code\" should be a Clojure keyword"}
++(deftest set-display-type-each-value-test
++  (async done
++    (let [cases [["code" :code type-ident] ["math" :math type-ident] ["quote" :quote type-ident]
++                 [":code" :code type-ident] [" Code " :code "Node Display Type"] [":MATH" :math "Node Display Type"]
++                 ["quote" :quote "Node Display Type"]]]
++      (with-graph done (count cases)
++        (fn [{:keys [conn self ids]}]
++          (p/doseq [[[value expected property] id] (map vector cases ids)]
++            (p/let [response (put! self id property value)
++                    got (request! self "GET" (str "/semantic/blocks/" id) nil)]
++              (ok? response (str (pr-str value) " by " property))
++              (is (= (typed expected) (state conn id))
++                  (str (pr-str value) " by " property ": the keyword and exactly its class tag"))
++              (is (= (name expected) (get-in got [:body :display-type])) (str (pr-str value) ": getBlock reports it"))
++              (is (not (contains? (:body got) :lang)) "no lang was set"))))))))
++
++;; Before the fix: {:error "Node Display Type: \"cod\" should be a Clojure keyword"}
++(deftest set-display-type-refuses-unknown-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self ids]}]
++        (let [[a b] ids]
++          (p/do
++            (p/doseq [[value shown] [["cod" "cod"] ["" ""] [5 "5"] [":foo/bar" ":foo/bar"] ["codes" "codes"]
++                                     ["::code" "::code"] ["foo/code" "foo/code"] [true "true"] [["code"] "[\"code\"]"]
++                                     ;; A class named by UUID or db id is not a type name either.
++                                     [(str (:block/uuid (d/entity @conn :logseq.class/Code-block)))
++                                      (str (:block/uuid (d/entity @conn :logseq.class/Code-block)))]
++                                     [(:db/id (d/entity @conn :logseq.class/Code-block))
++                                      (str (:db/id (d/entity @conn :logseq.class/Code-block)))]
++                                     ["Code-block" "Code-block"] ["logseq.class/Code-block" "logseq.class/Code-block"]]]
++              (p/let [before (snapshot conn)
++                      single (put! self a type-ident value)
++                      batch (batch-set! self [[b type-ident "code"] [a type-ident value]])]
++                (refused? single (str "entry 0: display-type: " (pr-str shown) " is not one of code, math, quote")
++                          (str "set " (pr-str value)))
++                (refused? batch (str "entry 1: display-type: " (pr-str shown) " is not one of code, math, quote")
++                          (str "batch " (pr-str value)))
++                (is (= before (snapshot conn)) (str (pr-str value) ": nothing written"))
++                (is (= plain (state conn a)) (str (pr-str value) ": the block is unchanged"))))
++            (p/let [response (put! self a type-ident nil)]
++              (refused? response "entry 0: display-type: \"\" is not one of code, math, quote" "null"))))))))
++
++;; Before the fix: {:error "Annotation type: \"x\" should be a Clojure keyword"}
++;; (A user property can't be keyword-typed, so two built-in keyword properties stand in for any.)
++(deftest other-keyword-property-refuses-text-test
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self ids]}]
++        (p/let [before (snapshot conn)
++                annotation (put! self (first ids) "logseq.property.pdf/hl-type" "x")
++                align (put! self (first ids) "Asset alignment" ":center")
++                batch (batch-set! self [[(first ids) type-ident "code"] [(first ids) "logseq.property.asset/align" "left"]])]
++          (refused? annotation "Annotation type: takes a keyword; only display-type can be set as text" "by ident")
++          (refused? align "Asset alignment: takes a keyword; only display-type can be set as text" "by title")
++          (refused? batch "entry 1: Asset alignment: takes a keyword; only display-type can be set as text" "batch")
++          (is (= before (snapshot conn))))))))
++
++;; Before the fix: {:error "Node Display Type: \"code\" should be a Clojure keyword"} (a page too).
++(deftest display-type-on-a-page-tag-or-property-refused-test
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self page-id ids]}]
++        (let [task (str (:block/uuid (d/entity @conn :logseq.class/Task)))
++              status (str (:block/uuid (d/entity @conn :logseq.property/status)))]
++          (p/doseq [[target kind] [[page-id "a page"] [task "a tag"] [status "a property"]]]
++            (p/let [before (snapshot conn)
++                    single (put! self target type-ident "code")
++                    lang (put! self target lang-ident "python")
++                    batch (batch-set! self [[(first ids) type-ident "code"] [target type-ident "quote"]])]
++              (refused? single (str "entry 0: display-type applies to blocks, not " kind) (str "set on " kind))
++              (refused? lang (str "entry 0: lang applies to blocks, not " kind) (str "lang on " kind))
++              (refused? batch (str "entry 1: display-type applies to blocks, not " kind) (str "batch on " kind))
++              (is (= before (snapshot conn)) (str kind ": nothing written")))))))))
++
++;; Before the fix: code couldn't be set at all, and lang on a text block was stored:
++;;   expected: (= 400 (:status response))  actual: 200
++(deftest lang-needs-code-test
++  (async done
++    (with-graph done 6
++      (fn [{:keys [conn self ids]}]
++        (let [[code1 code2 text math quote code3] ids
++              forty (apply str (repeat 40 "a"))]
++          (p/let [_ (put! self code1 type-ident "code")
++                  _ (put! self code2 type-ident "code")
++                  _ (put! self code3 type-ident "code")
++                  _ (put! self math type-ident "math")
++                  _ (put! self quote type-ident "quote")
++                  mermaid (put! self code1 lang-ident "mermaid")
++                  python (put! self code2 lang-ident "Python")
++                  longest (put! self code3 lang-ident forty)
++                  got (request! self "GET" (str "/semantic/blocks/" code2) nil)]
++            (ok? mermaid "mermaid") (ok? python "Python") (ok? longest "40 characters")
++            (is (= (typed :code "mermaid") (state conn code1)))
++            (is (= (typed :code "Python") (state conn code2)) "case kept")
++            (is (= "Python" (get-in got [:body :lang])) "getBlock reports lang")
++            (is (= "code" (get-in got [:body :display-type])))
++            (p/doseq [[id label] [[text "text"] [math "math"] [quote "quote"]]]
++              (p/let [before (snapshot conn)
++                      single (put! self id lang-ident "python")
++                      batch (batch-set! self [[code1 lang-ident "sql"] [id lang-ident "python"]])]
++                (refused? single "entry 0: lang needs display-type code" (str "lang on " label))
++                (refused? batch "entry 1: lang needs display-type code" (str "batch lang on " label))
++                (is (= before (snapshot conn)) (str label ": nothing written"))))
++            (p/doseq [value ["" "py thon" " python" "python\n" (str forty "a") 5 nil ["python"] true]]
++              (p/let [before (snapshot conn)
++                      single (put! self code1 lang-ident value)
++                      batch (batch-set! self [[code1 lang-ident value]])]
++                (refused? single "entry 0: lang: must be 1 to 40 characters with no spaces" (pr-str value))
++                (refused? batch "entry 0: lang: must be 1 to 40 characters with no spaces" (str "batch " (pr-str value)))
++                (is (= before (snapshot conn)))))
++            (is (= (typed :code "mermaid") (state conn code1)) "refused values left lang as it was")
++            ;; Re-sending the stored lang, alone or in a batch with the type, is a no-op, not a refusal.
++            (p/let [again (put! self code1 lang-ident "mermaid")
++                    batch (batch-set! self [[code1 lang-ident "mermaid"] [code1 type-ident "code"]])]
++              (ok? again "lang re-sent") (ok? batch "lang and type re-sent")
++              (is (= (typed :code "mermaid") (state conn code1))))))))))
++
++;; Final state, in any entry order. Before the fix every entry naming display type was refused:
++;;   {:error "entry 1: Node Display Type: \"code\" should be a Clojure keyword"}
++(deftest batch-lang-and-type-judged-on-final-state-test
++  (async done
++    (with-graph done 4
++      (fn [{:keys [conn self ids]}]
++        (let [[a b c d] ids]
++          (p/let [lang-first (batch-set! self [[a lang-ident "python"] [a type-ident "code"]])
++                  _ (ok? lang-first "lang before type")
++                  _ (is (= (typed :code "python") (state conn a)))
++                  type-first (batch-set! self [[b type-ident "code"] [b lang-ident "sql"]])
++                  _ (ok? type-first "type before lang")
++                  _ (is (= (typed :code "sql") (state conn b)))
++                  ;; Swapped across two blocks: each lang is judged on its own block's final type.
++                  swapped (batch-set! self [[c lang-ident "clojure"] [d type-ident "code"]
++                                            [d lang-ident "bash"] [c type-ident "code"]])
++                  _ (ok? swapped "swapped across blocks")
++                  _ (is (= [(typed :code "clojure") (typed :code "bash")] [(state conn c) (state conn d)]))
++                  ;; A chain whose last type isn't code refuses the lang, whatever came between.
++                  before (snapshot conn)
++                  chain (batch-set! self [[a type-ident "math"] [a lang-ident "rust"] [a type-ident "code"]
++                                          [a type-ident "quote"]])
++                  _ (refused? chain "entry 1: lang needs display-type code" "chain ending in quote")
++                  _ (is (= before (snapshot conn)) "nothing written")
++                  _ (is (= (typed :code "python") (state conn a)))
++                  ;; Reversed: the chain ending in code accepts the lang given first.
++                  reversed (batch-set! self [[a type-ident "quote"] [a lang-ident "rust"] [a type-ident "code"]])
++                  _ (ok? reversed "chain ending in code")
++                  _ (is (= (typed :code "rust") (state conn a)))
++                  ;; Code with lang, then quote: lang is retracted, and the read-back sees none.
++                  to-quote (batch-set! self [[b type-ident "quote"]])]
++            (ok? to-quote "code with lang to quote")
++            (is (= (typed :quote) (state conn b)))))))))
++
++(deftest switch-code-to-quote-test
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self ids]}]
++        (let [id (first ids)]
++          (p/let [_ (put! self id type-ident "code")
++                  _ (put! self id lang-ident "python")
++                  _ (is (= (typed :code "python") (state conn id)))
++                  response (put! self id type-ident "quote")
++                  got (request! self "GET" (str "/semantic/blocks/" id) nil)]
++            (ok? response "code to quote")
++            (is (= (typed :quote) (state conn id)) "lang and Code-block go, Quote-block comes")
++            (is (= "quote" (get-in got [:body :display-type])))
++            (is (not (contains? (:body got) :lang)))
++            (is (not-any? #(= "logseq.class/Code-block" (:ident %)) (get-in got [:body :tags])))))))))
++
++(deftest same-type-twice-test
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self ids]}]
++        (let [id (first ids)
++              txs (atom 0)]
++          (p/let [_ (put! self id type-ident "code")
++                  _ (put! self id lang-ident "python")
++                  _ (d/listen! conn ::count (fn [_] (swap! txs inc)))
++                  again (put! self id type-ident ":code")
++                  _ (d/unlisten! conn ::count)
++                  batch (batch-set! self [[id type-ident "code"] [id type-ident "Code"]])]
++            (ok? again "same type again") (ok? batch "same type twice in a batch")
++            (is (>= 1 @txs) (str "at most one transaction (a re-send changes nothing): " @txs))
++            (is (= (typed :code "python") (state conn id)) "one tag, lang kept")))))))
++
++(deftest heading-retracted-test
++  (async done
++    (with-graph done 3
++      (fn [{:keys [conn self ids]}]
++        (p/doseq [[id value] (map vector ids ["code" "math" "quote"])]
++          (p/let [_ (put! self id "logseq.property/heading" 2)
++                  _ (is (= 2 (:heading (state conn id))))
++                  response (put! self id type-ident value)
++                  got (request! self "GET" (str "/semantic/blocks/" id) nil)]
++            (ok? response value)
++            (is (nil? (:heading (state conn id))) (str value ": the heading is retracted"))
++            (is (not-any? #(= "logseq.property/heading" (:ident %)) (get-in got [:body :properties])))))))))
++
++;; Before the fix the class tag stayed (delete removed only the keyword, had it been set).
++(deftest delete-display-type-test
++  (async done
++    (with-graph done 4
++      (fn [{:keys [conn self ids]}]
++        (let [[a b c plain-id] ids]
++          (p/let [_ (batch-set! self [[a type-ident "code"] [a lang-ident "python"] [b type-ident "code"]
++                                      [b lang-ident "sql"] [c type-ident "math"]])
++                  _ (is (= [(typed :code "python") (typed :code "sql") (typed :math)]
++                           (mapv #(state conn %) [a b c])))
++                  single (delete! self a type-ident)
++                  batch (batch-delete! self [[b type-ident] [c type-ident]])
++                  no-op (delete! self plain-id type-ident)
++                  got (request! self "GET" (str "/semantic/blocks/" a) nil)]
++            (ok? single "delete") (ok? batch "batch delete") (ok? no-op "delete on a plain block")
++            (is (= [plain plain plain plain] (mapv #(state conn %) [a b c plain-id]))
++                "type, class tag and lang removed")
++            (is (not (contains? (:body got) :display-type)))))))))
++
++;; Before the fix Code was written as a tag (and the type was left unset):
++;;   expected: (= 400 (:status response))  actual: 200
++(deftest display-classes-refused-as-tags-test
++  (async done
++    (with-graph done 3
++      (fn [{:keys [conn self ids]}]
++        (let [[text code other] ids]
++          (p/let [example (request! self "POST" "/semantic/tags" {:title "Example"})
++                  example-id (get-in example [:body :uuid])
++                  _ (put! self code type-ident "code")
++                  _ (put! self other type-ident "math")]
++            (p/doseq [[value message] [["Code" "Code: set it with display-type code, not as a tag"]
++                                       ["logseq.class/Math-block" "Math: set it with display-type math, not as a tag"]
++                                       [(str (:block/uuid (d/entity @conn :logseq.class/Quote-block)))
++                                        "Quote: set it with display-type quote, not as a tag"]]]
++              (p/let [before (snapshot conn)
++                      single (put! self text "block/tags" value)
++                      listed (put! self text "block/tags" [example-id value])
++                      batch (batch-set! self [[text "block/tags" example-id] [text "block/tags" value]])]
++                (refused? single (str "Tags: " message) (str value))
++                (refused? listed (str "Tags: " message) (str value " in a list"))
++                (refused? batch (str "entry 1: Tags: " message) (str value " in a batch"))
++                (is (= before (snapshot conn)) "nothing written")))
++            (p/let [held (put! self code "block/tags" ["Code" example-id])
++                    _ (ok? held "a held Code is a no-op")
++                    _ (is (= (typed :code) (select-keys (state conn code) [:type :classes :lang :heading])))
++                    _ (is (some #(= "Example" (:block/title %)) (:block/tags (d/entity @conn [:block/uuid code]))))
++                    reset (put! self code "block/tags" [])
++                    _ (ok? reset "a reset list without Code")
++                    _ (is (= (typed :code) (state conn code)) "Code is kept, as private tags are")
++                    batch-reset (batch-set! self [[other type-ident "math"] [other "block/tags" [example-id]]]
++                                            :reset? true)
++                    _ (ok? batch-reset "a batch reset list without Math")
++                    _ (is (= (typed :math) (state conn other)) "Math is kept")
++                    journal (put! self text "block/tags" "Journal")]
++              (is (= 400 (:status journal)) (pr-str journal))
++              (is (string/includes? (str (get-in journal [:body :error])) "Journal is a built-in tag")
++                  "private tags are still refused"))))))))
++
++;; Before the fix code couldn't be set, so there was no warning:
++;;   expected: (= [...] (get-in response [:body :warnings]))  actual: nil
++(deftest escape-warning-test
++  (async done
++    (with-graph done 3
++      (fn [{:keys [conn self ids]}]
++        (let [[escaped clean escaped-quote] ids
++              title "\\#include <stdio.h>"
++              warning "title holds \\# escapes from earlier writes; to store it verbatim, call update_block with the title and display-type together"]
++          (d/transact! conn [{:block/uuid escaped :block/title title}
++                             {:block/uuid escaped-quote :block/title title}])
++          (p/let [response (put! self escaped type-ident "code")
++                  _ (is (= [warning] (get-in response [:body :warnings])))
++                  _ (is (= title (:block/title (d/entity @conn [:block/uuid escaped]))) "the title is unchanged")
++                  again (put! self escaped type-ident "math")
++                  quote (put! self escaped-quote type-ident "quote")
++                  plain-response (put! self clean type-ident "code")
++                  batch (batch-set! self [[escaped-quote type-ident "math"]])]
++            (ok? response "converted")
++            (is (not (contains? (:body again) :warnings)) "code to math isn't a conversion from text")
++            (is (not (contains? (:body quote) :warnings)) "quote keeps tag handling")
++            (is (not (contains? (:body plain-response) :warnings)) "no escapes, no warning")
++            (is (= [(str "entry 0: " warning)] (get-in batch [:body :warnings])) "batch names the entry")))))))
++
++(deftest edit-stamps-and-one-transaction-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self ids]}]
++        (let [[a b] ids
++              ops (atom [])]
++          (d/listen! conn ::ops #(swap! ops conj (:outliner-op (:tx-meta %))))
++          (p/let [single (put! self a type-ident "code" :headers stamped)
++                  single-ops @ops
++                  _ (reset! ops [])
++                  batch (batch-set! self [[b type-ident "math"] [a lang-ident "python"]] :headers stamped)
++                  batch-ops @ops
++                  _ (reset! ops [])
++                  deleted (delete! self a type-ident)]
++            (d/unlisten! conn ::ops)
++            (ok? single "single") (ok? batch "batch") (ok? deleted "delete")
++            (is (= 1 (count single-ops)) (str "one transaction: " (pr-str single-ops)))
++            (is (= 1 (count batch-ops)) (str "one transaction: " (pr-str batch-ops)))
++            (is (= 1 (count @ops)) (str "one transaction: " (pr-str @ops)))
++            (doseq [id [a b]]
++              (is (some? (:user.property/claude-editedBy (d/entity @conn [:block/uuid id]))) "stamped"))))))))
++
++;; STUBS A STEP (labelled): set-display-type! is redefined to add the class tag but skip the
++;; keyword, so the read-back sees a write that didn't store what was asked.
++(deftest read-back-mismatch-rejects-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self ids]}]
++        (let [[a b] ids
++              before (snapshot conn)]
++          (p/let [[single batch]
++                  (p/with-redefs [semantic/set-display-type!
++                                  (fn [conn block-id _type]
++                                    (outliner-property/set-block-property! conn block-id :block/tags
++                                                                           :logseq.class/Code-block))]
++                    (p/let [single (put! self a type-ident "code")
++                            batch (batch-set! self [[a lang-ident "python"] [a type-ident "code"]])]
++                      [single batch]))]
++            (is (= 500 (:status single)) (pr-str single))
++            (is (= "the write did not store what was asked: entry 0: display-type is not code" (get-in single [:body :error])))
++            (is (= 500 (:status batch)) (pr-str batch))
++            (is (= "the write did not store what was asked: entry 1: display-type is not code" (get-in batch [:body :error])))
++            (is (= before (snapshot conn)) "nothing committed")
++            (is (= [plain plain] [(state conn a) (state conn b)]))))))))
++
++;; Before the fix no read carried the type: actual: nil for (:display-type block).
++(deftest reads-report-display-type-and-lang-test
++  (async done
++    (with-graph done 3
++      (fn [{:keys [conn self page-id ids]}]
++        (let [[code math text] ids]
++          (p/let [_ (batch-set! self [[code type-ident "code"] [code lang-ident "python"] [math type-ident "math"]])
++                  many (request! self "GET" (str "/semantic/blocks?ids=" (string/join "," ids)) nil)
++                  listed (request! self "GET" (str "/semantic/pages/" page-id "/blocks") nil)
++                  by-uuid (fn [blocks] (into {} (map (juxt :uuid identity)) blocks))]
++            (doseq [[label blocks] [["getBlocks" (by-uuid (get-in many [:body :blocks]))]
++                                    ["listPageBlocks" (by-uuid (get-in listed [:body :blocks]))]]]
++              (is (= ["code" "python"] ((juxt :display-type :lang) (get blocks (str code)))) label)
++              (is (= ["math" nil] ((juxt :display-type :lang) (get blocks (str math)))) label)
++              (is (not (contains? (get blocks (str math)) :lang)) (str label ": no lang key"))
++              (is (some? (get blocks (str text))) label)
++              (is (not-any? #(contains? (get blocks (str text)) %) [:display-type :lang])
++                  (str label ": a plain block has neither key")))
++            (is (= (typed :code "python") (state conn code)))))))))
++
++;; A held display class sent as a tag is a no-op, also when an earlier entry in the batch changed
++;; the type: it must not bring the old class back beside the new one (tag and type drift).
++;; Before the fix (set-prepared-tags! adding a class the block no longer held):
++;;   expected: (= (typed :quote) (state conn id))  actual: {:classes #{Code-block Quote-block} ...}
++(deftest held-class-tag-never-re-added-test
++  (async done
++    (with-graph done 1
++      (fn [{:keys [conn self ids]}]
++        (let [id (first ids)]
++          (p/let [_ (put! self id type-ident "code")
++                  single (batch-set! self [[id type-ident "quote"] [id "block/tags" "Code"]])
++                  _ (ok? single "quote, then the held Code")
++                  _ (is (= (typed :quote) (state conn id)))
++                  _ (put! self id type-ident "code")
++                  listed (batch-set! self [[id type-ident "math"] [id "block/tags" ["Code"]]] :reset? true)]
++            (ok? listed "math, then a reset list holding Code")
++            (is (= (typed :math) (state conn id)))))))))
++
++;; A batch insert entry's properties are for its target, which can be a page, or a page the entry
++;; creates: display-type and lang are refused there too, and nothing is written.
++(deftest display-type-on-a-batch-insert-page-refused-test
++  (async done
++    (with-graph done 0
++      (fn [{:keys [conn self page-id]}]
++        (p/let [before (snapshot conn)
++                existing (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:target-id (str page-id) :properties {type-ident "code"}
++                                               :blocks [{:title "Example"}]}]})
++                created (request! self "POST" "/semantic/block-trees/batch"
++                                  {:entries [{:page "Example page" :properties {lang-ident "python"}
++                                              :blocks [{:title "Example"}]}]})]
++          (doseq [[label response kind] [["existing page" existing "display-type"] ["new page" created "lang"]]]
++            (is (= 400 (:status response)) (str label ": " (pr-str response)))
++            (is (string/includes? (str (get-in response [:body :error])) (str kind " applies to blocks, not a page"))
++                (str label ": " (pr-str (:body response)))))
++          (is (= before (snapshot conn)) "nothing written"))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
+index 122055e..25f7b14 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
+@@ -980,7 +980,12 @@
+                   {:value "five"} :headers stamped))
+       (fn [{:keys [a]} _] #{a})]
+      ["setBlockProperty, a built-in in a sub-namespace (a code block's language)"
+-      nil
++      ;; lang needs a code block (patch 0037), so A is made one first, as the app makes it.
++      (fn [{:keys [conn a]}]
++        (d/transact! conn [{:db/id (:db/id (d/entity @conn [:block/uuid a]))
++                            :logseq.property.node/display-type :code
++                            :block/tags (:db/id (d/entity @conn :logseq.class/Code-block))}])
++        nil)
+       (fn [{:keys [self a]}]
+         (request! self "PUT" (str "/semantic/blocks/" a "/properties/" (js/encodeURIComponent "logseq.property.code/lang"))
+                   {:value "clojure"} :headers stamped))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index f0fbcb1..543e81c 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -27,6 +27,7 @@
+             [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-signals-view-test]
+             [logseq.db-sync.semantic-knowledge-index-aliases-test]
++            [logseq.db-sync.semantic-display-type-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
