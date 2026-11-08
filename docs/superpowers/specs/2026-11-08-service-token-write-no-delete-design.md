@@ -346,3 +346,7 @@ So that a later unknown value cannot do the same, the new code fails closed **(c
 3. **Is an overwrite a delete?** This design treats replacing text or a value as an overwrite (allowed, restorable from the audit log) and removing a value with nothing in its place as a delete (refused). Should the worker be stopped from overwriting too, for some tools?
 4. **`update_tag` properties.** (Answered by step 0: values survive, so these are allowed.) Until step 0 shows values survive, `properties.remove` and `properties.set` are refused on the worker token. Is that acceptable in the meantime?
 5. **Dry runs.** Dry runs of deletes are allowed on the worker token so it can report what it would delete. Do you want them refused too?
+
+## As built: Claude Code settings (owner decision)
+
+Section 3.8 kept the seven delete tools out of `.claude/settings.json` so they would prompt. The owner chose the opposite after reading the spec: the settings allow every `logseq-service` tool with the server-wide rule `mcp__logseq-service`, because the service token sets the limits (a `write-no-delete` worker token can't delete whatever the client allows, and the test graph's `write` token is meant to run deletes without prompts). The claude.ai connector's `mcp__Logseq__` allow list stays read-only, since that connector has no server-side limit. The wiring test pins both. The build agents declined to widen Claude Code's own permissions on a workflow's say-so; the lead made the change on the owner's direct request.

@@ -933,7 +933,7 @@ A Claude Code cloud session or scheduled task has no browser, so it can't comple
    The next page shows the token once (`lsct_` and 43 characters). Copy it then. The connector keeps only its hash and can't show it again.
 2. **Add it to the cloud environment** as the secret `LOGSEQ_SERVICE_TOKEN`. If your connector isn't at `mcp.example.com`, add `LOGSEQ_MCP_HOST` with its hostname too.
 3. **Allow the connector in the network policy.** Unlike the claude.ai connector, this traffic goes from the session straight to your Worker, so add `mcp.example.com` to the environment's allowed domains.
-4. **Use it.** The checked-in `.mcp.json` defines a `logseq-service` server that reads `https://${LOGSEQ_MCP_HOST:-mcp.example.com}/mcp` and `${LOGSEQ_SERVICE_TOKEN}`, and `.claude/settings.json` enables it and allows its read tools without a prompt. Write tools still ask. In the session, `/mcp` should list `logseq-service` as connected, and its tools are named `mcp__logseq-service__<tool>` rather than `mcp__Logseq__<tool>`. The tools and arguments are the same.
+4. **Use it.** The checked-in `.mcp.json` defines a `logseq-service` server that reads `https://${LOGSEQ_MCP_HOST:-mcp.example.com}/mcp` and `${LOGSEQ_SERVICE_TOKEN}`, and `.claude/settings.json` enables it and allows all of its tools without a prompt (the server-wide rule `mcp__logseq-service`), because the token sets the limits: read, write with no deletes, or write. In the session, `/mcp` should list `logseq-service` as connected, and its tools are named `mcp__logseq-service__<tool>` rather than `mcp__Logseq__<tool>`. The tools and arguments are the same.
 5. **CLI fallback.** If the MCP server isn't loaded, `node scripts/logseq-mcp.mjs list_graphs` calls a tool from bash. Pass arguments as one JSON object: `node scripts/logseq-mcp.mjs search_graph '{"graph":"notes","query":"pricing"}'`. It reads `LOGSEQ_SERVICE_TOKEN` and the server from `LOGSEQ_MCP_URL`, else `https://$LOGSEQ_MCP_HOST/mcp`, else `https://mcp.example.com/mcp`. `LOGSEQ_MCP_URL` must be `https://` (plain `http://` only for `localhost` or `127.0.0.1`), because the token goes with the first request. It never takes the token as an argument and masks it in anything it prints. It exits 1 on an HTTP error, a JSON-RPC error or a tool error, and 2 on a usage error.
 6. **Edit.** **Edit** beside an active token opens `/tokens/<id>/edit`, where you can change its graphs, its mode and its expiry. The token string and its hash don't change, so the secret in your cloud environments stays valid. Editing is not a rotation: if the secret may have leaked, revoke it and issue a new one.
    - **Narrowing applies at once.** Removing a graph, lowering its access (read-write to read-write without deletes or to read-only, or read-write without deletes to read-only), or shortening the expiry takes effect on the token's next `/mcp` request, including in a session that is already running. A removed graph is then refused as outside the token's scope.
@@ -955,7 +955,7 @@ A Claude Code cloud session or scheduled task has no browser, so it can't comple
 
 A token never exceeds a graph's own mode, so on a read-only graph every token is read-only.
 
-**Deletes happen only with your approval.** A `write-no-delete` token refuses every delete outright. It has no way to ask for approval and no way to queue a delete for later. You approve a delete by giving it somewhere else: you delete in the Logseq app; you ask Claude through the claude.ai connector, which asks before any destructive tool; or you answer Claude Code's permission prompt in an interactive session, where the seven delete tools (`delete_page`, `delete_block`, `delete_blocks`, `delete_tag`, `delete_property`, `delete_block_property`, `batch_delete_block_property`) are never in an allow list. A session that hits a refused delete should not retry. It dry-runs where it can, reports what it would delete, and leaves the delete to you. A queue of delete requests to approve later is not built.
+**Deletes happen only with your approval.** A `write-no-delete` token refuses every delete outright. It has no way to ask for approval and no way to queue a delete for later. You approve a delete by giving it somewhere else: you delete in the Logseq app; you ask Claude through the claude.ai connector, which asks before any destructive tool; or, in a session whose settings still prompt for the delete tools (`delete_page`, `delete_block`, `delete_blocks`, `delete_tag`, `delete_property`, `delete_block_property`, `batch_delete_block_property`), you answer Claude Code's prompt there with a `write` token. A session that hits a refused delete should not retry. It dry-runs where it can, reports what it would delete, and leaves the delete to you. A queue of delete requests to approve later is not built.
 
 **Recipe: cloud worker.** An unattended cloud session or scheduled task that reads and writes your notes and never deletes there.
 
@@ -963,13 +963,13 @@ A token never exceeds a graph's own mode, so on a read-only graph every token is
 2. Add it to the cloud environment as `LOGSEQ_SERVICE_TOKEN`, with `LOGSEQ_MCP_HOST` if your connector isn't at `mcp.example.com`, and allow `mcp.example.com` in the network policy (steps 2 and 3).
 3. In the session, `list_graphs` shows `notes` with mode `write-no-delete`. Inserts, moves and property writes run; `delete_block` answers `service token 'worker' may not delete (write, no deletes): …`, and `get_activity_log` on `notes` shows the refusal.
 
-Whether a write asks first is up to the session's own permission settings. This repo's `.claude/settings.json` allows only the read tools, so a write prompts unless the session runs without prompts or you add the write tools to its allow list. Deletes are refused by the Worker whatever the settings say.
+This repo's `.claude/settings.json` allows every `logseq-service` tool, so the worker runs with no prompts. Deletes are refused by the Worker whatever the settings say. Turn the claude.ai Logseq connector off in that environment, or keep its write tools out of the allow list, so Claude doesn't route writes through it instead.
 
 **Recipe: connector dev.** A session that tests the connector's writes and deletes.
 
 1. Create a token named `ci` on `test` only with **read and write**. Never give a `write` token a personal graph: argument-level deletes (`update_property` with `convert_values` or `choices.retire`, an empty value in `set_block_property`) run through tools that aren't delete tools, so no allow list can make them prompt.
 2. Store it as `LOGSEQ_SERVICE_TOKEN` in the dev environment, as for the worker.
-3. `list_graphs` shows `test` with mode `write`. In an interactive session, keep the seven delete tools out of the allow list so each delete prompts.
+3. `list_graphs` shows `test` with mode `write`. With this repo's settings every tool, deletes included, runs without a prompt, which is the point of a test graph. Use a separate cloud environment for it, so its token never reaches a session that works on your notes.
 
 **Recipe: use from another repo.** Copy `.mcp.json` into the other repo as it is here:
 
@@ -985,23 +985,18 @@ Whether a write asks first is up to the session's own permission settings. This 
 }
 ```
 
-and enable the server in that repo's `.claude/settings.json`, listing each tool you want to run without a prompt by name:
+and enable the server in that repo's `.claude/settings.json`, allowing all of its tools:
 
 ```json
 {
   "enabledMcpjsonServers": ["logseq-service"],
   "permissions": {
-    "allow": [
-      "mcp__logseq-service__list_graphs",
-      "mcp__logseq-service__search_graph",
-      "mcp__logseq-service__get_page",
-      "mcp__logseq-service__insert_block_tree"
-    ]
+    "allow": ["mcp__logseq-service"]
   }
 }
 ```
 
-Name tools one by one from `connector/tools-manifest.json`. Leave out the seven delete tools so they always prompt, and never add a server-wide `mcp__logseq-service` rule or a wildcard, which would allow the deletes too. The token in that repo's environment decides which graphs it reaches (`notes` for a worker, `test` for development).
+The token in that repo's environment decides what Claude can do: which graphs it reaches and whether it can write or delete (`notes` with `write-no-delete` for a worker, `test` with `write` for development). If you would rather keep prompts for some tools, list the ones to allow by name from `connector/tools-manifest.json` instead of the server-wide rule.
 
 **Rollback.** Before you revert the connector Worker to a version from before `write-no-delete`, revoke every `write-no-delete` token at `/tokens`. The older code treats any access other than `read` as write, so it would give such a token full write, deletes included. Migration 0008 needs no reverse: older code reads `read` and `write` from the rebuilt table.
 
