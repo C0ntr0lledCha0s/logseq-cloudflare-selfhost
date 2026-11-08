@@ -2,6 +2,7 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 import { auditRetentionDays } from "../config";
 import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/common";
 import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
+import type { TokenScope } from "../auth/service-tokens";
 import type { GraphAccess } from "../tools/semantic";
 import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 
@@ -18,6 +19,7 @@ import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, ta
  *           includeSnapshot the scan is `limit` rows shorter, and the snapshots that fit the result
  *           are read by primary key after the page: still at most QUERY_SCAN_CAP
  *   recordRead INSERT of a kind = 'read' row, 2 written (READ_ROW_WRITES), 0 read
+ *   recordTokenEdit INSERT of a token_edit row with graph_id NULL, 2 written, 0 read
  *   probe   SELECT … LIMIT 0      0 read
  *   purge   oldest-row probe 1 read; with old rows, a DELETE over at most PURGE_BATCH ids
  *           (at most 501 more read, 1 written per row deleted)
@@ -126,6 +128,19 @@ export interface AuditPage {
   scanned: number;
   /** D1's own count of the rows both statements read. */
   rowsRead: number;
+}
+
+/** One applied service token edit (design 2026-11-08-edit-service-token-scope §3.6). */
+export interface TokenEdit {
+  at: number;
+  /** The token's name; the row's alias is `service:<name>`. */
+  name: string;
+  /** The owner's GitHub user id; the row's session is `github:<ownerId>`. */
+  ownerId: number;
+  /** The values the guarded UPDATE matched on. */
+  before: TokenScope;
+  /** The values read back after the UPDATE. */
+  after: TokenScope;
 }
 
 export interface PurgeResult {
@@ -420,6 +435,33 @@ export class AuditLog {
          VALUES (?, ?, ?, 'get_activity_log', 'read', 'ok', ?, ?, ?)`,
       )
       .bind(Date.now(), graphId, alias, JSON.stringify(addressed), READ_ROW_WRITES, rowsRead)
+      .run();
+    return result.meta.last_row_id;
+  }
+
+  /**
+   * Records one applied service token edit and answers the row's id. `graph_id` is NULL, so no
+   * `get`, `lookup`, `query` or get_activity_log call returns it. The scopes go inside `before.data`,
+   * not `targets`, which readers parse as AffectedTarget[]; only the three scope fields are kept, so
+   * the row holds names and ids and never the token or its hash. `added` and `removed` are by set,
+   * in the order the after and before lists give.
+   */
+  async recordTokenEdit(edit: TokenEdit): Promise<number> {
+    const scope = (s: TokenScope) => ({ graphIds: s.graphIds, access: s.access, expiresAt: s.expiresAt });
+    const had = new Set(edit.before.graphIds);
+    const has = new Set(edit.after.graphIds);
+    const data = {
+      before: scope(edit.before),
+      after: scope(edit.after),
+      added: [...has].filter((g) => !had.has(g)),
+      removed: [...had].filter((g) => !has.has(g)),
+    };
+    const result = await this.db
+      .prepare(
+        `INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, client, session, before)
+         VALUES (?, NULL, ?, 'token_edit', 'write', 'ok', 'wizard', ?, ?)`,
+      )
+      .bind(edit.at, `service:${edit.name}`, `github:${edit.ownerId}`, JSON.stringify({ source: "service_tokens", data }))
       .run();
     return result.meta.last_row_id;
   }
