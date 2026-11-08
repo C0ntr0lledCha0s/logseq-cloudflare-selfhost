@@ -17,8 +17,12 @@ import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.m
 
 export type { KbTitlesPage };
 
-/** Longest draft accepted, in characters. */
-export const TEXT_LIMIT = 20_000;
+/**
+ * Longest draft accepted, in characters. With 20,000 index pages, parsing the titles key and
+ * matching a draft this long takes a median of 9 to 10 ms in scripts/bench-suggest-links.mjs,
+ * against the front Worker's 10 ms CPU (spec section 5).
+ */
+export const TEXT_LIMIT = 10_000;
 /** Suggestions returned when the call names no limit, and the most it may name. */
 export const DEFAULT_LIMIT = 25;
 export const MAX_LIMIT = 50;
@@ -72,7 +76,11 @@ export interface MatchResult {
   /** Distinct stoplisted titles and aliases the draft mentions. */
   skippedStoplist: number;
   truncated: boolean;
-  /** Titles and aliases tokenised to build the candidate map (spec 3.3 c's bound). */
+  /**
+   * Titles and aliases tokenised to build the candidate map (spec 3.3 c's bound): only those whose
+   * first word is in the draft and, for a name of two or more words, whose first two words are
+   * next to each other in it.
+   */
   tokenised: number;
 }
 
@@ -88,12 +96,12 @@ const OUTLINE_PREFIX = /^[ \t]*(?:-[ \t]+)?/;
 const BLOCK_OPEN = /^#\+BEGIN_(SRC|QUOTE|EXPORT)\b/i;
 const PROPERTY_KEY = /^[^\s:]+::/;
 // Inline masks, tried in this order at each position. Groups: 1 [[link]] text, 2 markdown link
-// target, 3 #tag text.
+// target, 3 #tag text, 4 the backticks that open inline code (closed by a run of the same length,
+// so ``code with ` inside`` is one range).
 const INLINE = new RegExp(
   [
     String.raw`\$\$[\s\S]*?\$\$`,
     String.raw`\\\([\s\S]*?\\\)`,
-    "`[^`\\n]+`",
     String.raw`\[\[([^\n]*?)\]\]`,
     String.raw`\[[^\[\]\n]*\]\(([^)\n]*)\)`,
     String.raw`(?<![^\s(])#([^\s#\[\](){},;!?"']+)`,
@@ -101,6 +109,7 @@ const INLINE = new RegExp(
     String.raw`\{\{[^\n]*?\}\}`,
     String.raw`[a-z][a-z0-9+.-]*:\/\/\S+`,
     String.raw`www\.\S+`,
+    "(?<!`)(`+)(?!`)[^\\n]*?[^`\\n]\\4(?!`)",
   ].join("|"),
   "giu",
 );
@@ -108,6 +117,7 @@ const PAGE_LINK = /^\[\[(.*)\]\]$/;
 const TAG_TRAILING = /[.:]+$/;
 const JOINERS = /^[ \t\u00a0\u2010\u2011-]+$/;
 const ALL_DIGITS = /^\p{N}+$/u;
+const WORD_CHAR = /^[\p{L}\p{N}]/u;
 
 /**
  * The ranges no suggestion may touch (spec 3.3 a), and the link text found outside code. One pass
@@ -185,22 +195,119 @@ function isAsciiWordChar(c: number): boolean {
   return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
 
-/** `firstWord`, with a loop for ASCII names so most of 20,000 titles cost no regex. */
-function leadingWord(name: string): string | undefined {
+// Hashes of lower-cased words (30 bits, so V8 keeps them as small integers), so the walk over every
+// title and alias allocates no strings. A hash only rules a name out: a name that passes has its
+// first word checked exactly before it is tokenised, and `fits` checks every word.
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+
+function wordHash(word: string): number {
+  let h = FNV_OFFSET;
+  for (let i = 0; i < word.length; i++) h = Math.imul(h ^ word.charCodeAt(i), FNV_PRIME);
+  return h & 0x3fffffff;
+}
+
+function pairHash(first: number, second: number): number {
+  return (Math.imul(first ^ 0x5bd1e995, FNV_PRIME) ^ second) & 0x3fffffff;
+}
+
+/** The bounds of the first word `scanLead` passed. */
+const lead = { start: 0, end: 0 };
+
+/** What `scanLead` says of a name. */
+const NON_ASCII = -1;
+const RULED_OUT = 0;
+const ONE_WORD = 1;
+const MORE_WORDS = 2;
+
+/**
+ * Whether `name` could match the draft, by a loop over its ASCII characters that allocates
+ * nothing: RULED_OUT when it has no word, its first word's hash is not in `firsts`, or the hash of
+ * its first two words is not in `pairs`; else ONE_WORD or MORE_WORDS, with the first word's bounds
+ * in `lead`. NON_ASCII when a non-ASCII character comes before the second word ends: the caller
+ * then uses `firstWord` and `wordSpans`, which split the same way.
+ */
+function scanLead(name: string, firsts: Set<number>, pairs: Set<number>): number {
   let i = 0;
-  for (; i < name.length; i++) {
-    const c = name.charCodeAt(i);
-    if (c >= 128) return firstWord(name);
-    if (isAsciiWordChar(c)) break;
+  let first = 0;
+  for (let found = 0; found < 2; found++) {
+    for (; i < name.length; i++) {
+      const c = name.charCodeAt(i);
+      if (c >= 128) return NON_ASCII;
+      if (isAsciiWordChar(c)) break;
+    }
+    if (i === name.length) return found === 0 ? RULED_OUT : ONE_WORD;
+    let h = FNV_OFFSET;
+    let j = i;
+    for (; j < name.length; j++) {
+      const c = name.charCodeAt(j);
+      if (c >= 128) return NON_ASCII;
+      if (!isAsciiWordChar(c)) break;
+      h = Math.imul(h ^ (c >= 65 && c <= 90 ? c + 32 : c), FNV_PRIME);
+    }
+    h &= 0x3fffffff;
+    if (found === 0) {
+      if (!firsts.has(h)) return RULED_OUT;
+      first = h;
+      lead.start = i;
+      lead.end = j;
+    } else if (!pairs.has(pairHash(first, h))) {
+      return RULED_OUT;
+    }
+    i = j;
   }
-  if (i === name.length) return undefined;
-  let j = i;
-  for (; j < name.length; j++) {
-    const c = name.charCodeAt(j);
-    if (c >= 128) return firstWord(name);
-    if (!isAsciiWordChar(c)) break;
+  return MORE_WORDS;
+}
+
+function isSpace(c: number): boolean {
+  return (
+    c === 32 ||
+    (c >= 9 && c <= 13) ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+function isWordCharAt(text: string, i: number): boolean {
+  if (i >= text.length) return false;
+  const c = text.charCodeAt(i);
+  return c < 128 ? isAsciiWordChar(c) : WORD_CHAR.test(text.slice(i, i + 2));
+}
+
+/**
+ * Whether a match at [start, end) would sit inside an email address, a domain, a path or an
+ * identifier: the rest of its run of non-space characters holds an `@`, `/`, `\`, `_` or a `.`
+ * before a letter or digit. One pass builds prefix counts of those characters and each position's
+ * run bounds, so each check costs O(1).
+ */
+function glueCheck(text: string): (start: number, end: number) => boolean {
+  const n = text.length;
+  const glue = new Int32Array(n + 1);
+  const runStart = new Int32Array(n + 1);
+  const runEnd = new Int32Array(n + 1);
+  let from = 0;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    const marker = c === 64 || c === 47 || c === 92 || c === 95 || (c === 46 && isWordCharAt(text, i + 1));
+    glue[i + 1] = glue[i] + (marker ? 1 : 0);
+    runStart[i] = from;
+    if (isSpace(c)) from = i + 1;
   }
-  return name.slice(i, j).toLowerCase();
+  runStart[n] = from;
+  let to = n;
+  runEnd[n] = n;
+  for (let i = n - 1; i >= 0; i--) {
+    if (isSpace(text.charCodeAt(i))) to = i;
+    runEnd[i] = to;
+  }
+  return (start, end) => glue[start] - glue[runStart[start]] > 0 || glue[runEnd[end]] - glue[end] > 0;
 }
 
 interface Name {
@@ -213,8 +320,11 @@ interface Name {
 }
 
 interface Candidate {
+  /** The words, with each gap between them: one space for joiners, else the name's own characters. */
   key: string;
   words: string[];
+  /** `gaps[k]` comes before `words[k + 1]`: " " for joiners, else the characters the name has there. */
+  gaps: string[];
   names: Name[];
   /** Every name is stoplisted. */
   stop: boolean;
@@ -240,49 +350,97 @@ export function matchLinks(
     masked.push(r < ranges.length && ranges[r][0] < s.end);
   }
 
-  // Only titles whose first word the draft has (unmasked, or as link text) are tokenised.
+  // Only titles whose first word the draft has (unmasked, or as link text), and whose first two
+  // words are next to each other in it, are tokenised.
   const wanted = new Set<string>();
-  spans.forEach((s, i) => masked[i] || wanted.add(s.word));
+  const wantedHash = new Set<number>();
+  const pairsHash = new Set<number>();
+  const want = (words: string[], hashes: number[]) => {
+    for (let i = 0; i < words.length; i++) {
+      wanted.add(words[i]);
+      wantedHash.add(hashes[i]);
+      if (i + 1 < words.length) pairsHash.add(pairHash(hashes[i], hashes[i + 1]));
+    }
+  };
+  // Runs of unmasked words; a masked word breaks a run, so no pair spans a mask.
+  let run: string[] = [];
+  let runHashes: number[] = [];
+  spans.forEach((s, i) => {
+    if (masked[i]) {
+      want(run, runHashes);
+      run = [];
+      runHashes = [];
+    } else {
+      run.push(s.word);
+      runHashes.push(wordHash(s.word));
+    }
+  });
+  want(run, runHashes);
   const linkedLower = linked.map((l) => l.toLowerCase());
   for (const l of linked) {
-    const w = firstWord(l);
-    if (w !== undefined) wanted.add(w);
+    const ws = wordSpans(l).slice(0, 2).map((w) => w.word);
+    want(ws, ws.map(wordHash));
   }
 
   const byKey = new Map<string, Candidate>();
   let tokenised = 0;
   const add = (uuid: string, title: string, name: string, alias: string | undefined) => {
-    const first = leadingWord(name);
-    if (first === undefined || !wanted.has(first)) return;
+    const found = scanLead(name, wantedHash, pairsHash);
+    if (found === RULED_OUT) return;
+    let first: string | undefined;
+    if (found === NON_ASCII) {
+      first = firstWord(name);
+      if (first === undefined || !wanted.has(first)) return;
+    } else {
+      first = name.slice(lead.start, lead.end).toLowerCase();
+      if (!wanted.has(first)) return;
+    }
     tokenised++;
-    const words = wordSpans(name).map((s) => s.word);
-    const key = words.join(" ");
+    // A one-word ASCII name is its first word: no regex needed.
+    const ws = found === ONE_WORD ? [{ word: first, start: lead.start, end: lead.end }] : wordSpans(name);
+    if (found === NON_ASCII && ws.length > 1 && !pairsHash.has(pairHash(wordHash(ws[0].word), wordHash(ws[1].word)))) return;
+    const words = ws.map((w) => w.word);
+    const gaps: string[] = [];
+    let key = words[0];
+    for (let k = 1; k < ws.length; k++) {
+      const gap = name.slice(ws[k - 1].end, ws[k].start);
+      gaps.push(JOINERS.test(gap) ? " " : gap);
+      key += gaps[k - 1] + words[k];
+    }
     let c = byKey.get(key);
     if (!c) {
-      c = { key, words, names: [], stop: false, pages: [] };
+      c = { key, words, gaps, names: [], stop: false, pages: [] };
       byKey.set(key, c);
     }
     c.names.push({ uuid, title, alias, lower: name.toLowerCase(), stop: stoplisted(words, alias !== undefined) });
   };
-  for (const [uuid, title, aliases] of titles) {
-    add(uuid, title, title, undefined);
-    for (const alias of aliases) add(uuid, title, alias, alias);
+  // Indexed loops: destructuring 20,000 entries through the iterator protocol costs milliseconds.
+  for (let t = 0; t < titles.length; t++) {
+    const page = titles[t];
+    add(page[0], page[1], page[1], undefined);
+    const aliases = page[2];
+    for (let a = 0; a < aliases.length; a++) add(page[0], page[1], aliases[a], aliases[a]);
   }
 
   // A page whose title is another page's alias is that alias's page, not a candidate of its own.
   const byLower = new Map<string, Name[]>();
   for (const c of byKey.values()) {
-    const aliasOwners = new Set(c.names.filter((n) => n.alias !== undefined).map((n) => n.uuid));
-    c.names = c.names.filter((n) => n.alias !== undefined || ![...aliasOwners].some((u) => u !== n.uuid));
-    const live = c.names.filter((n) => !n.stop);
+    // One name (most candidates) needs no alias rule, and allocates nothing here.
+    if (c.names.length > 1) {
+      const aliasOwners = new Set(c.names.filter((n) => n.alias !== undefined).map((n) => n.uuid));
+      c.names = c.names.filter((n) => n.alias !== undefined || ![...aliasOwners].some((u) => u !== n.uuid));
+    }
+    const live = c.names.length === 1 ? (c.names[0].stop ? [] : c.names) : c.names.filter((n) => !n.stop);
     c.stop = live.length === 0;
     // A page's title comes before its aliases in `titles`, so a page matched both ways keeps the title.
-    const pages = new Map<string, Name>();
+    const pages = live.length > 1 ? new Map<string, Name>() : null;
     for (const n of live) {
-      if (!pages.has(n.uuid)) pages.set(n.uuid, n);
-      byLower.set(n.lower, [...(byLower.get(n.lower) ?? []), n]);
+      if (pages && !pages.has(n.uuid)) pages.set(n.uuid, n);
+      const same = byLower.get(n.lower);
+      if (same) same.push(n);
+      else byLower.set(n.lower, [n]);
     }
-    c.pages = [...pages.values()];
+    c.pages = pages ? [...pages.values()] : live;
   }
 
   const linkedPages = new Set<string>();
@@ -298,17 +456,27 @@ export function matchLinks(
   const byFirst = new Map<string, Candidate[]>();
   for (const c of byKey.values()) {
     c.pages = c.pages.filter((n) => !opts.exclude.has(n.uuid) && !linkedPages.has(n.uuid));
-    byFirst.set(c.words[0], [...(byFirst.get(c.words[0]) ?? []), c]);
+    const list = byFirst.get(c.words[0]);
+    if (list) list.push(c);
+    else byFirst.set(c.words[0], [c]);
   }
   for (const list of byFirst.values()) list.sort((a, b) => b.words.length - a.words.length);
 
-  const fits = (words: string[], i: number): boolean => {
+  // A gap the name fills with joiners takes any joiners; one with its own punctuation (Node.js,
+  // R&D) takes exactly those characters.
+  let glued: ((start: number, end: number) => boolean) | undefined;
+  const fits = (c: Candidate, i: number): boolean => {
+    const { words, gaps } = c;
     for (let k = 0; k < words.length; k++) {
       const j = i + k;
       if (j >= spans.length || masked[j] || spans[j].word !== words[k]) return false;
-      if (k > 0 && !JOINERS.test(text.slice(spans[j - 1].end, spans[j].start))) return false;
+      if (k > 0) {
+        const gap = text.slice(spans[j - 1].end, spans[j].start);
+        if (gaps[k - 1] === " " ? !JOINERS.test(gap) : gap !== gaps[k - 1]) return false;
+      }
     }
-    return true;
+    glued ??= glueCheck(text);
+    return !glued(spans[i].start, spans[i + words.length - 1].end);
   };
 
   let line = 1;
@@ -359,7 +527,7 @@ export function matchLinks(
   for (let i = 0; i < spans.length; ) {
     let taken = 1;
     for (const c of byFirst.get(spans[i].word) ?? []) {
-      if (!fits(c.words, i)) continue;
+      if (!fits(c, i)) continue;
       if (c.stop) {
         stopHits.add(c.key);
         continue;
@@ -422,9 +590,9 @@ export function thousands(n: number): string {
 }
 
 export const SUGGEST_LINKS_DESCRIPTION =
-  `Suggest [[links]] to pages that already exist for draft markdown you are about to write (up to ${thousands(TEXT_LIMIT)} characters). Read-only: it never writes. ` +
-  "Each suggestion gives the matched span (start, end, line, text), the page's title and UUID, the link to write and the reason (its title, or an alias of it). Matching is whole words, ignoring case, longest title first, and once per page (also_mentioned counts the later mentions); a page the draft already links is listed under already_linked. " +
-  "Text inside [[links]], tags, block refs, macros, markdown links, URLs, inline code, code blocks, math, quotes and property keys is never matched, nor are short or common titles (skipped_stoplist counts them). " +
+  `Suggest [[links]] to pages that already exist for draft markdown you are about to write (up to ${thousands(TEXT_LIMIT)} characters; call it once per part of a longer draft). Read-only: it never writes. ` +
+  "Each suggestion gives the matched span (start, end, line, text), the page's title and UUID, the link to write and the reason (its title, or an alias of it). Matching is whole words, ignoring case, longest title first, and once per page (also_mentioned counts the later mentions). Spaces and hyphens between a title's words are interchangeable, but punctuation inside a title (Node.js, R&D Budget) must appear as the title has it. A page the draft already links is listed under already_linked. " +
+  "Text inside [[links]], tags, block refs, macros, markdown links, URLs, inline code, code blocks, math, quotes and property keys is never matched, nor is a word joined into an email address, domain, path or identifier (by @, /, \\, _ or a dot before a letter or digit), nor are short or common titles (skipped_stoplist counts them). " +
   "Only pages in the knowledge index are suggested: no journals, tags, properties or pages tagged private. Two pages sharing a title are listed under ambiguous and never linked: ask which one is meant. " +
   `page names the page being written (UUID or title), and exclude names up to ${EXCLUDE_LIMIT} more pages never to suggest. limit is at most ${MAX_LIMIT} suggestions (default ${DEFAULT_LIMIT}), in draft order; truncated says when there were more. ` +
   "verify (default true) reads the suggested pages back with one getBlocks request and moves any deleted since the index was built to dropped_stale; verify: false skips that and the first line says the UUIDs are unverified. " +

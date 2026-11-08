@@ -40,7 +40,7 @@ test("--json reports parse and match times on a 500-page fixture, and the tokeni
 
   assert.equal(out.pages, 500);
   assert.equal(out.runs, 3);
-  assert.equal(out.draftChars, 20_000);
+  assert.equal(out.draftChars, 10_000);
   assert.equal(out.budgetMs, 10);
   assert.ok(out.titlesBytes > 0);
   for (const k of ["parseMs", "matchMs", "totalMs"]) {
@@ -54,13 +54,25 @@ test("--json reports parse and match times on a 500-page fixture, and the tokeni
   // bound is worked out here, apart from the bench, from the same seeded fixture.
   const { makeTitles, makeDraft } = await import(script);
   const titles = makeTitles(500);
-  const draftWords = new Set(words(makeDraft(titles, 20_000)));
+  const draftWords = new Set(words(makeDraft(titles, 10_000)));
   const names = titles.flatMap(([, title, aliases]) => [title, ...aliases]);
   const bound = names.filter((n) => draftWords.has(words(n)[0])).length;
   assert.equal(out.firstWordBound, bound);
   assert.ok(out.tokenised > 0);
   assert.ok(out.tokenised <= bound, `tokenised ${out.tokenised} > bound ${bound}`);
   assert.ok(bound < names.length, "the fixture has titles the draft never starts, so the bound is a real cut");
+
+  // r1-light-1: a name of two or more words is tokenised only when its first two words are also
+  // next to each other in the draft (outside [[links]] and `code`, or inside a link's text). The
+  // pair bound is worked out here from plain word pairs, which can only over-count.
+  const draftList = words(makeDraft(titles, 10_000));
+  const pairs = new Set(draftList.slice(1).map((w, i) => `${draftList[i]} ${w}`));
+  const pairBound = names.filter((n) => {
+    const w = words(n);
+    return draftWords.has(w[0]) && (w.length === 1 || pairs.has(`${w[0]} ${w[1]}`));
+  }).length;
+  assert.ok(out.tokenised <= pairBound, `tokenised ${out.tokenised} > pair bound ${pairBound}`);
+  assert.ok(pairBound < bound, `the pair bound ${pairBound} is a real cut of the first-word bound ${bound}`);
 });
 
 test("text output names the budget and both medians", { skip }, () => {

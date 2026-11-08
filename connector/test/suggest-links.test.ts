@@ -77,7 +77,7 @@ function at(text: string, needle: string, nth = 0): number {
 
 describe("constants", () => {
   it("are the plan's values, and COMMON_TITLES is spec 3.3 d verbatim", () => {
-    expect([TEXT_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, EXCLUDE_LIMIT]).toEqual([20_000, 25, 50, 50]);
+    expect([TEXT_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, EXCLUDE_LIMIT]).toEqual([10_000, 25, 50, 50]);
     expect([RELATED_LIMIT, RELATED_TEXT_CHARS, RELATED_TOP_K, MIN_SINGLE_WORD_CHARS]).toEqual([5, 2_000, 20, 4]);
     expect([...COMMON_TITLES]).toEqual(
       "note notes meeting meetings task tasks todo done doing later now idea ideas summary today tomorrow yesterday project projects person people area areas resource resources page journal tag inbox draft archive misc general home index test".split(
@@ -349,6 +349,175 @@ describe("matchLinks: masks (one rule each, with the same title matching outside
   });
 });
 
+describe("matchLinks: masks on an earlier line than a quote or property key (r1-tests-1)", () => {
+  // maskRanges pushes quote and property-key ranges during its line scan and the inline ranges of
+  // a segment only when that segment ends, so its ranges come out of order; the sort puts them right.
+  it("keeps an inline range that comes before a quote line", () => {
+    const text = "Run `Workflow Intelligence` now\n> a quote\nWorkflow Intelligence.";
+    expect(maskRanges(text).ranges).toEqual([
+      [4, 27],
+      [32, 41],
+    ]);
+  });
+
+  const inlineForms: [string, string][] = [
+    ["inline code", "`Workflow Intelligence`"],
+    ["a [[link]]", "[[Workflow Intelligence roadmap]]"],
+    ["a scheme:// URL", "https://example.com/Workflow-Intelligence"],
+    ["a {{macro}}", '{{query "Workflow Intelligence"}}'],
+  ];
+  const lineForms: [string, string][] = [
+    ["a > quote line", "> a quote"],
+    ["a property key", "status:: open"],
+  ];
+  for (const [inlineName, inline] of inlineForms) {
+    for (const [lineName, line] of lineForms) {
+      it(`masks ${inlineName} on a line before ${lineName}, and matches only outside both`, () => {
+        const text = `Run ${inline} now\n${line}\nWorkflow Intelligence.`;
+        expect(hits(text)).toEqual([["Workflow Intelligence", at(text, "Workflow Intelligence.")]]);
+      });
+    }
+  }
+});
+
+describe("matchLinks: punctuation inside a title (r1-correctness-1)", () => {
+  const NODE = "00000000-0000-4000-8000-0000000000e1";
+  const MOTHERS = "00000000-0000-4000-8000-0000000000e2";
+  const RD = "00000000-0000-4000-8000-0000000000e3";
+  const Q3Q4 = "00000000-0000-4000-8000-0000000000e4";
+  const APOLLO = "00000000-0000-4000-8000-0000000000e5";
+  const TITLES: KbTitlesPage[] = [
+    [NODE, "Node.js", []],
+    [MOTHERS, "Mother's Day", []],
+    [RD, "R&D Budget", []],
+    [Q3Q4, "Q3/Q4 Planning", []],
+    [APOLLO, "Project: Apollo", []],
+  ];
+
+  it("matches each title's own wording, ignoring case", () => {
+    for (const [title, text] of [
+      ["Node.js", "We moved to Node.js today."],
+      ["Node.js", "We moved to NODE.JS today."],
+      ["Mother's Day", "Plan for Mother's Day."],
+      ["R&D Budget", "The R&D Budget was cut."],
+      ["Q3/Q4 Planning", "Q3/Q4 Planning starts"],
+      ["Project: Apollo", "See project: apollo for more."],
+    ]) {
+      const start = text.toLowerCase().indexOf(title.toLowerCase());
+      expect(hits(text, TITLES), text).toEqual([[title, start]]);
+    }
+    const text = "Plan for Mother's Day.";
+    expect(applyLinks(text, match(text, TITLES).suggestions)).toBe("Plan for [[Mother's Day]].");
+  });
+
+  it("does not match a spelling with other separators in place of the title's punctuation", () => {
+    for (const text of [
+      "node js is fast",
+      "node-js is fast",
+      "Plan for Mother Day.",
+      "Plan for Mother’s Day.",
+      "The R D budget was cut.",
+      "The R-D Budget was cut.",
+      "Q3 Q4 Planning starts",
+      "Q3-Q4 Planning starts",
+      "See project apollo for more.",
+      "See project:apollo for more.",
+    ]) {
+      expect(hits(text, TITLES), text).toEqual([]);
+    }
+  });
+
+  it("keeps a title's spaces and hyphens interchangeable around its punctuation", () => {
+    const text = "The R&D-Budget was cut.";
+    expect(hits(text, TITLES)).toEqual([["R&D Budget", at(text, "R&D")]]);
+  });
+
+  it("titles with the same words but different punctuation are different pages, not ambiguous", () => {
+    const NODE_JS = "00000000-0000-4000-8000-0000000000e6";
+    const titles: KbTitlesPage[] = [...TITLES, [NODE_JS, "Node JS", []]];
+    const text = "Node.js and Node JS";
+    const result = match(text, titles);
+    expect(result.ambiguous).toEqual([]);
+    expect(result.suggestions.map((s) => [s.page.title, s.span.start])).toEqual([
+      ["Node.js", 0],
+      ["Node JS", at(text, "Node JS")],
+    ]);
+    // The same punctuation in another case is the same title, so two such pages are ambiguous.
+    const twin: KbTitlesPage[] = [...TITLES, ["00000000-0000-4000-8000-0000000000e7", "node.JS", []]];
+    expect(match("We use Node.js.", twin).ambiguous.map((a) => a.candidates.map((c) => c.title))).toEqual([["Node.js", "node.JS"]]);
+  });
+
+  it("counts a [[link]] to a punctuated title as already linked", () => {
+    const result = match("See [[node.js]], then Node.js again.", TITLES);
+    expect(result.alreadyLinked).toEqual(["Node.js"]);
+    expect(result.suggestions).toEqual([]);
+  });
+});
+
+describe("matchLinks: words joined into an address, domain or path (r1-correctness-2, r1-integrity-1)", () => {
+  const ACME = "00000000-0000-4000-8000-0000000000f1";
+  const TITLES: KbTitlesPage[] = [
+    [ACME, "Acme", []],
+    ["00000000-0000-4000-8000-0000000000f2", "React", []],
+    ["00000000-0000-4000-8000-0000000000f3", "GitHub", []],
+    ["00000000-0000-4000-8000-0000000000f4", "Workflow", []],
+    ["00000000-0000-4000-8000-0000000000f5", "Kubernetes", []],
+    ["00000000-0000-4000-8000-0000000000f6", "Head of Sales", []],
+  ];
+  // The decoy comes first; the same title then matches on its own, so only the rule stops the decoy.
+  const cases: [string, string, string][] = [
+    ["an email address", "Email jane@acme.com about it, then Acme.", "Acme."],
+    ["an email address's local part", "Email acme@example.com about it, then Acme.", "Acme."],
+    ["a mailto: address", "Write to mailto:sales@acme.com or Acme.", "Acme."],
+    ["a bare domain", "See acme.com for Acme.", "Acme."],
+    ["a bare domain with a path", "See acme.com/pricing for Acme.", "Acme."],
+    ["a hyphenated bare domain", "See acme-corp.com for Acme.", "Acme."],
+    ["a subdomain", "See docs.acme.io for Acme.", "Acme."],
+    ["a domain's later part", "Repo github.com/example/react and React.", "React."],
+    ["a home path", "Run it in ~/code/react, then React.", "React."],
+    ["a relative path", "Edit .github/workflows/workflow.yml for the Workflow.", "Workflow."],
+    ["a path's first part", "Run kubernetes/deploy.sh on Kubernetes.", "Kubernetes."],
+    ["a Windows path", "Open C:\\Users\\acme\\notes for Acme.", "Acme."],
+    ["a file name", "Open workflow.yml for the Workflow.", "Workflow."],
+    ["an identifier with _", "Set acme_api_key for Acme.", "Acme."],
+    ["a multi-word title in a path", "See /teams/head of sales/plan for the Head of Sales.", "Head of Sales."],
+    ["double-backtick inline code", "Use ``code with `Acme` inside`` here, then Acme.", "Acme."],
+  ];
+  for (const [name, text, outside] of cases) {
+    it(`does not match inside ${name}`, () => {
+      expect(hits(text, TITLES)).toEqual([[outside.replace(/\.$/, ""), at(text, outside)]]);
+    });
+  }
+
+  it("still matches next to sentence punctuation, brackets, quotes and a possessive", () => {
+    for (const text of [
+      "Talk to Acme.",
+      "Talk to Acme, then",
+      "Talk to (Acme) now",
+      "Talk to “Acme” now",
+      "Talk to Acme's team",
+      "Talk to Acme: now",
+      "Talk to Acme... now",
+      "Talk to **Acme** now",
+      "Acme",
+    ]) {
+      expect(hits(text, TITLES), text).toEqual([["Acme", at(text, "Acme")]]);
+    }
+  });
+
+  it("linked_text leaves the address, domain and path whole", () => {
+    const text = "Email jane@acme.com, see acme.com/pricing and ~/code/react; Acme and React.";
+    expect(applyLinks(text, match(text, TITLES).suggestions)).toBe(
+      "Email jane@acme.com, see acme.com/pricing and ~/code/react; [[Acme]] and [[React]].",
+    );
+  });
+
+  it("masks double-backtick inline code as one range", () => {
+    expect(maskRanges("Use ``code with `Acme` inside`` here").ranges).toEqual([[4, 31]]);
+    expect(maskRanges("a `b` c").ranges).toEqual([[2, 5]]);
+  });
+});
+
 describe("matchLinks: already linked", () => {
   it("skips a page linked earlier in any case, and lists it", () => {
     const text = "See [[workflow intelligence]]. Later, Workflow Intelligence again.";
@@ -586,6 +755,43 @@ describe("matchLinks: cost is sized by the draft", () => {
     expect(result.tokenised).toBeGreaterThan(0);
     expect(result.tokenised).toBeLessThanOrEqual(bound);
     expect(result.suggestions.map((s) => s.page.title)).toEqual(["Topic70 Review"]);
+  });
+});
+
+describe("matchLinks: cost is bounded by the draft's word pairs (r1-light-1)", () => {
+  it("tokenises a multi-word title only when its first two words are next to each other in the draft", () => {
+    const titles: KbTitlesPage[] = [];
+    for (let i = 0; i < 20_000; i++) {
+      titles.push([`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `Review Topic${i}`, []]);
+    }
+    // Every title starts with a draft word, but only one has its first two words side by side.
+    const draft = "Review the plan. We review the topic7 notes, and Topic9 later. Review Topic70 today.";
+    const result = match(draft, titles);
+    expect(result.tokenised).toBe(1);
+    expect(result.suggestions.map((s) => s.page.title)).toEqual(["Review Topic70"]);
+  });
+
+  it("does not count a pair across a masked range, and counts a pair inside a [[link]] for already_linked", () => {
+    const titles: KbTitlesPage[] = [
+      ["00000000-0000-4000-8000-0000000000c1", "Launch Plan", []],
+      ["00000000-0000-4000-8000-0000000000c2", "Launch Review", []],
+    ];
+    const result = match("Launch `x` Plan, and see [[Launch Review]].", titles);
+    expect(result.tokenised).toBe(1);
+    expect(result.alreadyLinked).toEqual(["Launch Review"]);
+    expect(result.suggestions).toEqual([]);
+  });
+
+  it("checks a non-ASCII title's first two words by tokenising it, and still matches it", () => {
+    const titles: KbTitlesPage[] = [
+      ["00000000-0000-4000-8000-0000000000c3", "Māori Health", []],
+      ["00000000-0000-4000-8000-0000000000c4", "Māori Language", []],
+      ["00000000-0000-4000-8000-0000000000c5", "Ōtautahi Office", []],
+    ];
+    const result = match("Māori health and language.", titles);
+    // The two Māori titles start with a draft word, so both are tokenised; Ōtautahi Office is not.
+    expect(result.tokenised).toBe(2);
+    expect(result.suggestions.map((s) => s.page.title)).toEqual(["Māori Health"]);
   });
 });
 
@@ -1018,7 +1224,7 @@ describe("suggest_links tool", () => {
 
   it("text over the limit is refused before any KV or sync call; the limit itself is accepted", async () => {
     const refused = await suggest({ text: "x".repeat(TEXT_LIMIT + 1) });
-    expect(refused).toEqual({ isError: true, text: "text: 20,001 characters is over the 20,000 limit" });
+    expect(refused).toEqual({ isError: true, text: "text: 10,001 characters is over the 10,000 limit" });
     expect(requests).toEqual([]);
     expect(kvCounts.get + kvCounts.put).toBe(0);
 

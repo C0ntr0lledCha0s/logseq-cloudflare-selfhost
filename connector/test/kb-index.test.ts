@@ -519,6 +519,29 @@ describe("titles key", () => {
       }
     });
 
+    it("writes the titles key before the record, so a failed titles write leaves no newer record (r1-tests-2)", async () => {
+      await callTool("kb_index", { graph: "work" });
+      const old = (await kvJson<{ builtAt: number }>("kb-index:work"))!;
+      await env.KB_INDEX_KV.put("kb-index-dirty:work", String(Date.now()));
+      const kv = env.KB_INDEX_KV;
+      const order: string[] = [];
+      const failing = {
+        get: kv.get.bind(kv),
+        list: kv.list.bind(kv),
+        delete: kv.delete.bind(kv),
+        put: async (key: string, ...rest: unknown[]) => {
+          order.push(key);
+          if (key.startsWith("kb-index-titles:")) throw new Error("KV put failed: daily write limit");
+          return (kv.put as (...a: unknown[]) => Promise<void>)(key, ...rest);
+        },
+      } as unknown as KVNamespace;
+      await expect(loadTitles(access({ ...testEnv(), KB_INDEX_KV: failing } as Env), "work", Date.now())).rejects.toThrow(
+        "daily write limit",
+      );
+      expect(order).toEqual(["kb-index-titles:work"]);
+      expect((await kvJson<{ builtAt: number }>("kb-index:work"))?.builtAt).toBe(old.builtAt);
+    });
+
     it("rebuilds when the titles key holds another graph", async () => {
       await callTool("kb_index", { graph: "work" });
       const titlesKey = "kb-index-titles:work";

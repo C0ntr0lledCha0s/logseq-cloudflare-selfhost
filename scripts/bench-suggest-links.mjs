@@ -24,7 +24,7 @@ export const BUDGET_MS = 10;
 /** Over the budget means strictly more than 10 ms; exactly 10 ms fits. */
 export const isOverBudget = (ms) => ms > BUDGET_MS;
 /** suggest_links's TEXT_LIMIT: the longest draft it accepts. */
-export const DRAFT_CHARS = 20_000;
+export const DRAFT_CHARS = 10_000;
 export const DEFAULT_PAGES = 20_000;
 export const DEFAULT_RUNS = 20;
 /** suggest_links's DEFAULT_LIMIT. */

@@ -98,6 +98,8 @@ matchLinks(text: string, titles: TitlesPage[], opts: { exclude: Set<string>; lim
 - bare URLs (`scheme://…` and `www.…`, to the next whitespace);
 - property keys before `::`.
 
+*As built (review round 1):* inline code closes on a run of as many backticks as opened it, so ``` ``code with `x` inside`` ``` is one range. A match is also refused when the rest of its run of non-space characters holds `@`, `/`, `\`, `_` or a `.` before a letter or digit, so a title is never linked inside an email address (`jane@acme.com`), a bare domain (`acme.com/pricing`), a path (`~/code/react`, `.github/workflows/workflow.yml`) or an identifier (`acme_api_key`). This is a rule on the match, not a mask, so a title with a dot of its own (`Node.js`) still matches; punctuation inside the match is the title's own.
+
 Every `[[Title]]` or `#[[Title]]` or `#Title` in the draft also goes into an already-linked set, matched ignoring case against titles and aliases. A page already linked anywhere in the draft is never suggested and is listed under `already_linked`.
 
 **b. Tokenising.** A new export in `semantic/ranking.ts`:
@@ -112,6 +114,8 @@ It matches `/[\p{L}\p{N}]+/gu`, the same character class `contentWords` splits o
 
 *As built (Stage 2):* the counter is `MatchResult.tokenised`, not module state. The first-word scan is a loop over ASCII names; a name with a non-ASCII character before its first word ends uses one regex (`firstWord` in `ranking.ts`, the same character class). The first words of the draft's `[[link]]` texts also join the Set, so a link to an alias finds its page.
 
+*As built (review round 1, cost):* the walk over every title and alias hashes each name's first word (and second, when it has one) in an ASCII loop that allocates nothing, and drops the name unless the hash of its first word is among the draft's words and the hash of its first two words is among the pairs of words next to each other in the draft (unmasked, or in a `[[link]]`'s text). A name that passes has its first word checked exactly before it is tokenised; a hash collision only costs one tokenisation, and `fits` checks every word. A one-word ASCII name skips the regex. `tokenised` counts the names past the first-word check, so it stays within the first-word bound and, for ASCII names, within the pair bound.
+
 **d. Stoplist** (an exported constant; each rule has its own test). A title or alias is never suggested if:
 
 1. every word in it is in `STOPWORDS`;
@@ -124,6 +128,8 @@ Multi-word titles that contain a stopword, such as "Head of Sales", still match.
 *As built (Stage 2, call):* rule 2 applies to page titles, not aliases. An alias is a short name the owner chose for the page, and section 3.7's own example suggests `[[OI]]`, which rule 2 would stop. `skipped_stoplist` counts the distinct stoplisted titles and aliases the draft mentions outside masks.
 
 **e. Matching.** Leftmost-longest over the unmasked words: at each word position the longest candidate wins, by word count and then by characters, so "Workflow Intelligence" beats "Workflow". A match must cover consecutive words with no masked range and no line break between them, and the characters between its words must be only spaces, hyphens or similar joiners. Because tokens are whole words, "Workflows" does not match "Workflow". Matching ignores case.
+
+*As built (review round 1):* a gap the title fills with joiners takes any joiners in the draft; a gap with other characters (`Node.js`, `R&D Budget`, `Q3/Q4 Planning`, `Project: Apollo`) takes exactly those characters, so a title matches its own wording and "node js" does not match `Node.js`. Candidates are grouped by their words and these gaps (a joiner gap counts as one space), so `Node.js` and `Node JS` are two candidates, not one ambiguous one. A curly apostrophe does not match a straight one.
 
 *As built (Stage 2):* candidates are grouped by their lower-cased words, so two candidates that match at the same position with the same word count have the same words and are one candidate; the character tie-break never decides. The joiners are space, tab, no-break space, `-`, U+2010 and U+2011. A match whose span holds an excluded or already-linked page still takes the span, so a shorter title inside it is not suggested instead.
 
@@ -200,7 +206,7 @@ Result size: 20,000 characters of `linked_text`, 50 suggestions and 5 related pa
 
 Each names the input and the reason:
 
-- `text: 31,204 characters is over the 20,000 limit`
+- `text: 31,204 characters is over the 10,000 limit`
 - `page: 2 pages are titled ‘Sprint’ (Sprint 6f1c…, Sprint 9a02…); pass the UUID`
 - `exclude: 51 entries is over the 50 limit`
 - `related: semantic search is off on this connector`
@@ -224,7 +230,7 @@ New tool `suggest_links`, hand-written, registered in `mcp.ts` next to `kb_index
 | Input | Type | Default | Notes |
 |---|---|---|---|
 | `graph` | alias, `ALIAS_PATTERN` | required | |
-| `text` | string, 1 to 20,000 characters | required | The draft markdown. |
+| `text` | string, 1 to 10,000 characters (20,000 before review round 1) | required | The draft markdown; a longer draft is sent in parts. |
 | `page` | UUID or title | none | The page being written; excluded. |
 | `exclude` | up to 50 UUIDs or titles | `[]` | Never suggested. |
 | `limit` | 1 to 50 | 25 | Suggestions returned, in draft order. |
@@ -257,6 +263,8 @@ Cold, stale or dirty cache: the same rebuild `kb_index` does, `ceil(pages / 200)
 At 200 calls a day: about 200 to 400 Worker requests, about 400 KV reads, about 200 D1 rows read (about 4,200 with related on every call), 0 rows written and up to about 200 neurons. All are far under the caps.
 
 **CPU on the 10 ms front Worker.** Time grows with the draft length plus the number of titles whose first word is in the draft. The largest cost is `JSON.parse` of the titles key, about 1.2 MB at 20,000 pages. Text is capped at 20,000 characters, there are no per-entry `Intl` formatters, and the regexes are built once at module load. In the workers test pool, `performance.now` does not advance during CPU work, so vitest cannot measure CPU. A Node bench script (`scripts/bench-suggest-links.mjs`, with its `*.test.mjs`) reports parse and match time on a 20,000-page fixture, and the PR quotes it against the 10 ms budget. **(call)** If the bench is over budget at 20,000 pages, the fallback is to store the titles key split by first letter of the first word and read only the keys for the draft's letters; that is not built unless the bench needs it.
+
+*As built (review round 1):* the bench was over budget (about 45 ms at 20,000 pages with a 20,000-character draft), and most of it was `matchLinks`, not the parse, so splitting the key by letter would not have fixed it. The matcher now rules names out by hashed first-word and first-two-word checks (section 3.3 c) and walks `titles` with indexed loops, and `TEXT_LIMIT` is 10,000 characters. The bench (Node v22, 20,000 pages, titles key 1,329 KiB, 10,000-character draft, median of 20 runs) gives `JSON.parse` 4.5 to 5.3 ms, `matchLinks` 4.0 to 4.5 ms, total 8.8 to 9.8 ms; 5,000 pages total about 4 ms. The first, cold run is still over (16 to 21 ms at 20,000 pages), and the parse is now about half the cost, so the margin at 20,000 pages is thin; a smaller titles-key format is the next step if production shows 1102 errors.
 
 ## 6. Safety
 
