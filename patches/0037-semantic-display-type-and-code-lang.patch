@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 7415fcc..4c2c5df 100644
+index 7415fcc..9badd98 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -76,6 +76,10 @@
@@ -693,7 +693,7 @@ index 7415fcc..4c2c5df 100644
                                                               :block/uuid (:block/uuid block))))))))
      (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
        truncated? (assoc :truncated true))))
-@@ -2326,27 +2698,63 @@
+@@ -2326,27 +2698,66 @@
      :semantic/blocks-update
      (p/let [body (body-clj request)
              block (find-entity db (:block-id path-params))]
@@ -720,14 +720,17 @@ index 7415fcc..4c2c5df 100644
 -                                          (fn [] (target-context @conn block e2ee?)))))))))
 +      ;; display-type and lang (patch 0037) are checked as set_block_property checks them; the title
 +      ;; is judged on the block's final type, the body's (or its fence's) or else the stored one. A
-+      ;; block's title that is one fence converts it, unless convert-fences=false; a page's,
++      ;; text block's title that is one fence converts it, unless convert-fences=false; a page's,
 +      ;; tag's or property's title is a name, never converted.
 +      (let [fields (keep (fn [[k ident]]
 +                           (when (contains? body k) [ident (display-value db ident (get body k) block)]))
 +                         [[:display-type display-type-ident] [:lang lang-ident]])
 +            explicit (into {} (map (fn [[ident prepared]] [ident (:value prepared)])) fields)
 +            convert? (convert-fences-option url)
-+            fence (when (and (true? convert?) (not e2ee?) (= "block" (some-> block block-kind)))
++            ;; Only a text block's fence converts: a code, math or quote block's title is its
++            ;; content, as the app's parse-block skips extraction for a block with a display-type.
++            fence (when (and (true? convert?) (not e2ee?) (= "block" (some-> block block-kind))
++                             (nil? (display-type-ident block)))
 +                    (fence-display-block (:title body)))
 +            converted (when (:type fence) fence)
 +            fence-error (when converted
@@ -778,7 +781,7 @@ index 7415fcc..4c2c5df 100644
  
      :semantic/refresh-refs
      (p/let [body (body-clj request)
-@@ -2424,7 +2832,8 @@
+@@ -2424,7 +2835,8 @@
        (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
                (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target, position, or blocks")
@@ -788,7 +791,7 @@ index 7415fcc..4c2c5df 100644
  
      :semantic/blocks-insert-tree
      (p/let [body (body-clj request)
-@@ -2435,7 +2844,7 @@
+@@ -2435,7 +2847,7 @@
          (or (nil? target) (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target or blocks")
          :else (insert-tree-response context target (:blocks body) (or (:position body) "append") {}
@@ -797,7 +800,7 @@ index 7415fcc..4c2c5df 100644
  
  (defn- batch-entries-error
    "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
-@@ -2465,22 +2874,29 @@
+@@ -2465,22 +2877,29 @@
              block (find-entity db (:block-id path-params))
              property-ident (resolve-property-ident db (:property-id path-params))
              prepared (when (and block property-ident)
@@ -836,7 +839,7 @@ index 7415fcc..4c2c5df 100644
  
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
-@@ -2491,14 +2907,16 @@
+@@ -2491,14 +2910,16 @@
          (stamp-property-refusal property-ident)
          (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
          :else
@@ -857,7 +860,7 @@ index 7415fcc..4c2c5df 100644
  
      :semantic/blocks-batch-set-property
      (p/let [body (body-clj request)
-@@ -2506,12 +2924,17 @@
+@@ -2506,12 +2927,17 @@
              reset? (true? (:isResetExistingValues body))
              ;; A class check judges a value by the tags it holds once the whole batch has applied,
              ;; so every entry's tag write is resolved first.
@@ -878,7 +881,7 @@ index 7415fcc..4c2c5df 100644
                                 entries))
              ;; An entry's block is scoped with the tags earlier entries in the batch give it. As
              ;; set-prepared-property! writes them, under reset a list of tags replaces the block's
-@@ -2539,18 +2962,22 @@
+@@ -2539,18 +2965,22 @@
                                            (cond-> replace? (update :replaced conj (:db/id block)))))))
                                  {:entries [] :added {} :replaced #{}}
                                  entries))))]
@@ -912,7 +915,7 @@ index 7415fcc..4c2c5df 100644
  
      :semantic/blocks-batch-delete-property
      (p/let [body (body-clj request)
-@@ -2561,16 +2988,18 @@
+@@ -2561,16 +2991,18 @@
                                  :property-ident (resolve-property-ident db property-id)}) entries))]
        (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
          (http/bad-request error)
@@ -941,7 +944,7 @@ index 7415fcc..4c2c5df 100644
  
  (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
           unverified!)
-@@ -2702,8 +3131,12 @@
+@@ -2702,8 +3134,12 @@
  
      :semantic/capture
      (p/let [body (body-clj request)]
@@ -955,7 +958,7 @@ index 7415fcc..4c2c5df 100644
          (if-let [time-zone (owner-time-zone self)]
            (let [today (authored-write! conn creator ensure-today-page! time-zone)]
              (if-not (valid-tree-identities? @conn today (:blocks body))
-@@ -4108,9 +4541,10 @@
+@@ -4108,9 +4544,10 @@
        (when (string? page) [:page (string/lower-case page)])))
  
  (defn- insert-entry
@@ -969,7 +972,7 @@ index 7415fcc..4c2c5df 100644
    (let [prefix (str "entries[" index "]")
          selected (when (contains? entry :target-id)
                     (resolve-page-selector db (:target-id entry) "target-id" {:e2ee? e2ee? :find find-entity}))
-@@ -4142,7 +4576,7 @@
+@@ -4142,7 +4579,7 @@
                      "invalid blocks"
                      (:error properties) (:error properties)))
          tree (when (and (nil? error) (contains? entry :blocks))
@@ -978,7 +981,7 @@ index 7415fcc..4c2c5df 100644
      (cond
        error (cond-> {:error (str prefix ": " error)}
                (= error (:error selected)) (merge (select-keys selected [:status :candidates])))
-@@ -4152,31 +4586,50 @@
+@@ -4152,31 +4589,50 @@
                       :page page
                       :position (or (:position entry) "append")
                       :properties (:properties properties)
@@ -1044,7 +1047,7 @@ index 7415fcc..4c2c5df 100644
                                                         {:error (str "entries[" index "]: must be an object")})
                          {:keys [key properties]} (:entry resolved)
                          entry-uuids (tree-uuids (:blocks entry))]
-@@ -4186,30 +4639,37 @@
+@@ -4186,30 +4642,37 @@
                        (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
                        :else (-> result
                                  (update :entries conj (dissoc (:entry resolved) :key))
@@ -1087,7 +1090,7 @@ index 7415fcc..4c2c5df 100644
  
  (defn- insert-label-checks
    "One label check per batch insert entry that gives a target-label: against its target, or the
-@@ -4294,10 +4754,12 @@
+@@ -4294,10 +4757,12 @@
  
      :semantic/blocks-batch-insert-tree
      (p/let [body (body-clj request)]
@@ -1102,7 +1105,7 @@ index 7415fcc..4c2c5df 100644
                             error
                             (when (= ::invalid dry-run?) "dry-run must be a boolean")
                             (when (= ::invalid verbose?) "verbose must be true or false"))]
-@@ -4309,8 +4771,9 @@
+@@ -4309,8 +4774,9 @@
                                              (check-labels! @tx-conn e2ee? (insert-label-checks @tx-conn (:entries body) entries))
                                              (insert-entries! tx-conn e2ee? entries)))]
                (when-not dry-run? (broadcast-change! self))
@@ -1115,7 +1118,7 @@ index 7415fcc..4c2c5df 100644
                             {:entries (mapv (fn [entry {:keys [target-id blocks created]}]
                                               (cond-> (merge entry (insert-context @write-conn (d/entity @write-conn [:block/uuid (uuid target-id)])
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 98c5ec5..271a649 100644
+index 98c5ec5..74d0061 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -113,20 +113,37 @@
@@ -1146,7 +1149,7 @@ index 98c5ec5..271a649 100644
 +  "How the tree and update operations write a code, math or quote block (patch 0037)."
 +  (str "display-type (code, math or quote) and lang (a code block's language) can be given on each block, or as the same properties (logseq.property.node/display-type or \"Node Display Type\", logseq.property.code/lang); given in both, the values must agree. An unknown value, lang without display-type code, or two different values is refused before anything is written, naming the node's path on the tree operations. A child doesn't take its parent's type."
 +       " A code or math title is stored exactly as sent, judged on the block's type after the write (the call's display-type, else the stored one): no # is escaped and no inline #tag or [[link]] is resolved, so it adds no tags, refs or pages. A quote title keeps tag and link handling."
-+       " A block whose whole title is one fence becomes a code or math block, as the app does, unless convert-fences=false: ```lang … ``` becomes a code block holding the lines inside, with that lang (```mermaid is highlighted code; the app draws no diagram), and $$…$$ a math block; the response marks the block converted: fence. Text before or after the fence, two fences and an unclosed fence stay text. An explicit display-type or lang that disagrees with the fence is refused, naming the node. ```query fences stay text (a Query block is not supported yet) and are listed under kept with their path and reason, as is a fence whose language is longer than 40 characters. E2EE titles are never converted."))
++       " A text block whose whole title is one fence becomes a code or math block, as the app does, unless convert-fences=false: ```lang … ``` becomes a code block holding the lines inside, with that lang (```mermaid is highlighted code; the app draws no diagram), and $$…$$ a math block; the response marks the block converted: fence. Text before or after the fence, two fences and an unclosed fence stay text. An explicit display-type or lang that disagrees with the fence is refused, naming the node. ```query fences stay text (a Query block is not supported yet) and are listed under kept with their path and reason, as is a fence whose language is longer than 40 characters. On update, a block that is already code, math or quote is never converted: its title is stored as sent under its type and lang, fence lines included. E2EE titles are never converted."))
  
  (def ^:private operation-docs
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
@@ -1339,10 +1342,10 @@ index 98c5ec5..271a649 100644
                                              :children {:type "array"
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
 new file mode 100644
-index 0000000..4cc4f1e
+index 0000000..cf2d9a7
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
-@@ -0,0 +1,1648 @@
+@@ -0,0 +1,1665 @@
 +(ns logseq.db-sync.semantic-display-type-test
 +  "Code, math and quote blocks through the property paths (patch 0037, stage 1). The block type
 +  lives in :logseq.property.node/display-type, a keyword property, and JSON can't carry a keyword,
@@ -2526,17 +2529,34 @@ index 0000000..4cc4f1e
 +                (when updated
 +                  (ok? updated (str "update " label))
 +                  (is (= expected (held conn update-id)) (str "update " label)))))
-+            ;; A stored type is not an explicit one: a fence on a quote block makes it code, and a bare
-+            ;; fence on a code block keeps its lang.
-+            (p/let [quote-id (placeholder! self page-id)
-+                    code-id (placeholder! self page-id)
-+                    _ (batch-set! self [[quote-id type-ident "quote"] [code-id type-ident "code"] [code-id lang-ident "c"]])
-+                    on-quote (update! self quote-id {:title python-fence})
-+                    on-code (update! self code-id {:title "```\nprint(1)\n```"})]
-+              (ok? on-quote "fence on a quote block")
-+              (ok? on-code "bare fence on a code block")
-+              (is (= (as-typed :code "print(1)" "python") (held conn quote-id)))
-+              (is (= (as-typed :code "print(1)" "c") (held conn code-id))))))))))
++            ;; A block that already has a type is never converted, as the app's parse-block skips
++            ;; extraction for one: a fence or $$ in a code, math or quote block is its content, kept
++            ;; verbatim with the stored type and lang. Before the fix: a markdown code block lost its
++            ;; outer fence and took lang js, and a latex code block became math.
++            (p/let [typed (fn [type lang]
++                            (p/let [id (placeholder! self page-id)
++                                    _ (batch-set! self (cond-> [[id type-ident type]] lang (conj [id lang-ident lang])))]
++                              id))
++                    js-fence "```js\nconsole.log(1)\n```"
++                    mermaid-fence "```mermaid\ngraph TD\n  A-->B\n```"
++                    cases [["code markdown, a ```js fence" "code" "markdown" js-fence {} :code]
++                           ["code markdown, a ```mermaid fence" "code" "markdown" mermaid-fence {} :code]
++                           ["code c, a bare fence" "code" "c" "```\nprint(1)\n```" {} :code]
++                           ["code latex, $$" "code" "latex" "$$x^2$$" {} :code]
++                           ["code, no lang, a ```python fence" "code" nil python-fence {} :code]
++                           ["math, $$" "math" nil "$$x^2$$" {} :math]
++                           ["math, a ```python fence" "math" nil python-fence {} :math]
++                           ["quote, a ```python fence" "quote" nil python-fence {} :quote]
++                           ["quote, $$" "quote" nil "$$x^2$$" {} :quote]
++                           ["code markdown, convert-fences=true" "code" "markdown" js-fence {:query "?convert-fences=true"} :code]
++                           ["code markdown, display-type code given" "code" "markdown" js-fence {:body {:display-type "code"}} :code]
++                           ["quote, display-type code given" "quote" nil python-fence {:body {:display-type "code"}} :code]]]
++              (p/doseq [[label type lang title {:keys [query body]} expected-type] cases]
++                (p/let [id (typed type lang)
++                        response (update! self id (merge {:title title} body) :query query)]
++                  (ok? response label)
++                  (is (not (contains? (:body response) :converted)) (str label ": not converted"))
++                  (is (= (as-typed expected-type title (when (= :code expected-type) lang)) (held conn id)) label))))))))))
 +
 +;; E2EE titles are ciphertext: never parsed, converted or kept; explicit fields still apply. A real
 +;; package can't look like a fence, so the second half STUBS THE PACKAGE CHECK (labelled): plaintext

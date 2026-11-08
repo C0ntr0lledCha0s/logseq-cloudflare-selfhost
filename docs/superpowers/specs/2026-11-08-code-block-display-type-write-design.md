@@ -128,6 +128,7 @@ The server does not copy the client's "last used lang" (`:logseq.kv/latest-code-
 
 - On by default for insert_block_tree, insert_block_children, batch_insert_block_trees, update_block and capture_to_today. The query flag `convert-fences=false` turns it off. It is validated like `dry-run` (`true`, `false`, or refused).
 - It runs only when the trimmed title starts and ends with ```` ``` ```` or `$$`. That is a string check before any mldoc parse, and the parse must give exactly one `Src` or `Displayed_Math` node, as the app's `standalone-display-block` requires.
+- On update_block it runs only on a text block (no stored display type), with the app's guard: `parse-block` skips extraction for a block that already has a display type. A code, math or quote block's title is stored as sent, fence lines included, with its type and lang kept (review round 2).
 - The result is the inner lines, display type code (or math) and the fence's language as lang. ```` ```mermaid ```` becomes a code block with lang `mermaid`. The app has no Mermaid renderer, so it shows as highlighted code, not a diagram; the help text says so.
 - Text before or after a fence, two fences, or an unclosed fence stay text.
 - An explicit display type on the same node wins only if it agrees; a conflict (a ```` ``` ```` fence with `display-type: "quote"`) is refused, naming the node.
