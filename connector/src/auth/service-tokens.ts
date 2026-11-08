@@ -30,13 +30,12 @@ export function rank(access: ServiceTokenAccess): number {
 }
 
 /**
- * The access values a token may authenticate with. `write-no-delete` is stored (migration 0008) but
- * not yet accepted: the connector does not refuse its deletes until the enforcement stage, which
- * widens this to every MODE_RANK key. Anything else, a value written past the CHECK included, is
- * refused too, so an unknown access fails closed rather than acting as write.
+ * The access values a token may authenticate with: every MODE_RANK key. Anything else, a value
+ * written past the CHECK included, is refused, so an unknown access fails closed rather than acting
+ * as write.
  */
-function acceptedAccess(access: unknown): access is "read" | "write" {
-  return access === "read" || access === "write";
+function acceptedAccess(access: unknown): access is ServiceTokenAccess {
+  return typeof access === "string" && Object.hasOwn(MODE_RANK, access);
 }
 
 /** A token as the wizard sees it. Deliberately has no hash field. */

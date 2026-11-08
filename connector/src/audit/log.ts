@@ -4,6 +4,7 @@ import { ToolError, lookupGraph, resolveGraph, withCallGraphs } from "../tools/c
 import { type AffectedTarget, describeWrite, takeReason } from "../tools/readable";
 import type { TokenScope } from "../auth/service-tokens";
 import type { GraphAccess } from "../tools/semantic";
+import { DRY_RUN_TOOLS, declaredDryRun, deleteReason, noDeleteMessage } from "../tools/deletes.mjs";
 import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, takeSnapshot } from "./snapshot";
 
 /**
@@ -24,6 +25,9 @@ import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, ta
  *   probe   SELECT … LIMIT 0      0 read
  *   purge   oldest-row probe 1 read; with old rows, a DELETE over at most PURGE_BATCH ids
  *           (at most 501 more read, 1 written per row deleted)
+ *
+ * A delete refused for a write-no-delete token (status `no-delete`) costs what a read-only refusal
+ * does: begin and finish, no snapshot read and no sync request. The delete check itself reads nothing.
  */
 
 /** Rows the outcome UPDATE by primary key writes, and reads. */
@@ -534,7 +538,7 @@ export interface AuditedWrite {
 export const AUDIT_MIGRATION_MISSING = "audit log unavailable: migration 0004 has not been applied; nothing was written";
 
 /** ToolError statuses that are refusals rather than failures: the call was turned down as given. */
-const REFUSALS = new Set(["refused", "unknown-graph", "read-only", "out-of-scope"]);
+const REFUSALS = new Set(["refused", "unknown-graph", "read-only", "out-of-scope", "no-delete"]);
 
 /** The argument names whose string values name what a call addresses (UUIDs, titles, dates or idents). */
 const ADDRESS_KEYS = ["block-id", "block-ids", "page-id", "target-id", "tag-id", "property-id", "page"];
@@ -658,7 +662,14 @@ export function audited(
     try {
       graphId = (await lookupGraph(ctx.access, alias))?.graphId ?? null;
       ({ reason, rest } = takeReason(args));
-      await resolveGraph(ctx.access, alias, true);
+      const graph = await resolveGraph(ctx.access, alias, true);
+      // A write-no-delete token: a call the delete table classes as a delete is refused here, before
+      // the snapshot, unless it is a dry run where its operation declares one (spec §3.5).
+      const by = graph.deletesRefusedBy;
+      const why = by === undefined ? null : deleteReason(tool, rest);
+      if (by !== undefined && why !== null && !declaredDryRun(tool, rest)) {
+        throw new ToolError(noDeleteMessage(by, tool, alias, why, Object.hasOwn(DRY_RUN_TOOLS, tool)), "no-delete");
+      }
     } catch (error) {
       refusal = error;
     }
