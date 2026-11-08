@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/storage.cljs b/deps/db-sync/src/logseq/db_sync/storage.cljs
-index d5aef35..510c41c 100644
+index d5aef35..8ccfc2e 100644
 --- a/deps/db-sync/src/logseq/db_sync/storage.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/storage.cljs
-@@ -205,6 +205,32 @@
+@@ -205,6 +205,38 @@
               (fn [tx-report]
                 (append-tx-for-tx-report sql tx-report))))
  
@@ -25,11 +25,17 @@ index d5aef35..510c41c 100644
 +  graph uploaded from the app keeps the app's stored schema, where the upload's re-added datoms can
 +  leave a many attribute (:block/closed-value-property) at cardinality one. Compares in memory and
 +  transacts (one logged tx) only when something differs. Skipped while a snapshot upload is still
-+  importing rows, since the graph is incomplete then."
++  importing rows, since the graph is incomplete then. The upload's reset clears that flag, so an
++  open between the upload's requests can still meet a partly imported graph: a repair that fails
++  there is skipped, and the open answers as it would without the repair. The next open after the
++  upload finishes repairs."
 +  [sql conn]
 +  (when-not (= "true" (str (get-meta sql :snapshot-uploading?)))
 +    (when-let [diffs (seq (schema-drift @conn))]
-+      (d/transact! conn (vec diffs))))
++      (try
++        (d/transact! conn (vec diffs))
++        (catch :default e
++          (js/console.warn "schema repair skipped:" (ex-message e))))))
 +  conn)
 +
  (defn open-conn
@@ -2202,10 +2208,10 @@ index 0000000..1f1233f
 +              (is (not-any? #{(ids k)} (concat day week)) (name k)))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
 new file mode 100644
-index 0000000..9651d55
+index 0000000..abfe15b
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,415 @@
 +(ns logseq.db-sync.semantic-uploaded-graph-schema-test
 +  "A graph first synced from the app arrives through the snapshot upload, and its stored datascript
 +  schema is the app's, not db-schema/schema: frontend.worker.sync.upload/<prepare-upload-temp-sqlite!
@@ -2220,6 +2226,8 @@ index 0000000..9651d55
 +            [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
++            [logseq.db-sync.checksum :as sync-checksum]
++            [logseq.db-sync.snapshot :as snapshot]
 +            [logseq.db-sync.storage :as storage]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db.frontend.schema :as db-schema]
@@ -2436,25 +2444,53 @@ index 0000000..9651d55
 +        (p/catch #(is false (str % (some-> % .-stack))))
 +        (p/finally done))))
 +
-+(deftest open-during-an-unfinished-upload-writes-nothing-test
-+  ;; Guard for the repair: while a snapshot upload is still importing rows the graph is incomplete,
-+  ;; so an open then must not write into it. Once the upload has finished, the next open repairs.
++(defn- upload-request!
++  "One POST /sync/graph-1/snapshot/upload through the real sync handler, as the app sends it."
++  [self rows reset? finished? checksum]
++  (let [body (#'sync-handler/frame-bytes (snapshot/encode-rows rows))
++        url (str "http://localhost/sync/graph-1/snapshot/upload?graph-id=graph-1&reset=" reset?
++                 "&finished=" finished? (when finished? (str "&checksum=" checksum)))]
++    (p/let [response (sync-handler/handle {:self self
++                                           :request (js/Request. url #js {:method "POST" :body body})
++                                           :url (js/URL. url)
++                                           :route {:handler :sync/snapshot-upload}})
++            text (.text response)]
++      {:status (.-status response) :body text})))
++
++;; Before the fix the open between the two requests threw
++;;   "No protocol method INode.node-conj defined for type null"
++;; because the upload's reset clears the :snapshot-uploading? flag, so the repair transacted over
++;; the partly imported rows; at the base the same open succeeded.
++(deftest open-between-upload-requests-succeeds-and-writes-nothing-test
++  ;; The app uploads a graph in several requests. Another request can open the graph between them;
++  ;; that open must answer as it did before the repair existed, write nothing, and leave the upload
++  ;; to finish. The first open after the upload has finished repairs the schema.
 +  (async done
-+    (-> (p/let [{:keys [sql self]} (uploaded-graph)
-+                _ (storage/set-meta! sql :snapshot-uploading? true)
-+                t-before (tx-log-t sql)
-+                _ (sync-handler/current-checksum self)
-+                conn (.-conn self)
-+                _ (is (= :db.cardinality/one (cardinality @conn :block/closed-value-property))
-+                      "no repair while the upload is unfinished")
-+                _ (is (= t-before (tx-log-t sql)) "an open during the upload writes nothing")
-+                _ (storage/set-meta! sql :snapshot-uploading? false)
-+                after #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}
-+                _ (sync-handler/current-checksum after)]
-+          (is (= :db.cardinality/many (cardinality @(.-conn after) :block/closed-value-property))
-+              "the first open after the upload finishes repairs"))
-+        (p/catch #(is false (str % (some-> % .-stack))))
-+        (p/finally done))))
++    (let [client (d/create-conn db-schema/schema)
++          _ (d/transact! client (sqlite-create-graph/build-db-initial-data "{}"))
++          checksum (sync-checksum/recompute-checksum @client)
++          rows (upload-rows client)
++          [part1 part2] (split-at (quot (* 3 (count rows)) 4) rows)
++          sql (memory-sql)
++          self #js {:sql sql :conn nil :schema-ready false :env #js {"DB" nil "TIMEZONE" "UTC"}}]
++      (-> (p/with-redefs [sync-handler/<set-graph-ready-for-use! (fn [& _] (p/resolved true))]
++            (p/let [first-part (upload-request! self part1 true false nil)
++                    t-before (tx-log-t sql)
++                    opened (try (sync-handler/current-checksum self) :opened
++                                (catch :default e (str "open failed: " (ex-message e))))
++                    t-after-open (tx-log-t sql)
++                    _ (set! (.-conn self) nil)
++                    second-part (upload-request! self part2 false true checksum)
++                    after #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}
++                    _ (sync-handler/current-checksum after)]
++              (is (= 200 (:status first-part)) (str first-part))
++              (is (= :opened opened) "an open between the upload's requests answers")
++              (is (= t-before t-after-open) "an open during the upload writes nothing")
++              (is (= 200 (:status second-part)) (str second-part))
++              (is (= :db.cardinality/many (cardinality @(.-conn after) :block/closed-value-property))
++                  "the first open after the upload finishes repairs")))
++          (p/catch #(is false (str % (some-> % .-stack))))
++          (p/finally done)))))
 +
 +;; ---------------------------------------------------------------------------------------------
 +;; Edit stamps on an uploaded graph
