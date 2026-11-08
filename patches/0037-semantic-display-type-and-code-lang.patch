@@ -502,10 +502,10 @@ index 98c5ec5..3ad352a 100644
                                              :children {:type "array"
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
 new file mode 100644
-index 0000000..a72fac2
+index 0000000..7c9d16a
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,544 @@
 +(ns logseq.db-sync.semantic-display-type-test
 +  "Code, math and quote blocks through the property paths (patch 0037, stage 1). The block type
 +  lives in :logseq.property.node/display-type, a keyword property, and JSON can't carry a keyword,
@@ -986,6 +986,51 @@ index 0000000..a72fac2
 +                  listed (batch-set! self [[id type-ident "math"] [id "block/tags" ["Code"]]] :reset? true)]
 +            (ok? listed "math, then a reset list holding Code")
 +            (is (= (typed :math) (state conn id)))))))))
++
++;; A class check in a batch judges a value by its final tags (final-tags), and a reset tag list keeps
++;; a held display class as set-prepared-tags! does. So a property limited to Code-block, Math-block
++;; or Quote-block still takes a block of that type as its value in a batch that resets the block's
++;; tags, in either entry order and by UUID or title. If final-tags dropped the class:
++;;   expected: (= 200 (:status response))  actual: 400
++;;   {:error "entry 1: no #Code object <uuid>"}
++(deftest batch-reset-keeps-display-class-for-class-check-test
++  (async done
++    (with-graph done 4
++      (fn [{:keys [conn self ids]}]
++        (let [[holder & typed-ids] ids]
++          (p/let [example (request! self "POST" "/semantic/tags" {:title "Example"})
++                  example-id (get-in example [:body :uuid])
++                  other (request! self "POST" "/semantic/tags" {:title "Other"})
++                  other-id (get-in other [:body :uuid])]
++            (p/doseq [[type id] (map vector [:code :math :quote] typed-ids)]
++              (p/let [class (d/entity @conn (classes type))
++                      title (str "Typed " (name type))
++                      _ (outliner-core/save-block! conn {:block/uuid id :block/title title})
++                      _ (put! self id type-ident (name type))
++                      property (outliner-property/upsert-property!
++                                conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                                {:property-name (str "about-" (name type))})
++                      property-id (subs (str (:db/ident property)) 1)
++                      limited (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent property-id))
++                                        {:classes {:set [(str (:block/uuid class))]}})]
++                (ok? limited (str property-id " is limited to " (:block/title class)))
++                (p/doseq [[label value tag-first?] [["UUID, tag entry first" (str id) true]
++                                                    ["UUID, value entry first" (str id) false]
++                                                    ["title, tag entry first" title true]
++                                                    ["title, value entry first" title false]]]
++                  (p/let [_ (outliner-property/remove-block-property! conn [:block/uuid holder] (:db/ident property))
++                          held (put! self id "block/tags" [other-id])
++                          _ (ok? held (str label ": the block holds Other"))
++                          entries [[id "block/tags" [example-id]] [holder property-id value]]
++                          response (batch-set! self (if tag-first? entries (vec (reverse entries))) :reset? true)
++                          label (str (name type) ", " label)]
++                    (ok? response label)
++                    (is (= id (:block/uuid (get (d/entity @conn [:block/uuid holder]) (:db/ident property))))
++                        (str label ": the value reads back"))
++                    (is (= (typed type) (state conn id)) (str label ": the block keeps its type and class"))
++                    (is (= #{(:block/title class) "Example"}
++                           (set (map :block/title (:block/tags (d/entity @conn [:block/uuid id])))))
++                        (str label ": the reset list replaced Other and kept the class"))))))))))))
 +
 +;; A batch insert entry's properties are for its target, which can be a page, or a page the entry
 +;; creates: display-type and lang are refused there too, and nothing is written.
