@@ -1138,8 +1138,12 @@ describe("service tokens", () => {
     const A = GRAPH_ID;
     const B = OTHER_GRAPH_ID;
     const PAGE_ID = "66666666-6666-4666-8666-666666666666";
-    const INTERIM =
-      "graph: adding graphs or raising to read-write needs the confirm step, which is not available yet; nothing was changed.";
+    const C = "77777777-7777-4777-8777-777777777777";
+    const THIRD = { ...OTHER_RECORD, alias: "third", graphId: C, graphName: "Third", mode: "write" as const, permission: "both" as const, token: "logseq_pat_ThirdToken789" };
+    const NOT_ROTATION = "Editing does not change the token. If it may have leaked, revoke it and issue a new one.";
+    const CHANGED =
+      "This token changed since you opened this page, or the page was not the one the wizard sent. The changes below are against its current values; check them and confirm again.";
+    const EFFECTIVE = "effective: read only (the graph is read-only)";
     const RANGE = "expires_days: a whole number of days from 1 to 365.";
     const NOT_CONNECTED = "graph: a chosen graph is not connected. Reload the page and choose again.";
     const ACCESS = "access: choose read-only or read-write.";
@@ -1200,6 +1204,31 @@ describe("service tokens", () => {
     ) {
       expect(page.res.status, label).toBe(status);
       expect(shown(page.html), label).toBe(message);
+      expect(page.html.match(LSCT), label).toBeNull();
+      expect(await snap(), label).toEqual(before);
+    }
+
+    const decode = (raw: string) => raw.replace(/&#(\d+);/g, (_m, code: string) => String.fromCharCode(Number(code)));
+
+    /** The edit form's hidden fields in page order, entities decoded: what the browser re-posts on Confirm. */
+    function confirmFields(html: string): string[][] {
+      const form = /<form[^>]*action="\/tokens\/[^"]+\/edit"[^>]*>([\s\S]*?)<\/form>/.exec(html)?.[1] ?? "";
+      return [...form.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)].map((m) => [m[1], decode(m[2])]);
+    }
+
+    /** The confirm page's gains and losses as plain text, in page order. */
+    function changes(html: string): { gains: string[]; losses: string[] } {
+      const list = (cls: string) => {
+        const ul = new RegExp(`<ul class="${cls}">([\\s\\S]*?)</ul>`).exec(html)?.[1] ?? "";
+        return [...ul.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((m) => decode(m[1].replace(/<[^>]+>/g, "")).trim());
+      };
+      return { gains: list("gains"), losses: list("losses") };
+    }
+
+    /** A 200 confirm page with no write. */
+    async function confirmShown(page: { res: Response; html: string }, before: Awaited<ReturnType<typeof snap>>, label = "") {
+      expect(page.res.status, `${label} ${shown(page.html)}`).toBe(200);
+      expect(page.html, label).toContain("<title>Confirm token changes");
       expect(page.html.match(LSCT), label).toBeNull();
       expect(await snap(), label).toEqual(before);
     }
@@ -1311,22 +1340,248 @@ describe("service tokens", () => {
       ]);
     });
 
-    it("a widening (an added graph, a swap, read to write, or a narrowing with a raise) is refused 400 for now and writes nothing", async () => {
+    it("a widening (an added graph, a swap, read to write, a narrowing with a raise) shows the confirm page and writes nothing; re-posting its fields applies it, and a re-send changes nothing (spec 8.2)", async () => {
       const h = await twoGraphs();
-      const one = await stored("one", { graphIds: [A], access: "read" });
-      const two = await stored("two", { graphIds: [A, B], access: "read" });
-      const before = await snap();
-      const cases: [string, string, Record<string, string>, string[]][] = [
-        ["add a graph", one.id, { access: "read" }, [A, B]],
-        ["add a graph, listed first", one.id, { access: "read" }, [B, A]],
-        ["swap", one.id, { access: "read" }, [B]],
-        ["read to write", one.id, { access: "write" }, [A]],
-        ["narrow and raise", two.id, { access: "write" }, [A]],
-        ["swap with a shorter expiry", one.id, { access: "read", expires_days: "5" }, [B]],
+      type Access = "read" | "write";
+      const shorter = expect.stringMatching(new RegExp(`^expiry shortened to ${day(Date.now() + 5 * DAY)} \\d{2}:\\d{2} UTC$`));
+      // label, stored graphs and access, form graphs and access, extra fields, gains, losses
+      const cases: [string, string[], Access, string[], Access, Record<string, string>, string[], unknown[]][] = [
+        ["add-graph", [A], "read", [A, B], "read", {}, ["gains read-only on other"], []],
+        ["add-graph-first", [A], "read", [B, A], "read", {}, ["gains read-only on other"], []],
+        ["read-to-write", [A], "read", [A], "write", {}, ["gains read-write on my-work-graph"], []],
+        ["swap", [A], "read", [B], "read", {}, ["gains read-only on other"], ["loses access to my-work-graph"]],
+        ["swap-reversed", [B], "read", [A], "read", {}, ["gains read-only on my-work-graph"], ["loses access to other"]],
+        ["narrow-and-raise", [A, B], "read", [A], "write", {}, ["gains read-write on my-work-graph"], ["loses access to other"]],
+        ["add-and-drop-write", [A], "write", [A, B], "read", {}, ["gains read-only on other"], ["loses read-write on my-work-graph"]],
+        ["swap-shorter-expiry", [A], "read", [B], "read", { expires_days: "5" }, ["gains read-only on other"], ["loses access to my-work-graph", shorter]],
       ];
-      for (const [label, id, fields, graphs] of cases) {
-        await refused(await edit(h, id, fields, graphs), 400, INTERIM, before, label);
+      for (const [name, graphIds, access, form, next, extra, gains, losses] of cases) {
+        const t = await stored(name, { graphIds, access });
+        const before = await snap();
+        const first = await edit(h, t.id, { access: next, ...extra }, form);
+        await confirmShown(first, before, name);
+        expect(changes(first.html), name).toEqual({ gains, losses });
+        expect(first.html, name).not.toContain(CHANGED);
+        applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), name);
+        const row = (await tokens().get(t.id))!;
+        expect(row, name).toMatchObject({ graphIds: form, access: next, revokedAt: null });
+        expect(row.updatedAt, name).not.toBeNull();
+        expect((await auditRows()).filter((r) => r.alias === `service:${name}`), name).toHaveLength(1);
+        if (extra.expires_days !== undefined) continue; // a re-sent day count counts from a later now: stage 3's extension refusal
+        const after = await snap();
+        applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)), `${name} re-sent`);
+        expect(await snap(), `${name} re-sent`).toEqual(after);
       }
+    });
+
+    it("chains: two confirmed widenings in a row each guard on what the one before stored; replaying the first page afterwards only narrows, so it applies at once", async () => {
+      const h = await twoGraphs();
+      const t = await stored("chain", { graphIds: [A], access: "read" });
+      const first = await edit(h, t.id, { access: "read" }, [A, B]);
+      expect(first.res.status).toBe(200);
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)));
+      const second = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(second.res.status).toBe(200);
+      expect(JSON.parse(decode(hidden(second.html, "base")!))).toMatchObject({ graphIds: [A, B], access: "read" });
+      // The first page's base is stale now, but its fields only drop write, so they need no confirm.
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(second.html)));
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html)));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], access: "read" });
+      const chain = (await auditRows()).map((r) => JSON.parse(r.before as string).data);
+      expect(chain.map((d) => [d.before.graphIds, d.before.access, d.after.graphIds, d.after.access])).toEqual([
+        [[A], "read", [A, B], "read"],
+        [[A, B], "read", [A, B], "write"],
+        [[A, B], "write", [A, B], "read"],
+      ]);
+    });
+
+    it("after a confirmed widening the next /mcp call reaches the added graph, and a write works after a confirmed read to write (spec 8.1, 8.2)", async () => {
+      const h = await twoGraphs();
+      answerPages();
+      await store().add({ ...THIRD });
+      const { token } = await create(h, { name: "ci", access: "read" }, [A]);
+      const id = (await rawRows())[0].id as string;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return {
+          isError: res.json.result.isError === true,
+          text: res.json.result.content.map((c: { text: string }) => c.text).join("\n"),
+        };
+      };
+      const read = { graph: "third", "page-id": PAGE_ID };
+      const outside = { isError: true, text: "graph 'third' is outside service token 'ci''s scope (it covers: my-work-graph)" };
+      expect(await call("get_page", read)).toEqual(outside);
+      const add = await edit(h, id, { access: "read" }, [A, C]);
+      expect(add.res.status).toBe(200);
+      expect(await call("get_page", read)).toEqual(outside);
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(add.html)));
+      expect((await call("get_page", read)).isError).toBe(false);
+      const write = { graph: "third", "block-id": PAGE_ID, body: { title: "x" } };
+      const readOnly = { isError: true, text: "graph 'third' is read-only (service token 'ci' is read-only)" };
+      expect(await call("update_block", write)).toEqual(readOnly);
+      const raise = await edit(h, id, { access: "write" }, [A, C]);
+      expect(changes(raise.html).gains).toEqual(["gains read-write on my-work-graph", "gains read-write on third"]);
+      expect(await call("update_block", write)).toEqual(readOnly);
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(raise.html)));
+      expect((await call("update_block", write)).text).not.toContain("is read-only");
+      assertNoToken();
+    });
+
+    it("the confirm page names gains and losses by alias, says an edit is not a rotation, and re-posts the form with confirm=1, base and the CSRF token; it holds no token", async () => {
+      const h = await twoGraphs();
+      await store().add({ ...THIRD });
+      const gone = "44444444-4444-4444-4444-444444444444";
+      const t = await stored("ci", { graphIds: [A, B, gone], access: "read" });
+      const row = (await tokens().get(t.id))!;
+      const before = await snap();
+      const page = await edit(h, t.id, { access: "write", expires_days: " 7 " }, [C, A]);
+      await confirmShown(page, before);
+      expect(page.html).toContain(`<span class="alias">ci</span>`);
+      expect(changes(page.html)).toEqual({
+        gains: ["gains read-write on third", "gains read-write on my-work-graph"],
+        losses: ["loses access to other", `loses access to ${gone} (not connected)`, expect.stringMatching(/^expiry shortened to /)],
+      });
+      expect(page.html).toContain(NOT_ROTATION);
+      expect(page.html).not.toContain(CHANGED);
+      expect(page.html).toContain(`action="/tokens/${t.id}/edit"`);
+      expect(page.html).toContain(`href="/tokens/${t.id}/edit"`);
+      expect(confirmFields(page.html)).toEqual([
+        ["csrf", h.csrf],
+        ["access", "write"],
+        ["expires_days", "7"],
+        ["graph", C],
+        ["graph", A],
+        ["confirm", "1"],
+        ["base", JSON.stringify({ graphIds: [A, B, gone], access: "read", expiresAt: row.expiresAt })],
+      ]);
+      expect(page.html).not.toContain(t.token.slice(5));
+      expect(page.html).not.toContain((await rawRows())[0].token_hash as string);
+    });
+
+    it("a forged confirm (confirm=1 with no base, a base that is not JSON or not the stored values) or a confirm other than 1 shows the confirm page and writes nothing", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "read" });
+      const row = (await tokens().get(t.id))!;
+      const good = { graphIds: [A, B], access: "read", expiresAt: row.expiresAt };
+      const base = (value: unknown) => ({ confirm: "1", base: JSON.stringify(value) });
+      const before = await snap();
+      // label, fields, whether the changed-since line shows
+      const cases: [string, Record<string, string>, boolean][] = [
+        ["no base", { confirm: "1" }, true],
+        ["empty base", { confirm: "1", base: "" }, true],
+        ["not json", { confirm: "1", base: "not json" }, true],
+        ["null", base(null), true],
+        ["a number", base(42), true],
+        ["a string", base("read"), true],
+        ["an array", base([good]), true],
+        ["no expiresAt", base({ graphIds: [A, B], access: "read" }), true],
+        ["expiresAt as a string", base({ ...good, expiresAt: String(row.expiresAt) }), true],
+        ["expiresAt a millisecond later", base({ ...good, expiresAt: row.expiresAt + 1 }), true],
+        ["graphs reordered", base({ ...good, graphIds: [B, A] }), true],
+        ["one graph missing", base({ ...good, graphIds: [A] }), true],
+        ["graphs as a string", base({ ...good, graphIds: A }), true],
+        ["graphs as JSON text", base({ ...good, graphIds: JSON.stringify([A, B]) }), true],
+        ["access raised", base({ ...good, access: "write" }), true],
+        ["no access", base({ graphIds: [A, B], expiresAt: row.expiresAt }), true],
+        ["confirm=true", { confirm: "true", base: JSON.stringify(good) }, false],
+        ["confirm empty", { confirm: "", base: JSON.stringify(good) }, false],
+        ["no confirm", { base: JSON.stringify(good) }, false],
+      ];
+      for (const [label, fields, stale] of cases) {
+        const page = await edit(h, t.id, { access: "write", ...fields }, [A, B]);
+        await confirmShown(page, before, label);
+        expect(page.html.includes(CHANGED), label).toBe(stale);
+        expect(decode(hidden(page.html, "base") ?? ""), label).toBe(JSON.stringify(good));
+      }
+      // The control: the stored values as base, in any key order and with an extra key, apply.
+      const reordered = { expiresAt: row.expiresAt, access: "read", graphIds: [A, B], note: "ignored" };
+      applied(await edit(h, t.id, { access: "write", ...base(reordered) }, [A, B]));
+      expect((await tokens().get(t.id))!.access).toBe("write");
+    });
+
+    it("a stale confirm (the token changed after the confirm page) shows the page again with a changed-since line and the current values, and writes nothing (spec 8.3)", async () => {
+      const h = await twoGraphs();
+      // The expiry was shortened in another tab.
+      const t = await stored("ci", { graphIds: [A], access: "write" });
+      const first = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(first.res.status).toBe(200);
+      applied(await edit(h, t.id, { access: "write", expires_days: "10" }, [A]));
+      const shortened = (await tokens().get(t.id))!;
+      let before = await snap();
+      const again = await h.page(`/tokens/${t.id}/edit`, confirmFields(first.html));
+      await confirmShown(again, before, "expiry");
+      expect(again.html).toContain(CHANGED);
+      expect(decode(hidden(again.html, "base")!)).toBe(JSON.stringify({ graphIds: [A], access: "write", expiresAt: shortened.expiresAt }));
+      expect(changes(again.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`], losses: [] });
+      // Confirming the page shown now applies it and keeps the shorter expiry.
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(again.html)));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B], access: "write", expiresAt: shortened.expiresAt });
+
+      // A graph was removed in another tab: the re-post now adds it back and raises, against the current row.
+      const u = await stored("nightly", { graphIds: [A, B], access: "read" });
+      const raise = await edit(h, u.id, { access: "write" }, [A, B]);
+      expect(changes(raise.html).gains).toEqual([`gains read-write on my-work-graph`, `gains read-write on other; ${EFFECTIVE}`]);
+      applied(await edit(h, u.id, { access: "read" }, [A]));
+      before = await snap();
+      const stale = await h.page(`/tokens/${u.id}/edit`, confirmFields(raise.html));
+      await confirmShown(stale, before, "graphs");
+      expect(stale.html).toContain(CHANGED);
+      expect(changes(stale.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`, "gains read-write on my-work-graph"], losses: [] });
+      expect((await tokens().get(u.id))!).toMatchObject({ graphIds: [A], access: "read" });
+    });
+
+    it("a confirming POST that carries a graph the page did not show applies exactly what it carries, and the audit row names both added graphs", async () => {
+      const h = await twoGraphs();
+      await store().add({ ...THIRD });
+      const t = await stored("ci", { graphIds: [A], access: "read" });
+      const page = await edit(h, t.id, { access: "read" }, [A, B]);
+      expect(changes(page.html).gains).toEqual(["gains read-only on other"]);
+      // The POST is the owner's own CSRF-checked form, so the gains are recomputed from it, not from the page.
+      applied(await h.page(`/tokens/${t.id}/edit`, [...confirmFields(page.html), ["graph", C]]));
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [A, B, C], access: "read" });
+      const [audit] = await auditRows();
+      expect(JSON.parse(audit.before as string).data).toMatchObject({ added: [B, C], removed: [] });
+    });
+
+    it("widening a read-write token to a read-only graph says effective read only, and after confirming a write there is refused with the plain message (spec 8.9)", async () => {
+      const h = await twoGraphs();
+      answerPages();
+      const { token } = await create(h, { name: "ci", access: "write" }, [A]);
+      const id = (await rawRows())[0].id as string;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const res = await mcp(h, token, "tools/call", { name, arguments: args });
+        expect(res.status).toBe(200);
+        return {
+          isError: res.json.result.isError === true,
+          text: res.json.result.content.map((c: { text: string }) => c.text).join("\n"),
+        };
+      };
+      const page = await edit(h, id, { access: "write" }, [A, B]);
+      expect(page.res.status).toBe(200);
+      expect(changes(page.html)).toEqual({ gains: [`gains read-write on other; ${EFFECTIVE}`], losses: [] });
+      applied(await h.page(`/tokens/${id}/edit`, confirmFields(page.html)));
+      expect(await call("update_block", { graph: "other", "block-id": PAGE_ID, body: { title: "x" } })).toEqual({
+        isError: true,
+        text: "graph 'other' is read-only",
+      });
+      expect((await call("get_page", { graph: "other", "page-id": PAGE_ID })).isError).toBe(false);
+      expect((await call("update_block", { graph: "my-work-graph", "block-id": PAGE_ID, body: { title: "x" } })).text).not.toContain("is read-only");
+      assertNoToken();
+    });
+
+    it("confirm fields do not hold back what already applies at once: a narrowing, a shorter expiry, or no change, with confirm=1 and any base", async () => {
+      const h = await twoGraphs();
+      const t = await stored("ci", { graphIds: [A, B], access: "write" });
+      const stale = JSON.stringify({ graphIds: [B], access: "read", expiresAt: 1 });
+      applied(await edit(h, t.id, { access: "read", confirm: "1", base: "not json" }, [A, B]), "write to read");
+      applied(await edit(h, t.id, { access: "read", confirm: "1", base: stale }, [B]), "remove a graph");
+      applied(await edit(h, t.id, { access: "read", confirm: "1", expires_days: "5" }, [B]), "shorter expiry");
+      expect((await tokens().get(t.id))!).toMatchObject({ graphIds: [B], access: "read" });
+      expect(await auditRows()).toHaveLength(3);
+      const before = await snap();
+      applied(await edit(h, t.id, { access: "read", confirm: "1", base: stale }, [B]), "no change");
+      expect(await snap()).toEqual(before);
     });
 
     it("expiry: shorter applies, the exact stored expiry is no change, an extension is refused naming the date, blank keeps it, and out-of-range days get the range message (spec 8.5)", async () => {
@@ -1636,7 +1891,7 @@ describe("service tokens", () => {
       }
     });
 
-    it("cost: an applied narrowing reads about 3 + N rows and writes 3; a refusal and a widening write none", async () => {
+    it("cost: an applied narrowing reads about 3 + N rows and writes 3; a refusal writes none; a widening's first POST reads 1 + N and writes none, and its confirm costs what a narrowing does", async () => {
       // Every statement the edit routes run: the token row, the graph list and the audit log.
       const m = meterTokens(undefined, /service_tokens|audit_log|FROM graphs ORDER BY/);
       const h = await twoGraphs({ DB: m.db });
@@ -1654,7 +1909,6 @@ describe("service tokens", () => {
       expect(total()).toEqual({ read: 3 + N, written: 3 });
       for (const [fields, graphs] of [
         [{ access: "admin" }, [A]],
-        [{ access: "write" }, [A, B]],
         [{ access: "read", expires_days: "365" }, [A]],
       ] as [Record<string, string>, string[]][]) {
         m.measured.length = 0;
@@ -1662,6 +1916,13 @@ describe("service tokens", () => {
         expect(total().written, JSON.stringify(fields)).toBe(0);
         expect(total().read, JSON.stringify(fields)).toBeLessThanOrEqual(1 + N);
       }
+      m.measured.length = 0;
+      const widen = await edit(h, t.id, { access: "write" }, [A, B]);
+      expect(widen.res.status).toBe(200);
+      expect(total()).toEqual({ read: 1 + N, written: 0 });
+      m.measured.length = 0;
+      applied(await h.page(`/tokens/${t.id}/edit`, confirmFields(widen.html)));
+      expect(total()).toEqual({ read: 3 + N, written: 3 });
     });
   });
 });

@@ -32,6 +32,7 @@ import {
   newGraphPage,
   newTokenPage,
   tokenCreatedPage,
+  tokenEditConfirmPage,
   tokenListPage,
   type TokenFormValues,
 } from "./views";
@@ -471,11 +472,41 @@ async function editTokenForm({ env, store, csrf }: Ctx, id: string): Promise<Res
   return editTokenPage(csrf, row, await store.list(), { graphIds: row.graphIds, access: row.access, expiresDays: "" });
 }
 
+/** An added graph (a swap counts, whatever else is removed) or read to write: the edits that need the confirm. */
+function isWidening(before: TokenScope, after: TokenScope): boolean {
+  const had = new Set(before.graphIds);
+  return after.graphIds.some((graphId) => !had.has(graphId)) || (before.access === "read" && after.access === "write");
+}
+
+/**
+ * Whether the confirm page's `base` field is the JSON of exactly `stored`: the same graphs in the same
+ * order, access and expiry, field by field. Anything else, unparseable text included, is unconfirmed.
+ */
+function baseMatches(raw: string, stored: TokenScope): boolean {
+  let base: unknown;
+  try {
+    base = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (typeof base !== "object" || base === null) return false;
+  const { graphIds, access, expiresAt } = base as Record<string, unknown>;
+  return (
+    Array.isArray(graphIds) &&
+    graphIds.length === stored.graphIds.length &&
+    graphIds.every((graphId, i) => graphId === stored.graphIds[i]) &&
+    access === stored.access &&
+    expiresAt === stored.expiresAt
+  );
+}
+
 /**
  * POST /tokens/:id/edit (spec 2026-11-08 §3.5): load and refuse, check audit_log, parse, diff, then
  * one guarded UPDATE, a read-back and the audit row. Nothing changed redirects without a write. A
- * widening (an added graph, including a swap, or read to write) is refused until the confirm step
- * exists; a narrowing, a shorter expiry or both apply at once. Each refusal comes before the UPDATE.
+ * narrowing, a shorter expiry or both apply at once. A widening (an added graph, including a swap, or
+ * read to write) shows the confirm page and writes nothing, until a re-post carries `confirm=1` and a
+ * `base` equal to the stored values; that re-post runs every check above again. Each refusal comes
+ * before the UPDATE.
  */
 async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id: string): Promise<Response> {
   const tokens = new ServiceTokenStore(env.DB);
@@ -495,10 +526,14 @@ async function submitTokenEdit({ env, session, csrf, store, form }: FormCtx, id:
     const added = after.graphIds.some((graphId) => !had.has(graphId));
     const removed = before.graphIds.some((graphId) => !has.has(graphId));
     if (!added && !removed && after.access === before.access && after.expiresAt === before.expiresAt) return toTokens();
-    if (added || (before.access === "read" && after.access === "write")) {
-      throw new FormError(
-        "graph: adding graphs or raising to read-write needs the confirm step, which is not available yet; nothing was changed.",
-      );
+    if (isWidening(before, after)) {
+      // Confirmed only by a re-post of the confirm page drawn against the row as it is now. A forged or
+      // stale confirm shows the page again; the UPDATE's before-value guard would refuse it anyway.
+      const confirming = text(form, "confirm") === "1";
+      if (!confirming || !baseMatches(text(form, "base"), before)) {
+        const days = text(form, "expires_days").trim();
+        return tokenEditConfirmPage(csrf, row, graphs, after, days, JSON.stringify(before), confirming);
+      }
     }
     if (!(await tokens.update(id, before, after, now))) {
       const current = editable(await tokens.get(id), env, now);
