@@ -11,6 +11,11 @@
 // before it is cut. The server is LOGSEQ_MCP_URL, else https://$LOGSEQ_MCP_HOST/mcp (as .mcp.json
 // builds it), else https://mcp.example.com/mcp.
 //
+// In a cloud environment that holds the token as a network secret (Bearer, for the connector's
+// host), the environment's proxy adds the bearer and the session has no token. Set
+// LOGSEQ_TOKEN_FROM_PROXY=1 and NODE_USE_ENV_PROXY=1 (Node's fetch ignores HTTPS_PROXY without it):
+// the CLI then sends no Authorization header. A token in LOGSEQ_SERVICE_TOKEN is still used first.
+//
 // Node 20 or later, no dependencies.
 
 import { pathToFileURL } from "node:url";
@@ -20,7 +25,9 @@ const PROTOCOL_VERSION = "2025-06-18";
 const USAGE =
   "usage: node scripts/logseq-mcp.mjs <tool> ['<json args>']\n" +
   "Reads the token from LOGSEQ_SERVICE_TOKEN, and the server from LOGSEQ_MCP_URL, else\n" +
-  `https://$LOGSEQ_MCP_HOST/mcp (the host .mcp.json uses), else ${DEFAULT_URL}.`;
+  `https://$LOGSEQ_MCP_HOST/mcp (the host .mcp.json uses), else ${DEFAULT_URL}.\n` +
+  "Where the environment's proxy adds the token (a network secret), set LOGSEQ_TOKEN_FROM_PROXY=1\n" +
+  "and NODE_USE_ENV_PROXY=1 instead of LOGSEQ_SERVICE_TOKEN.";
 /** Any service token's shape, so a token other than ours is not printed either. */
 const TOKEN_SHAPE = /lsct_[A-Za-z0-9_-]{43}/g;
 const MASK = "lsct_…";
@@ -127,10 +134,11 @@ const parseJson = (text, what, token) => {
 /** Posts one JSON-RPC message. Answers `{message, sessionId}`; `message` is null for a notification. */
 async function post(url, token, sessionId, rpc) {
   const headers = {
-    authorization: `Bearer ${token}`,
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
   };
+  // With no token, the environment's proxy adds the bearer (LOGSEQ_TOKEN_FROM_PROXY=1).
+  if (token) headers.authorization = `Bearer ${token}`;
   if (sessionId) headers["mcp-session-id"] = sessionId;
   if (rpc.method !== "initialize") headers["mcp-protocol-version"] = PROTOCOL_VERSION;
 
@@ -182,7 +190,13 @@ const textOf = (result) =>
 export async function main(argv, env) {
   const token = (env.LOGSEQ_SERVICE_TOKEN ?? "").trim();
   const [tool, rawArgs, ...extra] = argv;
-  if (!token) throw new CliError(`LOGSEQ_SERVICE_TOKEN is not set.\n${USAGE}`, 2);
+  if (!token && env.LOGSEQ_TOKEN_FROM_PROXY !== "1") {
+    throw new CliError(`LOGSEQ_SERVICE_TOKEN is not set, and LOGSEQ_TOKEN_FROM_PROXY=1 is not set either.\n${USAGE}`, 2);
+  }
+  if (!token && env.NODE_USE_ENV_PROXY !== "1") {
+    // Without it Node's fetch skips HTTPS_PROXY, so the proxy never adds the token.
+    throw new CliError(`LOGSEQ_TOKEN_FROM_PROXY=1 needs NODE_USE_ENV_PROXY=1, so requests go through the proxy that adds the token.\n${USAGE}`, 2);
+  }
   if (!tool || extra.length) throw new CliError(USAGE, 2);
   let args = {};
   if (rawArgs !== undefined) {
