@@ -298,3 +298,22 @@ All tests run in vitest-pool-workers against the real Worker (`createConnector()
 3. **History beyond audit retention.** The before and after values live in `audit_log` and are purged after `AUDIT_RETENTION_DAYS` (90 by default). `updated_at` keeps only the last time. Is that enough, or do you want a small `service_token_edits` table kept forever (a few rows a month)?
 4. **Step-up before widening.** The wizard session lasts its normal lifetime. Should widening a token also require a sign-in within, say, the last 10 minutes, as GitHub does for sensitive settings? It adds a GitHub round trip to a rare action.
 5. **Mixed edits.** A swap (remove one graph, add another) is treated as widening and needs the confirm. Should a confirm page also be shown for pure narrowing, so every scope change is reviewed the same way, or is applying narrowing at once right?
+
+## 12. As built
+
+The result follows the design. These are the places where it differs or adds detail.
+
+- **Section 11 is answered.** The owner kept every default: widening goes through the confirm page with no recent sign-in (questions 1 and 4); expiry can only shorten (2); history is `audit_log` plus `updated_at` on `/tokens`, with no history table (3); narrowing applies at once and a graph swap counts as widening (5).
+- **Widening was built in two steps.** The route first refused a widening outright, then the confirm page replaced that refusal. Only the final behaviour ships.
+- **The changed-since line.** The confirm page shows it only when the re-post carried `confirm=1` and its `base` was missing, unparseable or not equal to the stored graphs (in order), access and expiry. The first widening POST shows the page without it. A re-post with a stale `base` shows the page again and writes nothing.
+- **Confirm and narrowing.** `confirm=1` does not hold back an edit that is not a widening: a narrowing, a shorter expiry or no change with `confirm=1` and any `base` applies or redirects as usual.
+- **The confirming POST is trusted for its own fields.** The gains are recomputed from the posted `graph` fields, not from the page the owner saw. A graph added to the confirming POST that the page did not list applies, and the audit row names it under `added`. The POST is already the owner's CSRF-checked form, and `base` pins the before-values.
+- **Graph order and repeats.** Graphs keep the form's order with repeats dropped. The same graphs reordered, with nothing else changed, count as no change (303, no write).
+- **A graph that is no longer connected.** The edit page shows a token's graph that is no longer connected as a warning line without a box ("saving removes it"). The confirm page labels one as "not connected". The design did not cover this.
+- **Shared code.** The graph and access parser (`parseGraphsAndAccess`), `parseDays`, `readBackMismatch` and the graph checkboxes (`graphBoxes`) are shared between create and edit, so both refuse with the same words. `TokenScope` is exported from `auth/service-tokens.ts`.
+- **Confirm page contents.** Its "loses" list also names a shortened expiry (`expiry shortened to YYYY-MM-DD`). A read-only to read-write change lists a gain for each kept graph as well as each added one.
+- **Audit row.** `recordTokenEdit` records the time the request started, not the time of the insert. The read-back values, not the form values, are the `after` scope.
+- **Expiry boundary.** A token is treated as expired at exactly `expires_at`, for the edit GET and POST as for verification and the `/tokens` list. A test pins it.
+- **Tests.** The edit tests are in `connector/test/wizard.test.ts` (under *edit a token's graphs, mode and expiry*), with the store's statements pinned in `service-tokens.test.ts` and the audit row in `audit-log.test.ts` and `activity-log.test.ts`. The README documents the cost as about 3 + N rows read and 3 written per applied edit, as in section 5.
+- **Docs.** README §11.12 has the new **Edit** step (before **Revoke**), §11.12's closing paragraphs and cost, and §11.10's out-of-scope and read-only rows. `connector_help`, tool descriptions and `tools-manifest.json` are unchanged, as designed. REVIEW.md needed no new line.
+- **Logseq skill note.** As designed in section 4.
