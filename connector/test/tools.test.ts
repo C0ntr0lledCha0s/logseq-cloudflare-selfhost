@@ -757,6 +757,27 @@ describe("routing", () => {
     expect(tools.find((t) => t.name === "delete_blocks").annotations.destructiveHint).toBe(true);
   });
 
+  it("get_blocks takes view=signals and a property, and forwards both (patch 0035)", async () => {
+    syncHandler = () => Response.json({ blocks: [], missing: [] });
+    const read = await callTool("get_blocks", {
+      graph: "notes",
+      ids: "b1,b2",
+      view: "signals",
+      property: "user.property/project-status",
+    });
+    expect(read.isError, read.text).toBe(false);
+    expect(syncRequests).toHaveLength(1);
+    const url = new URL(syncRequests[0].url);
+    expect(url.pathname).toBe(`/api/v1/graphs/${NOTES_ID}/blocks`);
+    expect(url.searchParams.get("view")).toBe("signals");
+    expect(url.searchParams.get("property")).toBe("user.property/project-status");
+
+    const tool = (await listTools()).find((t) => t.name === "get_blocks");
+    expect(tool.inputSchema.properties.view.enum).toEqual(["summary", "outline", "signals"]);
+    expect(tool.inputSchema.properties.property.description).toContain("view=signals only");
+    expect(tool.description).toContain("stopping at 1000");
+  });
+
   it("write tools that echo inserted blocks default to verbose=false; verbose: true asks for titles", async () => {
     syncHandler = () => Response.json({ blocks: [{ uuid: "b1" }], count: 1 }, { status: 201 });
     const tree = { "target-id": "p1", blocks: [{ title: "Note" }] };
