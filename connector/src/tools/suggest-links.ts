@@ -2,8 +2,17 @@
 // sections 3.3 and 3.5). Pure functions with no I/O: they take the draft and the knowledge index's
 // titles and say which plain-text mentions could become [[links]]. The words come from item 27's
 // tokeniser (`wordSpans`, `STOPWORDS`), so matching and semantic search split text the same way.
+import type { McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import type { SemanticBindings } from "../semantic/config";
 import { STOPWORDS, firstWord, wordSpans } from "../semantic/ranking";
-import type { KbTitlesPage } from "./kb-index";
+import type { SemanticStore } from "../semantic/store";
+import { ToolError, resolveGraph, runTool, textResult, withCallGraphs } from "./common";
+import { type KbTitlesPage, age, loadTitles } from "./kb-index";
+import type { OnSuccess } from "./readable";
+import type { GraphAccess } from "./semantic";
+import { requestSignals } from "./semantic-search";
+import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 export type { KbTitlesPage };
 
@@ -391,4 +400,166 @@ export function resolvePageRef(
     if (found.length > 1) return { ambiguous: found };
   }
   return null;
+}
+
+// The tool (spec sections 3.4, 3.5, 3.7, 3.8 and 4). Read-only: it reads the kb_index titles key
+// (rebuilding it as kb_index would when stale), matches, and verifies the suggested pages with one
+// getBlocks view=signals read. It never writes to the graph, logs no audit entry and never marks
+// the index dirty.
+
+/** 31204 as "31,204", without an Intl formatter. */
+export function thousands(n: number): string {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+export const SUGGEST_LINKS_DESCRIPTION =
+  `Suggest [[links]] to pages that already exist for draft markdown you are about to write (up to ${thousands(TEXT_LIMIT)} characters). Read-only: it never writes. ` +
+  "Each suggestion gives the matched span (start, end, line, text), the page's title and UUID, the link to write and the reason (its title, or an alias of it). Matching is whole words, ignoring case, longest title first, and once per page (also_mentioned counts the later mentions); a page the draft already links is listed under already_linked. " +
+  "Text inside [[links]], tags, block refs, macros, markdown links, URLs, inline code, code blocks, math, quotes and property keys is never matched, nor are short or common titles (skipped_stoplist counts them). " +
+  "Only pages in the knowledge index are suggested: no journals, tags, properties or pages tagged private. Two pages sharing a title are listed under ambiguous and never linked: ask which one is meant. " +
+  `page names the page being written (UUID or title), and exclude names up to ${EXCLUDE_LIMIT} more pages never to suggest. limit is at most ${MAX_LIMIT} suggestions (default ${DEFAULT_LIMIT}), in draft order; truncated says when there were more. ` +
+  "verify (default true) reads the suggested pages back with one getBlocks request and moves any deleted since the index was built to dropped_stale; verify: false skips that and the first line says the UUIDs are unverified. " +
+  "linked_text is the draft with the suggestions applied: show it to the user, then write it with update_block or insert_block_tree.";
+
+/** `ref` as one index page's UUID; null (and a note) when no page has it; refused when several do. */
+function resolveRef(pages: KbTitlesPage[], ref: string, field: string, notes: string[], unknown: string): string | null {
+  const found = resolvePageRef(pages, ref);
+  if (found === null) {
+    notes.push(`${field}: no page ‘${ref}’ in the index${unknown}`);
+    return null;
+  }
+  if ("ambiguous" in found) {
+    const listed = found.ambiguous.map(([uuid, title]) => `${title} ${uuid}`).join(", ");
+    throw new ToolError(`${field}: ${found.ambiguous.length} pages are titled ‘${ref}’ (${listed}); pass the UUID`, "refused");
+  }
+  return found.uuid;
+}
+
+/**
+ * Registers `suggest_links`. `semantic` is the isolate's semantic search (null when off); the
+ * `related` leg that uses it is spec section 3.6.
+ */
+export function registerSuggestLinksTool(
+  server: McpServer,
+  access: GraphAccess,
+  semantic: { store: SemanticStore; bindings: SemanticBindings } | null,
+  onSuccess: OnSuccess,
+): void {
+  void semantic;
+  server.registerTool(
+    "suggest_links",
+    {
+      description: SUGGEST_LINKS_DESCRIPTION,
+      inputSchema: z.object({
+        graph: z.string().regex(new RegExp(ALIAS_PATTERN)).describe(GRAPH_PARAM_DESCRIPTION),
+        text: z.string().min(1).describe(`The draft markdown, up to ${thousands(TEXT_LIMIT)} characters.`),
+        page: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The page being written, by UUID or title; it is never suggested. A title several pages share is refused."),
+        exclude: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(`Up to ${EXCLUDE_LIMIT} more pages never to suggest, by UUID or title.`),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_LIMIT)
+          .optional()
+          .describe(`Most suggestions returned, in draft order (default ${DEFAULT_LIMIT}).`),
+        verify: z
+          .boolean()
+          .optional()
+          .describe("Read the suggested pages back with one getBlocks request and drop any deleted since the index was built (default true)."),
+      }),
+      annotations: annotationsFor("suggest_links"),
+    },
+    ({ graph: alias, text, page, exclude = [], limit = DEFAULT_LIMIT, verify = true }) =>
+      runTool("suggest_links", alias, () =>
+        withCallGraphs(async () => {
+          // Input checks run before any KV or sync call.
+          if (text.length > TEXT_LIMIT) {
+            throw new ToolError(`text: ${thousands(text.length)} characters is over the ${thousands(TEXT_LIMIT)} limit`, "refused");
+          }
+          if (exclude.length > EXCLUDE_LIMIT) {
+            throw new ToolError(`exclude: ${exclude.length} entries is over the ${EXCLUDE_LIMIT} limit`, "refused");
+          }
+
+          const now = Date.now();
+          let titles;
+          try {
+            titles = await loadTitles(access, alias, now);
+          } catch (error) {
+            if (error instanceof ToolError && error.status === "http-409") {
+              throw new ToolError("suggest_links needs the knowledge index, which is unavailable for E2EE graphs", error.status);
+            }
+            throw error;
+          }
+
+          const notes: string[] = [];
+          const excluded = new Set<string>();
+          if (page !== undefined) {
+            const uuid = resolveRef(
+              titles.pages,
+              page,
+              "page",
+              notes,
+              " (journals and pages tagged private are not in it); nothing was excluded",
+            );
+            if (uuid !== null) excluded.add(uuid);
+          }
+          exclude.forEach((ref, i) => {
+            const uuid = resolveRef(titles.pages, ref, `exclude[${i}]`, [], "");
+            if (uuid === null) notes.push(`exclude: no page ‘${ref}’ in the index`);
+            else excluded.add(uuid);
+          });
+
+          const result = matchLinks(text, titles.pages, { exclude: excluded, limit });
+          let suggestions = result.suggestions;
+          const droppedStale: PageRef[] = [];
+          if (verify && suggestions.length > 0) {
+            const graph = await resolveGraph(access, alias, false);
+            let found: Awaited<ReturnType<typeof requestSignals>>;
+            try {
+              found = await requestSignals(access, alias, graph.graphId, graph.pat, suggestions.map((s) => s.page.uuid));
+            } catch (error) {
+              const reason = `verify: getBlocks failed: ${error instanceof Error ? error.message : String(error)}`;
+              throw new ToolError(reason, error instanceof ToolError ? error.status : "verify-failed");
+            }
+            // A page the server lists as missing, or leaves out of blocks, is gone since the index was built.
+            const missing = new Set(found.missing);
+            const live = (uuid: string) => found.signals.has(uuid) && !missing.has(uuid);
+            for (const s of suggestions) if (!live(s.page.uuid)) droppedStale.push(s.page);
+            suggestions = suggestions.filter((s) => live(s.page.uuid));
+          }
+
+          const built = new Date(titles.builtAt).toISOString();
+          const ago = age(Date.now() - titles.builtAt);
+          const count = suggestions.length;
+          const summary = [
+            `${count} link ${count === 1 ? "suggestion" : "suggestions"} for graph "${alias}" (index built ${built.slice(11, 16)} UTC, ${ago})`,
+            `${result.alreadyLinked.length} already linked`,
+            `${droppedStale.length} dropped as stale`,
+            ...(verify ? [] : [`not verified (verify: false): the UUIDs come from the index built ${ago}`]),
+            ...notes,
+          ].join("; ");
+          const body = {
+            graph: alias,
+            index_built_at: built,
+            suggestions,
+            ambiguous: result.ambiguous,
+            related: [],
+            already_linked: result.alreadyLinked,
+            dropped_stale: droppedStale,
+            skipped_stoplist: result.skippedStoplist,
+            truncated: result.truncated,
+            linked_text: applyLinks(text, suggestions),
+          };
+          onSuccess("suggest_links", alias);
+          return textResult(`${summary}\n${JSON.stringify(body, null, 2)}`);
+        }),
+      ),
+  );
 }

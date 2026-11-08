@@ -205,7 +205,8 @@ export async function loadTitles(access: GraphAccess, alias: string, now: number
   return (await freshTitles(access, alias, now)) ?? (await rebuild(access, alias)).titles;
 }
 
-function age(ms: number): string {
+/** How long ago, for a cache's age: "just now", "23 min ago", "2 h 5 min ago". */
+export function age(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes} min ago`;

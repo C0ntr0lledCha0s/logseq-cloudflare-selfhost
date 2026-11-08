@@ -109,9 +109,42 @@ async function searchGraph(access: GraphAccess, alias: string, graphId: string, 
 }
 
 /**
- * `getBlocks` `view=signals` (patch 0035) for the candidates, in one request: each found uuid's
- * signal; a uuid the server lists under `missing` is absent. A failure fails the call as
- * `ranking signals: <reason>`, keeping a sync error's `ToolError` status.
+ * `getBlocks` `view=signals` (patch 0035) for `uuids`, in one request: each found uuid's signal, and
+ * the uuids the server lists under `missing` (deleted, hidden or in the Recycle bin). A sync error
+ * is thrown as `graphFetch` throws it; a body with no blocks array throws a plain Error.
+ */
+export async function requestSignals(
+  access: GraphAccess,
+  alias: string,
+  graphId: string,
+  pat: string,
+  uuids: string[],
+  property?: string,
+): Promise<{ signals: Map<string, RankingSignal>; missing: string[] }> {
+  const response = await graphFetch(access, alias, pat, {
+    method: "GET",
+    path: `/api/v1/graphs/${encodeURIComponent(graphId)}/blocks`,
+    query: { ids: uuids.join(","), view: "signals", ...(property === undefined ? {} : { property }) },
+  });
+  const body = (await response.json()) as { blocks?: unknown; missing?: unknown };
+  if (!Array.isArray(body.blocks)) throw new Error("getBlocks returned no blocks array");
+  const signals = new Map<string, RankingSignal>();
+  for (const b of body.blocks as Record<string, unknown>[]) {
+    signals.set(String(b.uuid), {
+      updatedAt: typeof b["updated-at"] === "number" ? b["updated-at"] : null,
+      referenceCount: typeof b["reference-count"] === "number" ? b["reference-count"] : 0,
+      status: typeof b.status === "string" ? b.status : null,
+      propertyValues: Array.isArray(b["property-values"]) ? (b["property-values"] as unknown[]).map(String) : null,
+    });
+  }
+  const missing = Array.isArray(body.missing) ? (body.missing as unknown[]).map(String) : [];
+  return { signals, missing };
+}
+
+/**
+ * `requestSignals` for semantic search's candidates: a uuid the server lists under `missing` is
+ * absent. A failure fails the call as `ranking signals: <reason>`, keeping a sync error's
+ * `ToolError` status.
  */
 async function fetchSignals(
   access: GraphAccess,
@@ -122,23 +155,7 @@ async function fetchSignals(
   property: string | undefined,
 ): Promise<Map<string, RankingSignal>> {
   try {
-    const response = await graphFetch(access, alias, pat, {
-      method: "GET",
-      path: `/api/v1/graphs/${encodeURIComponent(graphId)}/blocks`,
-      query: { ids: uuids.join(","), view: "signals", ...(property === undefined ? {} : { property }) },
-    });
-    const body = (await response.json()) as { blocks?: unknown };
-    if (!Array.isArray(body.blocks)) throw new Error("getBlocks returned no blocks array");
-    const signals = new Map<string, RankingSignal>();
-    for (const b of body.blocks as Record<string, unknown>[]) {
-      signals.set(String(b.uuid), {
-        updatedAt: typeof b["updated-at"] === "number" ? b["updated-at"] : null,
-        referenceCount: typeof b["reference-count"] === "number" ? b["reference-count"] : 0,
-        status: typeof b.status === "string" ? b.status : null,
-        propertyValues: Array.isArray(b["property-values"]) ? (b["property-values"] as unknown[]).map(String) : null,
-      });
-    }
-    return signals;
+    return (await requestSignals(access, alias, graphId, pat, uuids, property)).signals;
   } catch (error) {
     const text = `ranking signals: ${error instanceof Error ? error.message : String(error)}`;
     throw error instanceof ToolError ? new ToolError(text, error.status) : new Error(text, { cause: error });

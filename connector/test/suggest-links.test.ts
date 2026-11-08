@@ -2,8 +2,14 @@
 // 3.3 and 3.5). Every test calls the real functions on example pages; nothing is stubbed. Each mask
 // and stoplist rule has a test with a decoy that only that rule keeps from matching, so deleting
 // the rule fails a test (docs/solutions/testing/untested-rules-survive-mutation.md).
-import { describe, expect, it } from "vitest";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { GraphStore } from "../src/graphs";
+import { mcpHandler } from "../src/mcp";
 import { STOPWORDS, contentWords, wordSpans } from "../src/semantic/ranking";
+import { CONNECTOR_HELP } from "../src/tools/handwritten";
+import type { KbIndexEntry } from "../src/tools/kb-index";
+import { annotationsFor } from "../src/tools/spec.mjs";
 import {
   COMMON_TITLES,
   DEFAULT_LIMIT,
@@ -576,5 +582,464 @@ describe("matchLinks: cost is sized by the draft", () => {
     expect(result.tokenised).toBeGreaterThan(0);
     expect(result.tokenised).toBeLessThanOrEqual(bound);
     expect(result.suggestions.map((s) => s.page.title)).toEqual(["Topic70 Review"]);
+  });
+});
+
+// The tool through the MCP server, as kb-index.test.ts drives kb_index: real KV, real D1, the real
+// matcher and kb-index cache. Only the SYNC binding is faked, at HTTP level, answering
+// listKnowledgeIndex and getBlocks view=signals as patches 0013, 0035 and 0036 do.
+describe("suggest_links tool", () => {
+  const ORIGIN = "https://mcp.example.com";
+  const WORK_ID = "11111111-1111-1111-1111-111111111111";
+  const SECRET = "00000000-0000-4000-8000-0000000000ff";
+
+  function indexEntry([uuid, title, aliases]: KbTitlesPage, tags: string[] = []): KbIndexEntry {
+    return {
+      uuid,
+      title,
+      tags: tags.map((t) => ({ uuid: `tag-${t}`, title: t })),
+      classes: tags,
+      "reference-count": 1,
+      aliases,
+    };
+  }
+  /** The index the server holds; Secret Plans is tagged private, so exclude-tags=private leaves it out. */
+  const INDEX: { entry: KbIndexEntry; private: boolean }[] = [
+    ...PAGES.map((p) => ({ entry: indexEntry(p), private: false })),
+    { entry: indexEntry([SECRET, "Secret Plans", []], ["private"]), private: true },
+  ];
+
+  type SyncHandler = (request: Request) => Response | Promise<Response>;
+  let requests: Request[];
+  let stale: Set<string>;
+  let indexHandler: SyncHandler;
+  let blocksHandler: SyncHandler;
+  let kvCounts: { get: number; put: number; keysPut: string[] };
+  let spies: MockInstance[];
+
+  const serveIndex: SyncHandler = (request) => {
+    const url = new URL(request.url);
+    const excluded = url.searchParams.get("exclude-tags") === "private";
+    const pages = INDEX.filter((p) => !(excluded && p.private)).map((p) => p.entry);
+    const start = Number(url.searchParams.get("cursor") ?? "0");
+    const next = start + 200;
+    return Response.json({ pages: pages.slice(start, next), ...(next < pages.length ? { "next-cursor": String(next) } : {}) });
+  };
+  const serveSignals: SyncHandler = (request) => {
+    const ids = (new URL(request.url).searchParams.get("ids") ?? "").split(",");
+    return Response.json({
+      blocks: ids
+        .filter((id) => !stale.has(id))
+        .map((uuid) => ({ uuid, "updated-at": 1, "reference-count": 1, status: null, "property-values": null })),
+      missing: ids.filter((id) => stale.has(id)),
+    });
+  };
+
+  function testEnv(): Env {
+    const sync = {
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        requests.push(request.clone());
+        const path = new URL(request.url).pathname;
+        if (path.endsWith("/knowledge-index")) return indexHandler(request);
+        if (path.endsWith("/blocks")) return blocksHandler(request);
+        return Response.json({ error: `unexpected ${request.method} ${path}` }, { status: 500 });
+      },
+    } as unknown as Fetcher;
+    const kv = env.KB_INDEX_KV;
+    const counted = {
+      get: (...args: unknown[]) => {
+        kvCounts.get++;
+        return (kv.get as (...a: unknown[]) => unknown)(...args);
+      },
+      put: (key: string, ...rest: unknown[]) => {
+        kvCounts.put++;
+        kvCounts.keysPut.push(key);
+        return (kv.put as (...a: unknown[]) => unknown)(key, ...rest);
+      },
+      list: (...args: unknown[]) => (kv.list as (...a: unknown[]) => unknown)(...args),
+      delete: (key: string) => kv.delete(key),
+    } as unknown as KVNamespace;
+    return { ...env, SYNC: sync, KB_INDEX_KV: counted } as Env;
+  }
+
+  async function rpc(method: string, params: unknown): Promise<any> {
+    const request = new Request(`${ORIGIN}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const e = testEnv();
+    const ctx = createExecutionContext();
+    const res = await mcpHandler(e, ctx)(request, e, ctx);
+    await waitOnExecutionContext(ctx);
+    const text = await res.text();
+    const json = res.headers.get("Content-Type")?.includes("text/event-stream")
+      ? text
+          .split("\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)))
+          .find((msg) => msg.id === 1)
+      : JSON.parse(text);
+    expect(json.error).toBeUndefined();
+    return json.result;
+  }
+
+  async function suggest(args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {
+    const result = await rpc("tools/call", { name: "suggest_links", arguments: { graph: "work", ...args } });
+    return { isError: result.isError === true, text: result.content.map((c: { text: string }) => c.text).join("\n") };
+  }
+
+  /** The summary line and the JSON after it. */
+  async function suggestOk(args: Record<string, unknown>): Promise<{ summary: string; body: any }> {
+    const { isError, text } = await suggest(args);
+    expect(isError, text).toBe(false);
+    const nl = text.indexOf("\n");
+    return { summary: text.slice(0, nl), body: JSON.parse(text.slice(nl + 1)) };
+  }
+
+  /** Builds the cache with one call, then forgets that call's requests and KV counts. */
+  async function warm(): Promise<void> {
+    await suggestOk({ text: "nothing to link here" });
+    reset();
+  }
+
+  function reset(): void {
+    requests = [];
+    kvCounts = { get: 0, put: 0, keysPut: [] };
+  }
+
+  const blockCalls = () => requests.filter((r) => new URL(r.url).pathname.endsWith("/blocks"));
+  const idsOf = (r: Request) => new URL(r.url).searchParams.get("ids")!.split(",");
+
+  beforeEach(async () => {
+    await env.DB.exec("DELETE FROM graphs");
+    await env.DB.exec("DELETE FROM audit_log");
+    const { keys } = await env.KB_INDEX_KV.list();
+    await Promise.all(keys.map((k) => env.KB_INDEX_KV.delete(k.name)));
+    await new GraphStore(env.DB, env.GRAPH_TOKEN_KEY).add({
+      alias: "work",
+      graphId: WORK_ID,
+      graphName: "work",
+      mode: "write",
+      permission: "both",
+      expiresAt: null,
+      token: "logseq_pat_workToken123",
+    });
+    stale = new Set();
+    indexHandler = serveIndex;
+    blocksHandler = serveSignals;
+    reset();
+    spies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m));
+  });
+
+  afterEach(() => {
+    for (const spy of spies) spy.mockRestore();
+  });
+
+  it("warm cache, no suggestions: 0 sync calls and 2 KV reads", async () => {
+    await warm();
+    const { summary, body } = await suggestOk({ text: "A note about the weather." });
+    expect(requests).toEqual([]);
+    expect(kvCounts).toEqual({ get: 2, put: 0, keysPut: [] });
+    expect(summary).toMatch(/^0 link suggestions for graph "work" \(index built \d\d:\d\d UTC, just now\); 0 already linked; 0 dropped as stale$/);
+    expect(body.suggestions).toEqual([]);
+    expect(body.linked_text).toBe("A note about the weather.");
+  });
+
+  it("warm cache, suggestions: exactly 1 getBlocks view=signals call, and every spec 3.7 key", async () => {
+    await warm();
+    const text = "Notes on Workflow Intelligence.\nAsk OI and [[Head of Sales]] about workflow intelligence.";
+    const { summary, body } = await suggestOk({ text });
+    expect(requests).toHaveLength(1);
+    const [call] = requests;
+    const url = new URL(call.url);
+    expect(call.method).toBe("GET");
+    expect(url.pathname).toBe(`/api/v1/graphs/${WORK_ID}/blocks`);
+    expect(url.searchParams.get("view")).toBe("signals");
+    expect(idsOf(call)).toEqual([WI, OPS]);
+    expect(kvCounts).toEqual({ get: 2, put: 0, keysPut: [] });
+
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        "graph",
+        "index_built_at",
+        "suggestions",
+        "ambiguous",
+        "related",
+        "already_linked",
+        "dropped_stale",
+        "skipped_stoplist",
+        "truncated",
+        "linked_text",
+      ].sort(),
+    );
+    expect(body.graph).toBe("work");
+    expect(body.index_built_at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    expect(body.suggestions).toEqual([
+      {
+        span: { start: at(text, "Workflow Intelligence"), end: at(text, "Workflow Intelligence") + 21, line: 1, text: "Workflow Intelligence" },
+        page: { uuid: WI, title: "Workflow Intelligence" },
+        link: "[[Workflow Intelligence]]",
+        reason: "title",
+        also_mentioned: 1,
+      },
+      {
+        span: { start: at(text, "OI"), end: at(text, "OI") + 2, line: 2, text: "OI" },
+        page: { uuid: OPS, title: "Operational Intelligence" },
+        link: "[[OI]]",
+        reason: "alias ‘OI’ of Operational Intelligence",
+        also_mentioned: 0,
+      },
+    ]);
+    expect(body.ambiguous).toEqual([]);
+    expect(body.related).toEqual([]);
+    expect(body.already_linked).toEqual(["Head of Sales"]);
+    expect(body.dropped_stale).toEqual([]);
+    expect(body.skipped_stoplist).toBe(0);
+    expect(body.truncated).toBe(false);
+    expect(body.linked_text).toBe(
+      "Notes on [[Workflow Intelligence]].\nAsk [[OI]] and [[Head of Sales]] about workflow intelligence.",
+    );
+    expect(summary).toMatch(/^2 link suggestions for graph "work" \(index built \d\d:\d\d UTC, just now\); 1 already linked; 0 dropped as stale$/);
+  });
+
+  it("is read-only: only knowledge-index and getBlocks GETs, no dirty mark, no audit row, READ annotations", async () => {
+    // Cold: the rebuild kb_index does, then the verify read.
+    const { body } = await suggestOk({ text: "Workflow Intelligence and Māori Health." });
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI, MH]);
+    expect(requests.map((r) => `${r.method} ${new URL(r.url).pathname}`)).toEqual([
+      `GET /api/v1/graphs/${WORK_ID}/knowledge-index`,
+      `GET /api/v1/graphs/${WORK_ID}/blocks`,
+    ]);
+    expect(kvCounts.keysPut.sort()).toEqual(["kb-index-titles:work", "kb-index:work"]);
+    expect(await env.KB_INDEX_KV.get("kb-index-dirty:work")).toBeNull();
+    const { results } = await env.DB.prepare("SELECT COUNT(*) AS n FROM audit_log").all<{ n: number }>();
+    expect(results[0].n).toBe(0);
+    expect(annotationsFor("suggest_links")).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    const tools = (await rpc("tools/list", {})).tools;
+    const tool = tools.find((t: { name: string }) => t.name === "suggest_links");
+    expect(tool.annotations).toEqual(annotationsFor("suggest_links"));
+    expect(Object.keys(tool.inputSchema.properties).sort()).toEqual(["exclude", "graph", "limit", "page", "text", "verify"]);
+  });
+
+  it("verify drops a page getBlocks lists as missing from suggestions and linked_text, into dropped_stale", async () => {
+    await warm();
+    stale = new Set([WI]);
+    const text = "Workflow Intelligence met Head of Sales.";
+    const { summary, body } = await suggestOk({ text });
+    expect(blockCalls()).toHaveLength(1);
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([HOS]);
+    expect(body.dropped_stale).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
+    expect(body.linked_text).toBe("Workflow Intelligence met [[Head of Sales]].");
+    expect(summary).toMatch(/; 1 dropped as stale$/);
+  });
+
+  it("verify treats a UUID absent from blocks as stale even when missing does not list it", async () => {
+    await warm();
+    blocksHandler = () => Response.json({ blocks: [], missing: [] });
+    const { body } = await suggestOk({ text: "Workflow Intelligence." });
+    expect(body.suggestions).toEqual([]);
+    expect(body.dropped_stale).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
+    expect(body.linked_text).toBe("Workflow Intelligence.");
+  });
+
+  it("limit with a stale page: verify runs on the limited suggestions only and does not promote the next", async () => {
+    await warm();
+    stale = new Set([WI]);
+    const text = "Workflow Intelligence, Head of Sales and Māori Health.";
+    const { body } = await suggestOk({ text, limit: 2 });
+    expect(blockCalls()).toHaveLength(1);
+    expect(idsOf(blockCalls()[0])).toEqual([WI, HOS]);
+    expect(body.truncated).toBe(true);
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([HOS]);
+    expect(body.dropped_stale).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
+    expect(body.linked_text).toBe("Workflow Intelligence, [[Head of Sales]] and Māori Health.");
+  });
+
+  it("a failed verify fails the call, naming getBlocks and the reason", async () => {
+    await warm();
+    blocksHandler = () => Response.json({ error: "boom" }, { status: 500 });
+    const failed = await suggest({ text: "Workflow Intelligence." });
+    expect(failed.isError).toBe(true);
+    expect(failed.text).toBe("verify: getBlocks failed: sync server error (HTTP 500): boom");
+
+    blocksHandler = () => Response.json({ nothing: true });
+    const shapeless = await suggest({ text: "Workflow Intelligence." });
+    expect(shapeless.isError).toBe(true);
+    expect(shapeless.text).toBe("verify: getBlocks failed: getBlocks returned no blocks array");
+  });
+
+  it("verify: false makes no getBlocks call and the summary says the UUIDs are unverified", async () => {
+    await warm();
+    stale = new Set([WI]);
+    const { summary, body } = await suggestOk({ text: "Workflow Intelligence.", verify: false });
+    expect(requests).toEqual([]);
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI]);
+    expect(body.dropped_stale).toEqual([]);
+    expect(summary).toMatch(/; not verified \(verify: false\): the UUIDs come from the index built just now$/);
+  });
+
+  it("never suggests a page tagged private, which the index leaves out", async () => {
+    const { body } = await suggestOk({ text: "The Secret Plans for Workflow Intelligence." });
+    for (const r of requests.filter((r) => new URL(r.url).pathname.endsWith("/knowledge-index"))) {
+      expect(new URL(r.url).searchParams.get("exclude-tags")).toBe("private");
+    }
+    expect(body.suggestions.map((s: any) => s.page.title)).toEqual(["Workflow Intelligence"]);
+    expect(JSON.stringify(body)).not.toContain(SECRET);
+    expect(idsOf(blockCalls()[0])).toEqual([WI]);
+  });
+
+  it("page excludes the page being written, named by UUID (either case), title or title ignoring case", async () => {
+    await warm();
+    const text = "Workflow Intelligence and Head of Sales.";
+    for (const page of [WI, WI.toUpperCase(), "Workflow Intelligence", "workflow intelligence"]) {
+      const { summary, body } = await suggestOk({ text, page });
+      expect(body.suggestions.map((s: any) => s.page.uuid), page).toEqual([HOS]);
+      expect(summary, page).not.toContain("page:");
+    }
+  });
+
+  it("page shared by two pages is refused naming both UUIDs; the UUID of one excludes only that one", async () => {
+    await warm();
+    const refused = await suggest({ text: "Sprint review.", page: "sprint" });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(`page: 2 pages are titled ‘sprint’ (Sprint ${SPRINT_A}, Sprint ${SPRINT_B}); pass the UUID`);
+    expect(requests).toEqual([]);
+
+    const { body } = await suggestOk({ text: "Sprint review.", page: SPRINT_A });
+    expect(body.ambiguous).toEqual([]);
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([SPRINT_B]);
+  });
+
+  it("an exact title wins over a title equal only ignoring case, so it is not refused", async () => {
+    const lower = "00000000-0000-4000-8000-0000000000ee";
+    INDEX.push({ entry: indexEntry([lower, "head of sales", []]), private: false });
+    try {
+      const { body } = await suggestOk({ text: "Head of Sales and Workflow Intelligence.", page: "Head of Sales" });
+      // Head of Sales is excluded, so the other page with that title is no longer ambiguous.
+      expect(body.ambiguous).toEqual([]);
+      expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([lower, WI]);
+    } finally {
+      INDEX.pop();
+    }
+  });
+
+  it("a page or exclude entry naming no index page is a note, not an error", async () => {
+    await warm();
+    // An alias, a journal date, a bare integer and an unknown title or UUID are not index pages.
+    for (const page of ["2026-11-08", "42", "New Page", "00000000-0000-4000-8000-0000000000aa"]) {
+      const { summary, body } = await suggestOk({ text: "Workflow Intelligence.", page });
+      expect(body.suggestions.map((s: any) => s.page.uuid), page).toEqual([WI]);
+      expect(summary, page).toContain(
+        `; page: no page ‘${page}’ in the index (journals and pages tagged private are not in it); nothing was excluded`,
+      );
+    }
+    const { summary, body } = await suggestOk({ text: "Workflow Intelligence.", exclude: ["Nowhere", WI] });
+    expect(body.suggestions).toEqual([]);
+    expect(summary).toContain("; exclude: no page ‘Nowhere’ in the index");
+  });
+
+  it("page names a page by its own title, not an alias: the alias page Ops Intel leaves its target suggested", async () => {
+    await warm();
+    const { summary, body } = await suggestOk({ text: "Operational Intelligence.", page: "Ops Intel" });
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([OPS]);
+    expect(summary).not.toContain("page:");
+  });
+
+  it("exclude takes UUIDs and titles, in any order, and an ambiguous title is refused", async () => {
+    await warm();
+    const text = "Workflow Intelligence, Head of Sales and Māori Health.";
+    const forward = await suggestOk({ text, exclude: [WI, "head of sales"] });
+    const reversed = await suggestOk({ text, exclude: ["head of sales", WI] });
+    expect(forward.body.suggestions.map((s: any) => s.page.uuid)).toEqual([MH]);
+    expect(reversed.body).toEqual(forward.body);
+    // A repeated entry is a no-op, not a refusal.
+    const repeated = await suggestOk({ text, exclude: [WI, WI, "Workflow Intelligence"] });
+    expect(repeated.body.suggestions.map((s: any) => s.page.uuid)).toEqual([HOS, MH]);
+
+    const refused = await suggest({ text, exclude: [WI, "Sprint"] });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toBe(`exclude[1]: 2 pages are titled ‘Sprint’ (Sprint ${SPRINT_A}, Sprint ${SPRINT_B}); pass the UUID`);
+  });
+
+  it("text over the limit is refused before any KV or sync call; the limit itself is accepted", async () => {
+    const refused = await suggest({ text: "x".repeat(TEXT_LIMIT + 1) });
+    expect(refused).toEqual({ isError: true, text: "text: 20,001 characters is over the 20,000 limit" });
+    expect(requests).toEqual([]);
+    expect(kvCounts.get + kvCounts.put).toBe(0);
+
+    const big = await suggest({ text: "Workflow Intelligence ".repeat(1000).slice(0, TEXT_LIMIT) });
+    expect(big.isError, big.text).toBe(false);
+  });
+
+  it("more exclude entries than the limit are refused before any KV or sync call; the limit itself is accepted", async () => {
+    const many = Array.from({ length: EXCLUDE_LIMIT + 1 }, (_, i) => `Page ${i}`);
+    const refused = await suggest({ text: "Workflow Intelligence.", exclude: many });
+    expect(refused).toEqual({ isError: true, text: "exclude: 51 entries is over the 50 limit" });
+    expect(requests).toEqual([]);
+    expect(kvCounts.get + kvCounts.put).toBe(0);
+
+    const { body } = await suggestOk({ text: "Workflow Intelligence.", exclude: many.slice(0, EXCLUDE_LIMIT) });
+    expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI]);
+  });
+
+  it("an E2EE graph's 409 gives the readable error", async () => {
+    indexHandler = () => Response.json({ error: "graph insights are unavailable for E2EE graphs" }, { status: 409 });
+    const result = await suggest({ text: "Workflow Intelligence." });
+    expect(result).toEqual({
+      isError: true,
+      text: "suggest_links needs the knowledge index, which is unavailable for E2EE graphs",
+    });
+    expect(blockCalls()).toEqual([]);
+  });
+
+  it("the knowledge index's too-large refusal is unchanged", async () => {
+    indexHandler = () => Response.json({ pages: [], "next-cursor": "more" });
+    const result = await suggest({ text: "Workflow Intelligence." });
+    expect(result).toEqual({ isError: true, text: "the knowledge index of 'work' has more than 20000 pages" });
+    expect(blockCalls()).toEqual([]);
+  });
+
+  it("an ambiguous-only draft makes no getBlocks call and leaves linked_text as the draft", async () => {
+    await warm();
+    const text = "Sprint planning on Monday.";
+    const { body } = await suggestOk({ text });
+    expect(requests).toEqual([]);
+    expect(body.suggestions).toEqual([]);
+    expect(body.ambiguous).toEqual([
+      {
+        span: { start: 0, end: 6, line: 1, text: "Sprint" },
+        candidates: [
+          { uuid: SPRINT_A, title: "Sprint" },
+          { uuid: SPRINT_B, title: "Sprint" },
+        ],
+      },
+    ]);
+    expect(body.linked_text).toBe(text);
+  });
+
+  it("the description and help name the limits from the constants", async () => {
+    const tools = (await rpc("tools/list", {})).tools;
+    const tool = tools.find((t: { name: string }) => t.name === "suggest_links");
+    const thousands = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    expect(tool.description).toContain(`${thousands(TEXT_LIMIT)} characters`);
+    expect(tool.description).toContain(`at most ${MAX_LIMIT}`);
+    expect(tool.description).toContain(`default ${DEFAULT_LIMIT}`);
+    expect(tool.description).toContain(`up to ${EXCLUDE_LIMIT}`);
+    expect(tool.description).toMatch(/read-only/i);
+    expect(tool.inputSchema.properties.limit.maximum).toBe(MAX_LIMIT);
+    expect(CONNECTOR_HELP).toContain("suggest_links");
+    const help = (await rpc("tools/call", { name: "connector_help", arguments: {} })).content[0].text;
+    expect(help).toContain("call suggest_links");
   });
 });
