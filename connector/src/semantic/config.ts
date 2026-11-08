@@ -13,8 +13,41 @@ export const LEASE_MS = 50_000;
 export const ORPHAN_BATCH = 500;
 /** Nearest neighbours fetched per query (Vectorize allows 100 without values or metadata). */
 export const SEMANTIC_TOP_K = 50;
+/** suggest_links' `related: true`: pages returned, characters of the draft embedded, and vectors queried. */
+export const RELATED_LIMIT = 5;
+export const RELATED_TEXT_CHARS = 2_000;
+export const RELATED_TOP_K = 20;
 /** Keyword results fetched per query. */
 export const KEYWORD_LIMIT = 50;
+/** Content words a query needs before the ranking rules for multi-word questions apply. */
+export const RANKED_QUERY_WORDS = 3;
+/** Blocks of this many words or fewer are "short" for multi-word questions. */
+export const SHORT_BLOCK_WORDS = 2;
+/** A short block's similarity is multiplied by this, for ordering only, in a multi-word question's semantic list. */
+export const SHORT_BLOCK_WEIGHT = 0.75;
+/** Distinctive terms the keyword leg searches for a multi-word question. */
+export const KEYWORD_TERMS = 3;
+/** Keyword results fetched per distinctive term; the merged list is capped at `KEYWORD_LIMIT`. */
+export const KEYWORD_TERM_LIMIT = 20;
+/** A term search's hit joins the keyword list only when this many of the terms found it; one word of a question matches too many unrelated titles. */
+export const KEYWORD_TERM_MATCHES = 2;
+
+// Memory ranking (design 2026-11-08, section 3.4). RRF scores are compressed (rank 1 against rank 50
+// in one leg is 1.8x), so these bound the factors to 0.5 to 1 (recency) and 0.5 to 1.5 (importance).
+/** Recency never falls below this, so an old hit found by both legs still ties a fresh rank-1 one-leg hit. */
+export const RECENCY_FLOOR = 0.5;
+/** Importance gained per doubling of (1 + reference count): 3 references give 1.2, 7 give 1.3. */
+export const REF_WEIGHT = 0.1;
+/** Importance from references stops here (reached at 31 references). */
+export const IMPORTANCE_MAX = 1.5;
+/** Importance is multiplied by this once when any demotion rule matches, however many do. */
+export const DEMOTE_WEIGHT = 0.5;
+/** Age, in days, at which recency halves when `half_life_days` is not given. */
+export const DEFAULT_HALF_LIFE_DAYS = 90;
+/** Uuids sent in the one signals call per query: the server's `getBlocks` batch limit. */
+export const SIGNALS_LIMIT = 100;
+/** The signals view's `reference-count` stops here (patch 0035's `reference-count-cap`). */
+export const REFERENCE_COUNT_CAP = 1000;
 
 /** Turns texts into vectors of `DIMENSIONS` numbers, one per text, in order. */
 export interface Embedder {

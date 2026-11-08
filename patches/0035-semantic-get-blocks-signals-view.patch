@@ -1,0 +1,496 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index e54885f..9b4d6b1 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -3924,10 +3924,67 @@
+     (let [ids (mapv string/trim (string/split raw #","))]
+       (when (every? common-util/uuid-string? ids) ids))))
+ 
+-(defn- bulk-read-response [db ids view]
++(def ^:private reference-count-cap
++  "Where the signals view's reference-count stops: semantic search's importance saturates far
++  below it, and a tag page with thousands of referrers would otherwise walk them all."
++  1000)
++
++(defn- capped-referrer-count
++  "(count (referrer-ids db entity attributes)), stopping at reference-count-cap: a lazy walk over
++  each reference attribute's avet datoms that counts distinct visible referrers outside the
++  entity and its own blocks, and reads no further once the cap is reached."
++  [db entity attributes]
++  (let [id (:db/id entity)]
++    (->> attributes
++         (mapcat #(d/datoms db :avet % id))
++         (map :e)
++         (remove #(or (= id %)
++                      (let [referrer (d/entity db %)]
++                        (or (= id (:db/id (:block/page referrer)))
++                            (entity-util/hidden? referrer)))))
++         distinct
++         (take reference-count-cap)
++         count)))
++
++(defn- property-value-titles
++  "An entity's values of `ident` as text, in the order getBlock lists them: a page, node or
++  choice's title, a text or number value's content, a checkbox or datetime as written. nil when
++  the entity has no value."
++  [entity ident]
++  (let [value (get entity ident)]
++    (when (and (some? value) (not (and (coll? value) (empty? value))))
++      (mapv #(str (if (de/entity? %) (db-property/property-value-content %) %))
++            (if (set? value) (sort-by property-value-sort-key value) [value])))))
++
++(defn- signals-response
++  "The signals view of one entity: what semantic search ranks by, and no title or text."
++  [db entity attributes property]
++  (let [status (:db/ident (:logseq.property/status entity))]
++    {:uuid (uuid-string (:block/uuid entity))
++     :updated-at (:block/updated-at entity)
++     :reference-count (capped-referrer-count db entity attributes)
++     :status (when status (string/replace (name status) #"^status\." ""))
++     :property-values (when property
++                        (let [ident (:db/ident property)]
++                          (or (property-value-titles entity ident)
++                              (some-> (:block/page entity) (property-value-titles ident))
++                              [])))}))
++
++(defn- signals-property
++  "getBlocks' property parameter: a visible property, resolved as setBlockProperty's property-id
++  is (ident, UUID or title), but only among properties, so a page or tag ident is not found."
++  [db raw]
++  (let [entity (resolve-property db raw)]
++    (when (property? entity) entity)))
++
++(defn- bulk-read-response [db ids view & [property]]
+   (let [entities (map #(find-visible-entity db %) ids)
+         found (remove nil? entities)
+-        blocks (if (= "outline" view)
++        blocks (case view
++                 "signals"
++                 (let [attributes (reference-attributes db)]
++                   (mapv #(signals-response db % attributes property) found))
++                 "outline"
+                  ;; One outline budget for the whole response, as for a single page.
+                  (:blocks (reduce (fn [{:keys [budget] :as result} entity]
+                                     (let [outline (page-outline db entity budget)]
+@@ -4184,14 +4241,18 @@
+   (case handler
+     :semantic/blocks-get-many
+     (let [ids (parse-ids (.get (.-searchParams url) "ids"))
+-          view (or (.get (.-searchParams url) "view") "summary")]
++          view (or (.get (.-searchParams url) "view") "summary")
++          raw-property (.get (.-searchParams url) "property")
++          property (when (and (some? raw-property) (= "signals" view)) (signals-property db raw-property))]
+       (cond
+         (nil? ids) (http/bad-request "ids must be a comma-separated list of UUIDs")
+         (> (count ids) max-batch-size) (http/bad-request (str "at most " max-batch-size " ids"))
+         (not (apply distinct? (map string/lower-case ids))) (http/bad-request "duplicate id")
+-        (not (contains? #{"summary" "outline"} view)) (http/bad-request "view must be summary or outline")
++        (not (contains? #{"summary" "outline" "signals"} view)) (http/bad-request "view must be summary, outline or signals")
++        (and (some? raw-property) (not= "signals" view)) (http/bad-request "property needs view=signals")
++        (and (some? raw-property) (nil? property)) (http/bad-request (str "property not found: " raw-property))
+         (and e2ee? (= "outline" view)) (http/error-response "outlines are unavailable for E2EE graphs" 409)
+-        :else (http/json-response nil (bulk-read-response db ids view))))
++        :else (http/json-response nil (bulk-read-response db ids view property))))
+ 
+     :semantic/blocks-delete-many
+     (p/let [body (body-clj request)]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index a45c272..62add43 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -134,7 +134,7 @@
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+    "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
+-   "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
++   "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
+    "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
+@@ -505,8 +505,10 @@
+     (= "getBlocks" operation-id)
+     (into [{:name "ids" :in "query" :required true :schema {:type "string"}
+             :description "Comma-separated block or page UUIDs, at most 100."}
+-           {:name "view" :in "query" :schema {:enum ["summary" "outline"] :default "summary"}
+-            :description "summary: title, tags and properties. outline: also each entity's descendants as a markdown outline."}])
++           {:name "view" :in "query" :schema {:enum ["summary" "outline" "signals"] :default "summary"}
++            :description "summary: title, tags and properties. outline: also each entity's descendants as a markdown outline. signals: only uuid, updated-at, reference-count (stops at 1000), status and property-values, with no title or text."}
++           {:name "property" :in "query" :schema {:type "string"}
++            :description "view=signals only: a property ident (e.g. user.property/project-status), UUID or title. Each entity's property-values lists that property's values as text, from the entity, else its page, else []."}])
+     (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees"} operation-id)
+     (into [{:name "verbose" :in "query" :schema {:type "boolean" :default true}
+             :description "false returns only the inserted blocks' UUIDs, nested as inserted, and a count, without echoing their titles."}])
+@@ -574,7 +576,10 @@
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+                   "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
+-                  "getBlocks" (entity-response "BlocksResponse" "The blocks found, in request order, and the UUIDs not found")
++                  "getBlocks"
++                  {:description "The blocks found, in request order, and the UUIDs not found; with view=signals, each block's ranking signals only"
++                   :content {"application/json" {:schema {:anyOf [{:$ref "#/components/schemas/BlocksResponse"}
++                                                                  {:$ref "#/components/schemas/SignalsResponse"}]}}}}
+                   "deleteBlocks" (entity-response "DeleteBlocksResponse" "How many blocks were deleted, and each one named")
+                   "deleteBlock" (entity-response "DeleteBlocksResponse" "The deleted block, named")
+                   "moveBlocks" (entity-response "MovedBlocksResponse" "The moved blocks, with where each was and is")
+@@ -780,6 +785,19 @@
+    :BlocksResponse {:type "object" :required ["blocks" "missing"]
+                     :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockDetailResponse"}}
+                                  :missing {:type "array" :items {:type "string"}}}}
++:SignalsResponse {:type "object" :required ["blocks" "missing"]
++                     :properties {:blocks {:type "array"
++                                           :items {:type "object"
++                                                   :required ["uuid" "updated-at" "reference-count" "status" "property-values"]
++                                                   :properties {:uuid {:type "string"}
++                                                                :updated-at {:type ["integer" "null"]
++                                                                             :description "The entity's own :block/updated-at in ms; an edit to a child does not change it."}
++                                                                :reference-count {:type "integer" :minimum 0 :maximum 1000
++                                                                                  :description "Visible referrers outside the entity and its own blocks, stopping at 1000."}
++                                                                :status {:type ["string" "null"] :description "A task's status name (todo, doing, in-review, done, canceled, backlog), or null."}
++                                                                :property-values {:type ["array" "null"] :items {:type "string"}
++                                                                                  :description "null without property; else the property's values as text on the entity, else on its page, else []."}}}}
++                                  :missing {:type "array" :items {:type "string"}}}}
+    :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
+                           :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
+                                        :total-removed {:type "integer" :description "Those blocks and all their descendants."}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+index 2652d3e..bbdda0a 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+@@ -113,7 +113,7 @@
+                     "ids must be a comma-separated list of UUIDs"
+                     "duplicate id"
+                     "at most 100 ids"
+-                    "view must be summary or outline"]
++                    "view must be summary, outline or signals"]
+                    (mapv #(get-in % [:body :error]) errors)))
+             (is (= 409 (:status e2ee-outline)) "outlines need plaintext titles")
+             (is (some? (entity conn b)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_signals_view_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_signals_view_test.cljs
+new file mode 100644
+index 0000000..b910cbb
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_signals_view_test.cljs
+@@ -0,0 +1,311 @@
++(ns logseq.db-sync.semantic-signals-view-test
++  "getBlocks view=signals returns, per id, only what semantic search ranks by: uuid, updated-at,
++  reference-count (referrers outside the entity's own blocks, hidden ones left out, stopping at
++  1000), the task status and, with `property`, that property's value titles on the entity or else
++  on its page. It returns no title or text, so it answers on an E2EE graph too."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text) (js->clj (js/JSON.parse text) :keywordize-keys true))}))
++
++(defn- ident-id [property]
++  (subs (str (:db/ident property)) 1))
++
++(defn- signals-path [ids & [query]]
++  (str "/semantic/blocks?ids=" (string/join "," ids) "&view=signals" query))
++
++(defn- signals! [self ids & [query]]
++  (request! self "GET" (signals-path ids query) nil))
++
++(defn- by-uuid [response]
++  (into {} (map (juxt :uuid identity)) (get-in response [:body :blocks])))
++
++(defn- page [id title & {:as attrs}]
++  (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++         attrs))
++
++(defn- block [id title page-id parent-id order & {:as attrs}]
++  (merge {:block/uuid id :block/title title :block/order order
++          :block/page [:block/uuid page-id] :block/parent [:block/uuid parent-id]
++          :block/created-at 1 :block/updated-at 1}
++         attrs))
++
++(defn- with-graph
++  "A DB graph with a `Project status` choice property (Active, Archived) and an `about` node property."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              status (outliner-property/upsert-property!
++                      conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                      {:property-name "Project status"})
++              _ (outliner-property/upsert-closed-value! conn (:db/ident status) {:value "Active"})
++              _ (outliner-property/upsert-closed-value! conn (:db/ident status) {:value "Archived"})
++              about (outliner-property/upsert-property!
++                     conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/many}
++                     {:property-name "about"})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self :status status :about about}))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(deftest reference-count-counts-referrers-outside-the-entity-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self about]}]
++        (let [[pricing own other other-ref holder archive hidden-ref recycled
++               target sibling far] (repeatedly 11 random-uuid)
++              about-ident (:db/ident about)
++              pricing-ref [:block/uuid pricing]
++              target-ref [:block/uuid target]]
++          (d/transact! conn [(page pricing "Pricing")
++                             (page other "Other")
++                             (page holder "Holder")
++                             (page archive "Archive" :logseq.property/hide? true)])
++          (d/transact! conn [;; Pricing's own child refers to Pricing: not counted.
++                             (block own "See [[Pricing]]" pricing pricing "a0" :block/refs #{pricing-ref})
++                             (block target "Target" pricing pricing "a1")
++                             ;; A referrer on another page, linking Pricing and holding it as a
++                             ;; property value too: counted once.
++                             (block other-ref "Pricing notes" other other "a0"
++                                    :block/refs #{pricing-ref target-ref} about-ident #{pricing-ref})
++                             ;; A page holding Pricing as a property value: counted.
++                             {:block/uuid holder about-ident #{pricing-ref}}
++                             ;; Hidden referrers: one under a hidden page, one in the Recycle bin.
++                             (block hidden-ref "Old pricing" archive archive "a0" :block/refs #{pricing-ref target-ref})
++                             (block recycled "Deleted pricing" other other "a1"
++                                    :block/refs #{pricing-ref target-ref} :logseq.property/deleted-at 5)
++                             ;; A block's referrers: one on its own page, one on another page.
++                             (block sibling "Sibling of ((target))" pricing pricing "a2" :block/refs #{target-ref})
++                             (block far "Far from ((target))" other other "a2" :block/refs #{target-ref})])
++          (p/let [response (signals! self [pricing target])]
++            (is (= 200 (:status response)) (str (:body response)))
++            (let [blocks (by-uuid response)]
++              (is (= 2 (get-in blocks [(str pricing) :reference-count]))
++                  "the referrer on another page (once, though it links and holds Pricing) and the property holder; not Pricing's own child, nor the hidden or recycled referrer")
++              (is (= 3 (get-in blocks [(str target) :reference-count]))
++                  "a block's referrers on its own page and elsewhere, as referrer-ids counts them; not the hidden or recycled ones"))))))))
++
++(deftest reference-count-stops-at-1000-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (let [[pricing many quiet] (repeatedly 3 random-uuid)]
++          (d/transact! conn [(page pricing "Pricing") (page many "Many") (page quiet "Quiet")])
++          (d/transact! conn (map-indexed (fn [index id]
++                                           (block id (str "Ref " index) many many (str "a" index)
++                                                  :block/refs #{[:block/uuid pricing]}))
++                                         (repeatedly 1005 random-uuid)))
++          (p/let [response (signals! self [pricing quiet])]
++            (is (= 200 (:status response)) (str (:body response)))
++            (is (= {(str pricing) 1000 (str quiet) 0}
++                   (update-vals (by-uuid response) :reference-count))
++                "1005 referrers count as 1000; an entity no one refers to counts 0")))))))
++
++(deftest status-is-the-task-status-name-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (let [[tasks done-task canceled todo doing plain] (repeatedly 6 random-uuid)]
++          (d/transact! conn [(page tasks "Tasks")])
++          (d/transact! conn [(block done-task "Ship it" tasks tasks "a0" :logseq.property/status :logseq.property/status.done
++                                    :block/tags #{:logseq.class/Task})
++                             (block canceled "Drop it" tasks tasks "a1" :logseq.property/status :logseq.property/status.canceled
++                                    :block/tags #{:logseq.class/Task})
++                             (block todo "Plan it" tasks tasks "a2" :logseq.property/status :logseq.property/status.todo
++                                    :block/tags #{:logseq.class/Task})
++                             (block doing "Build it" tasks tasks "a3" :logseq.property/status :logseq.property/status.doing
++                                    :block/tags #{:logseq.class/Task})
++                             (block plain "Just a note" tasks tasks "a4")])
++          (p/let [response (signals! self [done-task canceled todo doing plain tasks])]
++            (is (= 200 (:status response)) (str (:body response)))
++            (is (= {(str done-task) "done" (str canceled) "canceled" (str todo) "todo" (str doing) "doing"
++                    (str plain) nil (str tasks) nil}
++                   (update-vals (by-uuid response) :status)))))))))
++
++(deftest property-values-from-the-block-else-its-page-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self status]}]
++        (let [[office plain-page inherits sibling bare page-only] (repeatedly 6 random-uuid)
++              path #(str "/semantic/blocks/" % "/properties/" (js/encodeURIComponent (ident-id status)))]
++          (d/transact! conn [(page office "Office move plan") (page plain-page "Plain")])
++          (d/transact! conn [(block inherits "Pack the desks" office office "a0")
++                             (block sibling "Book the van" office office "a1")
++                             (block bare "Nothing set" plain-page plain-page "a0")
++                             (block page-only "Also nothing" plain-page plain-page "a1")])
++          (p/let [set-page (request! self "PUT" (path office) {:value "Archived"})
++                  set-sibling (request! self "PUT" (path sibling) {:value "Active"})
++                  with-property (signals! self [inherits sibling office bare plain-page]
++                                          (str "&property=" (js/encodeURIComponent (ident-id status))))
++                  by-title (signals! self [inherits] (str "&property=" (js/encodeURIComponent "Project status")))
++                  without (signals! self [inherits sibling office bare])]
++            (is (= [200 200] (mapv :status [set-page set-sibling])) (str (:body set-page) (:body set-sibling)))
++            (is (= 200 (:status with-property)) (str (:body with-property)))
++            (is (= {(str inherits) ["Archived"]
++                    (str sibling) ["Active"]
++                    (str office) ["Archived"]
++                    (str bare) []
++                    (str plain-page) []}
++                   (update-vals (by-uuid with-property) :property-values))
++                "the block's own value, else its page's; the sibling keeps its own; [] when neither has one")
++            (is (= ["Archived"] (get-in (by-uuid by-title) [(str inherits) :property-values]))
++                "property resolves as setBlockProperty's property-id does, by title too")
++            (is (= 200 (:status without)))
++            (is (every? #(contains? % :property-values) (get-in without [:body :blocks])))
++            (is (every? nil? (map :property-values (get-in without [:body :blocks])))
++                "no property: property-values is null")))))))
++
++(defn- set-or-vec
++  "Many values come back in the order getBlock lists them; compare them as a set."
++  [expected actual]
++  (if (< 1 (count expected)) (when actual (vec (sort-by (into {} (map-indexed (fn [i v] [v i])) expected) actual))) actual))
++
++(deftest property-values-for-each-property-type-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self about]}]
++        (p/let [[host target journal] (repeatedly 3 random-uuid)
++                blocks (vec (repeatedly 9 random-uuid))
++                property! (fn [type cardinality title]
++                            (outliner-property/upsert-property!
++                             conn nil {:logseq.property/type type :db/cardinality cardinality}
++                             {:property-name title}))
++                text (property! :default :db.cardinality/one "note")
++                number (property! :number :db.cardinality/one "points")
++                url (property! :url :db.cardinality/one "link")
++                topic (property! :node :db.cardinality/one "topic")
++                due (property! :date :db.cardinality/one "due")
++                when-property (property! :datetime :db.cardinality/one "when")
++                checkbox (property! :checkbox :db.cardinality/one "ticked")
++                _ (d/transact! conn [(page host "Host") (page target "Pricing")
++                                     (page journal "Nov 5th, 2026" :block/journal-day 20261105
++                                           :block/tags #{:logseq.class/Journal})])
++                _ (d/transact! conn (map-indexed (fn [index id] (block id (str "Block " index) host host (str "a" index)))
++                                                 blocks))
++                cases [[text "Call the landlord" ["Call the landlord"]]
++                       [number 5 ["5"]]
++                       [url "https://example.com/plan" ["https://example.com/plan"]]
++                       [topic (str target) ["Pricing"]]
++                       [due (str journal) ["Nov 5th, 2026"]]
++                       [when-property 1700000000000 ["1700000000000"]]
++                       [checkbox true ["true"]]
++                       [about [(str target) (str journal)] ["Pricing" "Nov 5th, 2026"]]
++                       [:logseq.property/priority "high" ["High"]]]
++                writes (p/all (map (fn [id [property value _]]
++                                     (request! self "PUT" (str "/semantic/blocks/" id "/properties/"
++                                                               (js/encodeURIComponent (if (keyword? property)
++                                                                                        (subs (str property) 1)
++                                                                                        (ident-id property))))
++                                               {:value value}))
++                                   blocks cases))
++                reads (p/all (map (fn [id [property _ _]]
++                                    (signals! self [id] (str "&property="
++                                                             (js/encodeURIComponent (if (keyword? property)
++                                                                                      (subs (str property) 1)
++                                                                                      (ident-id property))))))
++                                  blocks cases))]
++          (is (every? #(= 200 (:status %)) writes) (str (mapv :body writes)))
++          (doseq [[[property _ expected] response] (map vector cases reads)]
++            (testing (str (if (keyword? property) property (:logseq.property/type property)))
++              (is (= 200 (:status response)) (str (:body response)))
++              (is (= expected (set-or-vec expected (get-in response [:body :blocks 0 :property-values])))))))))))
++
++(deftest property-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self status]}]
++        (let [[pricing a] (repeatedly 2 random-uuid)]
++          (d/transact! conn [(page pricing "Pricing")
++                             {:db/ident :user.class/Organization :block/uuid (random-uuid)
++                              :block/name "organization" :block/title "Organization"
++                              :block/tags :logseq.class/Tag}])
++          (d/transact! conn [(block a "A" pricing pricing "a0")])
++          (p/let [refusals (p/all (map #(request! self "GET" % nil)
++                                       [(signals-path [a] "&property=user.property/nope")
++                                        (signals-path [a] (str "&property=" pricing))
++                                        (signals-path [a] "&property=Pricing")
++                                        (signals-path [a] "&property=user.class/Organization")
++                                        (signals-path [a] "&property=logseq.class/Task")
++                                        (str "/semantic/blocks?ids=" a "&view=summary&property=" (js/encodeURIComponent (ident-id status)))
++                                        (str "/semantic/blocks?ids=" a "&view=outline&property=" (js/encodeURIComponent (ident-id status)))
++                                        (str "/semantic/blocks?ids=" a "&property=" (js/encodeURIComponent (ident-id status)))
++                                        (str "/semantic/blocks?ids=" a "&view=tree")]))
++                  ;; Calls the refusals must not catch.
++                  accepted (p/all (map #(request! self "GET" % nil)
++                                       [(str "/semantic/blocks?ids=" a)
++                                        (str "/semantic/blocks?ids=" a "&view=summary")
++                                        (str "/semantic/blocks?ids=" a "&view=outline")
++                                        (signals-path [a])
++                                        (signals-path [a] "&property=logseq.property/status")
++                                        (signals-path [a] "&graph-e2ee=true")]))]
++            (is (= (repeat 9 400) (mapv :status refusals)) (str (mapv :body refusals)))
++            (is (= ["property not found: user.property/nope"
++                    (str "property not found: " pricing)
++                    "property not found: Pricing"
++                    "property not found: user.class/Organization"
++                    "property not found: logseq.class/Task"
++                    "property needs view=signals"
++                    "property needs view=signals"
++                    "property needs view=signals"
++                    "view must be summary, outline or signals"]
++                   (mapv #(get-in % [:body :error]) refusals)))
++            (is (= (repeat 6 200) (mapv :status accepted)) (str (mapv :body accepted)))
++            (is (= [[]] (mapv :property-values (get-in (nth accepted 4) [:body :blocks])))
++                "a built-in property neither the block nor its page has: []")))))))
++
++(deftest signals-shape-missing-and-limits-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (let [[pricing a b unstamped hidden missing] (repeatedly 6 random-uuid)]
++          (d/transact! conn [(page pricing "Pricing")])
++          (d/transact! conn [(block a "Alpha" pricing pricing "a0" :block/updated-at 1762560000000)
++                             (block b "Beta" pricing pricing "a1" :block/updated-at 1700000000000)
++                             (dissoc (block unstamped "No stamp" pricing pricing "a2") :block/updated-at)
++                             (block hidden "Hidden" pricing pricing "a3" :logseq.property/hide? true)])
++          (p/let [forward (signals! self [a missing b unstamped hidden])
++                  reversed (signals! self [hidden unstamped b missing a])
++                  e2ee (signals! self [a b] "&graph-e2ee=true")
++                  errors (p/all (map #(request! self "GET" % nil)
++                                     [(signals-path (repeatedly 101 random-uuid))
++                                      (signals-path [a (string/upper-case (str a))])
++                                      (signals-path ["not-a-uuid"])]))]
++            (is (= 200 (:status forward)) (str (:body forward)))
++            (is (= [(str a) (str b) (str unstamped)] (mapv :uuid (get-in forward [:body :blocks])))
++                "found entities in request order")
++            (is (= [(str unstamped) (str b) (str a)] (mapv :uuid (get-in reversed [:body :blocks])))
++                "reversed request, reversed response")
++            (is (= [(str missing) (str hidden)] (get-in forward [:body :missing]))
++                "unknown and hidden uuids are missing")
++            (is (= [(str hidden) (str missing)] (get-in reversed [:body :missing])))
++            (is (= (by-uuid forward) (by-uuid reversed)) "each entity's signals don't depend on order")
++            (is (= {(str a) (:block/updated-at (d/entity @conn [:block/uuid a]))
++                    (str b) 1700000000000
++                    (str unstamped) nil}
++                   (update-vals (by-uuid forward) :updated-at)))
++            (is (every? #(= #{:uuid :updated-at :reference-count :status :property-values} (set (keys %)))
++                        (get-in forward [:body :blocks]))
++                "no title, properties, tags or other text")
++            (is (= #{:blocks :missing} (set (keys (:body forward)))))
++            (is (= 200 (:status e2ee)) "the view carries no text, so an E2EE graph answers it")
++            (is (= (select-keys (by-uuid forward) [(str a) (str b)]) (by-uuid e2ee)))
++            (is (= [400 400 400] (mapv :status errors)))
++            (is (= ["at most 100 ids" "duplicate id" "ids must be a comma-separated list of UUIDs"]
++                   (mapv #(get-in % [:body :error]) errors)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 7517a78..30042a7 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -26,6 +26,7 @@
+             [logseq.db-sync.semantic-readable-writes-test]
+             [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]
++            [logseq.db-sync.semantic-signals-view-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

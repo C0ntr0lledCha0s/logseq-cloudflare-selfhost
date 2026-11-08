@@ -4,7 +4,8 @@ area: cost
 tags: [cpu, 10ms, intl, datetimeformat, worker, list, get_activity_log]
 seen:
   - 2026-11-07 – item 28, review round 3 (r3-light-1)
-promoted_to: []
+  - 2026-11-08 – item 22 (suggest_links): the same blind spot at a larger scale, a matcher over every cached title cost 45 ms; see per-request-scan-of-a-cached-index-needs-a-cpu-bench-at-the-cap.md
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom

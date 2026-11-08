@@ -17,6 +17,7 @@ import { type GraphAccess, type GraphTool, buildGraphTools, registerGraphTools }
 import { type SemanticBindings, semanticBindings } from "./semantic/config";
 import { SemanticStore } from "./semantic/store";
 import { registerSemanticTools } from "./tools/semantic-search";
+import { registerSuggestLinksTool } from "./tools/suggest-links";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
@@ -135,6 +136,7 @@ export function mcpHandler(
       registerGraphTools(server, graphTools, onSuccess, audit);
       registerAssetTools(server, access, onSuccess, audit);
       registerKbIndexTool(server, access, onSuccess);
+      registerSuggestLinksTool(server, access, semantic, onSuccess);
       if (semantic) registerSemanticTools(server, { access, ...semantic }, onSuccess);
       return server;
     },
