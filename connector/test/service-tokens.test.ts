@@ -7,6 +7,7 @@ import {
   hashServiceToken,
   ServiceTokenStore,
   TOKEN_PATTERN,
+  type TokenScope,
   TOUCH_INTERVAL_MS,
 } from "../src/auth/service-tokens";
 import { timingSafeEqual } from "../src/crypto";
@@ -315,7 +316,9 @@ describe("ServiceTokenStore", () => {
       expiresAt: T0 + 90 * DAY,
       lastUsedAt: null,
       revokedAt: null,
+      updatedAt: null,
     });
+    expect(listed.every((r) => r.updatedAt === null)).toBe(true);
     expect(m.measured[1]).toMatchObject({ rowsRead: 1, rowsWritten: 0 });
     expect(await s.get("no-such-id")).toBeNull();
     for (const row of [...listed, got]) {
@@ -323,6 +326,221 @@ describe("ServiceTokenStore", () => {
       expect(Object.keys(row!)).not.toContain("token_hash");
       expect(JSON.stringify(row)).not.toMatch(/[0-9a-f]{64}/);
     }
+  });
+});
+
+/** Migration files as the tests apply them (vitest.config.ts injects TEST_MIGRATIONS). */
+function migration(prefix: string): string[] {
+  const all = (env as unknown as { TEST_MIGRATIONS: { name: string; queries: string[] }[] }).TEST_MIGRATIONS;
+  const found = all.find((m) => m.name.startsWith(prefix));
+  if (!found) throw new Error(`no migration ${prefix}`);
+  return found.queries;
+}
+
+describe("migration 0007", () => {
+  it("applies right after 0006 and adds updated_at as a nullable INTEGER with no default", async () => {
+    const applied = (await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{ name: string }>()).results.map(
+      (r) => r.name,
+    );
+    expect(applied.indexOf("0007_service_token_updated_at.sql")).toBe(applied.indexOf("0006_service_tokens.sql") + 1);
+    const columns = (
+      await env.DB.prepare("PRAGMA table_info(service_tokens)").all<{ name: string; type: string; notnull: number; dflt_value: unknown }>()
+    ).results;
+    expect(columns.find((c) => c.name === "updated_at")).toEqual(
+      expect.objectContaining({ name: "updated_at", type: "INTEGER", notnull: 0, dflt_value: null }),
+    );
+  });
+
+  it("keeps every value of a row that existed before it, and that row reads updated_at NULL", async () => {
+    // Rebuild service_tokens as 0006 left it, holding a row the Worker wrote before 0007, then apply 0007.
+    const { id, token } = await new ServiceTokenStore(env.DB).create(newToken("ci", { graphIds: [NOTES, WORK], access: "write" }));
+    await new ServiceTokenStore(env.DB).touch(id, T0 + 5);
+    await new ServiceTokenStore(env.DB).revoke(id, T0 + 6);
+    const COLUMNS_0006 = "id, name, token_hash, owner_id, graph_ids, access, created_at, expires_at, last_used_at, revoked_at";
+    const old = (await env.DB.prepare(`SELECT ${COLUMNS_0006} FROM service_tokens`).all<Record<string, unknown>>()).results[0];
+    await env.DB.exec("DROP TABLE service_tokens");
+    for (const query of migration("0006_")) await env.DB.prepare(query).run();
+    await env.DB.prepare(`INSERT INTO service_tokens (${COLUMNS_0006}) VALUES (${COLUMNS_0006.split(", ").map(() => "?").join(", ")})`)
+      .bind(...COLUMNS_0006.split(", ").map((c) => old[c] ?? null))
+      .run();
+    for (const query of migration("0007_")) await env.DB.prepare(query).run();
+    const rows = await allColumns();
+    expect(rows).toEqual([{ ...old, updated_at: null }]);
+    const s = new ServiceTokenStore(env.DB);
+    expect(await s.get(id)).toMatchObject({ graphIds: [NOTES, WORK], lastUsedAt: T0 + 5, revokedAt: T0 + 6, updatedAt: null });
+    expect((await s.findByHash(await hashServiceToken(token)))?.id).toBe(id);
+  });
+});
+
+describe("ServiceTokenStore.update", () => {
+  const NOW = T0 + DAY;
+  const ARCHIVE_ID = "33333333-3333-3333-3333-333333333333";
+
+  function scope(row: { graphIds: string[]; access: "read" | "write"; expiresAt: number }): TokenScope {
+    return { graphIds: [...row.graphIds], access: row.access, expiresAt: row.expiresAt };
+  }
+
+  async function hashOf(id: string): Promise<unknown> {
+    return (await env.DB.prepare("SELECT token_hash FROM service_tokens WHERE id = ?").bind(id).all()).results[0]?.token_hash;
+  }
+
+  /** A write token on WORK and NOTES, as the wizard would create it; and its scope as `get` reads it. */
+  async function seed(overrides: Partial<Parameters<ServiceTokenStore["create"]>[0]> = {}) {
+    const created = await new ServiceTokenStore(env.DB).create(
+      newToken("ci", { graphIds: [WORK, NOTES], access: "write", ...overrides }),
+    );
+    const row = (await new ServiceTokenStore(env.DB).get(created.id))!;
+    return { ...created, row, before: scope(row), hash: await hashOf(created.id) };
+  }
+
+  /** The hash is untouched, and the token from `create` still finds its own row by hash. */
+  async function expectSameToken(id: string, token: string, hash: unknown) {
+    expect(await hashOf(id)).toBe(hash);
+    expect(hash).toBe(await hashServiceToken(token));
+    expect((await new ServiceTokenStore(env.DB).findByHash(await hashServiceToken(token)))?.id).toBe(id);
+  }
+
+  it("applies a new scope, stamps updated_at, keeps token_hash, and reads 1 and writes 1", async () => {
+    const t = await seed();
+    const m = metered();
+    const after: TokenScope = { graphIds: [NOTES], access: "read", expiresAt: t.row.expiresAt - DAY };
+    expect(await new ServiceTokenStore(m.db).update(t.id, t.before, after, NOW)).toBe(true);
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([[1, 1]]);
+    expect(m.measured[0].sql).not.toContain("token_hash");
+    expect(await new ServiceTokenStore(env.DB).get(t.id)).toEqual({ ...t.row, ...after, updatedAt: NOW });
+    await expectSameToken(t.id, t.token, t.hash);
+    for (const value of Object.values((await allColumns())[0])) expect(String(value)).not.toContain(t.token);
+  });
+
+  it("stores the graphs in the order given (reversed, a swap, a widening): the order is the caller's", async () => {
+    const t = await seed();
+    const s = new ServiceTokenStore(env.DB);
+    let before = t.before;
+    for (const graphIds of [[NOTES, WORK], [WORK, NOTES], [ARCHIVE_ID, NOTES, WORK], [WORK]]) {
+      const after = { ...before, graphIds };
+      expect(await s.update(t.id, before, after, NOW + graphIds.length)).toBe(true);
+      expect((await s.get(t.id))?.graphIds).toEqual(graphIds);
+      before = after;
+    }
+    await expectSameToken(t.id, t.token, t.hash);
+  });
+
+  it("a chain of edits each applies from the last stored values; replaying an earlier edit misses", async () => {
+    const t = await seed();
+    const s = new ServiceTokenStore(env.DB);
+    const first: TokenScope = { ...t.before, graphIds: [WORK] };
+    const second: TokenScope = { ...first, access: "read" };
+    const third: TokenScope = { ...second, expiresAt: second.expiresAt - DAY };
+    expect(await s.update(t.id, t.before, first, NOW + 1)).toBe(true);
+    expect(await s.update(t.id, first, second, NOW + 2)).toBe(true);
+    expect(await s.update(t.id, second, third, NOW + 3)).toBe(true);
+    // The first edit again (a second tab), and the steps out of order: each guard sees newer values.
+    const m = metered();
+    const stale = new ServiceTokenStore(m.db);
+    expect(await stale.update(t.id, t.before, first, NOW + 4)).toBe(false);
+    expect(await stale.update(t.id, first, second, NOW + 5)).toBe(false);
+    expect(await stale.update(t.id, second, third, NOW + 6)).toBe(false);
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([
+      [1, 0],
+      [1, 0],
+      [1, 0],
+    ]);
+    expect(await s.get(t.id)).toEqual({ ...t.row, ...third, updatedAt: NOW + 3 });
+    await expectSameToken(t.id, t.token, t.hash);
+  });
+
+  it("a re-send of the stored values (after equal to before) still applies and stamps updated_at", async () => {
+    const t = await seed();
+    const s = new ServiceTokenStore(env.DB);
+    expect(await s.update(t.id, t.before, t.before, NOW)).toBe(true);
+    expect(await s.update(t.id, t.before, t.before, NOW + 1)).toBe(true);
+    expect(await s.get(t.id)).toEqual({ ...t.row, updatedAt: NOW + 1 });
+    await expectSameToken(t.id, t.token, t.hash);
+  });
+
+  it("applies a millisecond before expiry, on a token already used and one already edited", async () => {
+    const t = await seed();
+    const s = new ServiceTokenStore(env.DB);
+    await s.touch(t.id, NOW);
+    const after = { ...t.before, access: "read" as const };
+    expect(await s.update(t.id, t.before, after, t.row.expiresAt - 1)).toBe(true);
+    expect(await s.get(t.id)).toEqual({ ...t.row, ...after, lastUsedAt: NOW, updatedAt: t.row.expiresAt - 1 });
+  });
+
+  const misses: [string, (t: Awaited<ReturnType<typeof seed>>) => Promise<{ before: TokenScope; now?: number }>][] = [
+    ["revoked", async (t) => (await new ServiceTokenStore(env.DB).revoke(t.id, NOW - 1), { before: t.before })],
+    ["expired exactly now", async (t) => ({ before: t.before, now: t.row.expiresAt })],
+    ["expired a millisecond ago", async (t) => ({ before: t.before, now: t.row.expiresAt + 1 })],
+    ["stored graphs differ (another graph)", async (t) => ({ before: { ...t.before, graphIds: [WORK] } })],
+    ["stored graphs differ (the same graphs in another order)", async (t) => ({ before: { ...t.before, graphIds: [NOTES, WORK] } })],
+    ["stored graphs differ (a duplicate)", async (t) => ({ before: { ...t.before, graphIds: [WORK, NOTES, NOTES] } })],
+    ["stored access differs", async (t) => ({ before: { ...t.before, access: "read" } })],
+    ["stored expiry differs (later)", async (t) => ({ before: { ...t.before, expiresAt: t.before.expiresAt + 1 } })],
+    ["stored expiry differs (earlier)", async (t) => ({ before: { ...t.before, expiresAt: t.before.expiresAt - 1 } })],
+  ];
+
+  it.each(misses)("fails closed when %s: false, reads 1, writes 0, the row and hash unchanged", async (_label, arrange) => {
+    const t = await seed();
+    const { before, now = NOW } = await arrange(t);
+    const stored = await allColumns();
+    const after: TokenScope = { graphIds: [WORK], access: "read", expiresAt: Math.min(before.expiresAt, t.before.expiresAt) - DAY };
+    const m = metered();
+    expect(await new ServiceTokenStore(m.db).update(t.id, before, after, now)).toBe(false);
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([[1, 0]]);
+    expect(await allColumns()).toEqual(stored);
+    await expectSameToken(t.id, t.token, t.hash);
+  });
+
+  it("an unknown id reads 0 and writes 0, and leaves other rows alone", async () => {
+    const t = await seed();
+    const stored = await allColumns();
+    const m = metered();
+    const after = { ...t.before, access: "read" as const };
+    expect(await new ServiceTokenStore(m.db).update(crypto.randomUUID(), t.before, after, NOW)).toBe(false);
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([[0, 0]]);
+    expect(await allColumns()).toEqual(stored);
+  });
+
+  it("only the named row changes when another token holds the same scope", async () => {
+    const t = await seed();
+    const other = await new ServiceTokenStore(env.DB).create(newToken("nightly", { graphIds: [WORK, NOTES], access: "write" }));
+    const otherBefore = (await allColumns()).find((r) => r.id === other.id);
+    expect(await new ServiceTokenStore(env.DB).update(t.id, t.before, { ...t.before, access: "read" }, NOW)).toBe(true);
+    expect((await allColumns()).find((r) => r.id === other.id)).toEqual(otherBefore);
+  });
+
+  it("never extends expiry: a later after.expiresAt throws before any statement; an equal or earlier one is allowed", async () => {
+    const t = await seed();
+    const stored = await allColumns();
+    const m = metered();
+    const s = new ServiceTokenStore(m.db);
+    for (const later of [t.before.expiresAt + 1, t.before.expiresAt + 365 * DAY]) {
+      await expect(s.update(t.id, t.before, { ...t.before, graphIds: [WORK], expiresAt: later }, NOW)).rejects.toThrow(
+        /expir/,
+      );
+    }
+    // Even when the guard would miss anyway (stale before), the assertion answers first.
+    const staleBefore = { ...t.before, expiresAt: t.before.expiresAt - DAY };
+    await expect(s.update(t.id, staleBefore, { ...staleBefore, expiresAt: staleBefore.expiresAt + 1 }, NOW)).rejects.toThrow(
+      /expir/,
+    );
+    expect(m.measured).toEqual([]);
+    expect(await allColumns()).toEqual(stored);
+    expect(await s.update(t.id, t.before, { ...t.before, graphIds: [WORK] }, NOW)).toBe(true);
+    const shorter = { graphIds: [WORK], access: "write" as const, expiresAt: t.before.expiresAt - 1 };
+    expect(await s.update(t.id, { ...t.before, graphIds: [WORK] }, shorter, NOW + 1)).toBe(true);
+    expect(await new ServiceTokenStore(env.DB).get(t.id)).toEqual({ ...t.row, ...shorter, updatedAt: NOW + 1 });
+    await expectSameToken(t.id, t.token, t.hash);
+  });
+
+  it("findByHash still reads 1 and writes 0 on a hit after 0007 and after an update", async () => {
+    const t = await seed();
+    await new ServiceTokenStore(env.DB).update(t.id, t.before, { ...t.before, access: "read" }, NOW);
+    const m = metered();
+    const hit = await new ServiceTokenStore(m.db).findByHash(await hashServiceToken(t.token));
+    expect(hit).toMatchObject({ id: t.id, access: "read", graphIds: [WORK, NOTES] });
+    expect(Object.keys(hit!)).not.toContain("updatedAt");
+    expect(m.measured.map((x) => [x.rowsRead, x.rowsWritten])).toEqual([[1, 0]]);
   });
 });
 

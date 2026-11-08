@@ -28,6 +28,15 @@ export interface ServiceTokenRow {
   expiresAt: number;
   lastUsedAt: number | null;
   revokedAt: number | null;
+  /** When the owner last edited the scope (migration 0007); null when never edited. */
+  updatedAt: number | null;
+}
+
+/** The part of a token the owner can edit: what `update` guards on and what it writes. */
+export interface TokenScope {
+  graphIds: string[];
+  access: ServiceTokenAccess;
+  expiresAt: number;
 }
 
 /** What verification needs from the row found by hash (§3.2 step 2). */
@@ -73,9 +82,10 @@ interface Row {
   expires_at: number;
   last_used_at: number | null;
   revoked_at: number | null;
+  updated_at?: number | null;
 }
 
-const PUBLIC_COLUMNS = "id, name, owner_id, graph_ids, access, created_at, expires_at, last_used_at, revoked_at";
+const PUBLIC_COLUMNS = "id, name, owner_id, graph_ids, access, created_at, expires_at, last_used_at, revoked_at, updated_at";
 
 function toRow(row: Row): ServiceTokenRow {
   return {
@@ -88,13 +98,15 @@ function toRow(row: Row): ServiceTokenRow {
     expiresAt: row.expires_at,
     lastUsedAt: row.last_used_at,
     revokedAt: row.revoked_at,
+    updatedAt: row.updated_at ?? null,
   };
 }
 
 /**
  * The service_tokens table. Every statement uses `run` or `all`, so its D1 cost can be read from
  * `meta` (test/service-tokens.test.ts pins each: insert 4 written; hash lookup 1 read on a hit and 0
- * on a miss; touch 1 read and at most 1 written; revoke 1 read and 1 written; list about one read a row).
+ * on a miss; touch 1 read and at most 1 written; revoke 1 read and 1 written; list about one read a row;
+ * update 1 read and 1 written on a hit, 1 read and 0 written on a guard miss, 0 and 0 for an unknown id).
  */
 export class ServiceTokenStore {
   constructor(private readonly db: D1Database) {}
@@ -171,6 +183,42 @@ export class ServiceTokenStore {
     const result = await this.db
       .prepare("UPDATE service_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
       .bind(now, id)
+      .run();
+    return result.meta.changes > 0;
+  }
+
+  /**
+   * Replaces a token's graphs, access and expiry, and stamps `updated_at` (spec 2026-11-08 §3.3). One
+   * conditional UPDATE: it writes only while the token is unrevoked and unexpired at `now` and still
+   * holds exactly `before`, the values the caller's diff was computed from, so a second tab or a
+   * disconnect's revokeForGraph landing in between makes it miss, and the edit fails closed rather
+   * than overwriting a newer state or reviving a revoked token. `graph_ids` is compared as JSON text,
+   * which round-trips because create and update both store JSON.stringify of a string array; another
+   * order counts as a change. It takes no token and sets no token_hash, so an edit is never a
+   * rotation. Throws, before any statement, if `after` would extend the expiry. True when it wrote.
+   */
+  async update(id: string, before: TokenScope, after: TokenScope, now: number): Promise<boolean> {
+    if (after.expiresAt > before.expiresAt) {
+      throw new Error(`service token ${id}: an edit can only shorten the expiry, never extend it`);
+    }
+    const result = await this.db
+      .prepare(
+        `UPDATE service_tokens
+            SET graph_ids = ?, access = ?, expires_at = ?, updated_at = ?
+          WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
+            AND graph_ids = ? AND access = ? AND expires_at = ?`,
+      )
+      .bind(
+        JSON.stringify(after.graphIds),
+        after.access,
+        after.expiresAt,
+        now,
+        id,
+        now,
+        JSON.stringify(before.graphIds),
+        before.access,
+        before.expiresAt,
+      )
       .run();
     return result.meta.changes > 0;
   }

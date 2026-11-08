@@ -1,0 +1,14 @@
+-- service_tokens.updated_at: when the owner last edited a token's graphs, mode or expiry in the
+-- wizard (design docs/superpowers/specs/2026-11-08-edit-service-token-scope-design.md §3.2). NULL
+-- means never edited, which every row created before this migration reads. Only the wizard's guarded
+-- scope UPDATE (ServiceTokenStore.update) sets it; touch and revoke leave it alone.
+--
+-- It lives on the row rather than being read from audit_log because the /tokens list would pay extra
+-- reads for every token, and the time would vanish when the audit purge removes the token_edit row.
+--
+-- Cost, measured from D1 meta (spec §2, test/service-tokens.test.ts pins the statements): the ALTER
+-- runs once and reads about 22 rows (schema, not data) and writes 1. findByHash still reads 1 row on
+-- a hit, and the list still reads about one row per token. The conditional scope UPDATE reads its one
+-- row by primary key, and writes 1 on a hit and 0 on a guard miss; an unknown id reads 0. Nullable,
+-- no default, no backfill, no index and no trigger.
+ALTER TABLE service_tokens ADD COLUMN updated_at INTEGER;

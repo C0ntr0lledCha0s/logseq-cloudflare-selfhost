@@ -1040,6 +1040,7 @@ describe("service tokens", () => {
       expiresAt,
       lastUsedAt: null,
       revokedAt: null,
+      updatedAt: null,
     });
     const html = await tokenListPage([row("at-now", now), row("just-before", now + 1)], [], "csrf", now).text();
     const section = (name: string) => html.slice(html.indexOf(`id="token-${name}"`)).split("</section>")[0];
