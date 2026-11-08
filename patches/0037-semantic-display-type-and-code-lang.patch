@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 7415fcc..7106614 100644
+index 7415fcc..4c2c5df 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -76,6 +76,10 @@
@@ -262,7 +262,7 @@ index 7415fcc..7106614 100644
        (not= :db.type/ref (:db/valueType property))
        (if-let [refused (when (some? value) (refused-by-type db property [value] [value]))]
          (refusal property refused)
-@@ -1063,21 +1208,137 @@
+@@ -1063,21 +1208,139 @@
    list replaces the block's user tags, as the app's tag editor does: only the user tags it leaves out
    are removed, and the private tags the block holds (ldb/private-tags: Page, Tag, Journal, Property,
    Asset and the like), which the outliner refuses to remove, are kept. So sending a page's or tag's
@@ -345,26 +345,28 @@ index 7415fcc..7106614 100644
 +(declare unverified!)
 +
 +(defn- read-back-display!
-+  "Throws, answered as a 500, when the display write of entry `index` didn't read back."
-+  [db index block-id property-ident value]
++  "Throws, answered as a 500, when the display write of entry `entry` (\"entry 0\", \"entries[0]\")
++  didn't read back."
++  [db entry block-id property-ident value]
 +  (when (contains? #{display-type-ident lang-ident} property-ident)
 +    (when-let [problem (read-back-display db block-id property-ident value)]
-+      (unverified! [(str "entry " index ": " problem)]))))
++      (unverified! [(str entry ": " problem)]))))
 +
 +(defn- lang-error
-+  "Why a lang write in `writes` ({:block :property-ident :prepared}, in request order) can't be
-+  applied: lang needs display-type code, judged on each block's type once every write has applied,
-+  as *final-tags* judges tags; else nil."
++  "Why a lang write in `writes` ({:block :property-ident :prepared}, in request order, with :entry
++  naming its entry when that isn't \"entry <index>\") can't be applied: lang needs display-type
++  code, judged on each block's type once every write has applied, as *final-tags* judges tags; else
++  nil."
 +  [writes]
 +  (let [final (reduce (fn [types {:keys [block property-ident prepared]}]
 +                        (cond-> types
 +                          (and (= display-type-ident property-ident) (contains? prepared :value))
 +                          (assoc (:db/id block) (:value prepared))))
 +                      {} writes)]
-+    (some (fn [[index {:keys [block property-ident prepared]}]]
++    (some (fn [[index {:keys [block property-ident prepared entry]}]]
 +            (when (and (= lang-ident property-ident) (contains? prepared :value)
 +                       (not= :code (get final (:db/id block) (display-type-ident block))))
-+              (str "entry " index ": lang needs display-type code")))
++              (str (or entry (str "entry " index)) ": lang needs display-type code")))
 +          (map-indexed vector writes))))
 +
 +(def ^:private escape-warning
@@ -404,7 +406,7 @@ index 7415fcc..7106614 100644
      (= :block/tags property-ident)
      (set-prepared-tags! conn block-id value reset-existing-values?)
      (coll? value)
-@@ -1089,6 +1350,14 @@
+@@ -1089,6 +1352,14 @@
      :else
      (outliner-property/set-block-property! conn block-id property-ident value)))
  
@@ -419,24 +421,41 @@ index 7415fcc..7106614 100644
  ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
  ;; property UUID, ident or title. They are resolved before anything is written.
  (defn- property-selector
-@@ -1128,12 +1397,13 @@
+@@ -1125,15 +1396,27 @@
+   [db scope properties e2ee?]
+   (scope-with-tags db scope (property-tag-ids db scope properties e2ee?)))
+ 
++(defn- display-tag-write
++  "The final-tags write of a display-type `value` on the entity with db id `id`, or nil when `value`
++  names no type (the entry is refused)."
++  [db id value]
++  (when-let [type (parse-display-type value)]
++    [id [(:db/id (d/entity db (display-type-classes type)))] false true]))
++
  (defn- final-tags
-   "*final-tags* for a batch's tag writes, [[db-id tag-ids replace?] ...] in request order, applied
-   as set-prepared-tags! applies them: a write adds its tags, and one that replaces (a list under
+-  "*final-tags* for a batch's tag writes, [[db-id tag-ids replace?] ...] in request order, applied
+-  as set-prepared-tags! applies them: a write adds its tags, and one that replaces (a list under
 -  reset) first drops the user tags the entity holds and keeps the private ones."
-+  reset) first drops the user tags the entity holds and keeps the private ones and the display
-+  classes."
++  "*final-tags* for a batch's tag writes, [[db-id tag-ids replace? display?] ...] in request order,
++  applied as set-prepared-tags! applies them: a write adds its tags, and one that replaces (a list
++  under reset) first drops the user tags the entity holds and keeps the private ones and the display
++  classes. A display-type write (display-tag-write) drops the display classes and adds its own, as
++  set-display-type! does."
    [db writes]
 -  (let [private? #(contains? ldb/private-tags (:db/ident (d/entity db %)))]
+-    (->> (reduce (fn [result [id ids replace?]]
 +  (let [kept? #(or (contains? ldb/private-tags (:db/ident (d/entity db %))) (display-class? db %))]
-     (->> (reduce (fn [result [id ids replace?]]
++    (->> (reduce (fn [result [id ids replace? display?]]
                     (let [held (get result id (set (map :db/id (:block/tags (d/entity db id)))))]
 -                     (assoc result id (into (if replace? (set (filter private? held)) held) ids))))
-+                     (assoc result id (into (if replace? (set (filter kept? held)) held) ids))))
++                     (assoc result id (into (cond replace? (set (filter kept? held))
++                                                  display? (set (remove #(display-class? db %) held))
++                                                  :else held)
++                                            ids))))
                   {} writes)
           (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
           (into {}))))
-@@ -1163,34 +1433,94 @@
+@@ -1163,34 +1446,94 @@
                {:properties []}
                properties))))
  
@@ -540,7 +559,7 @@ index 7415fcc..7106614 100644
  
  (defn- insert-tree!
    "Inserts prepared `nodes` under `target` and sets each new block's properties. A node whose uuid
-@@ -1207,13 +1537,16 @@
+@@ -1207,13 +1550,16 @@
                                       :bottom? (not= position "prepend") :keep-uuid? true}))
      (mapv (fn [node block]
              (when (contains? fresh-ids (:block/uuid block))
@@ -561,7 +580,7 @@ index 7415fcc..7106614 100644
                  (seq children) (assoc :children children))))
            nodes blocks)))
  
-@@ -1226,6 +1559,17 @@
+@@ -1226,6 +1572,17 @@
        (= "false" raw) false
        :else ::invalid)))
  
@@ -579,7 +598,7 @@ index 7415fcc..7106614 100644
  (defn- tree-count [nodes]
    (reduce + (map #(inc (tree-count (:children %))) nodes)))
  
-@@ -1233,8 +1577,9 @@
+@@ -1233,8 +1590,9 @@
    (if verbose?
      nodes
      (mapv #(cond-> {:uuid (:uuid %)}
@@ -590,7 +609,7 @@ index 7415fcc..7106614 100644
               (:children %) (assoc :children (tree-response (:children %) false)))
            nodes)))
  
-@@ -2222,32 +2567,44 @@
+@@ -2222,32 +2580,44 @@
      "first-child" [target {:sibling? false :top? true}]
      "last-child" [target {:sibling? false :bottom? true}]))
  
@@ -647,7 +666,7 @@ index 7415fcc..7106614 100644
  
  (defn- refresh-candidates
    "Body blocks (not pages or property values) of `page`, or of the whole graph, whose stored title
-@@ -2270,13 +2627,14 @@
+@@ -2270,13 +2640,14 @@
    [conn [e title]]
    (let [db @conn
          block (d/entity db e)
@@ -664,7 +683,7 @@ index 7415fcc..7106614 100644
                (seq added))
        (let [show #(db-content/id-ref->title-ref % (map (fn [ref] (d/entity db ref)) (:block/refs prepared)))]
          {:e e :title title
-@@ -2305,7 +2663,8 @@
+@@ -2305,7 +2676,8 @@
                         (doseq [{:keys [e title]} changes]
                           (let [block (d/entity @tx-conn e)]
                             (outliner-core/save-block! tx-conn
@@ -674,7 +693,7 @@ index 7415fcc..7106614 100644
                                                               :block/uuid (:block/uuid block))))))))
      (cond-> {:applied (boolean apply?) :changed (mapv :response changes)}
        truncated? (assoc :truncated true))))
-@@ -2326,27 +2685,63 @@
+@@ -2326,27 +2698,63 @@
      :semantic/blocks-update
      (p/let [body (body-clj request)
              block (find-entity db (:block-id path-params))]
@@ -759,7 +778,7 @@ index 7415fcc..7106614 100644
  
      :semantic/refresh-refs
      (p/let [body (body-clj request)
-@@ -2424,7 +2819,8 @@
+@@ -2424,7 +2832,8 @@
        (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
                (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target, position, or blocks")
@@ -769,7 +788,7 @@ index 7415fcc..7106614 100644
  
      :semantic/blocks-insert-tree
      (p/let [body (body-clj request)
-@@ -2435,7 +2831,7 @@
+@@ -2435,7 +2844,7 @@
          (or (nil? target) (not (valid-tree-identities? db target (:blocks body))))
          (http/bad-request "invalid target or blocks")
          :else (insert-tree-response context target (:blocks body) (or (:position body) "append") {}
@@ -778,7 +797,7 @@ index 7415fcc..7106614 100644
  
  (defn- batch-entries-error
    "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
-@@ -2465,22 +2861,29 @@
+@@ -2465,22 +2874,29 @@
              block (find-entity db (:block-id path-params))
              property-ident (resolve-property-ident db (:property-id path-params))
              prepared (when (and block property-ident)
@@ -810,14 +829,14 @@ index 7415fcc..7106614 100644
 +                            (fn [tx-conn]
 +                              (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
 +                              (set-prepared-property! tx-conn (:db/id block) property-ident (:value prepared) true)
-+                              (read-back-display! @tx-conn 0 (:db/id block) property-ident (:value prepared))))
++                              (read-back-display! @tx-conn "entry 0" (:db/id block) property-ident (:value prepared))))
 +             (broadcast-change! self)
 +             (http/json-response nil (cond-> (with-context-or-unavailable {:updated true} (fn [] (target-context @conn block e2ee?)))
 +                                       (display-warnings writes false) (assoc :warnings (display-warnings writes false)))))))))
  
      :semantic/blocks-delete-property
      (let [block (find-entity db (:block-id path-params))
-@@ -2491,14 +2894,16 @@
+@@ -2491,14 +2907,16 @@
          (stamp-property-refusal property-ident)
          (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
          :else
@@ -831,14 +850,35 @@ index 7415fcc..7106614 100644
                               (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
 -                             (outliner-property/remove-block-property! tx-conn (:db/id block) property-ident)))
 +                             (remove-prepared-property! tx-conn (:db/id block) property-ident)
-+                             (read-back-display! @tx-conn 0 (:db/id block) property-ident nil)))
++                             (read-back-display! @tx-conn "entry 0" (:db/id block) property-ident nil)))
              (broadcast-change! self)
 -            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?))))))))
 +            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?)))))))))
  
      :semantic/blocks-batch-set-property
      (p/let [body (body-clj request)
-@@ -2539,18 +2944,22 @@
+@@ -2506,12 +2924,17 @@
+             reset? (true? (:isResetExistingValues body))
+             ;; A class check judges a value by the tags it holds once the whole batch has applied,
+             ;; so every entry's tag write is resolved first.
++            ;; A display-type entry swaps the block's display class, so it counts as a tag write.
+             tag-writes (when (sequential? entries)
+                          (keep (fn [{:keys [block-id property-id value]}]
+-                                 (let [block (find-entity db block-id)]
+-                                   (when (and block (= :block/tags (resolve-property-ident db property-id)))
++                                 (let [block (find-entity db block-id)
++                                       property-ident (when block (resolve-property-ident db property-id))]
++                                   (cond
++                                     (= :block/tags property-ident)
+                                      (when-let [ids (:value (prepare-property-value db :block/tags value e2ee? block))]
+-                                       [(:db/id block) (tag-ids ids) (and reset? (coll? ids))]))))
++                                       [(:db/id block) (tag-ids ids) (and reset? (coll? ids))])
++                                     (= display-type-ident property-ident)
++                                     (display-tag-write db (:db/id block) value))))
+                                entries))
+             ;; An entry's block is scoped with the tags earlier entries in the batch give it. As
+             ;; set-prepared-property! writes them, under reset a list of tags replaces the block's
+@@ -2539,18 +2962,22 @@
                                            (cond-> replace? (update :replaced conj (:db/id block)))))))
                                  {:entries [] :added {} :replaced #{}}
                                  entries))))]
@@ -864,7 +904,7 @@ index 7415fcc..7106614 100644
 +                 (doseq [[index {:keys [block property-ident prepared]}] (map-indexed vector resolved)]
 +                   (set-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)
 +                                           (true? (:isResetExistingValues body)))
-+                   (read-back-display! @temp-conn index (:db/id block) property-ident (:value prepared)))))
++                   (read-back-display! @temp-conn (str "entry " index) (:db/id block) property-ident (:value prepared)))))
 +             (broadcast-change! self)
 +             (http/json-response nil (cond-> (with-context-or-unavailable {:updated (count resolved)}
 +                                               (fn [] (affected-context @conn (map :block resolved) e2ee?)))
@@ -872,7 +912,7 @@ index 7415fcc..7106614 100644
  
      :semantic/blocks-batch-delete-property
      (p/let [body (body-clj request)
-@@ -2561,16 +2970,18 @@
+@@ -2561,16 +2988,18 @@
                                  :property-ident (resolve-property-ident db property-id)}) entries))]
        (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
          (http/bad-request error)
@@ -894,14 +934,14 @@ index 7415fcc..7106614 100644
 +                 (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
 +                 (doseq [[index {:keys [block property-ident]}] (map-indexed vector resolved)]
 +                   (remove-prepared-property! temp-conn (:db/id block) property-ident)
-+                   (read-back-display! @temp-conn index (:db/id block) property-ident nil))))
++                   (read-back-display! @temp-conn (str "entry " index) (:db/id block) property-ident nil))))
 +             (broadcast-change! self)
 +             (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
 +                                       (fn [] (affected-context @conn (map :block resolved) e2ee?)))))))))))
  
  (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
           unverified!)
-@@ -2702,8 +3113,12 @@
+@@ -2702,8 +3131,12 @@
  
      :semantic/capture
      (p/let [body (body-clj request)]
@@ -915,7 +955,7 @@ index 7415fcc..7106614 100644
          (if-let [time-zone (owner-time-zone self)]
            (let [today (authored-write! conn creator ensure-today-page! time-zone)]
              (if-not (valid-tree-identities? @conn today (:blocks body))
-@@ -4108,9 +4523,10 @@
+@@ -4108,9 +4541,10 @@
        (when (string? page) [:page (string/lower-case page)])))
  
  (defn- insert-entry
@@ -929,7 +969,7 @@ index 7415fcc..7106614 100644
    (let [prefix (str "entries[" index "]")
          selected (when (contains? entry :target-id)
                     (resolve-page-selector db (:target-id entry) "target-id" {:e2ee? e2ee? :find find-entity}))
-@@ -4142,7 +4558,7 @@
+@@ -4142,7 +4576,7 @@
                      "invalid blocks"
                      (:error properties) (:error properties)))
          tree (when (and (nil? error) (contains? entry :blocks))
@@ -938,7 +978,7 @@ index 7415fcc..7106614 100644
      (cond
        error (cond-> {:error (str prefix ": " error)}
                (= error (:error selected)) (merge (select-keys selected [:status :candidates])))
-@@ -4152,7 +4568,8 @@
+@@ -4152,31 +4586,50 @@
                       :page page
                       :position (or (:position entry) "append")
                       :properties (:properties properties)
@@ -947,9 +987,44 @@ index 7415fcc..7106614 100644
 +               :kept (:kept tree)})))
  
  (defn- insert-tag-writes
-   "The tag writes (see final-tags) of batch insert entries' `properties` on an existing target or page."
-@@ -4168,15 +4585,16 @@
-         entries))
+-  "The tag writes (see final-tags) of batch insert entries' `properties` on an existing target or page."
++  "The tag writes (see final-tags) of batch insert entries' `properties` on an existing target or
++  page, a display-type among them included."
+   [db e2ee? entries]
+-  (keep (fn [entry]
+-          (when (and (map? entry) (map? (:properties entry)))
+-            (let [page (:page entry)
+-                  existing (if (contains? entry :target-id)
+-                             (:ok (resolve-page-selector db (:target-id entry) "target-id" {:e2ee? e2ee? :find find-entity}))
+-                             (when (and (non-blank-string? page) (not e2ee?)) (insert-page db page)))
+-                  ids (when existing (property-tag-ids db existing (:properties entry) e2ee?))]
+-              (when (seq ids) [(:db/id existing) ids false]))))
+-        entries))
++  (mapcat (fn [entry]
++            (when (and (map? entry) (map? (:properties entry)))
++              (let [page (:page entry)
++                    existing (if (contains? entry :target-id)
++                               (:ok (resolve-page-selector db (:target-id entry) "target-id" {:e2ee? e2ee? :find find-entity}))
++                               (when (and (non-blank-string? page) (not e2ee?)) (insert-page db page)))
++                    ids (when existing (property-tag-ids db existing (:properties entry) e2ee?))
++                    display (when existing
++                              (some (fn [[k value]]
++                                      (when (= display-type-ident (resolve-property-ident db (property-selector k)))
++                                        (display-tag-write db (:db/id existing) value)))
++                                    (:properties entry)))]
++                (cond-> []
++                  (seq ids) (conj [(:db/id existing) ids false])
++                  display (conj display)))))
++          entries))
++
++(defn- insert-display-writes
++  "The display writes (as lang-error takes them) of resolved batch insert entries' properties on an
++  existing block, in request order."
++  [entries]
++  (for [[index {:keys [target properties]}] (map-indexed vector entries)
++        :when target
++        [property-ident value] properties]
++    {:block target :property-ident property-ident :prepared {:value value} :entry (str "entries[" index "]")}))
  
  (defn- resolve-insert-entries
 -  "Batch insert entries as {:entries [...]}, or {:error reason}. A block uuid may appear only once
@@ -969,7 +1044,7 @@ index 7415fcc..7106614 100644
                                                         {:error (str "entries[" index "]: must be an object")})
                          {:keys [key properties]} (:entry resolved)
                          entry-uuids (tree-uuids (:blocks entry))]
-@@ -4186,11 +4604,12 @@
+@@ -4186,30 +4639,37 @@
                        (reduced {:error (str "entries[" index "]: a block uuid is used more than once in the batch")})
                        :else (-> result
                                  (update :entries conj (dissoc (:entry resolved) :key))
@@ -981,9 +1056,38 @@ index 7415fcc..7106614 100644
 -                {:entries [] :uuids #{} :added {}}
 +                {:entries [] :kept [] :uuids #{} :added {}}
                  (map-indexed vector entries))
-         (dissoc :added)))))
+-        (dissoc :added)))))
++        (dissoc :added)
++        (as-> resolved
++          ;; lang needs display-type code, judged on each target's type once every entry has applied.
++          (if-let [error (and (:entries resolved) (lang-error (insert-display-writes (:entries resolved))))]
++            {:error error}
++            resolved))))))
  
-@@ -4294,10 +4713,12 @@
+ (defn- insert-entries!
+   "Applies resolved insert entries in order. A `page` entry uses the page that names (insert-page), or creates it."
+   [conn e2ee? entries]
+-  (mapv (fn [{:keys [target page position properties nodes]}]
++  (mapv (fn [index {:keys [target page position properties nodes]}]
+           (let [existing (if target (d/entity @conn (:db/id target)) (insert-page @conn page))
+                 target-id (:db/id (or existing
+                                       (let [[_ page-uuid] (outliner-page/create! conn page {})]
+                                         (d/entity @conn [:block/uuid page-uuid]))))]
+             (doseq [[property-ident value] properties]
+-              (set-prepared-property! conn target-id property-ident value false))
++              (set-prepared-property! conn target-id property-ident value false)
++              (read-back-display! @conn (str "entries[" index "]") target-id property-ident value))
+             (cond-> {:target-id (str (:block/uuid (d/entity @conn target-id)))
+                      :blocks (if (seq nodes)
+                                (insert-tree! conn (d/entity @conn target-id) nodes position e2ee?)
+                                [])}
+               (nil? existing) (assoc :created true))))
+-        entries))
++        (range) entries))
+ 
+ (defn- insert-label-checks
+   "One label check per batch insert entry that gives a target-label: against its target, or the
+@@ -4294,10 +4754,12 @@
  
      :semantic/blocks-batch-insert-tree
      (p/let [body (body-clj request)]
@@ -998,7 +1102,7 @@ index 7415fcc..7106614 100644
                             error
                             (when (= ::invalid dry-run?) "dry-run must be a boolean")
                             (when (= ::invalid verbose?) "verbose must be true or false"))]
-@@ -4309,8 +4730,9 @@
+@@ -4309,8 +4771,9 @@
                                              (check-labels! @tx-conn e2ee? (insert-label-checks @tx-conn (:entries body) entries))
                                              (insert-entries! tx-conn e2ee? entries)))]
                (when-not dry-run? (broadcast-change! self))
@@ -1011,7 +1115,7 @@ index 7415fcc..7106614 100644
                             {:entries (mapv (fn [entry {:keys [target-id blocks created]}]
                                               (cond-> (merge entry (insert-context @write-conn (d/entity @write-conn [:block/uuid (uuid target-id)])
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 98c5ec5..dfb2d79 100644
+index 98c5ec5..271a649 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -113,20 +113,37 @@
@@ -1059,7 +1163,7 @@ index 98c5ec5..dfb2d79 100644
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
 -   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
-+   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
 -   "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
 -   "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note)]
@@ -1078,7 +1182,7 @@ index 98c5ec5..dfb2d79 100644
 +   "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
 +   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept. " value-notes " " display-type-note)]
 +   "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Answers the block's page, breadcrumb and snippet (target)."]
-+   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link. " display-type-note " lang is judged on each block's type once every entry has applied, so lang may come before display-type for the same block; warnings name their entry.")]
++   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link. " display-type-note " lang is judged on each block's type once every entry has applied, so lang may come before display-type for the same block; warnings name their entry. A display-type entry swaps the block's Code, Math or Quote tag, so a property limited to one of those tags judges the block by the type the batch leaves it with, in any entry order.")]
 +   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too."]
 +   "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
@@ -1235,10 +1339,10 @@ index 98c5ec5..dfb2d79 100644
                                              :children {:type "array"
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
 new file mode 100644
-index 0000000..8299db9
+index 0000000..4cc4f1e
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_display_type_test.cljs
-@@ -0,0 +1,1431 @@
+@@ -0,0 +1,1648 @@
 +(ns logseq.db-sync.semantic-display-type-test
 +  "Code, math and quote blocks through the property paths (patch 0037, stage 1). The block type
 +  lives in :logseq.property.node/display-type, a keyword property, and JSON can't carry a keyword,
@@ -2533,7 +2637,15 @@ index 0000000..8299db9
 +                                        {:title "```python\n# comment\nprint(1)\n```" :children [{:title "child"}]}
 +                                        {:title "x = 1" :display-type "code"}
 +                                        {:title "$$E=mc^2$$"}
-+                                        {:title "# Said\nline two" :display-type "quote"}])
++                                        {:title "# Said\nline two" :display-type "quote"}
++                                        {:title "y = 2" :display-type "code" :lang "python"}
++                                        {:title "a^2" :display-type "math"}
++                                        {:title "Heard" :display-type "quote"}])
++                ;; A typed block can hold a heading set later (set_block_property takes it) or made in
++                ;; the app; the outline never prefixes it, which would break the fence.
++                _ (p/doseq [block (take-last 3 (get-in inserted [:body :blocks]))]
++                    (p/let [response (put! self (:uuid block) "logseq.property/heading" 2)]
++                      (ok? response (str "heading on " (:title block)))))
 +                outline (request! self "GET" (str "/semantic/pages/" page-id "/outline") nil)]
 +          (created? inserted "insert")
 +          (is (= 200 (:status outline)) (pr-str outline))
@@ -2548,7 +2660,12 @@ index 0000000..8299db9
 +                                    "  ```"
 +                                    "- $$E=mc^2$$"
 +                                    "- > # Said"
-+                                    "  > line two"])
++                                    "  > line two"
++                                    "- ```python"
++                                    "  y = 2"
++                                    "  ```"
++                                    "- $$a^2$$"
++                                    "- > Heard"])
 +                 (get-in outline [:body :markdown]))))))))
 +
 +;; The owner's bulk conversion: update_block on an old fenced text block, title unchanged, converts
@@ -2660,7 +2777,15 @@ index 0000000..8299db9
 +                id (random-uuid)
 +                first-try (insert-tree! self page-id [{:uuid (str id) :title python-fence :display-type "code"}])
 +                before (snapshot conn)
-+                retry (insert-tree! self page-id [{:uuid (str id) :title python-fence :display-type "code"}])]
++                retry (insert-tree! self page-id [{:uuid (str id) :title python-fence :display-type "code"}])
++                after-retry (snapshot conn)
++                ;; Without display-type the fence alone converts; on a reused block nothing is converted.
++                fence-id (random-uuid)
++                fence-first (insert-tree! self page-id [{:uuid (str fence-id) :title python-fence}])
++                fence-before (snapshot conn)
++                fence-retry (insert-tree! self page-id [{:uuid (str fence-id) :title python-fence}])
++                quiet-retry (insert-tree! self page-id [{:uuid (str fence-id) :title python-fence}]
++                                          :query "?verbose=false")]
 +          (ok? renamed "page rename")
 +          (is (= {:type nil :classes #{} :title "$$E=mc^2$$"}
 +                 (select-keys (held conn page-id) [:type :classes :title]))
@@ -2669,7 +2794,203 @@ index 0000000..8299db9
 +          (created? first-try "first")
 +          (created? retry "retry")
 +          (is (= (as-typed :code "print(1)" "python") (held conn id)))
-+          (is (= (:datoms before) (:datoms (snapshot conn))) "the retry added nothing"))))))
++          (is (= (:datoms before) (:datoms after-retry)) "the retry added nothing")
++          (created? fence-first "fence first") (created? fence-retry "fence retry") (created? quiet-retry "quiet retry")
++          (is (= "fence" (get-in fence-first [:body :blocks 0 :converted])) "the first try converted the fence")
++          (is (not (contains? (get-in fence-retry [:body :blocks 0]) :converted)) "a retry converted nothing")
++          (is (not (contains? (get-in quiet-retry [:body :blocks 0]) :converted)) "nor with verbose=false")
++          (is (= (:datoms fence-before) (:datoms (snapshot conn))) "the fence retries added nothing")
++          (is (= (as-typed :code "print(1)" "python") (held conn fence-id))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Review round 1.
++
++(def ^:private unverified "the write did not store what was asked: ")
++
++(defn- unverified? [response expected label]
++  (is (= 500 (:status response)) (str label ": " (pr-str (:body response))))
++  (is (= (str unverified expected) (get-in response [:body :error])) label))
++
++;; STUBS A STEP (labelled): set-display-type! is redefined to add the class tag but skip the
++;; keyword. Every tree path and update_block reads the type back in its transaction, so each call
++;; answers 500 naming the node's path, and nothing is committed. Without the read-back each answered
++;; 201 or 200 and stored a block tagged Code with no type.
++(deftest tree-and-update-read-back-mismatch-rejects-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self page-id ids]}]
++        (let [[parent target] ids
++              code {:title "x = 1" :display-type "code"}]
++          ;; capture_to_today makes today's journal before its write, so it is made first here.
++          (p/let [warm-up (capture! self [{:title "plain"}])
++                  _ (created? warm-up "today's journal")
++                  before (snapshot conn)
++                  responses
++                  (p/with-redefs [semantic/set-display-type!
++                                  (fn [conn block-id _type]
++                                    (outliner-property/set-block-property! conn block-id :block/tags
++                                                                           :logseq.class/Code-block))]
++                    (p/let [top (insert-tree! self page-id [{:title "plain"} code])
++                            nested (insert-tree! self page-id [{:title "plain" :children [{:title "plain"} code]}])
++                            children (insert-children! self parent [code])
++                            batch (batch-insert! self [{:target-id (str page-id) :blocks [{:title "plain"}]}
++                                                       {:target-id (str page-id) :blocks [code]}])
++                            captured (capture! self [code])
++                            updated (update! self target {:title "x = 1" :display-type "code"})
++                            fence (update! self target {:title "```python\nprint(1)\n```"})]
++                      [top nested children batch captured updated fence]))]
++            (doseq [[response expected label]
++                    (map vector responses
++                         ["blocks[1]: display-type is not code"
++                          "blocks[0].children[1]: display-type is not code"
++                          "blocks[0]: display-type is not code"
++                          "entries[1].blocks[0]: display-type is not code"
++                          "blocks[0]: display-type is not code"
++                          "display-type is not code"
++                          "display-type is not code"]
++                         ["insert_block_tree" "insert_block_tree, nested" "insert_block_children"
++                          "batch_insert_block_trees" "capture_to_today" "update_block" "update_block, fence"])]
++              (unverified? response expected label))
++            (is (= before (snapshot conn)) "nothing committed")
++            (is (= [plain plain] [(state conn parent) (state conn target)]))))))))
++
++;; STUBS A STEP (labelled): clear-display-type! is redefined to remove only the keyword, leaving the
++;; class tag and lang. Both delete routes read back, so each answers 500 naming the entry and
++;; commits nothing. Without the read-back each answered {:deleted n} with the block still tagged Code.
++(deftest delete-read-back-mismatch-rejects-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self ids]}]
++        (let [[a b] ids]
++          (p/let [_ (batch-set! self [[a type-ident "code"] [a lang-ident "python"] [b type-ident "math"]])
++                  before (snapshot conn)
++                  [single batch]
++                  (p/with-redefs [semantic/clear-display-type!
++                                  (fn [conn block-id]
++                                    (outliner-property/remove-block-property! conn block-id :logseq.property.node/display-type))]
++                    (p/let [single (delete! self a type-ident)
++                            batch (batch-delete! self [[a "logseq.property/heading"] [b type-ident]])]
++                      [single batch]))]
++            (unverified? single "entry 0: its display class tag was not removed" "delete")
++            (unverified? batch "entry 1: its display class tag was not removed" "batch delete")
++            (is (= before (snapshot conn)) "nothing committed")
++            (is (= [(typed :code "python") (typed :math)] [(state conn a) (state conn b)]))))))))
++
++;; A batch insert entry's properties on an existing block follow the rule every other path applies:
++;; lang needs display-type code, judged on the block's type once every entry has applied, and the
++;; refusal names the entry. Before the fix these answered 201: lang stored on a text block, or on a
++;; math block, or dropped by the quote type written after it:
++;;   expected: (= 400 (:status response))  actual: 201
++(deftest batch-insert-entry-lang-needs-code-test
++  (async done
++    (with-graph done 7
++      (fn [{:keys [conn self ids]}]
++        (let [[text code other lang-first type-first split-a split-b] ids]
++          (p/let [_ (batch-set! self [[code type-ident "code"] [code lang-ident "python"]
++                                      [other type-ident "code"]])]
++            (p/doseq [[label entries expected]
++                      [["lang on a text block" [{:target-id (str text) :properties {lang-ident "js"}}]
++                        "entries[0]: lang needs display-type code"]
++                       ["lang, then quote" [{:target-id (str code) :properties {lang-ident "js" type-ident "quote"}}]
++                        "entries[0]: lang needs display-type code"]
++                       ["quote, then lang" [{:target-id (str code) :properties {type-ident "quote" lang-ident "js"}}]
++                        "entries[0]: lang needs display-type code"]
++                       ["math with lang" [{:target-id (str code) :properties {type-ident "math" lang-ident "python"}}]
++                        "entries[0]: lang needs display-type code"]
++                       ["a later entry makes it quote"
++                        [{:target-id (str other) :blocks [{:title "plain"}]}
++                         {:target-id (str code) :properties {lang-ident "js"}}
++                         {:target-id (str code) :properties {type-ident "quote"}}]
++                        "entries[1]: lang needs display-type code"]
++                       ["an earlier entry makes it quote"
++                        [{:target-id (str code) :properties {type-ident "quote"}}
++                         {:target-id (str code) :properties {lang-ident "js"}}]
++                        "entries[1]: lang needs display-type code"]]]
++              (p/let [before (snapshot conn)
++                      response (batch-insert! self entries)]
++                (refused? response expected label)
++                (is (= before (snapshot conn)) (str label ": nothing written"))))
++            (is (= [(typed nil) (typed :code "python")] [(state conn text) (state conn code)]))
++            ;; The final type is code: accepted in either key order and across entries.
++            (p/let [response (batch-insert! self [{:target-id (str lang-first) :properties {lang-ident "js" type-ident "code"}}
++                                                  {:target-id (str type-first) :properties {type-ident "code" lang-ident "go"}}
++                                                  {:target-id (str split-a) :properties {lang-ident "sql"}}
++                                                  {:target-id (str split-a) :properties {type-ident "code"}}
++                                                  {:target-id (str split-b) :properties {type-ident "code"}}
++                                                  {:target-id (str split-b) :properties {lang-ident "rust"}}])]
++              (created? response "final type code")
++              (is (= [(typed :code "js") (typed :code "go") (typed :code "sql") (typed :code "rust")]
++                     (mapv #(state conn %) [lang-first type-first split-a split-b]))))))))))
++
++;; STUBS A STEP (labelled): set-display-type! is redefined to add the class tag but skip the
++;; keyword. A batch insert entry's display-type on its target reads back, answering 500 naming the
++;; entry, with nothing committed. Before the fix: 201, and the block tagged Code with no type.
++(deftest batch-insert-entry-read-back-test
++  (async done
++    (with-graph done 2
++      (fn [{:keys [conn self ids]}]
++        (let [[a b] ids
++              before (snapshot conn)]
++          (p/let [response
++                  (p/with-redefs [semantic/set-display-type!
++                                  (fn [conn block-id _type]
++                                    (outliner-property/set-block-property! conn block-id :block/tags
++                                                                           :logseq.class/Code-block))]
++                    (batch-insert! self [{:target-id (str a) :properties {"logseq.property/heading" 2}}
++                                         {:target-id (str b) :properties {type-ident "code"}}]))]
++            (unverified? response "entries[1]: display-type is not code" "batch insert entry")
++            (is (= before (snapshot conn)) "nothing committed")
++            (is (= [plain plain] [(state conn a) (state conn b)]))))))))
++
++;; A display-type entry changes the block's class tag, so a batch's class check sees it as it sees a
++;; tag entry: a property limited to Code takes a block the same batch makes code, and refuses one the
++;; same batch makes math, in either entry order, on batch_set_block_property and on batch insert
++;; entry properties. Before the fix the class check judged the block by its tags before the batch:
++;;   math: expected: (= 400 (:status response))  actual: 200 {:updated 2}, and P held a Math block
++;;   code: expected: (= 200 (:status response))  actual: 400 {:error "entry 1: no #Code object <uuid>"}
++(deftest batch-display-type-seen-by-class-check-test
++  (async done
++    (with-graph done 9
++      (fn [{:keys [conn self ids]}]
++        (let [[holder & blocks] ids
++              [to-math-1 to-math-2 to-math-3 to-math-4 to-code-1 to-code-2 to-code-3 to-code-4] blocks]
++          (p/let [class (d/entity @conn :logseq.class/Code-block)
++                  property (outliner-property/upsert-property!
++                            conn nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                            {:property-name "about-code"})
++                  p-id (subs (str (:db/ident property)) 1)
++                  limited (request! self "PATCH" (str "/semantic/properties/" (js/encodeURIComponent p-id))
++                                    {:classes {:set [(str (:block/uuid class))]}})
++                  _ (ok? limited "about-code is limited to Code")
++                  _ (batch-set! self (mapv (fn [id] [id type-ident "code"]) [to-math-1 to-math-2 to-math-3 to-math-4]))
++                  value-of (fn [] (:block/uuid (get (d/entity @conn [:block/uuid holder]) (:db/ident property))))
++                  set-entries (fn [id type reversed?]
++                                (cond-> [[id type-ident type] [holder p-id (str id)]] reversed? (-> reverse vec)))
++                  insert-entries (fn [id type reversed?]
++                                   (cond-> [{:target-id (str id) :properties {type-ident type}}
++                                            {:target-id (str holder) :properties {p-id (str id)}}]
++                                     reversed? (-> reverse vec)))]
++            (p/doseq [[label send id reversed? index] [["batch set" batch-set! to-math-1 false 1]
++                                                       ["batch set, reversed" batch-set! to-math-2 true 0]
++                                                       ["batch insert" batch-insert! to-math-3 false 1]
++                                                       ["batch insert, reversed" batch-insert! to-math-4 true 0]]]
++              (p/let [before (snapshot conn)
++                      insert? (= send batch-insert!)
++                      response (send self (if insert? (insert-entries id "math" reversed?) (set-entries id "math" reversed?)))]
++                (refused? response (str (if insert? (str "entries[" index "]: " p-id) (str "entry " index))
++                                        ": no #Code object " id)
++                          (str label ": made math"))
++                (is (= before (snapshot conn)) (str label ": nothing written"))
++                (is (= (typed :code) (state conn id)) label)))
++            (p/doseq [[label send id reversed?] [["batch set" batch-set! to-code-1 false]
++                                                 ["batch set, reversed" batch-set! to-code-2 true]
++                                                 ["batch insert" batch-insert! to-code-3 false]
++                                                 ["batch insert, reversed" batch-insert! to-code-4 true]]]
++              (p/let [insert? (= send batch-insert!)
++                      response (send self (if insert? (insert-entries id "code" reversed?) (set-entries id "code" reversed?)))]
++                (is (contains? #{200 201} (:status response)) (str label ", made code: " (pr-str (:body response))))
++                (is (= (typed :code) (state conn id)) label)
++                (is (= id (value-of)) (str label ": the value reads back"))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
 index 122055e..25f7b14 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_edit_stamps_test.cljs
