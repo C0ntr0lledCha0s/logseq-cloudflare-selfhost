@@ -85,6 +85,8 @@ This matches the fixture's recorded `baseline` and `floor` (hybrid recall 1.00, 
 
 The patch includes db-sync tests (section 8).
 
+As built (plan Stage 1): `property` takes an ident, a UUID or a title, resolved as `setBlockProperty` resolves its property, but only among properties, so a page or tag ident is `property not found`. The view-check message is now `view must be summary, outline or signals`. `reference-count` is a lazy walk over each reference attribute's avet datoms (`capped-referrer-count`), not `referrer-ids` itself. It applies the same rules (distinct visible referrers, not the entity itself or a block on its own page) and stops reading at 1,000. `property-values` lists value titles as `getBlock` does: a page, node or choice's title, a text or number value's content. `status` is the status ident's name without the `status.` prefix.
+
 ### 3.2 New arguments to `semantic_search` (panel)
 
 | Argument | Type | Modes | Meaning |
@@ -134,6 +136,8 @@ Demotion rules: `status:done`, `status:canceled`, `tag:<name>` for each matching
 - `DEMOTE_WEIGHT` stays **0.5** and `DEFAULT_HALF_LIFE_DAYS` stays **90**.
 
 Ranges, then: `recency` 0.5 to 1, `importance` 0.5 to 1.5. Even so, memory mode is mostly decided by the factors, and relevance breaks ties among hits of similar age and links: at a 90-day half-life, an 18-day-old hit (recency 0.87) drops below a fresh hit 9 places further down one leg. This is the intended effect for memory questions and the reason it isn't the default (question 1). The unit tests pin each constant against these boundaries (section 8).
+
+As built (plan Stage 3): stored tags are already lowercase, so `demote_tags` entries are lowercased to match them, and `demoted-by` lists the caller's own spelling (`tag:Archives` for `demote_tags: ["Archives"]`). A uuid the signals view doesn't return gets the neutral signal (no updated-at, 0 references, no status, no property values). `applyMemoryRanking` returns unrounded values; `hybridSearch` rounds them when it builds the hit (score and relevance at 5 dp, factors at 3 dp).
 
 Nothing is filtered by scoring. Every candidate RRF returned is still there, and `limit` up to 50 reaches it.
 
@@ -309,6 +313,8 @@ To be filled in by the build:
 | Offline, extended fixture, after (Stage 4) | relevance | old 12: 1.00; memory 4: 1.00 | old 12: 0.85; memory 4: 0.58 |
 | Offline, extended fixture, after (Stage 4) | memory | memory 4: 1.00 | memory 4: 0.875 (pricing, domain and office current twins rank 1; the old decision ranks 2) |
 | Live, after | relevance and memory | | |
+
+As built (plan Stage 5): adding `updated_after` did not change the eval, which doesn't use it, so the Stage 4 rows stand. The live row is still to be filled in by the owner (section 9, step 2). The README (11.8 and 11.11) and `connector_help` describe memory mode, the cost of its one extra request and the two new troubleshooting rows; `tools-manifest.json` is unchanged, as it lists names, methods, paths and annotations only.
 
 ## 10. Out of scope
 
