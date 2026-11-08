@@ -21,7 +21,7 @@ The stored datoms were correct. Only reads changed: `(:block/closed-value-proper
 
 Patch 0034 (amended, no new number, because the repair and the stamp ship together):
 
-- `storage/repair-schema!` compares the built-in attributes' schema with `db-schema/schema` in memory and transacts one logged tx only when they differ. It is called by the semantic and sync `ensure-conn!`, not by `open-conn`, so the read-only node scripts never write. It is skipped while `snapshot-uploading?` is set, because the graph is incomplete then. It costs no D1 rows.
+- `storage/repair-schema!` compares the built-in attributes' schema with `db-schema/schema` in memory and transacts one logged tx only when they differ. It is called by the semantic and sync `ensure-conn!`, not by `open-conn`, so the read-only node scripts never write. It is meant to be skipped while a snapshot upload is importing, because the graph is incomplete then; review found that this guard does not fire on the real upload path (open item, below). It costs no D1 rows.
 - `choice-owners` reads a choice's owners from `:eavt` datoms. `stamp-choice-conflict`, `convert_values`' `choice?` and the health check's `value-property` use it, so they are right before the first open repairs the schema.
 
 ## How to catch it next time
@@ -30,4 +30,5 @@ Patch 0034 (amended, no new number, because the repair and the stamp ship togeth
 - Don't read a many attribute through an entity set when a datoms read gives the same answer. Reverse reads (`:block/_closed-value-property`) always return a set and are safe.
 - Check `(:schema @conn)` for the attribute when a many attribute misbehaves on one graph only.
 - Data effect: before this fix, `convert_values` on an uploaded graph could delete the property's own choice and answer 500 (the choice was not recognised as the property's own). The owner may want to check past `convert_values` calls on uploaded graphs in the audit log.
-- The repair runs on the first request after deploy. A connection opened during a multi-chunk upload stays unrepaired until the Durable Object restarts; the datom reads cover stamps meanwhile.
+- The repair runs on the first request after deploy. The datom reads cover stamps whether or not the repair has run.
+- Open follow-ups from review (not fixed in the hotfix): the 'upload in progress' guard in `repair-schema!` keeps its own copy of the snapshot-upload meta key, and its test sets a state the handler never produces, so the guard is unproven and a rename would drop it silently. When a guard keys on state set elsewhere, test it by driving the real handler that sets the state, and reference the one constant instead of copying it.
