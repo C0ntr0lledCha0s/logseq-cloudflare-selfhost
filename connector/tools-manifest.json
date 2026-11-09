@@ -484,6 +484,17 @@
     }
   },
   {
+    "name": "run_named_query",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/named-queries/{name}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "save_document",
     "method": null,
     "path": null,

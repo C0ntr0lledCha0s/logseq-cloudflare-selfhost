@@ -99,6 +99,8 @@ export const ANNOTATIONS = Object.freeze({
   promote_page_to_tag: DESTRUCTIVE,
   read_file: READ,
   refresh_refs: DESTRUCTIVE,
+  // Patch 0039: a POST like datalog_query; it runs a vetted query on the same read-only view.
+  run_named_query: READ,
   save_document: ADDITIVE,
   save_file_from_url: Object.freeze({ ...ADDITIVE, openWorldHint: true }),
   search_graph: READ,

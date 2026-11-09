@@ -238,7 +238,7 @@ function specWithFakeOperation(): OpenApiSpec {
 /** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
 const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file", "suggest_links"];
 // Reads sent as POST because their input can be long (patch 0039).
-const READ_NOT_GET = ["datalog_query"];
+const READ_NOT_GET = ["datalog_query", "run_named_query"];
 const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",
@@ -1139,6 +1139,52 @@ describe("hand-written tools", () => {
     expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname, JSON.parse(r.body)])).toEqual([
       ["POST", `/api/v1/graphs/${WORK_ID}/query`, { ...body, "dry-run": false }],
     ]);
+  });
+
+  it("run_named_query is generated from runNamedQuery: a POST of {params?, limit?, dry-run?} on name, annotated READ, with no reason and no write tables", async () => {
+    const tools = await listTools();
+    const named = tools.find((t) => t.name === "run_named_query");
+    expect(named).toBeDefined();
+    expect(named.inputSchema.required).toEqual(expect.arrayContaining(["graph", "name"]));
+    // The body is optional: an empty one runs the query with its defaults.
+    expect(named.inputSchema.required).not.toContain("body");
+    expect(Object.keys(named.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "limit", "params"]);
+    expect(named.inputSchema.properties.reason).toBeUndefined();
+    expect(named.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["projects-untouched", "meetings-without-decision", "open-tasks-by-client", "pages-missing-property", "can be overridden", "params.<name>", "404", "Private", "E2EE"]) {
+      expect(named.description, phrase).toContain(phrase);
+    }
+    // name is a plain string, not an enum, so an unknown name reaches the server's 404 listing the names.
+    expect(named.inputSchema.properties.name.enum).toBeUndefined();
+    for (const table of [DELETE_RULES, DRY_RUN_TOOLS, SNAPSHOT_PLAN, CONTEXT_TOOLS, NO_CONTEXT_TOOLS]) {
+      expect(Object.hasOwn(table, "run_named_query")).toBe(false);
+    }
+    expect(committedManifest.find((e) => e.name === "run_named_query")).toMatchObject({
+      method: "POST",
+      path: "/api/v1/graphs/{graph-id}/named-queries/{name}",
+      annotations: { readOnlyHint: true },
+    });
+    const rows = { name: "projects-untouched", params: { days: 14 }, columns: ["updated-at", "page"], rows: [], "total-rows": 0, returned: 0, query: "{}", inputs: "[]", rules: "[]" };
+    syncHandler = () => Response.json(rows);
+    const result = await callTool("run_named_query", { graph: "work", name: "projects-untouched", body: { params: { days: 14 } } });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual(rows);
+    const bare = await callTool("run_named_query", { graph: "work", name: "open-tasks-by-client" });
+    expect(bare.isError, bare.text).toBe(false);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["POST", `/api/v1/graphs/${WORK_ID}/named-queries/projects-untouched`],
+      ["POST", `/api/v1/graphs/${WORK_ID}/named-queries/open-tasks-by-client`],
+    ]);
+    expect(JSON.parse(syncRequests[0].body)).toMatchObject({ params: { days: 14 } });
+  });
+
+  it("run_named_query passes an unknown name through to the server's 404, which lists the names", async () => {
+    const error = "no named query projects_untouched (names: projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property)";
+    syncHandler = () => Response.json({ error }, { status: 404 });
+    const result = await callTool("run_named_query", { graph: "work", name: "projects_untouched" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property");
+    expect(syncRequests.map((r) => new URL(r.url).pathname)).toEqual([`/api/v1/graphs/${WORK_ID}/named-queries/projects_untouched`]);
   });
 
   it("set_page_favorite is generated from setPageFavorite: a PUT of {favorite, dry-run?} on page-id, annotated destructive and idempotent", async () => {

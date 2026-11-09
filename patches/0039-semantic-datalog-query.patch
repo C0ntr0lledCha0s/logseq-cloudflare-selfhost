@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..a0b0e4f
+index 0000000..64ebe08
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,855 @@
+@@ -0,0 +1,995 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -36,6 +36,8 @@ index 0000000..a0b0e4f
 +            [logseq.db-sync.common :as common]
 +            [logseq.db-sync.worker.graph-insights :as graph-insights]
 +            [logseq.db-sync.worker.http :as http]
++            [logseq.db-sync.worker.named-queries :as named-queries]
++            [logseq.db.frontend.class :as db-class]
 +            [promesa.core :as p]))
 +
 +(def scan-cap
@@ -793,6 +795,21 @@ index 0000000..a0b0e4f
 +        (conj (str "limit: must be an integer from 1 to " max-limit))
 +        (and (contains? body :dry-run) (not (boolean? (:dry-run body)))) (conj "dry-run: must be true or false")))))
 +
++(defn- checked-query
++  "`query` (as parsed) with `inputs` and `rules` checked as every query is before it runs, write
++  forms first and then the validator: {:query (normalised) :given :inputs :rules} or a refusal."
++  [query inputs rules]
++  (let [writes (concat (write-form-errors "query" query)
++                       (write-form-errors "inputs" inputs)
++                       (write-form-errors "rules" rules))
++        normalised (normalise-query query)
++        invalid (or (:error normalised)
++                    (validate-query (:ok normalised) rules inputs))
++        problems (cond-> (vec writes) invalid (conj invalid))]
++    (if (seq problems)
++      (refusal 400 (string/join "; " problems))
++      {:query (:ok normalised) :given query :inputs inputs :rules rules})))
++
 +(defn- parse-request
 +  "The body's query, inputs and rules parsed, normalised and validated: {:query :inputs :rules
 +  :given} or a refusal."
@@ -812,16 +829,7 @@ index 0000000..a0b0e4f
 +                              [(str "inputs: at most " max-inputs " values (got " (count inputs) ")")]))]
 +        (if (seq (concat parse-problems shape-problems))
 +          (refusal 400 (string/join "; " (concat parse-problems shape-problems)))
-+          (let [writes (concat (write-form-errors "query" query)
-+                               (write-form-errors "inputs" inputs)
-+                               (write-form-errors "rules" rules))
-+                normalised (normalise-query query)
-+                invalid (or (:error normalised)
-+                            (validate-query (:ok normalised) rules (or inputs [])))
-+                problems (cond-> (vec writes) invalid (conj invalid))]
-+            (if (seq problems)
-+              (refusal 400 (string/join "; " problems))
-+              {:query (:ok normalised) :given query :inputs (or inputs []) :rules rules})))))))
++          (checked-query query (or inputs []) rules))))))
 +
 +(defn- respond [result]
 +  (if (refusal? result)
@@ -859,8 +867,140 @@ index 0000000..a0b0e4f
 +                                  :scan-cap (test-cap self "datalogScanCap")
 +                                  :row-cap (test-cap self "datalogRowCap")
 +                                  :echo {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}}))))))))
++
++;; Named queries
++;; =============
++
++(def ^:private day-ms 86400000)
++
++(defn- resolve-tag-param
++  "A :tag param's value: the tag `value` names (by `resolve-tag`) and every tag extending it."
++  [db resolve-tag {:keys [binding] param-name :name} value]
++  (let [field (str "params." param-name)]
++    (if-not (string? value)
++      {:error (str field ": must be a tag title, UUID or ident (a string)")}
++      (if-let [tag (resolve-tag db value)]
++        (let [children (map #(d/entity db %) (db-class/get-structured-children db (:db/id tag)))
++              ids (vec (sort (cons (:db/id tag) (map :db/id children))))]
++          {:input (if (= :set binding) (set ids) ids)
++           :echo {:title (:block/title tag)
++                  :ident (keyword-text (:db/ident tag))
++                  :includes (vec (sort (map :block/title children)))}})
++        {:error (str field ": no tag titled " value)}))))
++
++(defn- resolve-property-param
++  "A :property param's value: the ident of the property `value` names (by `resolve-property`),
++  whose type is one of `types` when the param limits them."
++  [db resolve-property {:keys [types] param-name :name} value]
++  (let [field (str "params." param-name)]
++    (if-not (string? value)
++      {:error (str field ": must be a property title, UUID or ident (a string)")}
++      (if-let [property (resolve-property db value)]
++        (let [type (or (:logseq.property/type property) :default)]
++          (if (and types (not (contains? types type)))
++            {:error (str field ": " (:block/title property) " is a " (name type) " property; give one whose values"
++                         " are pages or text (a node, default, url or date property)")}
++            {:input (:db/ident property)
++             :echo {:title (:block/title property)
++                    :ident (keyword-text (:db/ident property))
++                    :type (name type)}}))
++        {:error (str field ": no property titled " value)}))))
++
++(defn- resolve-days-param
++  "A :days param's value: a cutoff `value` days before `now`, in ms."
++  [now {:keys [bounds] param-name :name} value]
++  (let [[lo hi] bounds]
++    (if (and (integer? value) (<= lo value hi))
++      {:input (- now (* value day-ms)) :echo value}
++      {:error (str "params." param-name ": must be " lo "-" hi)})))
++
++(defn resolve-params
++  "The inputs of named query `entry` from the `given` params (keyword keys) and the defaults:
++  {:inputs [one per param, in order] :params {name echo}} or {:errors [message …]}, each message
++  naming params.<name>. Tags resolve with `resolve-tag` and properties with `resolve-property`
++  (the semantic API's own resolvers); a default that no longer resolves is an error like any other."
++  [db {:keys [resolve-tag resolve-property now]} query-name entry given]
++  (let [params (:params entry)
++        known (set (map (comp keyword :name) params))
++        unknown (for [k (keys given) :when (not (contains? known k))]
++                  (str "params." (name k) ": not a param of " query-name " (params: "
++                       (string/join ", " (map :name params)) ")"))
++        resolved (for [{:keys [type required] param-name :name :as param} params
++                       :let [k (keyword param-name)
++                             value (get given k (:default param))]]
++                   (cond
++                     (and required (not (contains? given k)))
++                     {:error (str "params." param-name ": required; give a "
++                                  (if (= :tag type) "tag" "property") " title, UUID or ident")}
++                     (= :tag type) (resolve-tag-param db resolve-tag param value)
++                     (= :property type) (resolve-property-param db resolve-property param value)
++                     (= :days type) (resolve-days-param now param value)))
++        errors (concat unknown (keep :error resolved))]
++    (if (seq errors)
++      {:errors (vec errors)}
++      {:inputs (mapv :input resolved)
++       :params (into {} (map (fn [{param-name :name} {:keys [echo]}] [param-name echo]) params resolved))})))
++
++(def ^:private named-body-fields #{:params :limit :dry-run})
++
++(defn- named-body-errors [body]
++  (if-not (map? body)
++    ["body: give a JSON object with params, limit or dry-run"]
++    (let [{:keys [params limit]} body]
++      (cond-> (mapv #(str (name %) ": not a field; the body takes params, limit and dry-run")
++                    (remove named-body-fields (keys body)))
++        (and (contains? body :params) (not (map? params)))
++        (conj "params: must be an object of param values, e.g. {\"days\": 30}")
++        (and (contains? body :limit) (not (and (integer? limit) (<= 1 limit max-limit))))
++        (conj (str "limit: must be an integer from 1 to " max-limit))
++        (and (contains? body :dry-run) (not (boolean? (:dry-run body)))) (conj "dry-run: must be true or false")))))
++
++(defn- named-response [result]
++  (if (refusal? result)
++    (http/error-response (::error result) (::status result))
++    (http/json-response :semantic/named-query result)))
++
++(defn handle-named-query
++  "POST /named-queries/:name: refuses an E2EE graph first, then a name that isn't one (404 listing
++  the names), a body or params that can't be used (each naming params.<name>), and otherwise
++  resolves the params with `resolve-tag` and `resolve-property` and runs the entry as datalogQuery
++  runs a query: the same write-form check, validator, private filter and caps. The response is
++  datalogQuery's plus name, the resolved params (titles and idents) and rules."
++  [{:keys [request db e2ee? self path-params resolve-tag resolve-property]}]
++  (reset! last-run {:private-set-built? false :scanned 0 :pulled 0})
++  (let [query-name (:name path-params)
++        entry (get named-queries/named-queries query-name)]
++    (cond
++      e2ee? (http/error-response "run_named_query is unavailable on an E2EE graph (titles are ciphertext)" 409)
++      (nil? entry) (http/error-response (str "no named query " query-name " (names: "
++                                             (string/join ", " (keys named-queries/named-queries)) ")")
++                                        404)
++      :else
++      (p/let [body (-> (p/let [json (common/read-json request)] (js->clj json :keywordize-keys true))
++                       (p/catch (fn [_] ::malformed)))]
++        (let [body (if (nil? body) {} body)
++              problems (if (= ::malformed body) ["body: give a JSON object with params, limit or dry-run"] (named-body-errors body))]
++          (named-response
++           (if (seq problems)
++             (refusal 400 (string/join "; " problems))
++             (let [{:keys [errors inputs params]} (resolve-params db {:resolve-tag resolve-tag
++                                                                      :resolve-property resolve-property
++                                                                      :now (.now js/Date)}
++                                                                  query-name entry (or (:params body) {}))
++                   checked (when-not errors (checked-query (:query entry) inputs (:rules entry)))
++                   echo {:name query-name :params params :query (pr-str (:query entry))
++                         :inputs (pr-str inputs) :rules (pr-str (or (:rules entry) []))}]
++               (cond
++                 errors (refusal 400 (string/join "; " errors))
++                 (refusal? checked) checked
++                 (true? (:dry-run body)) (assoc echo :dry-run true)
++                 :else (run-query db {:query (:query checked) :inputs inputs :rules (:rules entry)
++                                      :limit (or (:limit body) default-limit)
++                                      :scan-cap (test-cap self "datalogScanCap")
++                                      :row-cap (test-cap self "datalogRowCap")
++                                      :echo echo}))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d8e3144..1d0fb1f 100644
+index d8e3144..ea2f038 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -15,6 +15,7 @@
@@ -871,42 +1011,178 @@ index d8e3144..1d0fb1f 100644
              [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
              [logseq.db-sync.worker.http :as http]
              [logseq.db-sync.worker.ws :as ws]
-@@ -5513,6 +5514,7 @@
+@@ -5513,6 +5514,10 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
 +    (= :semantic/datalog-query handler) (datalog/handle-query context)
++    (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
++                                                                         :resolve-tag resolve-tag-selector
++                                                                         :resolve-property resolve-property-selector))
      :else (http/not-found)))
  
  (defn- answering-stamp-conflicts
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+new file mode 100644
+index 0000000..9d8b646
+--- /dev/null
++++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+@@ -0,0 +1,105 @@
++(ns logseq.db-sync.worker.named-queries
++  "The named queries runNamedQuery runs (patch 0039), as data. Each entry is a map in the shape of
++  Logseq's advanced query, {:title :query :rules :params}, so its {:query :inputs} pair can be
++  written into a Query block. :query is the map form; :in binds $, then % when the entry has
++  rules, then one input per param in :params order. Each param is {:name :type :default :bounds},
++  with :required instead of a default when it has none:
++
++  - :tag resolves by UUID, ident or title (case-insensitive), then expands to the tag and every tag
++    extending it: a vector of class ids for a collection binding [?t ...], or a set when :binding
++    is :set (for contains? inside a not-join, where a collection binding can't reach);
++  - :property resolves by UUID, ident or title to the property's ident (:types limits its type);
++  - :days is an integer within :bounds and becomes a cutoff in ms (now less that many days).
++
++  The handler resolves the params, then the query runs through the same validator, private filter
++  and caps as datalogQuery, so no entry can get round a guard.
++
++  Datascript joins a pattern to the rows before it by scanning the attribute unless one value is
++  bound, and the scan cap counts that scan. So each entry reads per row with get-else and missing?
++  (one entity's datoms each) where it can, and scans an attribute only where it has to: the
++  not-join over a project's blocks and the child rule under a meeting.")
++
++(def ^:private days-bounds [1 3650])
++
++(def ^:private child-rules
++  "A block's descendants, through :block/parent. Right-recursive: the parent pattern binds ?x before
++  the call."
++  '[[(child ?p ?c) [?c :block/parent ?p]]
++    [(child ?p ?c) [?x :block/parent ?p] (child ?x ?c)]])
++
++(def named-queries
++  (array-map
++   "projects-untouched"
++   {:title "Projects untouched"
++    :description "Pages tagged tag (or a tag extending it) whose own updated-at is older than days, with no block on the page updated since."
++    :query '{:find [?updated (pull ?p [:block/uuid :block/title])]
++             :keys [updated-at page]
++             :in [$ [?tag ...] ?cutoff]
++             :where [[?p :block/tags ?tag]
++                     [(missing? $ ?p :block/page)]
++                     [(get-else $ ?p :block/updated-at 0) ?updated]
++                     [(< ?updated ?cutoff)]
++                     (not-join [?p ?cutoff]
++                               [?b :block/page ?p]
++                               [(get-else $ ?b :block/updated-at 0) ?b-updated]
++                               [(>= ?b-updated ?cutoff)])]}
++    :rules nil
++    :params [{:name "tag" :type :tag :default "Project"}
++             {:name "days" :type :days :default 30 :bounds days-bounds}]}
++
++   "meetings-without-decision"
++   {:title "Meetings without a decision"
++    :description "Pages or blocks tagged meeting_tag, created within days, with no block below them (at any depth) tagged decision_tag."
++    :query '{:find [?created (pull ?m [:block/uuid :block/title])]
++             :keys [created-at meeting]
++             :in [$ % [?meeting-tag ...] ?decision-tags ?cutoff]
++             :where [[?m :block/tags ?meeting-tag]
++                     [(get-else $ ?m :block/created-at 0) ?created]
++                     [(>= ?created ?cutoff)]
++                     (not-join [?m ?decision-tags]
++                               (child ?m ?d)
++                               [?d :block/tags ?d-tag]
++                               [(contains? ?decision-tags ?d-tag)])]}
++    :rules child-rules
++    :params [{:name "meeting_tag" :type :tag :default "Business Meeting"}
++             {:name "decision_tag" :type :tag :default "Decision" :binding :set}
++             {:name "days" :type :days :default 90 :bounds days-bounds}]}
++
++   "open-tasks-by-client"
++   {:title "Open tasks by client"
++    :description "Blocks tagged Task whose status is not Done or Canceled, with the client from the task's own client_property, else its page's (empty when neither has one), sorted by client title."
++    :query '{:find [?client (pull ?t [:block/uuid :block/title])]
++             :keys [client task]
++             :in [$ ?prop]
++             :where [[?t :block/tags :logseq.class/Task]
++                     [(get-else $ ?t :logseq.property/status 0) ?status]
++                     (not [?status :db/ident :logseq.property/status.done])
++                     (not [?status :db/ident :logseq.property/status.canceled])
++                     ;; 0 stands for none: get-else can't default to nil, and an entity id is never 0.
++                     [(get-else $ ?t ?prop 0) ?own]
++                     [(get-else $ ?t :block/page 0) ?page]
++                     (or-join [?own ?page ?prop ?c]
++                              (and [(pos? ?own)] [(identity ?own) ?c])
++                              (and [(zero? ?own)] [(pos? ?page)] [(get-else $ ?page ?prop 0) ?c])
++                              (and [(zero? ?own)] [(zero? ?page)] [(ground 0) ?c]))
++                     (or-join [?c ?client]
++                              (and [(pos? ?c)] [(get-else $ ?c :block/title "") ?client])
++                              (and [(zero? ?c)] [(ground "") ?client]))]}
++    :rules nil
++    ;; The client is read as the value's :block/title, so the property's values must be entities
++    ;; with a title: not a number (its value is :logseq.property/value) and not a raw value.
++    :params [{:name "client_property" :type :property :default "forClient"
++              :types #{:default :url :date :node :asset :entity :class :page :property}}]}
++
++   "pages-missing-property"
++   {:title "Pages missing a property"
++    :description "Pages tagged tag (or a tag extending it) that have no value for property."
++    :query '{:find [(pull ?p [:block/uuid :block/title])]
++             :keys [page]
++             :in [$ [?tag ...] ?prop]
++             :where [[?p :block/tags ?tag]
++                     [(missing? $ ?p :block/page)]
++                     [(missing? $ ?p ?prop)]]}
++    :rules nil
++    :params [{:name "tag" :type :tag :required true}
++             {:name "property" :type :property :required true}]}))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..03a6634 100644
+index 1365b0a..5fc98a0 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -104,6 +104,9 @@
+@@ -104,6 +104,11 @@
      :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
     {:method "GET" :path "/api/v1/graphs/:graph-id/block-changes" :internal-path "/semantic/block-changes"
      :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
 +   ;; A read: POST only because the query can be long.
 +   {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
 +    :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/named-queries/:name" :internal-path "/semantic/named-queries/:name"
++    :handler :semantic/named-query :operation-id "runNamedQuery" :scope "logseq/read" :rate-class :read}
     {:method "GET" :path "/api/v1/graphs/:graph-id/e2ee/public-keys" :internal-path "/e2ee/public-keys"
      :handler :semantic/e2ee-public-keys :operation-id "getE2eePublicKeys" :scope "logseq/read" :rate-class :read :edge? true}
     {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/encrypt" :internal-path "/e2ee/encrypt"
-@@ -195,6 +198,12 @@
+@@ -195,6 +200,21 @@
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "datalogQuery" ["Run a read-only Datalog query"
-+                   (str "Runs a read-only Datalog query against the graph and returns the rows. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
++                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): they are written to stay within the caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p))."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
++   "runNamedQuery" ["Run a named read-only query"
++                    (str "Runs one of four vetted read-only queries by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
++                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page."
++                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them, at any depth, tagged decision_tag; columns created-at (ms) and meeting."
++                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with the client from the task's own client_property, else its page's, else empty, sorted by client title; columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused."
++                         " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page."
++                         " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task pulled as uuid and title, so the uuid is a handle for the other tools."
++                         " The response is datalog_query's (columns, rows, total-rows, returned, truncated) plus name, the resolved params (titles and idents; a tag's includes lists the tags extending it) and the query, inputs and rules as EDN, which run as the same query through datalog_query."
++                         " The query runs under every datalog_query guard: a read-only view, the private filter (anything tagged Private, on a private page or under a private block is left out), the scan cap (20,000 datoms, 422), the row cap and limit (1 to 200, default 50) and the byte cap. A param that doesn't resolve or is out of range answers 400 naming it (params.<name>), never empty rows, including a default the graph doesn't have (no Business Meeting tag, say): pass the graph's own tag or property instead. An unknown name answers 404 listing the names. With dry-run=true the resolved params and the query, inputs and rules come back without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
     "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
     "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
     "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
-@@ -498,6 +507,18 @@
+@@ -257,7 +277,9 @@
+             (= "property-id" parameter)
+             (assoc :description "Property UUID, qualified ident, or exact title.")
+             (= "page-id" parameter)
+-            (assoc :description page-selector-description)))
++            (assoc :description page-selector-description)
++            (= "name" parameter)
++            (assoc :description "The named query: projects-untouched, meetings-without-decision, open-tasks-by-client or pages-missing-property (exactly, lower case with hyphens).")))
+         (re-seq #":([^/]+)" path)))
+ 
+ (def ^:private pagination-parameters
+@@ -498,6 +520,25 @@
                                                                     :items {:type "string"}}}}
                                     :convert_values {:type "boolean"
                                                      :description "For a default (text) property: true turns its free-text values into the choices the call leaves, matched exactly, then ignoring case. Text that matches no choice refuses the call; add those choices under choices.add in the same call. Refused while the property has a default value, or when a text value has child blocks (deleting it would delete them); values cleared to the empty placeholder are left as they are. Preview the mapping with dry-run=true."}}}
@@ -922,26 +1198,50 @@ index 1365b0a..03a6634 100644
 +                                 :dry-run {:type "boolean" :default false
 +                                           :description "Check the query and return it, inputs and rules as EDN, without running it."}}
 +                    :additionalProperties false}
++    "runNamedQuery" {:properties {:params {:type "object"
++                                           :description "The query's params by name, each overriding its default, e.g. {\"tag\": \"Project\", \"days\": 30}. pages-missing-property needs tag and property."}
++                                  :limit {:type "integer" :minimum 1 :maximum 200 :default 50
++                                          :description "Most rows returned, 1 to 200; total-rows always counts every row."}
++                                  :dry-run {:type "boolean" :default false
++                                            :description "Resolve the params and return the query, inputs and rules as EDN, without running it."}}
++                     :additionalProperties false}
      "encryptE2eeText" {:required ["key" "texts"]
                         :properties {:texts {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "string"}}
-@@ -651,6 +672,7 @@
+@@ -580,8 +621,9 @@
+      :content {"application/octet-stream"
+                {:schema {:type "string" :format "binary"}}}}
+     (when-let [schema (request-schema operation-id)]
+-      ;; promotePageToTag's body is optional: an empty one promotes the page as it is.
+-      {:required (not= "promotePageToTag" operation-id)
++      ;; promotePageToTag's body is optional: an empty one promotes the page as it is. So is
++      ;; runNamedQuery's: an empty one runs the query with its defaults.
++      {:required (not (contains? #{"promotePageToTag" "runNamedQuery"} operation-id))
+        :content {"application/json" {:schema (assoc schema :type "object")}}})))
+ 
+ (defn- list-response [response-key schema description]
+@@ -651,6 +693,8 @@
                    "listFavorites" (entity-response "FavoritesResponse" "The favourites in sidebar order")
                    "setPageFavorite" (entity-response "FavoriteWriteResponse" "What was done, the page, and the list read back")
                    "reorderFavorites" (entity-response "FavoritesResponse" "The favourites in the new order, read back")
 +                  "datalogQuery" (entity-response "DatalogQueryResponse" "The rows, or with dry-run=true the query as EDN")
++                  "runNamedQuery" (entity-response "NamedQueryResponse" "The rows with the resolved params, or with dry-run=true the query as EDN")
                    "getProperty"
                    (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
                    "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
-@@ -662,6 +684,7 @@
+@@ -662,6 +706,11 @@
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
++           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
++                            "404" {:description "No named query has that name; the error lists the names"}
++                            "409" {:description "The graph is E2EE"}
++                            "422" {:description "The query scanned more than 20,000 datoms (the scan cap) or matched more than 2,500 rows (the row cap); narrow it with a more specific tag or fewer days"}}
 +           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) and was stopped, or matched more than 2,500 rows (the row cap) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
-@@ -1030,6 +1053,21 @@
+@@ -1030,6 +1079,37 @@
                                                              :description "In sidebar order; empty when the graph has none."
                                                              :items {:$ref "#/components/schemas/Favorite"}}
                                                  :dry-run {:type "boolean" :description "reorderFavorites with dry-run=true: true; nothing was written."}}}
@@ -960,15 +1260,31 @@ index 1365b0a..03a6634 100644
 +                                                   :inputs {:type "string" :description "The inputs as EDN."}
 +                                                   :rules {:type "string" :description "dry-run only: the rules as EDN."}
 +                                                   :dry-run {:type "boolean" :description "true when the query was checked and not run."}}}
++               :NamedQueryResponse {:type "object"
++                                    :properties {:name {:type "string" :description "The named query run."}
++                                                 :params {:type "object"
++                                                          :description "Each param as resolved: a tag as {title, ident, includes (the tags extending it)}, a property as {title, ident, type}, days as the number."}
++                                                 :columns {:type "array" :items {:type "string"}}
++                                                 :rows {:type "array" :items {:type "array" :items {}}
++                                                        :description "Sorted rows, as datalog_query answers them; a pulled page or task as {block/uuid, block/title}."}
++                                                 :total-rows {:type "integer"}
++                                                 :returned {:type "integer"}
++                                                 :truncated {:type "object" :required ["by" "note"]
++                                                             :properties {:by {:enum ["limit" "byte-cap"]}
++                                                                          :note {:type "string"}}}
++                                                 :query {:type "string" :description "The query as EDN (map form)."}
++                                                 :inputs {:type "string" :description "The resolved inputs as EDN, bound after $ (and % when there are rules)."}
++                                                 :rules {:type "string" :description "The rules as EDN ([] when none)."}
++                                                 :dry-run {:type "boolean" :description "true when the query was checked and not run."}}}
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..e9b0249
+index 0000000..29320f9
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,1259 @@
+@@ -0,0 +1,1646 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -991,6 +1307,7 @@ index 0000000..e9b0249
 +            [datascript.core :as d]
 +            [logseq.db-sync.test-sql :as test-sql]
 +            [logseq.db-sync.worker.handler.datalog :as datalog]
++            [logseq.db-sync.worker.named-queries :as named-queries]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
 +            [logseq.db.sqlite.export :as sqlite-export]
@@ -2228,6 +2545,392 @@ index 0000000..e9b0249
 +          (testing "the pull reads the entity's own datoms, not the rest of the index"
 +            (is (<= (- titled-scanned plain-scanned) tag-datoms) [plain-scanned titled-scanned tag-datoms])
 +            (is (< nested-scanned 100) nested-scanned)))))))
++
++;; Named queries (POST /named-queries/:name, runNamedQuery)
++;; =========================================================
++;; Before stage 4 there is no such route: every request below answers 404 {:error "not found"}.
++
++(def ^:private day-ms 86400000)
++
++(defn- named!
++  "POST /named-queries/`query-name` with `body` (a map, or nil for no body)."
++  ([self query-name body] (named! self query-name body false))
++  ([self query-name body e2ee?]
++   (request! self "POST" (str "/semantic/named-queries/" query-name) body e2ee?)))
++
++(defn- age!
++  "Fixture time: sets `attr` of the entities with `uuids` to `days` days ago, the way an entity
++  written that long ago holds it. The API stamps every write with now, so a stale page can only be
++  made by moving its stamp."
++  [conn attr days uuids]
++  (let [at (- (.now js/Date) (* days day-ms))]
++    (d/transact! conn (vec (for [u uuids] [:db/add [:block/uuid (uuid (str u))] attr at])))))
++
++(defn- row-titles
++  "The :block/title of the pulled column `col` of each row, in row order."
++  [response col]
++  (mapv #(get-in % [col :block/title]) (get-in response [:body :rows])))
++
++(defn- seed-named
++  "Fixtures for the named queries, written through the real handler (only stamps are moved, by
++  age!): tags Private, Project, Client Project (extends Project), Business Meeting, Decision and
++  Key Decision (extends Decision); a node property forClient; project pages, meetings as pages and
++  as blocks, and tasks with every status and client placement."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          tag! (fn [body] (p/let [r (ok! (request! self "POST" "/semantic/tags" body) 201)] (uuid-of r)))
++          page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++          task! (fn [title page status]
++                  (p/let [r (ok! (request! self "POST" "/semantic/tasks" {:title title :page-id (str page) :status status}) 201)]
++                    (uuid-of r)))
++          _ (tag! {:title "Private"})
++          project-tag (tag! {:title "Project"})
++          _ (tag! {:title "Client Project" :extends ["Project"]})
++          _ (tag! {:title "Business Meeting"})
++          _ (tag! {:title "Decision"})
++          _ (tag! {:title "Key Decision" :extends ["Decision"]})
++          for-client (ok! (request! self "POST" "/semantic/properties" {:title "forClient" :type "node"}) 201)
++          for-client-path (js/encodeURIComponent (get-in for-client [:body :ident]))
++          client! (fn [id client]
++                    (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" for-client-path) {:value client}) 200))
++          _ (page! "zq Acme")
++          _ (page! "zq Beta")
++          ;; Projects
++          stale (page! "zq Stale Project")
++          [stale-block] (insert! self stale [{:title "zq stale notes"}])
++          fresh-child (page! "zq Fresh Child Project")
++          [fresh-child-block] (insert! self fresh-child [{:title "zq fresh child notes"}])
++          fresh (page! "zq Fresh Project")
++          client-project (page! "zq Stale Client Project")
++          private-project (page! "zq Stale Private Project")
++          project-block-page (page! "zq Project Blocks")
++          [project-block] (insert! self project-block-page [{:title "zq stale project block"}])
++          _ (set-tags! self stale ["Project"])
++          _ (set-tags! self fresh-child ["Project"])
++          _ (set-tags! self fresh ["Project"])
++          _ (set-tags! self client-project ["Client Project"])
++          _ (set-tags! self private-project ["Project" "Private"])
++          _ (set-tags! self (:uuid project-block) ["Project"])
++          _ (client! fresh "zq Acme")
++          ;; Meetings
++          undecided (page! "zq Meeting Undecided")
++          _ (insert! self undecided [{:title "zq agenda"}])
++          decided (page! "zq Meeting Decided")
++          [deep] (insert! self decided [{:title "zq discussion" :children [{:title "zq detail" :children [{:title "zq ship it"}]}]}])
++          old-meeting (page! "zq Old Meeting")
++          log (page! "zq Meeting Log")
++          [standup retro other-decision key-meeting]
++          (insert! self log [{:title "zq standup" :children [{:title "zq notes" :children [{:title "zq agreed"}]}]}
++                             {:title "zq retro" :children [{:title "zq went well"}]}
++                             {:title "zq unrelated decision"}
++                             {:title "zq planning" :children [{:title "zq key call"}]}])
++          _ (set-tags! self undecided ["Business Meeting"])
++          _ (set-tags! self decided ["Business Meeting"])
++          _ (set-tags! self old-meeting ["Business Meeting"])
++          _ (set-tags! self (get-in deep [:children 0 :children 0 :uuid]) ["Decision"])
++          _ (set-tags! self (:uuid standup) ["Business Meeting"])
++          _ (set-tags! self (get-in standup [:children 0 :children 0 :uuid]) ["Decision"])
++          _ (set-tags! self (:uuid retro) ["Business Meeting"])
++          _ (set-tags! self (:uuid other-decision) ["Decision"])
++          _ (set-tags! self (:uuid key-meeting) ["Business Meeting"])
++          _ (set-tags! self (get-in key-meeting [:children 0 :uuid]) ["Key Decision"])
++          ;; Tasks
++          client-work (page! "zq Client Work")
++          other-work (page! "zq Other Work")
++          _ (client! client-work "zq Acme")
++          own (task! "zq task own client" client-work "todo")
++          _ (client! own "zq Beta")
++          _ (task! "zq task page client" client-work "doing")
++          _ (task! "zq task done" client-work "done")
++          _ (task! "zq task canceled" client-work "canceled")
++          _ (task! "zq task no client" other-work "todo")]
++    ;; Stamps last, so no later write moves them.
++    (age! conn :block/updated-at 60 [stale (:uuid stale-block) fresh-child client-project private-project
++                                     (:uuid project-block)])
++    (age! conn :block/created-at 100 [old-meeting])
++    {:conn conn :self self :project-tag project-tag :fresh-child-block (:uuid fresh-child-block) :other-work other-work
++     :for-client (get-in for-client [:body :ident])}))
++
++(defn- with-named [done run]
++  (-> (p/let [graph (seed-named)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(def ^:private names
++  ["projects-untouched" "meetings-without-decision" "open-tasks-by-client" "pages-missing-property"])
++
++(deftest named-projects-untouched-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "projects-untouched" {:params {:days 30}})]
++          (is (= 200 (:status response)) (pr-str response))
++          (testing "stale project pages, a tag extending Project included; a fresh page, a page with a fresh child edit and a block are not"
++            (is (= #{"zq Stale Project" "zq Stale Client Project"}
++                   (set (row-titles response 1))) (pr-str (:body response))))
++          (is (= ["updated-at" "page"] (get-in response [:body :columns])))
++          (is (= "projects-untouched" (get-in response [:body :name])))
++          (is (= {:title "Project" :includes ["Client Project"]}
++                 (select-keys (get-in response [:body :params :tag]) [:title :includes])))
++          (is (string/starts-with? (str (get-in response [:body :params :tag :ident])) "user.class/Project"))
++          (is (= 30 (get-in response [:body :params :days])))
++          (is (string? (get-in response [:body :query])))
++          (is (string? (get-in response [:body :inputs]))))))))
++
++(deftest named-projects-untouched-defaults-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [no-body (named! self "projects-untouched" nil)
++                empty-params (named! self "projects-untouched" {:params {}})
++                same-as-default (named! self "projects-untouched" {:params {:tag "Project" :days 30}})
++                by-case (named! self "projects-untouched" {:params {:tag "pROJECT"}})
++                short (named! self "projects-untouched" {:params {:days 1}})
++                longest (named! self "projects-untouched" {:params {:days 3650}})]
++          (testing "defaults (tag Project, days 30), a re-sent default, another case and the bounds all run"
++            (doseq [r [no-body empty-params same-as-default by-case]]
++              (is (= [200 #{"zq Stale Project" "zq Stale Client Project"}] [(:status r) (set (row-titles r 1))]) (pr-str r)))
++            (is (= [200 #{"zq Stale Project" "zq Stale Client Project"}] [(:status short) (set (row-titles short 1))]))
++            (is (= [200 []] [(:status longest) (get-in longest [:body :rows])]) "nothing is older than 10 years")))))))
++
++(deftest named-tag-by-uuid-and-ident-test
++  (async done
++    (with-named done
++      (fn [{:keys [conn self project-tag]}]
++        (p/let [ident (subs (str (:db/ident (d/entity @conn [:block/uuid project-tag]))) 1)
++                by-uuid (named! self "projects-untouched" {:params {:tag (str project-tag)}})
++                by-ident (named! self "projects-untouched" {:params {:tag ident}})]
++          (doseq [r [by-uuid by-ident]]
++            (is (= [200 #{"zq Stale Project" "zq Stale Client Project"}] [(:status r) (set (row-titles r 1))]) (pr-str r))))))))
++
++(deftest named-meetings-without-decision-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "meetings-without-decision" {:params {:days 90}})
++                defaults (named! self "meetings-without-decision" nil)
++                wider (named! self "meetings-without-decision" {:params {:days 365}})]
++          (is (= 200 (:status response)) (pr-str response))
++          (testing "a meeting page with no decision and a meeting block whose page holds a decision elsewhere are returned;
++                    a decision two levels below a meeting page, a grandchild decision, a Key Decision child and an older meeting are not"
++            (is (= #{"zq Meeting Undecided" "zq retro"} (set (row-titles response 1))) (pr-str (:body response))))
++          (is (= ["created-at" "meeting"] (get-in response [:body :columns])))
++          (is (= (get-in response [:body :rows]) (get-in defaults [:body :rows])) "days defaults to 90")
++          (is (= #{"zq Meeting Undecided" "zq retro" "zq Old Meeting"} (set (row-titles wider 1))) "days widens the window")
++          (is (= {:title "Decision" :includes ["Key Decision"]}
++                 (select-keys (get-in response [:body :params :decision_tag]) [:title :includes])))
++          (is (= "Business Meeting" (get-in response [:body :params :meeting_tag :title]))))))))
++
++(deftest named-open-tasks-by-client-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "open-tasks-by-client" nil)]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= ["client" "task"] (get-in response [:body :columns])))
++          (testing "Done and Canceled absent; the client from the task, else its page, else empty; sorted by client title"
++            (is (= [["" "zq task no client"] ["zq Acme" "zq task page client"] ["zq Beta" "zq task own client"]]
++                   (mapv (fn [[client task]] [client (:block/title task)]) (get-in response [:body :rows])))
++                (pr-str (:body response))))
++          (is (= "forClient" (get-in response [:body :params :client_property :title]))))))))
++
++(deftest named-pages-missing-property-test
++  (async done
++    (with-named done
++      (fn [{:keys [self for-client]}]
++        (p/let [response (named! self "pages-missing-property" {:params {:tag "Project" :property "forClient"}})
++                by-ident (named! self "pages-missing-property" {:params {:tag "Project" :property for-client}})]
++          (is (= 200 (:status response)) (pr-str response))
++          (testing "project pages without forClient (a tag extending Project included); the page that has it and a tagged block are not"
++            (is (= #{"zq Stale Project" "zq Fresh Child Project" "zq Stale Client Project"}
++                   (set (row-titles response 0))) (pr-str (:body response))))
++          (is (= (get-in response [:body :rows]) (get-in by-ident [:body :rows])) "a property by ident")
++          (is (= {:title "forClient" :ident for-client}
++                 (select-keys (get-in response [:body :params :property]) [:title :ident]))))))))
++
++(deftest named-fresh-child-edit-test
++  ;; The outliner stamps a page when a block on it is saved; this pins the not-join for a block
++  ;; written without that stamp (a sync from an older client, an import).
++  (async done
++    (with-named done
++      (fn [{:keys [conn self fresh-child-block]}]
++        (p/let [_ (age! conn :block/updated-at 60 [fresh-child-block])
++                stale-now (named! self "projects-untouched" nil)]
++          (is (contains? (set (row-titles stale-now 1)) "zq Fresh Child Project")
++              "once its child is stale too, the page is untouched"))))))
++
++(deftest private-in-named-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [responses [(named! self "projects-untouched" nil)
++                           (named! self "projects-untouched" {:params {:days 1}})
++                           (named! self "pages-missing-property" {:params {:tag "Project" :property "forClient"}})]
++                responses (p/all responses)]
++          (doseq [r responses]
++            (is (= 200 (:status r)) (pr-str r))
++            (is (not (string/includes? (:text r) "zq Stale Private Project")) (:text r))))))))
++
++(deftest named-params-refusals-test
++  (async done
++    (with-named done
++      (fn [{:keys [conn self]}]
++        (p/let [before (snapshot conn)
++                cases [["days 0" "projects-untouched" {:params {:days 0}} "params.days: must be 1-3650"]
++                       ["days 3651" "projects-untouched" {:params {:days 3651}} "params.days: must be 1-3650"]
++                       ["days as a string" "projects-untouched" {:params {:days "30"}} "params.days: must be 1-3650"]
++                       ["days negative" "meetings-without-decision" {:params {:days -1}} "params.days: must be 1-3650"]
++                       ["days a fraction" "meetings-without-decision" {:params {:days 1.5}} "params.days: must be 1-3650"]
++                       ["an unknown param" "projects-untouched" {:params {:tags "Project"}}
++                        "params.tags: not a param of projects-untouched (params: tag, days)"]
++                       ["no tag" "pages-missing-property" {:params {:property "forClient"}} "params.tag: required"]
++                       ["no property" "pages-missing-property" {:params {:tag "Project"}} "params.property: required"]
++                       ["neither" "pages-missing-property" nil "params.tag: required"]
++                       ["a tag that isn't one" "projects-untouched" {:params {:tag "Projet"}} "params.tag: no tag titled Projet"]
++                       ["a page title as a tag" "projects-untouched" {:params {:tag "zq Acme"}} "params.tag: no tag titled zq Acme"]
++                       ["a tag given as a number" "projects-untouched" {:params {:tag 3}} "params.tag: must be a tag title, UUID or ident"]
++                       ["a property that isn't one" "pages-missing-property" {:params {:tag "Project" :property "forClent"}}
++                        "params.property: no property titled forClent"]
++                       ["params not an object" "projects-untouched" {:params ["Project"]} "params: must be an object"]
++                       ["a body field it doesn't take" "projects-untouched" {:query "[:find ?e]"} "query: not a field"]
++                       ["limit 0" "projects-untouched" {:limit 0} "limit: must be an integer from 1 to 200"]]
++                responses (p/all (map (fn [[_ query-name body]] (named! self query-name body)) cases))]
++          (doseq [[[label _ _ message] response] (map vector cases responses)]
++            (is (refused? response message) (str label ": " (pr-str response))))
++          (testing "every refusal is a 400, never rows"
++            (is (every? #(nil? (get-in % [:body :rows])) responses)))
++          (is (= before (snapshot conn))))))))
++
++(deftest named-client-property-kinds-test
++  ;; client_property's values must carry a title: a node, text, url or date property does; a
++  ;; number, checkbox or datetime property's values don't, so the query would drop every task.
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [create! (fn [title type]
++                          (ok! (request! self "POST" "/semantic/properties" {:title title :type type}) 201))
++                _ (p/all (map (fn [[t ty]] (create! t ty))
++                              [["zq client text" "default"] ["zq client url" "url"] ["zq client date" "date"]
++                               ["zq client number" "number"] ["zq client checkbox" "checkbox"]
++                               ["zq client datetime" "datetime"]]))
++                accepted (p/all (map #(named! self "open-tasks-by-client" {:params {:client_property %}})
++                                     ["forClient" "zq client text" "zq client url" "zq client date"]))
++                refused (p/all (map #(named! self "open-tasks-by-client" {:params {:client_property %}})
++                                    ["zq client number" "zq client checkbox" "zq client datetime"]))]
++          (doseq [r accepted] (is (= 200 (:status r)) (pr-str r)))
++          (doseq [[r type] (map vector refused ["number" "checkbox" "datetime"])]
++            (is (refused? r (str "params.client_property: zq client " type " is a " type " property")) (pr-str r))))))))
++
++(deftest named-client-from-text-property-test
++  (async done
++    (with-named done
++      (fn [{:keys [self other-work]}]
++        (p/let [prop (ok! (request! self "POST" "/semantic/properties" {:title "zq client text" :type "default"}) 201)
++                path (js/encodeURIComponent (get-in prop [:body :ident]))
++                _ (ok! (request! self "PUT" (str "/semantic/blocks/" other-work "/properties/" path) {:value "zq Gamma"}) 200)
++                response (named! self "open-tasks-by-client" {:params {:client_property "zq client text"}})]
++          (is (= 200 (:status response)) (pr-str response))
++          (testing "a text property's value is the client; a task on a page with none has an empty client"
++            (is (= [["" "zq task own client"] ["" "zq task page client"] ["zq Gamma" "zq task no client"]]
++                   (mapv (fn [[c t]] [c (:block/title t)]) (get-in response [:body :rows])))
++                (pr-str (:body response)))))))))
++
++(deftest named-defaults-unresolved-test
++  ;; A graph without the default tags: the defaults name tags it doesn't have, so the call is a
++  ;; 400 naming each param, never empty rows.
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                meetings (named! self "meetings-without-decision" nil)
++                projects (named! self "projects-untouched" nil)
++                tasks (named! self "open-tasks-by-client" nil)]
++          (is (refused? meetings "params.meeting_tag: no tag titled Business Meeting"
++                        "params.decision_tag: no tag titled Decision") (pr-str meetings))
++          (is (refused? projects "params.tag: no tag titled Project") (pr-str projects))
++          (is (refused? tasks "params.client_property: no property titled forClient") (pr-str tasks))
++          (is (false? (:private-set-built? @datalog/last-run)) "nothing ran"))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest named-unknown-name-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [responses (p/all (map #(named! self % nil) ["Projects-Untouched" "projects_untouched" "datalog" "projects-untouched-x"]))]
++          (doseq [r responses]
++            (is (= 404 (:status r)) (pr-str r))
++            (is (string/includes? (str (get-in r [:body :error]))
++                                  (str "(names: " (string/join ", " names) ")")) (pr-str r))))))))
++
++(deftest named-route-test
++  (let [operation (semantic-routes/match-public "POST" "/api/v1/graphs/graph-1/named-queries/projects-untouched")
++        document (semantic-routes/openapi-document "https://issuer.example")
++        post (get-in document [:paths "/api/v1/graphs/{graph-id}/named-queries/{name}" :post])
++        schema (get-in post [:requestBody :content "application/json" :schema])
++        datalog-post (get-in document [:paths "/api/v1/graphs/{graph-id}/query" :post])]
++    (is (= {:handler :semantic/named-query :operation-id "runNamedQuery" :scope "logseq/read" :rate-class :read
++            :internal-path "/semantic/named-queries/:name" :path-params {:graph-id "graph-1" :name "projects-untouched"}}
++           (select-keys operation [:handler :operation-id :scope :rate-class :internal-path :path-params])))
++    (is (= "runNamedQuery" (:operationId post)))
++    (is (= #{"params" "limit" "dry-run"} (set (map name (keys (:properties schema))))))
++    (is (false? (:additionalProperties schema)))
++    (is (false? (get-in post [:requestBody :required])) "the body is optional: every param has a default or is named")
++    (is (= ["graph-id" "name"] (mapv :name (filter #(= "path" (:in %)) (:parameters post)))))
++    (doseq [phrase (concat names ["Project" "Business Meeting" "Decision" "forClient" "days" "30" "90"
++                                  "can be overridden" "params.<name>" "404" "Private" "E2EE"])]
++      (is (string/includes? (:description post) phrase) phrase))
++    (is (contains? (:responses post) "404"))
++    (is (string/includes? (:description datalog-post) "run_named_query"))))
++
++(deftest every-entry-validates-test
++  (is (= (set names) (set (keys named-queries/named-queries))))
++  (doseq [[query-name {:keys [query rules params]}] named-queries/named-queries]
++    (let [normalised (datalog/normalise-query query)
++          inputs (mapv (fn [{:keys [type binding]}]
++                         (case type
++                           :tag (if (= :set binding) #{1} [1])
++                           :days 0
++                           :property :block/title))
++                       params)]
++      (is (:ok normalised) (str query-name ": " (:error normalised)))
++      (is (nil? (datalog/validate-query (:ok normalised) rules inputs)) query-name))))
++
++(deftest named-dry-run-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "meetings-without-decision" {:dry-run true})]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (true? (get-in response [:body :dry-run])))
++          (is (= "meetings-without-decision" (get-in response [:body :name])))
++          (is (string/includes? (get-in response [:body :query]) ":block/tags"))
++          (is (string/includes? (get-in response [:body :rules]) "child"))
++          (is (string? (get-in response [:body :inputs])))
++          (is (nil? (get-in response [:body :rows])))
++          (is (= {:private-set-built? false :scanned 0 :pulled 0} @datalog/last-run)))))))
++
++(deftest named-e2ee-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "projects-untouched" nil true)
++                unknown (named! self "nope" nil true)]
++          (is (= [409 "run_named_query is unavailable on an E2EE graph (titles are ciphertext)"]
++                 [(:status response) (get-in response [:body :error])]) (pr-str response))
++          (is (= 409 (:status unknown)) "before the name is looked up")
++          (is (false? (:private-set-built? @datalog/last-run))))))))
++
++(deftest named-limit-test
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [response (named! self "open-tasks-by-client" {:limit 1})
++                most (named! self "open-tasks-by-client" {:limit 200})]
++          (is (= [200 1 3 "limit"]
++                 [(:status response) (get-in response [:body :returned]) (get-in response [:body :total-rows])
++                  (get-in response [:body :truncated :by])]) (pr-str response))
++          (is (= 3 (get-in most [:body :returned]))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

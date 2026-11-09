@@ -878,6 +878,13 @@ describe("scope", () => {
     expect(await auditRows()).toEqual([]);
   });
 
+  it("read-only scope runs a named query: run_named_query reaches the sync server with one POST and writes no audit row", async () => {
+    const result = await call("run_named_query", { graph: "work", name: "projects-untouched", body: { params: { days: 30 } } }, READ_CI);
+    expect(result.isError, result.text).toBe(false);
+    expect(syncCalls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([["POST", `/api/v1/graphs/${WORK}/named-queries/projects-untouched`]]);
+    expect(await auditRows()).toEqual([]);
+  });
+
   it("out of scope: a read and a write tool are refused listing the covered aliases; the write's audit row is refused", async () => {
     const message = "graph 'notes' is outside service token 'ci''s scope (it covers: work)";
     expect(await call("get_page", { graph: "notes", "page-id": PAGE }, READ_CI)).toEqual({ isError: true, text: message });
