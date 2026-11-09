@@ -110,6 +110,17 @@
     }
   },
   {
+    "name": "datalog_query",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/query",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "delete_block",
     "method": "DELETE",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",

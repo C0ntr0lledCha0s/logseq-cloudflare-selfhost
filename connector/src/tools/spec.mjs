@@ -65,6 +65,8 @@ export const ANNOTATIONS = Object.freeze({
   create_property: ADDITIVE,
   create_tag: ADDITIVE,
   create_task: ADDITIVE,
+  // Patch 0039: a POST only because the query can be long; it runs on a read-only view of the graph.
+  datalog_query: READ,
   delete_block: DESTRUCTIVE_IDEMPOTENT,
   delete_block_property: DESTRUCTIVE_IDEMPOTENT,
   delete_blocks: DESTRUCTIVE_IDEMPOTENT,

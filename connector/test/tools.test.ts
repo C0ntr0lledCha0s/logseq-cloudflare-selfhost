@@ -11,7 +11,9 @@ import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
 import { CODE_BLOCKS_HELP, CONNECTOR_HELP } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
-import { toAffectedTargets } from "../src/tools/readable";
+import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
+import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
+import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
 import {
   ANNOTATIONS,
@@ -235,6 +237,8 @@ function specWithFakeOperation(): OpenApiSpec {
 
 /** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
 const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file", "suggest_links"];
+// Reads sent as POST because their input can be long (patch 0039).
+const READ_NOT_GET = ["datalog_query"];
 const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",
@@ -262,7 +266,7 @@ const ADDITIVE_NAMED = [
 
 function expectedHints(name: string, method: string | null) {
   const classes: string[] = [];
-  if (method === "GET" || READ_HANDWRITTEN.includes(name)) classes.push("read");
+  if (method === "GET" || READ_HANDWRITTEN.includes(name) || READ_NOT_GET.includes(name)) classes.push("read");
   if (name.startsWith("delete_") || DESTRUCTIVE_NAMED.includes(name)) classes.push("destructive");
   if (/^(create|insert)_/.test(name) || ADDITIVE_NAMED.includes(name)) classes.push("additive");
   // A new tool must be classified on purpose, and no tool may sit in two classes.
@@ -817,6 +821,16 @@ describe("routing", () => {
     }
     expect(syncRequests).toHaveLength(0);
   });
+
+  it("a read sent as POST runs on a read-mode graph: datalog_query reaches the sync server, while a POST write next to it is refused", async () => {
+    syncHandler = () => Response.json({ columns: [], rows: [], "total-rows": 0, returned: 0, query: "[]", inputs: "[]" });
+    const read = await callTool("datalog_query", { graph: "notes", body: { query: "[:find ?t :where [?e :block/title ?t]]" } });
+    expect(read.isError, read.text).toBe(false);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["POST", `/api/v1/graphs/${NOTES_ID}/query`]]);
+    const write = await callTool("create_page", { graph: "notes", body: { title: "x" } });
+    expect(write).toMatchObject({ isError: true, text: "graph 'notes' is read-only" });
+    expect(syncRequests).toHaveLength(1);
+  });
 });
 
 describe("errors", () => {
@@ -1088,6 +1102,39 @@ describe("hand-written tools", () => {
     expect(result.isError, result.text).toBe(false);
     expect(JSON.parse(result.text)).toEqual({ favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] });
     expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
+  });
+
+  it("datalog_query is generated from datalogQuery: a POST of {query, inputs?, rules?, limit?, dry-run?} annotated READ, with no reason and no write tables", async () => {
+    const tools = await listTools();
+    const query = tools.find((t) => t.name === "datalog_query");
+    expect(query).toBeDefined();
+    expect(query.inputSchema.required).toEqual(expect.arrayContaining(["graph", "body"]));
+    expect(query.inputSchema.properties.body.required).toEqual(["query"]);
+    expect(Object.keys(query.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "inputs", "limit", "query", "rules"]);
+    expect(query.inputSchema.properties.reason).toBeUndefined();
+    // A POST is taken for a write unless ANNOTATIONS says otherwise (patch 0039: POST only because the query can be long).
+    expect(query.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["read-only", "Private", "E2EE", ":block/uuid", "share a variable", "default 50"]) {
+      expect(query.description, phrase).toContain(phrase);
+    }
+    // A read never needs a delete rule, a snapshot plan or a context class: those tables throw only for write tools.
+    for (const table of [DELETE_RULES, DRY_RUN_TOOLS, SNAPSHOT_PLAN, CONTEXT_TOOLS, NO_CONTEXT_TOOLS]) {
+      expect(Object.hasOwn(table, "datalog_query")).toBe(false);
+    }
+    expect(committedManifest.find((e) => e.name === "datalog_query")).toMatchObject({
+      method: "POST",
+      path: "/api/v1/graphs/{graph-id}/query",
+      annotations: { readOnlyHint: true },
+    });
+    const rows = { columns: ["?t"], rows: [["Projects"]], "total-rows": 1, returned: 1, query: "[:find ?t]", inputs: "[]" };
+    syncHandler = () => Response.json(rows);
+    const body = { query: "[:find ?t :where [?e :block/title ?t]]", limit: 10 };
+    const result = await callTool("datalog_query", { graph: "work", body });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual(rows);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname, JSON.parse(r.body)])).toEqual([
+      ["POST", `/api/v1/graphs/${WORK_ID}/query`, { ...body, "dry-run": false }],
+    ]);
   });
 
   it("set_page_favorite is generated from setPageFavorite: a PUT of {favorite, dry-run?} on page-id, annotated destructive and idempotent", async () => {

@@ -1,0 +1,1229 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+new file mode 100644
+index 0000000..dfd4ea6
+--- /dev/null
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+@@ -0,0 +1,510 @@
++(ns logseq.db-sync.worker.handler.datalog
++  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
++
++  Read-only by construction: the query, inputs and rules are read as EDN (nothing is evaluated;
++  only #uuid and #inst tags), a static validator refuses write forms, functions off the allow-list,
++  functions in variable position (so none can be passed through inputs), sources other than $,
++  undefined rules and cross products, and what passes runs with d/q on a d/filter view of the db,
++  never on the conn. The filter hides private content: anything tagged with a class titled Private
++  (any case) or a class extending one, every block on a private page or under a private block, and
++  every ref to one of those, so neither results, pulls (reverse refs included), missing?, get-else
++  nor aggregates can see it. Rows are sorted with a type rank, so mixed types never make compare
++  throw, and cut to limit."
++  (:require [cljs.reader :as reader]
++            [cljs.tools.reader.edn :as edn]
++            [cljs.tools.reader.reader-types :as reader-types]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.common :as common]
++            [logseq.db-sync.worker.graph-insights :as graph-insights]
++            [logseq.db-sync.worker.http :as http]
++            [promesa.core :as p]))
++
++(def scan-cap 50000)
++(def byte-cap 100000)
++(def default-limit 50)
++(def max-limit 200)
++(def max-query-chars 4000)
++(def max-inputs 20)
++(def max-pull-depth 2)
++(def many-attr-limit 50)
++
++(def allowed-fns
++  "The functions and predicates a clause may call, by symbol: Datascript's query-fns less the ones
++  that cost CPU without scanning datoms (rand, range, the regex functions, which also invite ReDoS),
++  build large strings (clojure.string's join, replace, split and the like) or print. Deny by default:
++  a built-in a Datascript bump adds stays refused until it is added here."
++  '#{= == not= != < > <= >= + - * / quot rem mod inc dec max min
++     zero? pos? neg? even? odd? compare
++     true? false? nil? some? not and or complement identical?
++     identity keyword name namespace type vector list set hash-map array-map
++     count not-empty empty? contains? str subs get
++     -differ? get-else get-some missing? ground tuple untuple
++     clojure.string/blank? clojure.string/includes? clojure.string/starts-with?
++     clojure.string/ends-with? clojure.string/lower-case clojure.string/upper-case
++     clojure.string/capitalize clojure.string/index-of clojure.string/last-index-of
++     clojure.string/trim clojure.string/trim-newline clojure.string/triml clojure.string/trimr
++     number? integer? string? boolean? keyword?})
++
++(def ^:private allowed-aggregates
++  "Datascript's aggregates less rand and sample (random rows) and the custom `aggregate`, which would
++  take a function from inputs."
++  '#{sum avg median variance stddev distinct min max count count-distinct})
++
++(def ^:private allowed-list (string/join ", " (sort-by str allowed-fns)))
++
++(def ^:private query-keys [:find :in :where :keys :strs :syms :with])
++
++(def ^:private write-keywords
++  #{:db/add :db/retract :db/retractEntity :db/retractAttribute :db/cas})
++
++(def last-run
++  "What the latest request did, for tests: whether it built the private set and how many datoms the
++  filter was asked about. Reset at the start of every request."
++  (atom {:private-set-built? false :scanned 0}))
++
++(defn- refusal [status message] {::status status ::error message})
++
++(defn- refusal? [x] (and (map? x) (contains? x ::error)))
++
++(defn- format-count [n]
++  (string/replace (str n) #"\B(?=(\d{3})+(?!\d))" ","))
++
++;; Parsing
++;; =======
++
++(defn parse-edn
++  "Reads `s`, the body field `field`, as one EDN form: {:ok form} or {:error message} naming the
++  field and, for a syntax error, the line and column. Only #uuid and #inst tags are read; nothing is
++  evaluated."
++  [field s]
++  (let [rdr (reader-types/indexing-push-back-reader s)
++        eof (js-obj)
++        opts {:eof eof
++              ;; cljs.reader's own #uuid and #inst readers; the EDN reader has none by default.
++              :readers {'uuid (get @reader/*tag-table* 'uuid)
++                        'inst (get @reader/*tag-table* 'inst)}
++              :default (fn [tag _]
++                         (throw (ex-info "bad tag" {::bad-tag tag})))}
++        position (fn [data]
++                   (str " at line " (or (:line data) (reader-types/get-line-number rdr))
++                        ", column " (or (:col data) (:column data) (reader-types/get-column-number rdr))))]
++    (try
++      (let [form (edn/read opts rdr)]
++        (cond
++          (identical? eof form) {:error (str field ": empty; give an EDN form")}
++          (not (identical? eof (edn/read opts rdr)))
++          {:error (str field ": unexpected text after the form" (position nil) "; give one EDN form")}
++          :else {:ok form}))
++      (catch :default e
++        (let [data (ex-data e)]
++          (if-let [tag (::bad-tag data)]
++            {:error (str field ": reader tag #" tag " is not allowed (only #uuid and #inst)")}
++            {:error (str field ": EDN parse error" (position data) ": " (ex-message e))}))))))
++
++;; Write forms
++;; ===========
++
++(defn- write-form-errors
++  "Every write-shaped value in `form` (a transaction keyword, any :db.fn/ keyword, or a map with
++  :db/id), each as `field: … is a write form`."
++  [field form]
++  (->> (tree-seq coll? seq form)
++       (keep (fn [x]
++               (cond
++                 (and (keyword? x) (or (contains? write-keywords x) (= "db.fn" (namespace x))))
++                 (str field ": " x " is a write form; datalog_query is read-only")
++                 (and (map? x) (contains? x :db/id))
++                 (str field ": a map with :db/id is a write form; datalog_query is read-only"))))
++       distinct))
++
++;; Query shape
++;; ===========
++
++(defn- variable? [x] (and (symbol? x) (nil? (namespace x)) (string/starts-with? (name x) "?")))
++
++(defn- source? [x] (and (symbol? x) (nil? (namespace x)) (string/starts-with? (name x) "$")))
++
++(defn- vars-in [form] (set (filter variable? (tree-seq coll? seq form))))
++
++(defn normalise-query
++  "The query as a map of `query-keys` to vectors: {:ok map} or {:error message}. The vector form
++  [:find … :where …] is split at its keywords."
++  [q]
++  (let [unknown (fn [k] (if (= :rules k)
++                          "query: :rules is not a query key; pass rules in the rules field"
++                          (str "query: " (pr-str k) " is not a query key (keys: "
++                               (string/join ", " (map str query-keys)) ")")))]
++    (cond
++      (map? q)
++      (if-let [bad (seq (remove (set query-keys) (keys q)))]
++        {:error (string/join "; " (map unknown bad))}
++        (if-let [bad (seq (remove (comp sequential? val) q))]
++          {:error (string/join "; " (map #(str "query: " (key %) " must be a vector") bad))}
++          {:ok (update-vals q vec)}))
++
++      (vector? q)
++      (if-not (keyword? (first q))
++        {:error "query: give [:find … :where …] or {:find […] :where […]}"}
++        (let [parts (partition-by keyword? q)
++              pairs (partition-all 2 parts)
++              errors (concat
++                      (for [[ks _] pairs, k (butlast ks)] (str "query: " (pr-str k) " has no values"))
++                      (for [[ks _] pairs, k ks :when (not (contains? (set query-keys) k))] (unknown k))
++                      (for [[k n] (frequencies (map (comp last first) pairs)) :when (> n 1)]
++                        (str "query: " (pr-str k) " is given " n " times")))]
++          (if (seq errors)
++            {:error (string/join "; " (distinct errors))}
++            {:ok (into {} (map (fn [[ks vs]] [(last ks) (vec vs)])) pairs)})))
++
++      :else {:error "query: give [:find … :where …] or {:find […] :where […]}"})))
++
++(defn- clause-kind [clause]
++  (cond
++    (vector? clause) (if (seq? (first clause)) (if (next clause) :fn :pred) :pattern)
++    (seq? clause) (let [[head] clause]
++                    (cond
++                      (source? head) :sourced
++                      (contains? '#{not not-join or or-join and} head) head
++                      (symbol? head) :rule
++                      :else :invalid))
++    :else :invalid))
++
++(declare clause-errors)
++
++(defn- source-errors [label form]
++  (for [s (distinct (filter #(and (source? %) (not= '$ %)) (tree-seq coll? seq form)))]
++    (str label ": source " s " is not allowed; only the default source $")))
++
++(defn- function-error [label f]
++  (cond
++    (variable? f) (str label ": " f " is a variable in function position; functions can't be passed as inputs")
++    (not (symbol? f)) (str label ": " (pr-str f) " in function position is not a function name")
++    (not (contains? allowed-fns f)) (str label ": function " f " is not allowed (allowed: " allowed-list ")")))
++
++(defn- clause-errors
++  "Why `clause` can't run, each prefixed with `label`; `rule-names` are the rules it may call."
++  [label rule-names clause]
++  (let [nested (fn [clauses] (mapcat #(clause-errors label rule-names %) clauses))]
++    (case (clause-kind clause)
++      (:fn :pred) (let [[[f & args]] clause]
++                    (concat (keep identity [(function-error label f)]) (source-errors label args)))
++      :pattern (source-errors label clause)
++      :sourced (concat (source-errors label [(first clause)]) (clause-errors label rule-names (apply list (rest clause))))
++      (not or and) (nested (rest clause))
++      (not-join or-join) (nested (drop 2 clause))
++      :rule (concat (when-not (contains? rule-names (first clause))
++                      [(str label ": rule " (first clause) " is not defined in rules")])
++                    (source-errors label (rest clause)))
++      [(str label ": " (pr-str clause) " is not a clause")])))
++
++(defn- clause-vars
++  "The variables `clause` joins: a predicate joins none (it filters a cross product, it doesn't
++  join one); or-join and not-join join their declared variables; anything else joins every variable
++  it holds."
++  [clause]
++  (case (clause-kind clause)
++    :pred #{}
++    (not-join or-join) (vars-in (second clause))
++    :sourced (clause-vars (apply list (rest clause)))
++    (vars-in clause)))
++
++(defn- cross-product-error
++  "The refusal when the where clauses fall into more than one group of clauses sharing variables."
++  [where]
++  (let [parent (volatile! {})
++        root (fn root [v] (let [p (get @parent v v)] (if (= p v) v (root p))))
++        union! (fn [a b] (let [ra (root a) rb (root b)] (when (not= ra rb) (vswap! parent assoc ra rb))))
++        ;; Every union happens before any root is read.
++        grouped (vec (keep-indexed (fn [i clause]
++                                     (when-let [vs (seq (clause-vars clause))]
++                                       (doseq [v (rest vs)] (union! (first vs) v))
++                                       [(inc i) (first vs)]))
++                                   where))
++        firsts (reduce (fn [acc [i v]] (let [r (root v)] (if (contains? acc r) acc (assoc acc r i))))
++                       {} grouped)]
++    (when (> (count firsts) 1)
++      (let [[a b] (sort (vals firsts))]
++        (str "where: clauses " a " and " b " share no variable (a cross product); join them through a shared variable")))))
++
++(defn- find-errors [find]
++  (for [element find
++        :when (seq? element)
++        :let [[f & args] element]
++        error (cond
++                (= 'pull f) (source-errors "find" args)
++                (variable? f) [(str "find: " f " is a variable in function position; functions can't be passed as inputs")]
++                (not (contains? allowed-aggregates f))
++                [(str "find: aggregate " (pr-str f) " is not allowed (allowed: pull, "
++                      (string/join ", " (sort-by str allowed-aggregates)) ")")]
++                :else (source-errors "find" args))]
++    error))
++
++(defn- in-errors
++  "Problems with :in, and the number of inputs it binds after $ and %."
++  [in rules?]
++  (let [bindings (remove #{'$ '%} in)
++        sources (filter source? in)]
++    {:errors (concat
++              (when (and (seq in) (not= '$ (first in))) [":in: must start with $"])
++              (for [s (distinct sources) :when (not= '$ s)]
++                (str ":in: source " s " is not allowed; only the default source $"))
++              (when (and (some #{'%} in) (not rules?)) [":in: % needs rules; give rules or remove %"])
++              (when (and rules? (not (some #{'%} in))) ["rules: given, but :in has no %; add % to :in"]))
++     :bound (count (remove source? bindings))}))
++
++(defn- rule-names [rules] (set (keep #(when (and (vector? %) (seq? (first %))) (ffirst %)) rules)))
++
++(defn- rules-errors [rules]
++  (if-not (vector? rules)
++    ["rules: must be an EDN vector of rules, each [(name ?args) clauses…]"]
++    (let [names (rule-names rules)]
++      (mapcat (fn [i rule]
++                (if-not (and (vector? rule) (seq? (first rule)) (symbol? (ffirst rule)))
++                  [(str "rules " (inc i) ": must be [(name ?args) clauses…]")]
++                  (let [rule-name (ffirst rule)]
++                    (mapcat (fn [j clause] (clause-errors (str "rules: rule " rule-name " clause " (inc j)) names clause))
++                            (range) (rest rule)))))
++              (range) rules))))
++
++(defn validate-query
++  "nil when `q` (normalised) may run with `rules` and `inputs`, else one message listing every
++  clause's refusal."
++  [q rules inputs]
++  (let [where (:where q)
++        names (rule-names rules)
++        {in-problems :errors bound :bound} (in-errors (or (:in q) '[$]) (some? rules))
++        errors (concat
++                in-problems
++                (when (and (empty? in-problems) (not= bound (count inputs)))
++                  [(str "inputs: " (count inputs) " value" (when (not= 1 (count inputs)) "s") " given, but :in binds "
++                        bound " after $")])
++                (when (empty? (:find q)) ["query: :find is required"])
++                (find-errors (:find q))
++                (when (and (:keys q) (not= (count (:keys q)) (count (remove '#{. ...} (flatten (:find q))))))
++                  [(str "query: :keys names " (count (:keys q)) " columns for " (count (:find q)) " find elements")])
++                (mapcat (fn [i clause] (clause-errors (str "where " (inc i)) names clause)) (range) where)
++                (when rules (rules-errors rules)))]
++    (if (seq errors)
++      (string/join "; " (distinct errors))
++      (cross-product-error where))))
++
++;; The private filter
++;; ==================
++
++(defn ref-attrs
++  "The attributes whose values are entity ids."
++  [db]
++  (set (keep (fn [[attr props]] (when (= :db.type/ref (:db/valueType props)) attr)) (d/schema db))))
++
++(defn private-ids
++  "Every entity a query must not see: whatever is tagged with a class titled private (any case) or
++  with a class extending one, every block whose page is one of those, and every descendant of
++  those. A property value block is under its owner, so it follows its owner."
++  [db]
++  (let [lineage (graph-insights/class-lineage-fn db)
++        tag-class (d/entid db :logseq.class/Tag)
++        classes (map :e (d/datoms db :avet :block/tags tag-class))
++        private-class? (fn [class-id]
++                         (some #(= "private" (some-> (:block/title %) string/lower-case)) (lineage class-id)))
++        roots (->> classes
++                   (filter private-class?)
++                   (mapcat #(d/datoms db :avet :block/tags %))
++                   (map :e))
++        children (fn [id] (concat (map :e (d/datoms db :avet :block/parent id))
++                                  (map :e (d/datoms db :avet :block/page id))))]
++    (loop [seen (transient #{}) queue (vec roots)]
++      (if-let [id (peek queue)]
++        (if (contains? seen id)
++          (recur seen (pop queue))
++          (recur (conj! seen id) (into (pop queue) (children id))))
++        (persistent! seen)))))
++
++(defn query-filter
++  "`db` filtered to hide `private` entities and refs to them; `counter` (a volatile) counts every
++  datom the filter is asked about."
++  [db private refs counter]
++  (d/filter db (fn [_ datom]
++                 (vswap! counter inc)
++                 (not (or (contains? private (:e datom))
++                          (and (contains? refs (:a datom)) (contains? private (:v datom))))))))
++
++;; Running
++;; =======
++
++(defn type-rank
++  "Sort rank of a value's type, so values of different types order without compare throwing."
++  [v]
++  (cond
++    (nil? v) 0
++    (boolean? v) 1
++    (number? v) 2
++    (string? v) 3
++    (keyword? v) 4
++    (uuid? v) 5
++    :else 6))
++
++(defn- sort-key [v]
++  (let [rank (type-rank v)]
++    [rank (if (= 6 rank) (pr-str v) v)]))
++
++(defn sort-rows
++  "`rows` in a deterministic order: column by column, by type rank, then value."
++  [rows]
++  (->> rows
++       (map (fn [row] [(mapv sort-key row) row]))
++       (sort-by first (fn [a b]
++                        (or (some (fn [[[ra va] [rb vb]]]
++                                    (let [c (if (= ra rb) (compare va vb) (compare ra rb))]
++                                      (when-not (zero? c) c)))
++                                  (map vector a b))
++                            0)))
++       (mapv second)))
++
++(defn- keyword-text [k] (subs (str k) 1))
++
++(defn serialise
++  "A result value as JSON-ready data: keywords as text without the colon, uuids as text."
++  [v]
++  (cond
++    (keyword? v) (keyword-text v)
++    (uuid? v) (str v)
++    (symbol? v) (str v)
++    (instance? js/Date v) (.getTime v)
++    (map? v) (into {} (map (fn [[k x]] [(if (keyword? k) (keyword-text k) (str k)) (serialise x)])) v)
++    (coll? v) (mapv serialise v)
++    :else v))
++
++(defn- relation-find
++  "A :find in any of Datascript's shapes as a relation find: [?x .] and [[?x ...]] become [?x], and
++  [[?x ?y]] becomes [?x ?y]."
++  [find]
++  (cond
++    (and (= 2 (count find)) (= '. (second find))) [(first find)]
++    (and (= 1 (count find)) (vector? (first find))) (vec (remove #{'...} (first find)))
++    :else find))
++
++(defn- query-args [in fdb rules inputs]
++  (loop [[b & more] (or (seq in) '[$]) inputs inputs args []]
++    (cond
++      (nil? b) args
++      (= '$ b) (recur more inputs (conj args fdb))
++      (= '% b) (recur more inputs (conj args rules))
++      :else (recur more (rest inputs) (conj args (first inputs))))))
++
++(defn- query-error-message
++  "A Datascript error from running the caller's query as a 400 message, or nil for anything else."
++  [e]
++  (when-let [data (ex-data e)]
++    (when (keyword? (:error data))
++      (str "query: " (ex-message e)))))
++
++(defn run-query
++  "Runs the normalised, validated query `q` on `db` filtered for privacy; returns {:columns :rows
++  :total-rows :returned :truncated?}, or a refusal."
++  [db {:keys [query inputs rules limit]}]
++  (let [private (private-ids db)
++        _ (swap! last-run assoc :private-set-built? true)
++        counter (volatile! 0)
++        fdb (query-filter db private (ref-attrs db) counter)
++        find (relation-find (:find query))
++        runnable (-> query (dissoc :keys :strs :syms) (assoc :find find))
++        columns (or (some->> (or (:keys query) (:strs query) (:syms query)) (mapv str))
++                    (mapv pr-str find))
++        result (try
++                 (apply d/q runnable (query-args (:in query) fdb rules inputs))
++                 (catch :default e
++                   (refusal 400 (or (query-error-message e) (str "query: failed while running: " (ex-message e)))))
++                 (finally (swap! last-run assoc :scanned @counter)))]
++    (if (refusal? result)
++      result
++      (let [rows (sort-rows (map vec result))
++            total (count rows)
++            kept (subvec rows 0 (min limit total))]
++        (cond-> {:columns columns
++                 :rows (mapv serialise kept)
++                 :total-rows total
++                 :returned (count kept)}
++          (> total limit)
++          (assoc :truncated {:by "limit"
++                             :note (str "returned " (format-count (count kept)) " of " (format-count total)
++                                        " rows (limit " limit ", maximum " max-limit
++                                        "); narrow the query or add a :where clause")}))))))
++
++;; The handler
++;; ===========
++
++(def ^:private body-fields #{:query :inputs :rules :limit :dry-run})
++
++(defn- body-errors [body]
++  (if-not (map? body)
++    ["body: give a JSON object with query"]
++    (let [{:keys [query inputs rules limit]} body]
++      (cond-> (mapv #(str (name %) ": not a field; the body takes query, inputs, rules, limit and dry-run")
++                    (remove body-fields (keys body)))
++        (not (string? query)) (conj "query: required, an EDN string")
++        (and (string? query) (> (count query) max-query-chars))
++        (conj (str "query: at most " (format-count max-query-chars) " characters (got " (format-count (count query)) ")"))
++        (and (contains? body :inputs) (not (string? inputs))) (conj "inputs: must be an EDN string")
++        (and (contains? body :rules) (not (string? rules))) (conj "rules: must be an EDN string")
++        (and (contains? body :limit) (not (and (integer? limit) (<= 1 limit max-limit))))
++        (conj (str "limit: must be an integer from 1 to " max-limit))
++        (and (contains? body :dry-run) (not (boolean? (:dry-run body)))) (conj "dry-run: must be true or false")))))
++
++(defn- parse-request
++  "The body's query, inputs and rules parsed, normalised and validated: {:query :inputs :rules
++  :given} or a refusal."
++  [body]
++  (let [problems (body-errors body)]
++    (if (seq problems)
++      (refusal 400 (string/join "; " problems))
++      (let [parsed (cond-> {:query (parse-edn "query" (:query body))}
++                     (:inputs body) (assoc :inputs (parse-edn "inputs" (:inputs body)))
++                     (:rules body) (assoc :rules (parse-edn "rules" (:rules body))))
++            parse-problems (keep :error (vals parsed))
++            {:keys [query inputs rules]} (update-vals parsed :ok)
++            shape-problems (concat
++                            (when (and (contains? parsed :inputs) (not (vector? inputs)) (empty? parse-problems))
++                              ["inputs: must be an EDN vector"])
++                            (when (and (vector? inputs) (> (count inputs) max-inputs))
++                              [(str "inputs: at most " max-inputs " values (got " (count inputs) ")")]))]
++        (if (seq (concat parse-problems shape-problems))
++          (refusal 400 (string/join "; " (concat parse-problems shape-problems)))
++          (let [writes (concat (write-form-errors "query" query)
++                               (write-form-errors "inputs" inputs)
++                               (write-form-errors "rules" rules))
++                normalised (normalise-query query)
++                invalid (or (:error normalised)
++                            (validate-query (:ok normalised) rules (or inputs [])))
++                problems (cond-> (vec writes) invalid (conj invalid))]
++            (if (seq problems)
++              (refusal 400 (string/join "; " problems))
++              {:query (:ok normalised) :given query :inputs (or inputs []) :rules rules})))))))
++
++(defn- respond [result]
++  (if (refusal? result)
++    (http/error-response (::error result) (::status result))
++    (http/json-response :semantic/datalog-query result)))
++
++(defn handle-query
++  "POST /query: refuses an E2EE graph first, then a body, query, inputs or rules that can't run,
++  and otherwise answers the dry run or the rows."
++  [{:keys [request db e2ee?]}]
++  (reset! last-run {:private-set-built? false :scanned 0})
++  (if e2ee?
++    (http/error-response "datalog_query is unavailable on an E2EE graph (titles are ciphertext)" 409)
++    (p/let [body (-> (p/let [json (common/read-json request)] (js->clj json :keywordize-keys true))
++                     (p/catch (fn [_] ::malformed)))]
++      (if (= ::malformed body)
++        (http/bad-request "body: give a JSON object with query")
++        (let [parsed (parse-request body)]
++          (respond
++           (cond
++             (refusal? parsed) parsed
++             (true? (:dry-run body)) {:dry-run true
++                                      :query (pr-str (:given parsed))
++                                      :inputs (pr-str (:inputs parsed))
++                                      :rules (pr-str (or (:rules parsed) []))}
++             :else (merge (run-query db {:query (:query parsed) :inputs (:inputs parsed) :rules (:rules parsed)
++                                         :limit (or (:limit body) default-limit)})
++                          {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}))))))))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index d8e3144..1d0fb1f 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -15,6 +15,7 @@
+             [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.graph-insights :as graph-insights]
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
++            [logseq.db-sync.worker.handler.datalog :as datalog]
+             [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
+             [logseq.db-sync.worker.http :as http]
+             [logseq.db-sync.worker.ws :as ws]
+@@ -5513,6 +5514,7 @@
+     (contains? bulk-handlers handler) (handle-bulk context)
+     (contains? insight-handlers handler) (handle-insights context)
+     (= :semantic/block-changes handler) (handle-block-changes context)
++    (= :semantic/datalog-query handler) (datalog/handle-query context)
+     :else (http/not-found)))
+ 
+ (defn- answering-stamp-conflicts
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 1365b0a..fa47834 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -104,6 +104,9 @@
+     :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/block-changes" :internal-path "/semantic/block-changes"
+     :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
++   ;; A read: POST only because the query can be long.
++   {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
++    :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/e2ee/public-keys" :internal-path "/e2ee/public-keys"
+     :handler :semantic/e2ee-public-keys :operation-id "getE2eePublicKeys" :scope "logseq/read" :rate-class :read :edge? true}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/encrypt" :internal-path "/e2ee/encrypt"
+@@ -195,6 +198,12 @@
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+    "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
+    "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
++   "datalogQuery" ["Run a read-only Datalog query"
++                   (str "Runs a read-only Datalog query against the graph and returns the rows. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
++                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused."
++                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible."
++                        " Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50); total-rows counts every row, and truncated says when the limit cut them. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title) and uuids as text."
++                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, :in) and the reason; a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
+    "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
+    "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
+    "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
+@@ -498,6 +507,18 @@
+                                                                    :items {:type "string"}}}}
+                                    :convert_values {:type "boolean"
+                                                     :description "For a default (text) property: true turns its free-text values into the choices the call leaves, matched exactly, then ignoring case. Text that matches no choice refuses the call; add those choices under choices.add in the same call. Refused while the property has a default value, or when a text value has child blocks (deleting it would delete them); values cleared to the empty placeholder are left as they are. Preview the mapping with dry-run=true."}}}
++    "datalogQuery" {:required ["query"]
++                    :properties {:query {:type "string" :maxLength 4000
++                                         :description "The query as EDN, the vector form [:find ?t :where [?e :block/title ?t]] or the map form {:find [?t] :where [[?e :block/title ?t]]}."}
++                                 :inputs {:type "string"
++                                          :description "An EDN vector of the values bound to :in after $, in order, at most 20, e.g. [\"Project\" #uuid \"…\"]."}
++                                 :rules {:type "string"
++                                         :description "An EDN vector of rules, bound to % in :in, e.g. [[(tagged ?e ?tag) [?e :block/tags ?t] [?t :block/title ?tag]]]."}
++                                 :limit {:type "integer" :minimum 1 :maximum 200 :default 50
++                                         :description "Most rows returned, 1 to 200; total-rows always counts every row."}
++                                 :dry-run {:type "boolean" :default false
++                                           :description "Check the query and return it, inputs and rules as EDN, without running it."}}
++                    :additionalProperties false}
+     "encryptE2eeText" {:required ["key" "texts"]
+                        :properties {:texts {:type "array" :minItems 1 :maxItems 100
+                                             :items {:type "string"}}
+@@ -651,6 +672,7 @@
+                   "listFavorites" (entity-response "FavoritesResponse" "The favourites in sidebar order")
+                   "setPageFavorite" (entity-response "FavoriteWriteResponse" "What was done, the page, and the list read back")
+                   "reorderFavorites" (entity-response "FavoritesResponse" "The favourites in the new order, read back")
++                  "datalogQuery" (entity-response "DatalogQueryResponse" "The rows, or with dry-run=true the query as EDN")
+                   "getProperty"
+                   (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
+                   "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
+@@ -1030,6 +1052,21 @@
+                                                             :description "In sidebar order; empty when the graph has none."
+                                                             :items {:$ref "#/components/schemas/Favorite"}}
+                                                 :dry-run {:type "boolean" :description "reorderFavorites with dry-run=true: true; nothing was written."}}}
++               :DatalogQueryResponse {:type "object"
++                                      :properties {:columns {:type "array" :items {:type "string"}
++                                                             :description "One name per :find element: its :keys name, else the element as written."}
++                                                   :rows {:type "array" :items {:type "array" :items {}}
++                                                          :description "Sorted rows, each one value per column; keywords as text without the colon, uuids as text."}
++                                                   :total-rows {:type "integer" :description "Every row the query matched."}
++                                                   :returned {:type "integer" :description "The rows in rows."}
++                                                   :truncated {:type "object" :required ["by" "note"]
++                                                               :description "Present when rows holds fewer than total-rows."
++                                                               :properties {:by {:enum ["limit"]}
++                                                                            :note {:type "string"}}}
++                                                   :query {:type "string" :description "The query as EDN."}
++                                                   :inputs {:type "string" :description "The inputs as EDN."}
++                                                   :rules {:type "string" :description "dry-run only: the rules as EDN."}
++                                                   :dry-run {:type "boolean" :description "true when the query was checked and not run."}}}
+                :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
+                                       :properties {:uuid {:type "string"}
+                                                    :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+new file mode 100644
+index 0000000..4cc58e6
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+@@ -0,0 +1,599 @@
++(ns logseq.db-sync.semantic-datalog-query-test
++  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
++  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
++  functions bound through inputs, sources other than $, undefined rules and cross products, each
++  naming the clause, and runs what passes on a d/filter view of the db that hides private content:
++  anything tagged with a class titled Private (any case) or a class extending one, the blocks on a
++  private page, every block under a private block, and any ref to one of those. Rows are sorted with
++  a type rank and cut to limit. E2EE graphs answer 409 before anything is parsed; dry-run answers the
++  EDN without building the private set or running the query.
++
++  Fixtures are written through the real handler: tags Private, Secret (extends Private), Hush
++  (extends Secret), Project and Topic; pages zq Public Plans (Project), zq Private Plans (Private),
++  zq Secret Plans (Secret, Project), zq Hush Plans (Hush, Project) and zq Notes. zq Private Plans
++  holds a block that refs zq Public Plans and a rating value; zq Notes holds zq Hidden note (tagged
++  Private) with a child tagged Topic, zq Public note with a child, and a block that refs zq Private
++  Plans. Every fixture title holds zq, so a query can pick them out."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.built-ins :as built-ins]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.datalog :as datalog]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body :text}. With e2ee?,
++  the request carries graph-e2ee=true as the index's flag reaches the DO."
++  ([self method path body] (request! self method path body false))
++  ([self method path body e2ee?]
++   (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1"
++                    (when e2ee? "&graph-e2ee=true"))
++           response (sync-handler/handle-http
++                     self
++                     (js/Request. url (clj->js (cond-> {:method method
++                                                        :headers {"content-type" "application/json"}}
++                                                 (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++           text (.text response)]
++     {:status (.-status response)
++      :text text
++      :body (when (seq text)
++              (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                   (catch :default _ text)))})))
++
++(defn- edn [form] (if (string? form) form (pr-str form)))
++
++(defn- query!
++  "POST /query with `form` (an EDN string, or a form printed as EDN) and the other body fields."
++  [self form & {:keys [inputs rules e2ee?] :as more}]
++  (request! self "POST" "/semantic/query"
++            (cond-> (merge {:query (edn form)} (dissoc more :inputs :rules :e2ee?))
++              (some? inputs) (assoc :inputs (edn inputs))
++              (some? rules) (assoc :rules (edn rules)))
++            e2ee?))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- ok!
++  "`response` (or a promise of it), asserted to have `status`."
++  [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- uuid-of [response] (uuid (get-in response [:body :uuid])))
++
++(defn- set-tags! [self id titles]
++  (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent "block/tags"))
++                 {:value titles})
++       200))
++
++(defn- insert! [self target blocks]
++  (p/let [response (ok! (request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks}) 201)]
++    (get-in response [:body :blocks])))
++
++(defn- title-of
++  "The title as stored: an entity's :block/title shows a ref's title, the datom holds its uuid."
++  [conn id]
++  (:v (first (d/datoms @conn :eavt (:db/id (d/entity @conn [:block/uuid id])) :block/title))))
++
++(defn- seed-graph
++  "A conn with the fixtures the namespace docstring names, and the handler context to call it
++  through."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          tag! (fn [body] (p/let [r (ok! (request! self "POST" "/semantic/tags" body) 201)] (uuid-of r)))
++          page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++          private-tag (tag! {:title "Private"})
++          _secret-tag (tag! {:title "Secret" :extends ["Private"]})
++          _hush-tag (tag! {:title "Hush" :extends ["Secret"]})
++          _project-tag (tag! {:title "Project"})
++          _topic-tag (tag! {:title "Topic"})
++          public-plans (page! "zq Public Plans")
++          private-plans (page! "zq Private Plans")
++          secret-plans (page! "zq Secret Plans")
++          hush-plans (page! "zq Hush Plans")
++          notes (page! "zq Notes")
++          _ (set-tags! self public-plans ["Project"])
++          _ (set-tags! self private-plans ["Private"])
++          _ (set-tags! self secret-plans ["Secret" "Project"])
++          _ (set-tags! self hush-plans ["Hush" "Project"])
++          [plan-block] (insert! self private-plans [{:title "zq private plan block, see [[zq Public Plans]]"}])
++          [hidden public-note see] (insert! self notes [{:title "zq Hidden note" :children [{:title "zq Hidden child"}]}
++                                                         {:title "zq Public note" :children [{:title "zq Public child"}]}
++                                                         {:title "zq See [[zq Private Plans]]"}])
++          _ (set-tags! self (:uuid hidden) ["Private"])
++          _ (set-tags! self (get-in hidden [:children 0 :uuid]) ["Topic"])
++          rating (outliner-property/upsert-property!
++                  conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                  {:property-name "rating"})
++          rating-path (js/encodeURIComponent (subs (str (:db/ident rating)) 1))
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" private-plans "/properties/" rating-path) {:value "zq five stars"}) 200)
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" public-plans "/properties/" rating-path) {:value "zq four stars"}) 200)]
++    {:conn conn :self self :private-tag private-tag
++     :public-plans public-plans :private-plans private-plans :secret-plans secret-plans
++     :hush-plans hush-plans :notes notes
++     :plan-block (uuid (:uuid plan-block)) :hidden (uuid (:uuid hidden))
++     :hidden-child (uuid (get-in hidden [:children 0 :uuid]))
++     :public-note (uuid (:uuid public-note)) :public-child (uuid (get-in public-note [:children 0 :uuid]))
++     :see (uuid (:uuid see)) :rating (:db/ident rating)}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(def ^:private private-titles
++  ["zq Private Plans" "zq Secret Plans" "zq Hush Plans" "zq private plan block" "zq Hidden note"
++   "zq Hidden child" "zq five stars"])
++
++(defn- leaks
++  "The private fixture titles that appear anywhere in `text`."
++  [text]
++  (filterv #(string/includes? text %) private-titles))
++
++(defn- refused?
++  "A 400 whose error holds every one of `parts`."
++  [response & parts]
++  (and (= 400 (:status response))
++       (every? #(string/includes? (str (get-in response [:body :error])) %) parts)))
++
++(def ^:private zq-titles '[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]])
++
++;; Before patch 0039 there is no such route: every request below answers 404 {:error "not found"}.
++
++(deftest read-only-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (let [cases [["transact! by name" "where 1: function transact! is not allowed (allowed: "
++                      {:form '[:find ?b :where [(transact! ?b)]]}]
++                     ["a namespaced transact!" "where 2: function datascript.core/transact! is not allowed"
++                      {:form '[:find ?b :where [?b :block/title ?t] [(datascript.core/transact! ?b)]]}]
++                     ["a function name given as a string" "where 2: \"transact!\" in function position is not a function name"
++                      {:form '[:find ?b :where [?b :block/title ?t] [("transact!" ?t)]]}]
++                     [":db/add in inputs" "inputs: :db/add is a write form; datalog_query is read-only"
++                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
++                       :inputs '[[:db/add 1 :block/title "x"]]}]
++                     ["a nested :db/add in an inputs collection" "inputs: :db/add is a write form"
++                      {:form '[:find ?t :in $ [?x ...] :where [?e :block/title ?t] [(= ?t ?x)]]
++                       :inputs '[[[:db/add 1 :block/title "x"]]]}]
++                     ["a :db/id map in inputs" "inputs: a map with :db/id is a write form"
++                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
++                       :inputs '[{:db/id 1 :block/title "x"}]}]
++                     [":db/retractEntity in the query" "query: :db/retractEntity is a write form; datalog_query is read-only"
++                      {:form '[:find ?e :where [?e :block/title :db/retractEntity]]}]
++                     [":db.fn/call in an or-join" "query: :db.fn/call is a write form"
++                      {:form '[:find ?e :where [?e :block/title ?t] (or-join [?e] [?e :db.fn/call ?t] [?e :block/name ?t])]}]
++                     [":db/add in a rule body" "rules: :db/add is a write form"
++                      {:form '[:find ?e :in $ % :where (w ?e)] :rules '[[(w ?e) [?e :db/add ?x]]]}]
++                     ["?f bound through inputs" "where 2: ?f is a variable in function position; functions can't be passed as inputs"
++                      {:form '[:find ?e :in $ ?f :where [?e :block/title ?t] [(?f ?t)]]
++                       :inputs '[clojure.core/identity]}]
++                     ["range" "where 2: function range is not allowed"
++                      {:form '[:find ?n :where [?e :block/title ?t] [(range 1000000) [?n ...]]]}]
++                     ["re-find" "where 2: function re-find is not allowed"
++                      {:form '[:find ?t :where [?e :block/title ?t] [(re-find "zq" ?t)]]}]
++                     ["rand" "where 2: function rand is not allowed"
++                      {:form '[:find ?e ?r :where [?e :block/title ?t] [(rand) ?r]]}]
++                     ["rand as an aggregate" "find: aggregate rand is not allowed"
++                      {:form '[:find (rand ?t) :where [?e :block/title ?t]]}]
++                     ["clojure.string/join" "where 2: function clojure.string/join is not allowed"
++                      {:form '[:find ?s :where [?e :block/title ?t] [(clojure.string/join ?t ?t) ?s]]}]
++                     ["re-find inside not-join" "where 2: function re-find is not allowed"
++                      {:form '[:find ?e :where [?e :block/title ?t] (not-join [?t] [(re-find "x" ?t)])]}]
++                     ["rand inside or" "where 2: function rand is not allowed"
++                      {:form '[:find ?e :where [?e :block/title ?t] (or [(rand) ?t] [?e :block/name ?t])]}]
++                     ["re-find in a rule body" "rules: rule bad clause 2: function re-find is not allowed"
++                      {:form '[:find ?e :in $ % :where (bad ?e)]
++                       :rules '[[(bad ?e) [?e :block/title ?t] [(re-find "x" ?t)]]]}]
++                     ["an input-bound aggregate" "find: ?f is a variable in function position"
++                      {:form '[:find (?f ?t) :in $ ?f :where [?e :block/title ?t]] :inputs '[count]}]]]
++          (p/doseq [[label message {:keys [form inputs rules]}] cases]
++            (p/let [before (snapshot conn)
++                    response (query! self form :inputs inputs :rules rules)]
++              (testing label
++                (is (refused? response message) (pr-str response))
++                (is (= before (snapshot conn)) "max-tx and the datom count are unchanged")
++                (is (false? (:private-set-built? @datalog/last-run)) "a refused call never builds the private set")))))))))
++
++(deftest refusal-lists-every-clause-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [response (query! self '[:find ?e :where [?e :block/title ?t] [(rand) ?r] [(re-find "x" ?t)]])]
++          (is (refused? response "where 2: function rand is not allowed" "where 3: function re-find is not allowed")
++              (pr-str response)))))))
++
++(def ^:private removed-fns
++  '#{rand rand-int range re-pattern re-find re-matches re-seq
++     clojure.string/join clojure.string/replace clojure.string/replace-first clojure.string/split
++     clojure.string/split-lines clojure.string/escape clojure.string/reverse
++     meta pr-str print-str println-str prn-str})
++
++(deftest allow-list-exists-test
++  (testing "every allowed symbol is a Datascript query function, so a rename on a bump fails here"
++    (is (seq datalog/allowed-fns))
++    (is (= #{} (set (remove #(contains? built-ins/query-fns %) datalog/allowed-fns)))))
++  (testing "no removed symbol is allowed"
++    (is (= #{} (set (filter removed-fns datalog/allowed-fns)))))
++  (testing "the pure functions the spec keeps are allowed"
++    (is (every? datalog/allowed-fns '[= < > <= >= not= + - * / get-else get-some missing? ground tuple untuple
++                                       count clojure.string/includes? clojure.string/starts-with?
++                                       clojure.string/ends-with? clojure.string/lower-case
++                                       clojure.string/upper-case clojure.string/blank? string? number?])))
++  (testing "deny by default: everything else in query-fns is allowed, nothing outside it"
++    (is (= (set (remove removed-fns (keys built-ins/query-fns))) datalog/allowed-fns))))
++
++(deftest source-and-rules-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [two-sources (query! self '[:find ?t :in $ $2 :where [?e :block/title ?t]] :inputs '[[]])
++                clause-source (query! self '[:find ?t :where [$2 ?e :block/title ?t]])
++                pct-no-rules (query! self '[:find ?t :in $ % :where [?e :block/title ?t]])
++                rules-no-pct (query! self '[:find ?t :where [?e :block/title ?t]]
++                                     :rules '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
++                undefined (query! self '[:find ?t :in $ % :where [?e :block/title ?t] (linked ?e ?x)]
++                                  :rules '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
++                no-rules-call (query! self '[:find ?t :where [?e :block/title ?t] (linked ?e)])
++                no-dollar (query! self '[:find ?t :in ?x :where [?e :block/title ?t]] :inputs '["x"])
++                valid (query! self '[:find ?title :in $ % :where (tagged ?e "Project") [?e :block/title ?title]]
++                              :rules '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
++                recursive (query! self '[:find ?title :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?title]]
++                                  :rules '[[(under ?b ?p) [?b :block/parent ?p]]
++                                           [(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]])]
++          (is (refused? two-sources ":in: source $2 is not allowed; only the default source $") (pr-str two-sources))
++          (is (refused? clause-source "where 1: source $2 is not allowed; only the default source $") (pr-str clause-source))
++          (is (refused? pct-no-rules ":in: % needs rules") (pr-str pct-no-rules))
++          (is (refused? rules-no-pct "rules: given, but :in has no %") (pr-str rules-no-pct))
++          (is (refused? undefined "where 2: rule linked is not defined in rules") (pr-str undefined))
++          (is (refused? no-rules-call "where 2: rule linked is not defined in rules") (pr-str no-rules-call))
++          (is (refused? no-dollar ":in: must start with $") (pr-str no-dollar))
++          (testing "a valid rule runs, on the filtered db: Secret and Hush Plans are tagged Project but private"
++            (is (= [200 [["zq Public Plans"]]] [(:status valid) (get-in valid [:body :rows])]) (pr-str valid)))
++          (testing "a recursive rule runs"
++            (is (= 200 (:status recursive)) (pr-str recursive))
++            (is (= #{"zq Public note" "zq Public child" "zq See"}
++                   (set (map #(first (string/split (first %) #" \[")) (get-in recursive [:body :rows]))))
++                "under zq Notes, without the private block and its child")))))))
++
++(deftest cross-product-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [disjoint (query! self '[:find ?a ?b :where [?a :block/title "zq Notes"] [?b :block/title "zq Public Plans"]])
++                third (query! self '[:find ?a ?b :where [?a :block/title ?t] [?b :block/title ?u] [(= ?t "zq Notes")]])
++                pred-only (query! self '[:find ?a ?b :where [?a :block/created-at ?x] [?b :block/created-at ?y] [(< ?x ?y)]])
++                rule-join (query! self '[:find ?ta ?tb :in $ % :where [?a :block/title ?ta] [?b :block/title ?tb]
++                                         [(= ?tb "zq Notes")] (child ?a ?b)]
++                                  :rules '[[(child ?a ?b) [?a :block/parent ?b]]])
++                or-join (query! self '[:find ?ta ?tb :where [?a :block/title ?ta] [?b :block/title "zq Notes"]
++                                       [?b :block/title ?tb]
++                                       (or-join [?a ?b] [?a :block/parent ?b] [?a :block/page ?b])])
++                not-join (query! self '[:find ?ta :where [?a :block/title ?ta] [?a :block/page ?p]
++                                        [?p :block/title "zq Notes"] [?b :block/title "zq Public note"]
++                                        (not-join [?a ?b] [?a :block/parent ?b])])]
++          (is (refused? disjoint "where: clauses 1 and 2 share no variable (a cross product); join them through a shared variable")
++              (pr-str disjoint))
++          (is (refused? third "where: clauses 1 and 2 share no variable") (pr-str third))
++          (testing "a predicate filters a cross product, it doesn't join one"
++            (is (refused? pred-only "where: clauses 1 and 2 share no variable") (pr-str pred-only)))
++          (testing "a rule call and an or-join join their arguments"
++            (is (= 200 (:status rule-join)) (pr-str rule-join))
++            (is (contains? (set (get-in rule-join [:body :rows])) ["zq Public note" "zq Notes"]))
++            (is (= 200 (:status or-join)) (pr-str or-join))
++            (is (contains? (set (get-in or-join [:body :rows])) ["zq Public child" "zq Notes"])))
++          (testing "not-join's variables join"
++            (is (= 200 (:status not-join)) (pr-str not-join))
++            (is (not (contains? (set (map first (get-in not-join [:body :rows]))) "zq Public child")))))))))
++
++(deftest forms-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (let [pad (fn [s n] (str s (apply str (repeat (- n (count s)) " "))))
++              base "[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t \"zq Notes\")]]"
++              in-vars (string/join " " (map #(str "?a" %) (range 1 21)))
++              twenty (str "[:find ?t :in $ " in-vars " :where [(str " in-vars ") ?t] [?e :block/title ?t]]")]
++          (p/let [vector-form (query! self '[:find ?t :with ?e :keys title :where [?e :block/title ?t]
++                                             [(clojure.string/starts-with? ?t "zq Public")]])
++                  map-form (query! self '{:find [?t] :with [?e] :keys [title]
++                                          :where [[?e :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]})
++                  rules-key (query! self '{:find [?t] :where [[?e :block/title ?t]] :rules []})
++                  timeout-key (query! self '[:find ?t :timeout 5 :where [?e :block/title ?t]])
++                  at-limit (query! self (pad base 4000))
++                  over-limit (query! self (pad base 4001))
++                  twenty-inputs (query! self twenty :inputs (vec (cons "zq Notes" (repeat 19 ""))))
++                  twenty-one (query! self twenty :inputs (vec (cons "zq Notes" (repeat 20 ""))))
++                  limit-0 (query! self base :limit 0)
++                  limit-201 (query! self base :limit 201)
++                  limit-string (query! self base :limit "50")
++                  limit-200 (query! self base :limit 200)
++                  unknown-field (query! self base :timeout 5)
++                  no-query (request! self "POST" "/semantic/query" {:limit 5})]
++            (testing "the vector and map forms give the same rows, with :keys naming the columns"
++              (is (= 200 (:status vector-form)) (pr-str vector-form))
++              (is (= ["title"] (get-in vector-form [:body :columns])))
++              (is (= [["zq Public Plans"] ["zq Public child"] ["zq Public note"]]
++                     (get-in vector-form [:body :rows]))
++                  "sorted as compare sorts strings: upper case first")
++              (is (= (select-keys (:body vector-form) [:columns :rows :total-rows])
++                     (select-keys (:body map-form) [:columns :rows :total-rows]))))
++            (testing "unknown query keys are refused naming the key"
++              (is (refused? rules-key "query: :rules is not a query key; pass rules in the rules field") (pr-str rules-key))
++              (is (refused? timeout-key "query: :timeout is not a query key") (pr-str timeout-key)))
++            (testing "4,000 characters run; 4,001 are refused naming the limit"
++              (is (= [200 [["zq Notes"]]] [(:status at-limit) (get-in at-limit [:body :rows])]) (pr-str at-limit))
++              (is (refused? over-limit "query: at most 4,000 characters (got 4,001)") (pr-str over-limit)))
++            (testing "20 inputs run; 21 are refused naming the limit"
++              (is (= [200 [["zq Notes"]]] [(:status twenty-inputs) (get-in twenty-inputs [:body :rows])]) (pr-str twenty-inputs))
++              (is (refused? twenty-one "inputs: at most 20 values (got 21)") (pr-str twenty-one)))
++            (testing "limit is an integer from 1 to 200"
++              (is (refused? limit-0 "limit: must be an integer from 1 to 200") (pr-str limit-0))
++              (is (refused? limit-201 "limit: must be an integer from 1 to 200") (pr-str limit-201))
++              (is (refused? limit-string "limit: must be an integer from 1 to 200") (pr-str limit-string))
++              (is (= 200 (:status limit-200)) (pr-str limit-200)))
++            (testing "the body takes only its fields, and query is required"
++              (is (refused? unknown-field "timeout: not a field; the body takes query, inputs, rules, limit and dry-run")
++                  (pr-str unknown-field))
++              (is (refused? no-query "query: required") (pr-str no-query)))))))))
++
++(deftest private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self private-plans public-plans see plan-block hidden hidden-child]}]
++        (let [private-id (:db/id (d/entity @conn [:block/uuid private-plans]))
++              see-title (title-of conn see)
++              public-titles #{"zq Public Plans" "zq Notes" "zq Public note" "zq Public child" see-title "zq four stars"}]
++          (p/let [titles (query! self zq-titles :limit 200)
++                  counted (query! self '[:find (count ?e) :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]])
++                  missing (query! self '[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]
++                                         [(missing? $ ?e :block/parent)]])
++                  get-else (query! self '[:find ?t ?p :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]
++                                          [(get-else $ ?e :block/parent 0) ?p]])
++                  reverse-refs (query! self '[:find (pull ?p [:block/title {:block/_refs [:block/title]}])
++                                              :where [?p :block/title "zq Public Plans"]])
++                  ref-targets (query! self '[:find ?p :where [?b :block/title ?bt] [(clojure.string/starts-with? ?bt "zq See")]
++                                             [?b :block/refs ?p]])
++                  pulled (query! self '[:find (pull ?e [*]) :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]]
++                                 :limit 200)
++                  private-tag (query! self '[:find ?t :where [?e :block/title "Private"] [?e :block/title ?t]])]
++            (testing "the fixtures are what the test needs: the See block refs the private page in the db"
++              (is (contains? (set (map :db/id (:block/refs (d/entity @conn [:block/uuid see])))) private-id))
++              (is (some? (d/entity @conn [:block/uuid plan-block])))
++              (is (= "Private" (some-> (d/entity @conn [:block/uuid hidden]) :block/tags (->> (map :block/title) (some #{"Private"})))))
++              (is (= #{"Topic"} (set (map :block/title (:block/tags (d/entity @conn [:block/uuid hidden-child])))))))
++            (testing "a title query returns the public fixtures only"
++              (is (= 200 (:status titles)) (pr-str titles))
++              (is (= public-titles (set (map first (get-in titles [:body :rows]))))))
++            (testing "count counts only what is public"
++              (is (= [[(count public-titles)]] (get-in counted [:body :rows])) (pr-str counted)))
++            (testing "missing? and get-else see the filtered db"
++              (is (= 200 (:status missing)) (pr-str missing))
++              (is (= [] (leaks (:text missing))))
++              (is (contains? (set (map first (get-in missing [:body :rows]))) "zq Public Plans"))
++              (is (= 200 (:status get-else)) (pr-str get-else))
++              (is (= [] (leaks (:text get-else)))))
++            (testing "a reverse-ref pull leaves out the private block that refs the page"
++              (is (= 200 (:status reverse-refs)) (pr-str reverse-refs))
++              (is (= [] (leaks (:text reverse-refs))) (:text reverse-refs)))
++            (testing "a ref to a private page is hidden: the See block's refs don't name it"
++              (is (= 200 (:status ref-targets)) (pr-str ref-targets))
++              (is (not (contains? (set (map first (get-in ref-targets [:body :rows]))) private-id))))
++            (testing "(pull ?e [*]) holds no private title and no ref to the private page"
++              (is (= 200 (:status pulled)) (pr-str pulled))
++              (is (= [] (leaks (:text pulled))))
++              (is (not (string/includes? (:text pulled) (str "{\"db/id\":" private-id "}")))))
++            (testing "a public block's title keeps the private page's uuid, never its title"
++              (is (string/includes? see-title (str private-plans))))
++            (testing "the Private tag itself stays visible"
++              (is (= [["Private"]] (get-in private-tag [:body :rows])) (pr-str private-tag)))
++            (testing "public-plans is the page a private block refs"
++              (is (some? public-plans)))))))))
++
++(deftest private-tag-case-test
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "PRIVATE"}) 201)
++                page (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title "zq Shouting"}) 201)] (uuid-of r))
++                _ (set-tags! self page ["PRIVATE"])
++                response (query! self zq-titles)]
++          (is (= [200 []] [(:status response) (get-in response [:body :rows])]) (pr-str response)))
++        (p/catch #(is false (str %)))
++        (p/finally done))))
++
++(deftest sort-and-limit-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (d/transact! conn (for [i (range 60)]
++                            {:block/uuid (random-uuid) :block/name (str "zq bulk " (.padStart (str i) 2 "0"))
++                             :block/title (str "zq bulk " (.padStart (str i) 2 "0"))
++                             :block/tags #{:logseq.class/Page} :block/created-at (inc i) :block/updated-at 1}))
++        (p/let [bulk '[:find ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq bulk")]]
++                first-run (query! self bulk)
++                second-run (query! self bulk)
++                mixed (query! self '[:find ?e ?v :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq bulk 0")]
++                                     (or-join [?e ?v]
++                                              [?e :block/title ?v]
++                                              [?e :block/created-at ?v]
++                                              [?e :block/uuid ?v]
++                                              (and [?e :block/name] [(ground :page) ?v])
++                                              (and [?e :block/name] [(ground true) ?v]))]
++                              :limit 200)]
++          (testing "60 matches, no limit: 50 rows in a stable order, with the limit named"
++            (is (= 200 (:status first-run)) (pr-str first-run))
++            (is (= (mapv #(vector (str "zq bulk " (.padStart (str %) 2 "0"))) (range 50)) (get-in first-run [:body :rows])))
++            (is (= (get-in first-run [:body :rows]) (get-in second-run [:body :rows])))
++            (is (= {:total-rows 60 :returned 50
++                    :truncated {:by "limit" :note "returned 50 of 60 rows (limit 50, maximum 200); narrow the query or add a :where clause"}}
++                   (select-keys (:body first-run) [:total-rows :returned :truncated]))))
++          (testing "a column of strings, numbers, uuids, keywords and booleans sorts without throwing"
++            (is (= 200 (:status mixed)) (pr-str mixed))
++            (is (= 50 (get-in mixed [:body :total-rows])))
++            (is (= ["boolean" "number" "string" "string" "string"]
++                   (mapv #(let [v (second %)] (cond (boolean? v) "boolean" (number? v) "number" :else "string"))
++                         (take 5 (get-in mixed [:body :rows]))))
++                "per entity: true, then the number, then the uuid, title and keyword as strings")))))))
++
++(deftest e2ee-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [response (query! self zq-titles :e2ee? true)
++                malformed (query! self "[:find ?t :where" :e2ee? true)]
++          (is (= [409 "datalog_query is unavailable on an E2EE graph (titles are ciphertext)"]
++                 [(:status response) (get-in response [:body :error])]) (pr-str response))
++          (is (= 409 (:status malformed)) "before anything is parsed")
++          (is (false? (:private-set-built? @datalog/last-run))))))))
++
++(deftest dry-run-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [ran (query! self zq-titles)
++                after-run @datalog/last-run
++                response (query! self '[:find ?t :in $ ?x :where [?e :block/title ?x] [?e :block/title ?t]]
++                                 :inputs '["zq Notes"] :dry-run true)
++                after-dry-run @datalog/last-run]
++          (testing "a run builds the private set and scans datoms"
++            (is (= 200 (:status ran)))
++            (is (true? (:private-set-built? after-run)))
++            (is (pos? (:scanned after-run))))
++          (testing "a dry run answers the EDN and runs nothing"
++            (is (= [200 {:dry-run true
++                         :query "[:find ?t :in $ ?x :where [?e :block/title ?x] [?e :block/title ?t]]"
++                         :inputs "[\"zq Notes\"]"
++                         :rules "[]"}]
++                   [(:status response) (:body response)]) (pr-str response))
++            (is (= {:private-set-built? false :scanned 0} after-dry-run))))))))
++
++(deftest parse-errors-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [unclosed (query! self "[:find ?t :where [?e :block/title ?t]")
++                bad-token (query! self "[:find ?t\n :where [?e :block/title ?t] }]")
++                js-tag (query! self '[:find ?t :in $ ?x :where [?e :block/title ?x] [?e :block/title ?t]] :inputs "[#js {}]")
++                regex (query! self "[:find ?t :where [?e :block/title ?t] [(re-find #\"x\" ?t)]]")
++                trailing (query! self "[:find ?t :where [?e :block/title ?t]] [:find ?e]")
++                uuid-ok (query! self '[:find ?t :in $ ?u :where [?e :block/uuid ?u] [?e :block/title ?t]]
++                                :inputs (str "[#uuid \"" (random-uuid) "\"]"))
++                mismatch (query! self '[:find ?t :in $ ?a ?b :where [?e :block/title ?a] [?e :block/title ?b] [?e :block/title ?t]]
++                                 :inputs '["x"])
++                not-vector (query! self zq-titles :inputs "{:a 1}")]
++          (is (refused? unclosed "query: EDN parse error at line 1, column") (pr-str unclosed))
++          (is (refused? bad-token "query: EDN parse error at line 2, column") (pr-str bad-token))
++          (is (refused? js-tag "inputs: reader tag #js is not allowed (only #uuid and #inst)") (pr-str js-tag))
++          (is (refused? regex "query: EDN parse error") (pr-str regex))
++          (is (refused? trailing "query: unexpected text after the form") (pr-str trailing))
++          (is (= [200 []] [(:status uuid-ok) (get-in uuid-ok [:body :rows])]) (pr-str uuid-ok))
++          (is (refused? mismatch "inputs: 1 value given, but :in binds 2 after $") (pr-str mismatch))
++          (is (refused? not-vector "inputs: must be an EDN vector") (pr-str not-vector)))))))
++
++(deftest reached-through-handle-test
++  (let [operation (semantic-routes/match-public "POST" "/api/v1/graphs/graph-1/query")
++        document (semantic-routes/openapi-document "https://issuer.example")
++        post (get-in document [:paths "/api/v1/graphs/{graph-id}/query" :post])
++        schema (get-in post [:requestBody :content "application/json" :schema])]
++    (is (= {:handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read
++            :internal-path "/semantic/query"}
++           (select-keys operation [:handler :operation-id :scope :rate-class :internal-path])))
++    (is (= "datalogQuery" (:operationId post)))
++    (is (= #{"query" "inputs" "rules" "limit" "dry-run"} (set (map name (keys (:properties schema))))))
++    (is (= ["query"] (:required schema)))
++    (is (false? (:additionalProperties schema)))
++    (doseq [phrase ["read-only" "Private" "E2EE" ":block/uuid" "share a variable" "default 50"]]
++      (is (string/includes? (:description post) phrase) phrase))))
++
++(deftest accepted-inputs-test
++  ;; Each kind of value inputs can bind, and each form the refusals sit next to, still runs.
++  (async done
++    (with-graph done
++      (fn [{:keys [self notes]}]
++        (let [notes-only [["zq Notes"]]
++              cases [["a string" '[:find ?t :in $ ?t :where [?e :block/title ?t]] '["zq Notes"] notes-only]
++                     ["a uuid (#uuid)" '[:find ?t :in $ ?u :where [?e :block/uuid ?u] [?e :block/title ?t]]
++                      (str "[#uuid \"" notes "\"]") notes-only]
++                     ["a keyword" '[:find ?t :in $ ?k :where [?c :db/ident ?k] [?c :block/title ?t]] '[:logseq.class/Tag] [["Tag"]]]
++                     ["a number" '[:find ?t :in $ ?n :where [?e :block/title ?t] [?e :block/created-at ?c] [(> ?c ?n)]
++                                   [(= ?t "zq Notes")]] '[0] notes-only]
++                     ["a date (#inst)" '[:find ?t :in $ ?d :where [?e :block/title "zq Notes"] [?e :block/title ?t] [(some? ?d)]]
++                      "[#inst \"2026-11-09T00:00:00.000-00:00\"]" notes-only]
++                     ["a boolean" '[:find ?t :in $ ?b :where [?e :block/title "zq Notes"] [?e :block/title ?t] [(true? ?b)]]
++                      '[true] notes-only]
++                     ["a collection" '[:find ?t :in $ [?t ...] :where [?e :block/title ?t]] '[["zq Notes" "zq Public note"]]
++                      [["zq Notes"] ["zq Public note"]]]
++                     ["a relation" '[:find ?t ?k :in $ [[?t ?k]] :where [?e :block/title ?t]] '[[["zq Notes" 1]]] [["zq Notes" 1]]]
++                     ["a tuple" '[:find ?t :in $ [?t ?u] :where [?e :block/title ?t] [?e :block/title ?u]] '[["zq Notes" "zq Notes"]] notes-only]
++                     ["% before the inputs" '[:find ?t :in $ % ?tag :where (tagged ?e ?tag) [?e :block/title ?t]] '["Project"]
++                      [["zq Public Plans"]]]
++                     ["% after the inputs" '[:find ?t :in $ ?tag % :where (tagged ?e ?tag) [?e :block/title ?t]] '["Project"]
++                      [["zq Public Plans"]]]
++                     [":db/id in a pull pattern" '[:find (pull ?e [:block/title]) :where [?e :block/title "zq Notes"] [?e :db/ident ?i]]
++                      nil []]
++                     ["$ named in a pattern and in get-else" '[:find ?t ?o :where [$ ?e :block/title "zq Notes"] [?e :block/title ?t]
++                                                                [(get-else $ ?e :logseq.property/icon "none") ?o]]
++                      nil [["zq Notes" "none"]]]
++                     ["a chain whose join comes last" '[:find ?t :where [?b :block/title ?t] [?p :block/title "zq Notes"]
++                                                         [?b :block/parent ?p] [(clojure.string/starts-with? ?t "zq Public")]]
++                      nil [["zq Public note"]]]
++                     ["the same chain reversed" '[:find ?t :where [?b :block/parent ?p] [?p :block/title "zq Notes"]
++                                                   [?b :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]
++                      nil [["zq Public note"]]]
++                     ["a function binding joins" '[:find ?t :where [?e :block/title ?t] [(clojure.string/lower-case ?t) ?l]
++                                                    [?p :block/name ?l] [(= ?l "zq notes")]]
++                      nil notes-only]
++                     ["a scalar find" '[:find ?t . :where [?e :block/title "zq Notes"] [?e :block/title ?t]] nil notes-only]
++                     ["a collection find" '[:find [?t ...] :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]
++                      nil [["zq Public Plans"] ["zq Public child"] ["zq Public note"]]]
++                     ["an aggregate" '[:find (count ?e) :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]
++                      nil [[3]]]]
++              rules '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]]]
++          (p/doseq [[label form inputs rows] cases]
++            (p/let [response (query! self form :inputs inputs :rules (when (some #{'%} (flatten form)) rules))]
++              (testing label
++                (is (= [200 rows] [(:status response) (get-in response [:body :rows])]) (pr-str response))))))))))
++
++(deftest datascript-errors-are-400-test
++  ;; An error Datascript raises while running the caller's query is the caller's: a 400 naming it.
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [unbound (query! self '[:find ?t :where [(clojure.string/starts-with? ?t "zq")] [?e :block/title ?t]])]
++          (is (refused? unbound "query: Insufficient bindings: #{?t} not bound in [(clojure.string/starts-with? ?t")
++              (pr-str unbound)))))))
++
++(deftest pull-keeps-db-id-test
++  ;; :db/id as a pull attribute is a read, not the :db/id map a write would send.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [response (query! self '[:find (pull ?e [:db/id :block/title]) :where [?e :block/title "zq Notes"]])]
++          (is (= [200 [[{:db/id (:db/id (d/entity @conn [:block/uuid notes])) :block/title "zq Notes"}]]]
++                 [(:status response) (get-in response [:body :rows])])
++              (pr-str response)))))))
++
++(deftest private-page-without-parent-chain-test
++  ;; A block whose :block/page is private is hidden even when its :block/parent chain doesn't reach
++  ;; the page (a stale page ref, as an uploaded graph can hold): the page rule, not only the
++  ;; descendant walk, hides it.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self private-plans public-note]}]
++        (d/transact! conn [{:block/uuid (random-uuid) :block/title "zq stale private block"
++                            :block/page [:block/uuid private-plans] :block/parent [:block/uuid public-note]
++                            :block/order "a1" :block/created-at 1 :block/updated-at 1}])
++        (p/let [response (query! self zq-titles :limit 200)]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (not (string/includes? (:text response) "zq stale private block")) (:text response)))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index f8de330..7c49e9c 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -30,6 +30,7 @@
+             [logseq.db-sync.semantic-knowledge-index-aliases-test]
+             [logseq.db-sync.semantic-display-type-test]
+             [logseq.db-sync.semantic-favorites-test]
++            [logseq.db-sync.semantic-datalog-query-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

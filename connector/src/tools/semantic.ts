@@ -162,13 +162,25 @@ interface DeleteRoute {
   pattern: RegExp;
 }
 
+/** An operation's path after `/graphs/{graph-id}`, as a pattern. */
+function routePattern(op: GraphOperation): RegExp {
+  return new RegExp(`^${op.path.replace(/^\/api\/v1\/graphs\/\{graph-id\}/, "").replace(/\{[^}]+\}/g, "[^/]+")}$`);
+}
+
 function deleteRoutes(operations: GraphOperation[]): DeleteRoute[] {
+  return operations.filter((op) => op.method === "DELETE").map((op) => ({ name: op.name, pattern: routePattern(op) }));
+}
+
+/** A read sent with a method other than GET (datalog_query, patch 0039), by method and path pattern. */
+interface ReadRoute {
+  method: string;
+  pattern: RegExp;
+}
+
+function nonGetReadRoutes(operations: GraphOperation[]): ReadRoute[] {
   return operations
-    .filter((op) => op.method === "DELETE")
-    .map((op) => ({
-      name: op.name,
-      pattern: new RegExp(`^${op.path.replace(/^\/api\/v1\/graphs\/\{graph-id\}/, "").replace(/\{[^}]+\}/g, "[^/]+")}$`),
-    }));
+    .filter((op) => op.method !== "GET" && annotationsFor(op.name).readOnlyHint)
+    .map((op) => ({ method: op.method, pattern: routePattern(op) }));
 }
 
 /**
@@ -189,7 +201,7 @@ function refuseDelete(graph: ResolvedGraph, alias: string, req: UpstreamRequest,
   );
 }
 
-async function request(access: GraphAccess, req: UpstreamRequest, routes: DeleteRoute[]): Promise<unknown> {
+async function request(access: GraphAccess, req: UpstreamRequest, routes: DeleteRoute[], reads: ReadRoute[]): Promise<unknown> {
   const match = GRAPH_PATH.exec(req.path);
   // Upstream builds the path from the transformed spec, and the input schema enforces the alias pattern.
   if (!match || !ALIAS.test(match[1])) throw new Error("generated tool produced an unexpected path");
@@ -202,7 +214,9 @@ async function request(access: GraphAccess, req: UpstreamRequest, routes: Delete
       throw new ToolError("path arguments may not be '.' or '..'", "refused");
     }
   }
-  const graph = await resolveGraph(access, alias, req.method !== "GET");
+  // A write needs a graph (and token) in write mode; a read annotated READ may use any method.
+  const write = req.method !== "GET" && !reads.some((r) => r.method === req.method && r.pattern.test(rest));
+  const graph = await resolveGraph(access, alias, write);
   refuseDelete(graph, alias, req, rest, routes);
   const response = await graphFetch(access, alias, graph.pat, {
     method: req.method,
@@ -253,7 +267,8 @@ export function buildGraphTools(spec: OpenApiSpec, access: GraphAccess): GraphTo
     },
   };
   const routes = deleteRoutes([...operations.values()]);
-  registerSemanticApiTools(recorder, transformSpec(spec), (req: UpstreamRequest) => request(access, req, routes));
+  const reads = nonGetReadRoutes([...operations.values()]);
+  registerSemanticApiTools(recorder, transformSpec(spec), (req: UpstreamRequest) => request(access, req, routes, reads));
   if (tools.size !== operations.size) throw new Error("upstream did not register every graph operation");
   return [...tools.values()];
 }
