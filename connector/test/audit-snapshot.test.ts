@@ -34,6 +34,13 @@ const B3 = "aaaaaaaa-0000-4000-8000-000000000003";
 const J5 = "00000001-2026-1105-0000-000000000000";
 const TAG = "cccccccc-0000-4000-8000-000000000001";
 const PROP = "bbbbbbbb-0000-4000-8000-000000000001";
+/** listFavorites' answer (patch 0038): the visible favourites in sidebar order. */
+const favorites = {
+  favorites: [
+    { uuid: J5, title: "Nov 5th, 2026", kind: "journal" },
+    { uuid: TAG, title: "Meeting", kind: "tag" },
+  ],
+};
 
 interface SyncCall {
   method: string;
@@ -152,6 +159,7 @@ function fixtures(path: string, url: URL): Response {
   if (path.startsWith("/pages/")) return Response.json(page);
   if (path.startsWith("/tags/")) return Response.json(tag);
   if (path.startsWith("/properties/")) return Response.json(property);
+  if (path === "/favorites") return Response.json(favorites);
   return Response.json({ error: `no fixture for ${path}` }, { status: 404 });
 }
 
@@ -208,6 +216,8 @@ const PRE_READS: Record<string, { args: Record<string, unknown>; path: string; i
   delete_tag: { args: { "tag-id": TAG }, path: `/tags/${TAG}`, source: "getTag" },
   update_property: { args: { "property-id": PROP, body: { title: "Place" } }, path: `/properties/${PROP}`, source: "getProperty" },
   delete_property: { args: { "property-id": PROP }, path: `/properties/${PROP}`, source: "getProperty" },
+  // A remove's before-snapshot is the whole list, read as the write finds the page (by its fixed uuid).
+  set_page_favorite: { args: { "page-id": J5, body: { favorite: false } }, path: "/favorites", source: "getFavorites" },
 };
 
 /** Writes that overwrite nothing, so read nothing first. */
@@ -235,6 +245,7 @@ const DRY_RUNS: Record<string, "query" | "body"> = {
   delete_blocks: "body",
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
+  set_page_favorite: "body",
 };
 
 describe("snapshot plan", () => {
@@ -281,7 +292,11 @@ describe("pre-reads", () => {
       expect(snap.truncated, name).toBeUndefined();
       expect(snap.e2ee, name).toBeUndefined();
       expect(snap.data, name).toEqual(
-        p.source === "getBlocks" ? (p.view === "outline" ? outline : summary) : { getPageOutline: pageOutline, getPage: page, getTag: tag, getProperty: property }[p.source],
+        p.source === "getBlocks"
+          ? p.view === "outline"
+            ? outline
+            : summary
+          : { getPageOutline: pageOutline, getPage: page, getTag: tag, getProperty: property, getFavorites: favorites }[p.source],
       );
     }
   });
@@ -837,6 +852,53 @@ describe("refusals keep the pages their read found", () => {
     expect(JSON.parse(pageRow!.targets!)[0]).toMatchObject({ uuid: J5, pageTitle: pageOutlineTruncated.title });
     const listed = await call("get_activity_log", { page: J5 });
     for (const id of ids) expect(listed.text, `entry ${id}`).toContain(`"id":${id},`);
+  });
+});
+
+describe("set_page_favorite (patch 0038)", () => {
+  it("add and remove each read the whole favourites list first, with one GET of /favorites, and store it", async () => {
+    for (const favorite of [true, false]) {
+      syncCalls = [];
+      serve(fixtures, () => Response.json({ result: favorite ? "added" : "removed", favorites: [] }));
+      const { result, row } = await audited("set_page_favorite", { "page-id": J5, body: { favorite } });
+      expect(result.isError, result.text).toBe(false);
+      expect(syncCalls.map((c) => [c.method, c.path]), String(favorite)).toEqual([
+        ["GET", `${GRAPH}/favorites`],
+        ["PUT", `${GRAPH}/pages/${J5}/favorite`],
+      ]);
+      expect(before(row), String(favorite)).toEqual({ source: "getFavorites", data: favorites });
+      expect(row.status).toBe("ok");
+    }
+  });
+
+  it("on an E2EE graph the list reads as on any other (the page is found by uuid): no fallback read, the list is the snapshot", async () => {
+    // listFavorites answers on E2EE graphs; the write itself is refused there by the server.
+    serve(fixtures, () => Response.json({ error: "favourites can't be changed on E2EE graphs; the favourites page and its blocks are encrypted" }, { status: 400 }));
+    const { row } = await audited("set_page_favorite", { "page-id": J5, body: { favorite: false } });
+    expect(gets().map((c) => c.path)).toEqual([`${GRAPH}/favorites`]);
+    expect(before(row)).toEqual({ source: "getFavorites", data: favorites });
+    expect(row.status).toBe("error");
+  });
+
+  it("a remove whose list can't be read is refused, nothing sent to the write; a 409 has no fallback", async () => {
+    for (const status of [500, 409]) {
+      syncCalls = [];
+      serve(() => Response.json({ error: "boom" }, { status }));
+      const { result, row } = await audited("set_page_favorite", { "page-id": J5, body: { favorite: false } });
+      expect(result.isError).toBe(true);
+      expect(row, String(status)).toMatchObject({ status: "refused" });
+      expect(row.error, String(status)).toMatch(/^audit snapshot failed: .*boom; nothing was deleted$/);
+      expect(gets(), String(status)).toHaveLength(1);
+      expect(writes(), String(status)).toEqual([]);
+    }
+  });
+
+  it("a remove's dry run reads the list to be refused as the real call would be, and keeps nothing", async () => {
+    serve(fixtures, () => Response.json({ result: "removed", favorites: [], "dry-run": true }));
+    const { row } = await audited("set_page_favorite", { "page-id": J5, body: { favorite: false, "dry-run": true } });
+    expect(row).toMatchObject({ status: "ok", dry_run: 1, before: null });
+    expect(syncCalls.map((c) => c.method)).toEqual(["GET", "PUT"]);
+    expect(JSON.parse(syncCalls[1].body)).toEqual({ favorite: false, "dry-run": true });
   });
 });
 

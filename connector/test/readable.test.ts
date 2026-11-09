@@ -389,6 +389,11 @@ describe("context classes", () => {
     for (const reason of Object.values(NO_CONTEXT_TOOLS)) expect(reason.length).toBeGreaterThan(10);
   });
 
+  it("set_page_favorite is no-context: its response names the page and returns the whole list (patch 0038)", () => {
+    expect(contextClassFor("set_page_favorite")).toBe("no-context");
+    expect(NO_CONTEXT_TOOLS.set_page_favorite).toBe("the response names the page and returns the whole list");
+  });
+
   it("a tool in neither table is refused", () => {
     expect(contextClassFor("delete_blocks")).toBe("context");
     expect(contextClassFor("create_property")).toBe("no-context");

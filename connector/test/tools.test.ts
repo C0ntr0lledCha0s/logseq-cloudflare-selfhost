@@ -245,6 +245,8 @@ const DESTRUCTIVE_NAMED = [
   "batch_set_block_property",
   "refresh_refs",
   "promote_page_to_tag",
+  // favorite=false removes the page from the favourites list (patch 0038).
+  "set_page_favorite",
   // Its entries' properties replace an existing target's values.
   "batch_insert_block_trees",
 ];
@@ -1085,6 +1087,35 @@ describe("hand-written tools", () => {
     expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
   });
 
+  it("set_page_favorite is generated from setPageFavorite: a PUT of {favorite, dry-run?} on page-id, annotated destructive and idempotent", async () => {
+    const tools = await listTools();
+    const set = tools.find((t) => t.name === "set_page_favorite");
+    expect(set).toBeDefined();
+    expect(set.inputSchema.required).toEqual(expect.arrayContaining(["graph", "page-id", "body"]));
+    expect(set.inputSchema.properties.body.required).toEqual(["favorite"]);
+    expect(Object.keys(set.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "favorite"]);
+    expect(set.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["appended at the bottom", "adds a new favourite at the top", "Unavailable for E2EE graphs", "already a favourite", "was not a favourite"]) {
+      expect(set.description, phrase).toContain(phrase);
+    }
+    expect(committedManifest.find((e) => e.name === "set_page_favorite")).toMatchObject({
+      method: "PUT",
+      path: "/api/v1/graphs/{graph-id}/pages/{page-id}/favorite",
+    });
+    const listed = { favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] };
+    syncHandler = (request) =>
+      request.method === "GET" ? Response.json(listed) : Response.json({ result: "added", page: listed.favorites[0], ...listed });
+    const result = await callTool("set_page_favorite", { graph: "work", "page-id": PAGE_UUID, body: { favorite: true } });
+    expect(result.isError, result.text).toBe(false);
+    expect(writeJson(result.text)).toMatchObject({ result: "added", favorites: listed.favorites });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${WORK_ID}/favorites`],
+      ["PUT", `/api/v1/graphs/${WORK_ID}/pages/${PAGE_UUID}/favorite`],
+    ]);
+    // The generated schema fills dry-run's default.
+    expect(JSON.parse(syncRequests[1].body)).toEqual({ favorite: true, "dry-run": false });
+  });
+
   it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
     syncHandler = () =>
       Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],
@@ -1327,6 +1358,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   create_property: { body: { title: "Venue" } },
   update_property: { "property-id": "Venue", body: {} },
   delete_property: { "property-id": "Venue" },
+  set_page_favorite: { "page-id": PAGE_UUID, body: { favorite: true } },
 };
 
 /** The selectors each call above names, as `addressed` stores them. */
@@ -1356,6 +1388,7 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   create_property: [],
   update_property: ["Venue"],
   delete_property: ["Venue"],
+  set_page_favorite: [PAGE_UUID],
 };
 
 /** Where each tool with a dry run takes its flag. */
@@ -1369,6 +1402,7 @@ const DRY_RUN_IN: Record<string, "query" | "body"> = {
   delete_blocks: "body",
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
+  set_page_favorite: "body",
 };
 
 /** A response naming one target and one affected block, as patch 0028's BlockContext does. */

@@ -528,6 +528,17 @@
     }
   },
   {
+    "name": "set_page_favorite",
+    "method": "PUT",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/favorite",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "suggest_links",
     "method": null,
     "path": null,

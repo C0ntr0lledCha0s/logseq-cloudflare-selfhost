@@ -104,6 +104,8 @@ export const ANNOTATIONS = Object.freeze({
   semantic_search: READ,
   suggest_links: READ,
   set_block_property: DESTRUCTIVE_IDEMPOTENT,
+  // Patch 0038: favorite=false removes the page from the list; a re-send changes nothing.
+  set_page_favorite: DESTRUCTIVE_IDEMPOTENT,
   update_block: DESTRUCTIVE,
   update_page: DESTRUCTIVE,
   update_property: DESTRUCTIVE,
