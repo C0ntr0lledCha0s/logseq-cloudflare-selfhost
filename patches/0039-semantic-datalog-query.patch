@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..64ebe08
+index 0000000..31df408
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,995 @@
+@@ -0,0 +1,1000 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -373,17 +373,22 @@ index 0000000..64ebe08
 +;; into itself (directly or through other rules) before reading a datom bound to that call keeps
 +;; adding branches while the filter is asked about few datoms, so the scan cap never stops it; a
 +;; left-recursive closure ran past 120 s at a cap of 100. Every such cycle is refused up front.
++;; A get-some binds like a data pattern: it reads its entity's datom through the filter (counted)
++;; and drops the row when there is none, so a walk up through it, [(get-some $ ?b :block/parent)
++;; [_ ?x]] (above ?x ?a), stops where the data does. Other functions can bind a value without
++;; reading one (get-else's default, ground, identity), so they bind nothing here.
 +
 +(declare body-calls)
 +
 +(defn- clause-calls
 +  "The rule calls in `clause` as [[callee guarded?] …], and the variables bound after it. `bound`
-+  holds the variables a data pattern (or a call to a rule `settled?` says can't call back) bound
-+  earlier; a call is guarded when it holds one of them. Each or branch starts from `bound`, and
-+  or-join and not-join see only their declared variables."
++  holds the variables a data pattern, a get-some (or a call to a rule `settled?` says can't call
++  back) bound earlier; a call is guarded when it holds one of them. Each or branch starts from
++  `bound`, and or-join and not-join see only their declared variables."
 +  [clause bound settled?]
 +  (case (clause-kind clause)
 +    :pattern [[] (into bound (vars-in clause))]
++    :fn [[] (if (= 'get-some (ffirst clause)) (into bound (vars-in (second clause))) bound)]
 +    :sourced (clause-calls (apply list (rest clause)) bound settled?)
 +    :rule (let [callee (first clause)
 +                vs (vars-in (rest clause))]
@@ -436,7 +441,7 @@ index 0000000..64ebe08
 +                     (if-let [cycle (and (not (covered r)) (cycle-from r))]
 +                       [(conj errors (str "rules: rule " r " recurses (" (string/join " → " cycle) ") before a data"
 +                                          " pattern binds any of the call's variables; the scan cap can't stop that,"
-+                                          " so start the rule with a data pattern that binds one, e.g."
++                                          " so start the rule with a data pattern (or a get-some) that binds one, e.g."
 +                                          " [?b :block/parent ?x] (under ?x ?p)"))
 +                        (into covered cycle)]
 +                       [errors covered]))
@@ -1024,10 +1029,10 @@ index d8e3144..ea2f038 100644
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 new file mode 100644
-index 0000000..9d8b646
+index 0000000..1786185
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,113 @@
 +(ns logseq.db-sync.worker.named-queries
 +  "The named queries runNamedQuery runs (patch 0039), as data. Each entry is a map in the shape of
 +  Logseq's advanced query, {:title :query :rules :params}, so its {:query :inputs} pair can be
@@ -1037,7 +1042,8 @@ index 0000000..9d8b646
 +
 +  - :tag resolves by UUID, ident or title (case-insensitive), then expands to the tag and every tag
 +    extending it: a vector of class ids for a collection binding [?t ...], or a set when :binding
-+    is :set (for contains? inside a not-join, where a collection binding can't reach);
++    is :set (one value, so a not-join asks about any of the tags, where a collection binding would
++    ask about each in turn);
 +  - :property resolves by UUID, ident or title to the property's ident (:types limits its type);
 +  - :days is an integer within :bounds and becomes a cutoff in ms (now less that many days).
 +
@@ -1045,17 +1051,21 @@ index 0000000..9d8b646
 +  and caps as datalogQuery, so no entry can get round a guard.
 +
 +  Datascript joins a pattern to the rows before it by scanning the attribute unless one value is
-+  bound, and the scan cap counts that scan. So each entry reads per row with get-else and missing?
-+  (one entity's datoms each) where it can, and scans an attribute only where it has to: the
-+  not-join over a project's blocks and the child rule under a meeting.")
++  bound, and the scan cap counts that scan. So each entry reads per row with get-else, get-some and
++  missing? (one entity's datoms each): meetings-without-decision walks up from each decision with
++  get-some rather than down from each meeting through :block/parent. One scan is left, because no
++  index leads from a page to its blocks: projects-untouched's not-join reads :block/page for every
++  block when two or more stale pages remain, so on a graph above about 20,000 blocks it can answer
++  422. A tag with tags extending it binds two or more classes, so its :block/tags pattern scans
++  :block/tags (every tagged page and block) once.")
 +
 +(def ^:private days-bounds [1 3650])
 +
-+(def ^:private child-rules
-+  "A block's descendants, through :block/parent. Right-recursive: the parent pattern binds ?x before
-+  the call."
-+  '[[(child ?p ?c) [?c :block/parent ?p]]
-+    [(child ?p ?c) [?x :block/parent ?p] (child ?x ?c)]])
++(def ^:private above-rules
++  "A block's ancestors, walked up through :block/parent with get-some: one datom per row and level,
++  where a pattern [?b :block/parent ?x] would scan every block once two or more rows are bound."
++  '[[(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?a]]]
++    [(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]])
 +
 +(def named-queries
 +  (array-map
@@ -1086,11 +1096,14 @@ index 0000000..9d8b646
 +             :where [[?m :block/tags ?meeting-tag]
 +                     [(get-else $ ?m :block/created-at 0) ?created]
 +                     [(>= ?created ?cutoff)]
++                     ;; Up from each decision rather than down from each meeting: the decisions
++                     ;; are few, and a walk down would scan :block/parent. The tags come in as one
++                     ;; set, so the not-join asks about any of them, not about each in turn.
 +                     (not-join [?m ?decision-tags]
-+                               (child ?m ?d)
-+                               [?d :block/tags ?d-tag]
-+                               [(contains? ?decision-tags ?d-tag)])]}
-+    :rules child-rules
++                               [(identity ?decision-tags) [?decision-tag ...]]
++                               [?d :block/tags ?decision-tag]
++                               (above ?d ?m))]}
++    :rules above-rules
 +    :params [{:name "meeting_tag" :type :tag :default "Business Meeting"}
 +             {:name "decision_tag" :type :tag :default "Decision" :binding :set}
 +             {:name "days" :type :days :default 90 :bounds days-bounds}]}
@@ -1134,7 +1147,7 @@ index 0000000..9d8b646
 +    :params [{:name "tag" :type :tag :required true}
 +             {:name "property" :type :property :required true}]}))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..5fc98a0 100644
+index 1365b0a..79b7a87 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1154,15 +1167,15 @@ index 1365b0a..5fc98a0 100644
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "datalogQuery" ["Run a read-only Datalog query"
-+                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): they are written to stay within the caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
-+                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p))."
++                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each reads a few datoms per row rather than scanning an attribute, except projects-untouched, which can reach the scan cap on a large graph (see run_named_query). query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
++                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern or a get-some binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p)). A data pattern joined to two or more bound rows scans its whole attribute, so to walk up from bound blocks use get-some, which reads one datom per row ([(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]); get-else, ground and identity don't count as reading data, since they bind a value whether or not a datom exists."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
 +   "runNamedQuery" ["Run a named read-only query"
 +                    (str "Runs one of four vetted read-only queries by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
-+                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page."
-+                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them, at any depth, tagged decision_tag; columns created-at (ms) and meeting."
++                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. To check the blocks it reads every block's page once when two or more stale pages remain, so on a graph with more than about 20,000 blocks it can answer 422 (the scan cap): a larger days or a narrower tag leaves fewer pages to check."
++                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them, at any depth, tagged decision_tag; columns created-at (ms) and meeting. It walks up from each decision-tagged block, so it reads the decisions and their ancestors, not every block."
 +                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with the client from the task's own client_property, else its page's, else empty, sorted by client title; columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused."
 +                         " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page."
 +                         " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task pulled as uuid and title, so the uuid is a handle for the other tools."
@@ -1281,10 +1294,10 @@ index 1365b0a..5fc98a0 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..29320f9
+index 0000000..a22579a
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,1646 @@
+@@ -0,0 +1,1718 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -2078,7 +2091,7 @@ index 0000000..29320f9
 +
 +(defn- left-recursion-message [rule cycle]
 +  (str "rules: rule " rule " recurses (" cycle ") before a data pattern binds any of the call's variables;"
-+       " the scan cap can't stop that, so start the rule with a data pattern that binds one,"
++       " the scan cap can't stop that, so start the rule with a data pattern (or a get-some) that binds one,"
 +       " e.g. [?b :block/parent ?x] (under ?x ?p)"))
 +
 +(deftest rule-left-recursion-refused-test
@@ -2156,6 +2169,41 @@ index 0000000..29320f9
 +              (is (= 200 (:status response)) (pr-str response))
 +              (is (contains? (set (map first (get-in response [:body :rows]))) "zq Public child")
 +                  (pr-str response)))))))))
++
++;; A walk up through get-some reads one datom per row: get-some answers nil, and drops the row,
++;; when the entity has no such datom, and every datom it finds goes through the filter. So a call
++;; after it is guarded like a call after a data pattern. Functions that bind a value without reading
++;; one (get-else's default, ground, identity) still leave the call unguarded.
++(def ^:private above-rules
++  '[[(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?a]]]
++    [(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]])
++
++(deftest rule-recursion-through-get-some-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self conn]}]
++        (p/let [before (snapshot conn)
++                q '[:find ?t :in $ % :where [?b :block/title "zq Public child"] (above ?b ?a) [?a :block/title ?t]]
++                walked (query! self q :rules above-rules)
++                _ (set-scan-cap! self 2)
++                capped (query! self q :rules above-rules)
++                _ (set-scan-cap! self 20)
++                refused (p/all (for [[_ rules] [["get-else's default" '[(above ?b ?a) [(get-else $ ?b :block/parent 0) ?x] (above ?x ?a)]]
++                                                ["ground" '[(above ?b ?a) [(ground 1) ?x] (above ?x ?a)]]
++                                                ["identity of a head variable" '[(above ?b ?a) [(identity ?b) ?x] (above ?x ?a)]]
++                                                ["a get-some that binds none of the call's variables"
++                                                 '[(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?b ?a)]]]]
++                                 (query! self q :rules [(first above-rules) rules])))
++                _ (set-scan-cap! self nil)]
++          (testing "the walk up from a block reaches its parent block and its page"
++            (is (= 200 (:status walked)) (pr-str walked))
++            (is (= #{"zq Public note" "zq Notes"} (set (map first (get-in walked [:body :rows])))) (pr-str walked)))
++          (testing "every datom get-some reads counts towards the scan cap"
++            (is (= [422 (cap-message "2")] [(:status capped) (get-in capped [:body :error])]) (pr-str capped)))
++          (testing "a function that binds without reading a datom leaves the call unguarded"
++            (doseq [r refused]
++              (is (refused? r (left-recursion-message "above" "above → above")) (pr-str r))))
++          (is (= before (snapshot conn))))))))
 +
 +;; The row cap: a join that fans out from few datoms
 +;; =================================================
@@ -2522,7 +2570,12 @@ index 0000000..29320f9
 +    (is (= ["limit" "byte-cap"] (get-in truncated [:properties :by :enum])))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "scan cap"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 datoms"))
-+    (is (string/includes? (get-in post [:responses "422" :description] "") "2,500 rows (the row cap)"))))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "2,500 rows (the row cap)"))
++    (testing "the tool text says which named query can reach the scan cap, and how a walk up stays under it"
++      (let [named (get-in document [:paths "/api/v1/graphs/{graph-id}/named-queries/{name}" :post :description])]
++        (is (not (string/includes? (:description post) "stay within the caps")))
++        (is (string/includes? (:description post) "[(get-some $ ?b :block/parent) [_ ?x]]"))
++        (is (string/includes? named "more than about 20,000 blocks it can answer 422"))))))
 +
 +
 +(deftest pull-reads-only-its-entity-test
@@ -2650,6 +2703,7 @@ index 0000000..29320f9
 +                                     (:uuid project-block)])
 +    (age! conn :block/created-at 100 [old-meeting])
 +    {:conn conn :self self :project-tag project-tag :fresh-child-block (:uuid fresh-child-block) :other-work other-work
++     :undecided undecided :retro (:uuid retro)
 +     :for-client (get-in for-client [:body :ident])}))
 +
 +(defn- with-named [done run]
@@ -2905,7 +2959,7 @@ index 0000000..29320f9
 +          (is (true? (get-in response [:body :dry-run])))
 +          (is (= "meetings-without-decision" (get-in response [:body :name])))
 +          (is (string/includes? (get-in response [:body :query]) ":block/tags"))
-+          (is (string/includes? (get-in response [:body :rules]) "child"))
++          (is (string/includes? (get-in response [:body :rules]) "above"))
 +          (is (string? (get-in response [:body :inputs])))
 +          (is (nil? (get-in response [:body :rows])))
 +          (is (= {:private-set-built? false :scanned 0 :pulled 0} @datalog/last-run)))))))
@@ -2931,6 +2985,37 @@ index 0000000..29320f9
 +                 [(:status response) (get-in response [:body :returned]) (get-in response [:body :total-rows])
 +                  (get-in response [:body :truncated :by])]) (pr-str response))
 +          (is (= 3 (get-in most [:body :returned]))))))))
++
++(deftest named-queries-at-scale-test
++  ;; Datascript joins a pattern to two or more bound rows by scanning its whole attribute, and the
++  ;; scan cap counts that scan. A walk down from each meeting through :block/parent scanned every
++  ;; block once per level, so a graph of a few thousand blocks answered 422. 6,000 plain blocks
++  ;; (none tagged), under a meeting page, under a meeting block and on a page that is neither a
++  ;; meeting nor a project, must leave every named query's answer as it was.
++  (async done
++    (with-named done
++      (fn [{:keys [self undecided retro other-work]}]
++        (p/let [;; One at a time: last-run holds the latest request's count.
++                run-all (fn [] (p/let [projects (named! self "projects-untouched" nil)
++                                       meetings (named! self "meetings-without-decision" nil)
++                                       meetings (assoc meetings :scanned (:scanned @datalog/last-run))
++                                       tasks (named! self "open-tasks-by-client" nil)
++                                       missing (named! self "pages-missing-property" {:params {:tag "Project" :property "forClient"}})]
++                                 [projects meetings tasks missing]))
++                before (run-all)
++                _ (bulk! self undecided 2000 #(str "zq meeting filler " %))
++                _ (bulk! self retro 2000 #(str "zq retro filler " %))
++                _ (bulk! self other-work 2000 #(str "zq other filler " %))
++                after (run-all)
++                answer (fn [r] [(:status r) (get-in r [:body :error]) (get-in r [:body :rows])])]
++          (doseq [[query-name b a] (map vector names before after)]
++            (testing (str query-name " answers the same rows with 6,000 more blocks")
++              (is (= 200 (:status b)) (pr-str b))
++              (is (= (answer b) (answer a)) (pr-str (answer a)))))
++          (testing "meetings-without-decision reads no more datoms for blocks that aren't decisions"
++            (is (= (:scanned (nth before 1)) (:scanned (nth after 1)))
++                (pr-str [(:scanned (nth before 1)) (:scanned (nth after 1))]))))))))
++
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
