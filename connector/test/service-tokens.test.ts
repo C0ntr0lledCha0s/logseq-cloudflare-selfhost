@@ -1812,6 +1812,12 @@ describe("write-no-delete", () => {
       ["set_page_favorite", { "page-id": PAGE, body: { favorite: true } }],
       ["set_page_favorite", { "page-id": PAGE, body: { favorite: true } }],
       ["set_page_favorite", { "page-id": PAGE, body: { favorite: true, "dry-run": false } }],
+      // A reorder keeps every slot: a full list, its re-send, an empty list and a dry run aren't deletes.
+      ["reorder_favorites", { body: { "page-ids": [PAGE, B1] } }],
+      ["reorder_favorites", { body: { "page-ids": [PAGE, B1] } }],
+      ["reorder_favorites", { body: { "page-ids": [B1, PAGE], "dry-run": false } }],
+      ["reorder_favorites", { body: { "page-ids": [] } }],
+      ["reorder_favorites", { body: { "page-ids": [B1, PAGE], "dry-run": true } }],
     ];
     const listed = new Map((await tools(WORKER)).map((t) => [t.name, t]));
     for (const [tool, args] of cases) {
@@ -1892,6 +1898,24 @@ describe("write-no-delete", () => {
     expect((await ndAuditRows()).map((r) => [r.tool, r.status, r.error])).toEqual([
       ["set_page_favorite", "refused", message],
       ["set_page_favorite", "refused", message],
+    ]);
+  });
+
+  it("reorder_favorites: a write-no-delete token reorders (the list read first, then the PUT, audited ok); a read token is refused with 0 sync calls", async () => {
+    const result = await ndCall("reorder_favorites", { graph: "notes", body: { "page-ids": [B1, PAGE] } }, WORKER);
+    expect(result.text).not.toContain("may not delete");
+    expect(ndSync.map((s) => [s.method, new URL(s.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${NOTES}/favorites`],
+      ["PUT", `/api/v1/graphs/${NOTES}/favorites`],
+    ]);
+    expect(JSON.parse(ndSync[1].body)).toEqual({ "page-ids": [B1, PAGE], "dry-run": false });
+    ndSync = [];
+    const message = "graph 'notes' is read-only (service token 'ci' is read-only)";
+    expect(await ndCall("reorder_favorites", { graph: "notes", body: { "page-ids": [B1, PAGE] } }, READ_NOTES)).toEqual({ isError: true, text: message });
+    expect(ndSync).toEqual([]);
+    expect((await ndAuditRows()).map((r) => [r.tool, r.status])).toEqual([
+      ["reorder_favorites", expect.not.stringMatching(/refused/)],
+      ["reorder_favorites", "refused"],
     ]);
   });
 

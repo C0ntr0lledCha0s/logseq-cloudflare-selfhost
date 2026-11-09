@@ -106,6 +106,8 @@ export const ANNOTATIONS = Object.freeze({
   set_block_property: DESTRUCTIVE_IDEMPOTENT,
   // Patch 0038: favorite=false removes the page from the list; a re-send changes nothing.
   set_page_favorite: DESTRUCTIVE_IDEMPOTENT,
+  // Patch 0038: overwrites the favourites' order (which page each slot links); a re-send changes nothing.
+  reorder_favorites: DESTRUCTIVE_IDEMPOTENT,
   update_block: DESTRUCTIVE,
   update_page: DESTRUCTIVE,
   update_property: DESTRUCTIVE,

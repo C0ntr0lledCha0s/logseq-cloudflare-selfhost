@@ -247,6 +247,8 @@ const DESTRUCTIVE_NAMED = [
   "promote_page_to_tag",
   // favorite=false removes the page from the favourites list (patch 0038).
   "set_page_favorite",
+  // It overwrites which page each favourite slot links (patch 0038).
+  "reorder_favorites",
   // Its entries' properties replace an existing target's values.
   "batch_insert_block_trees",
 ];
@@ -268,7 +270,8 @@ function expectedHints(name: string, method: string | null) {
   const openWorldHint = name === "save_file_from_url";
   if (classes[0] === "read") return { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint };
   if (classes[0] === "additive") return { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint };
-  const idempotentHint = /^(batch_)?(delete|set)_/.test(name);
+  // reorder_favorites overwrites the whole order: repeating it changes nothing (spec 2026-11-09 §3.7).
+  const idempotentHint = /^(batch_)?(delete|set)_/.test(name) || name === "reorder_favorites";
   return { readOnlyHint: false, destructiveHint: true, idempotentHint, openWorldHint };
 }
 
@@ -1116,6 +1119,32 @@ describe("hand-written tools", () => {
     expect(JSON.parse(syncRequests[1].body)).toEqual({ favorite: true, "dry-run": false });
   });
 
+  it("reorder_favorites is generated from reorderFavorites: a PUT of {page-ids, dry-run?} on the graph, annotated destructive and idempotent", async () => {
+    const tools = await listTools();
+    const reorder = tools.find((t) => t.name === "reorder_favorites");
+    expect(reorder).toBeDefined();
+    expect(reorder.inputSchema.required).toEqual(expect.arrayContaining(["graph", "body"]));
+    expect(Object.keys(reorder.inputSchema.properties).sort()).toEqual(expect.not.arrayContaining(["page-id"]));
+    expect(reorder.inputSchema.properties.body.required).toEqual(["page-ids"]);
+    expect(Object.keys(reorder.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "page-ids"]);
+    expect(reorder.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["full list", "call listFavorites first", "order keys are unchanged", "never deleted", "not a favourite", "duplicate", "missing", "Unavailable for E2EE graphs"]) {
+      expect(reorder.description, phrase).toContain(phrase);
+    }
+    expect(committedManifest.find((e) => e.name === "reorder_favorites")).toMatchObject({ method: "PUT", path: "/api/v1/graphs/{graph-id}/favorites" });
+    const listed = { favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }, { uuid: NOTES_PAGE, title: "Notes", kind: "page" }] };
+    syncHandler = (request) => (request.method === "GET" ? Response.json(listed) : Response.json({ favorites: [...listed.favorites].reverse() }));
+    const result = await callTool("reorder_favorites", { graph: "work", body: { "page-ids": [NOTES_PAGE, PAGE_UUID] } });
+    expect(result.isError, result.text).toBe(false);
+    expect(writeJson(result.text)).toMatchObject({ favorites: [...listed.favorites].reverse() });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${WORK_ID}/favorites`],
+      ["PUT", `/api/v1/graphs/${WORK_ID}/favorites`],
+    ]);
+    // The generated schema fills dry-run's default; the list goes as given, in order.
+    expect(JSON.parse(syncRequests[1].body)).toEqual({ "page-ids": [NOTES_PAGE, PAGE_UUID], "dry-run": false });
+  });
+
   it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
     syncHandler = () =>
       Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],
@@ -1359,6 +1388,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   update_property: { "property-id": "Venue", body: {} },
   delete_property: { "property-id": "Venue" },
   set_page_favorite: { "page-id": PAGE_UUID, body: { favorite: true } },
+  reorder_favorites: { body: { "page-ids": [PAGE_UUID, NOTES_PAGE] } },
 };
 
 /** The selectors each call above names, as `addressed` stores them. */
@@ -1389,6 +1419,8 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   update_property: ["Venue"],
   delete_property: ["Venue"],
   set_page_favorite: [PAGE_UUID],
+  // page-ids is not one of the audit log's address keys, so the entries aren't recorded as addressed.
+  reorder_favorites: [],
 };
 
 /** Where each tool with a dry run takes its flag. */
@@ -1403,6 +1435,7 @@ const DRY_RUN_IN: Record<string, "query" | "body"> = {
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
   set_page_favorite: "body",
+  reorder_favorites: "body",
 };
 
 /** A response naming one target and one affected block, as patch 0028's BlockContext does. */

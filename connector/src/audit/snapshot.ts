@@ -172,6 +172,8 @@ export const SNAPSHOT_PLAN: Readonly<Record<string, SnapshotPlanEntry>> = Object
   // A remove is a delete, so its read must succeed; listFavorites answers on E2EE graphs too, so there
   // is no fallback read (the server refuses the write there).
   set_page_favorite: { source: "getFavorites", read: favorites, delete: { e2ee: () => null }, keep: "the ordered favourites list" },
+  // Not a delete (every slot is kept), so a failed read is kept as the snapshot's error.
+  reorder_favorites: { source: "getFavorites", read: favorites, keep: "the ordered favourites list" },
   refresh_refs: { source: "refresh_refs", keep: "each changed block's text before the refresh, from its own response" },
   insert_block_children: { source: "none", why: NOTHING_OVERWRITTEN },
   insert_block_tree: { source: "none", why: NOTHING_OVERWRITTEN },

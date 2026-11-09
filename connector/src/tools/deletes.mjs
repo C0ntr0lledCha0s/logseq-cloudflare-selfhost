@@ -137,6 +137,9 @@ export const DELETE_RULES = Object.freeze({
       return index === -1 ? null : `entry ${index}: ${EMPTY_VALUE}`;
     },
   },
+  // Patch 0038: a reorder re-points the visible favourite slots at their new pages and keeps every slot
+  // (hidden ones included); a list that isn't the whole set is refused by the server, not trimmed.
+  reorder_favorites: { never: "rewrites which page each favourite slot links; the permutation check removes nothing" },
   // Patch 0038: favorite=false removes every slot linking the page from the favourites list (the page
   // itself is untouched). favorite=true only adds; a missing or non-boolean favorite is refused by the
   // server for its shape, so it is not a delete here.
@@ -199,6 +202,7 @@ export const DRY_RUN_TOOLS = Object.freeze({
   insert_block_children: "body",
   insert_block_tree: "body",
   set_page_favorite: "body",
+  reorder_favorites: "body",
 });
 
 /**

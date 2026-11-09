@@ -218,6 +218,8 @@ const PRE_READS: Record<string, { args: Record<string, unknown>; path: string; i
   delete_property: { args: { "property-id": PROP }, path: `/properties/${PROP}`, source: "getProperty" },
   // A remove's before-snapshot is the whole list, read as the write finds the page (by its fixed uuid).
   set_page_favorite: { args: { "page-id": J5, body: { favorite: false } }, path: "/favorites", source: "getFavorites" },
+  // A reorder's before-snapshot is the whole list in its old order.
+  reorder_favorites: { args: { body: { "page-ids": [TAG, J5] } }, path: "/favorites", source: "getFavorites" },
 };
 
 /** Writes that overwrite nothing, so read nothing first. */
@@ -246,6 +248,7 @@ const DRY_RUNS: Record<string, "query" | "body"> = {
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
   set_page_favorite: "body",
+  reorder_favorites: "body",
 };
 
 describe("snapshot plan", () => {
@@ -899,6 +902,29 @@ describe("set_page_favorite (patch 0038)", () => {
     expect(row).toMatchObject({ status: "ok", dry_run: 1, before: null });
     expect(syncCalls.map((c) => c.method)).toEqual(["GET", "PUT"]);
     expect(JSON.parse(syncCalls[1].body)).toEqual({ favorite: false, "dry-run": true });
+  });
+});
+
+describe("reorder_favorites (patch 0038)", () => {
+  it("reads the whole favourites list first, with one GET of /favorites, and stores it as the old order", async () => {
+    serve(fixtures, () => Response.json({ favorites: [...favorites.favorites].reverse() }));
+    const { result, row } = await audited("reorder_favorites", { body: { "page-ids": [TAG, J5] } });
+    expect(result.isError, result.text).toBe(false);
+    expect(syncCalls.map((c) => [c.method, c.path])).toEqual([
+      ["GET", `${GRAPH}/favorites`],
+      ["PUT", `${GRAPH}/favorites`],
+    ]);
+    expect(before(row)).toEqual({ source: "getFavorites", data: favorites });
+    expect(row.status).toBe("ok");
+  });
+
+  it("is not a delete: a list that can't be read is kept as the snapshot's error and the write goes ahead", async () => {
+    serve(() => Response.json({ error: "boom" }, { status: 500 }), () => Response.json({ favorites: [] }));
+    const { result, row } = await audited("reorder_favorites", { body: { "page-ids": [] } });
+    expect(result.isError, result.text).toBe(false);
+    expect(row.status).toBe("ok");
+    expect(writes()).toHaveLength(1);
+    expect(before(row)).toEqual({ source: "getFavorites", error: "sync server error (HTTP 500): boom" });
   });
 });
 

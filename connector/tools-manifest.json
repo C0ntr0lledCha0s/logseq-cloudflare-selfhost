@@ -462,6 +462,17 @@
     }
   },
   {
+    "name": "reorder_favorites",
+    "method": "PUT",
+    "path": "/api/v1/graphs/{graph-id}/favorites",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "save_document",
     "method": null,
     "path": null,

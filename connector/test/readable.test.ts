@@ -394,6 +394,11 @@ describe("context classes", () => {
     expect(NO_CONTEXT_TOOLS.set_page_favorite).toBe("the response names the page and returns the whole list");
   });
 
+  it("reorder_favorites is no-context: its response returns the whole list in its new order (patch 0038)", () => {
+    expect(contextClassFor("reorder_favorites")).toBe("no-context");
+    expect(NO_CONTEXT_TOOLS.reorder_favorites).toBe("the response returns the whole list in its new order");
+  });
+
   it("a tool in neither table is refused", () => {
     expect(contextClassFor("delete_blocks")).toBe("context");
     expect(contextClassFor("create_property")).toBe("no-context");

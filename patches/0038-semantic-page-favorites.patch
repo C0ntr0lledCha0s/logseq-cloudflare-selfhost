@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 9f8eb44..43df9ca 100644
+index 9f8eb44..e02824c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -3,9 +3,11 @@
@@ -14,7 +14,7 @@ index 9f8eb44..43df9ca 100644
              [logseq.db :as ldb]
              [logseq.db.common.order :as db-order]
              [logseq.db-sync.common :as common]
-@@ -5122,6 +5124,192 @@
+@@ -5122,6 +5124,290 @@
            (http/json-response nil (assoc feed :epoch epoch :t t))
            (http/error-response "changes since that point are no longer available; list again without since" 410))))))
  
@@ -156,10 +156,108 @@ index 9f8eb44..43df9ca 100644
 +                                (when dry-run? (read-back-favorites! @tx-conn target-id favorite?))))]
 +    (if dry-run? result (read-back-favorites! @conn target-id favorite?))))
 +
++(def ^:private reorder-body-fields #{:page-ids :dry-run})
++
++(defn- reorder-body-errors
++  "reorderFavorites' body problems, each naming the field: page-ids is required and a list, dry-run an
++  optional boolean, and nothing else is taken."
++  [body]
++  (if (and (some? body) (not (map? body)))
++    ["body: give an object with page-ids"]
++    (cond-> (mapv #(str (name %) ": not a field; the body takes page-ids and dry-run")
++                  (remove reorder-body-fields (keys body)))
++      (not (sequential? (:page-ids body))) (conj "page-ids: give the full list of favourites, each a page UUID or title")
++      (= ::invalid (dry-run-option body)) (conj "dry-run: must be true or false"))))
++
++(defn- favourite-label [entity]
++  (str "\"" (:block/title entity) "\" (" (:block/uuid entity) ")"))
++
++(defn- reorder-targets
++  "The favourites `page-ids` names, in its order, as {:targets [entity ...]}, or {:error message}
++  naming every entry that isn't one of `favorites` (the visible list's targets) or repeats an earlier
++  one, and every favourite no entry names. A title resolves as page-id does (pages and journals, a
++  journal by its ISO date); a tag, property or block goes by its UUID. Hidden and recycled entities
++  name nothing."
++  [db page-ids favorites]
++  (let [favorite-ids (set (map :db/id favorites))
++        {:keys [targets problems]}
++        (reduce
++         (fn [{:keys [seen] :as acc} [i page-id]]
++           (let [field (str "entry " i)
++                 selected (when (string? page-id)
++                            (resolve-page-selector db page-id field {:find find-visible-entity}))
++                 target (:ok selected)
++                 problem (cond
++                           (not (string? page-id)) (str field ": must be a page UUID or title")
++                           (:error selected) (:error selected)
++                           (nil? target) (str field ": no page " page-id)
++                           (contains? seen (:db/id target)) (str field ": duplicate of entry " (get seen (:db/id target)))
++                           (not (contains? favorite-ids (:db/id target))) (str field ": " (favourite-label target) " is not a favourite"))]
++             (cond-> (update acc :targets conj target)
++               problem (update :problems conj problem)
++               (and target (not (contains? seen (:db/id target)))) (assoc-in [:seen (:db/id target)] i))))
++         {:targets [] :problems [] :seen {}}
++         (map-indexed vector page-ids))
++        named (set (keep :db/id targets))
++        missing (remove #(contains? named (:db/id %)) favorites)
++        problems (cond-> problems
++                   (seq missing) (conj (str "missing: " (string/join ", " (map favourite-label missing)))))]
++    (if (seq problems)
++      {:error (str "page-ids: " (string/join "; " problems))}
++      {:targets targets})))
++
++(defn- reorder-favorites!
++  "Puts `targets` (a permutation of the visible favourites) in that order on `conn`, the graph or a
++  dry-run copy, as the app does: each visible slot, in its place, is re-pointed with save-block at the
++  page it should now hold, so every order key stays and hidden slots (link-less, a hidden or recycled
++  page's, a later duplicate) are untouched. The rewritten slot's refs become its new page, as the
++  app's refs pipeline (which doesn't run for a server write) would make them. One atomic-write!, the
++  edit stamp dropped; the list read back, 500 when it isn't in the order given."
++  [conn creator dry-run? targets]
++  (let [expected (mapv :db/id targets)
++        read-back (fn [db]
++                    (when-not (= expected (mapv (comp :db/id :target) (visible-favorites db)))
++                      (throw (ex-info "favourites did not read back in the order given"
++                                      {::unverified "favourites did not read back in the order given"})))
++                    (favorites-list db))
++        result (atomic-write! conn (dissoc creator :stamp?) dry-run? :save-block
++                              (fn [tx-conn]
++                                (doseq [[{:keys [slot target]} new-target] (map vector (visible-favorites @tx-conn) targets)
++                                        :when (not= (:db/id target) (:db/id new-target))]
++                                  (outliner-core/save-block!
++                                   tx-conn
++                                   {:block/uuid (:block/uuid slot)
++                                    :block/link (:db/id new-target)
++                                    :block/refs [(:db/id new-target)]
++                                    :db/other-tx (mapv #(vector :db/retract (:db/id slot) :block/refs (:db/id %))
++                                                       (remove #(= (:db/id new-target) (:db/id %)) (:block/refs slot)))}))
++                                (when dry-run? (read-back @tx-conn))))]
++    (if dry-run? result (read-back @conn))))
++
 +(defn- handle-favorites [{:keys [^js self request conn db handler path-params e2ee? creator]}]
 +  (case handler
 +    :semantic/favorites-list
 +    (http/json-response nil {:favorites (favorites-list db)})
++
++    :semantic/favorites-reorder
++    (if e2ee?
++      (http/bad-request "favourites can't be changed on E2EE graphs; the favourites page and its blocks are encrypted")
++      (p/let [body (body-clj request)]
++        (let [body-errors (reorder-body-errors body)
++              favorites (mapv :target (visible-favorites db))
++              {:keys [targets error]} (when (empty? body-errors) (reorder-targets db (:page-ids body) favorites))
++              dry-run? (true? (:dry-run body))]
++          (cond
++            (seq body-errors) (http/bad-request (string/join "; " body-errors))
++            error (http/bad-request error)
++            ;; The order asked is the order held: nothing to write.
++            (= (map :db/id favorites) (map :db/id targets))
++            (http/json-response nil (cond-> {:favorites (favorites-list db)} dry-run? (assoc :dry-run true)))
++            :else
++            (rejecting
++             #(let [favorites (reorder-favorites! conn creator dry-run? targets)]
++                (when-not dry-run? (broadcast-change! self))
++                (http/json-response nil (cond-> {:favorites favorites} dry-run? (assoc :dry-run true)))))))))
 +
 +    :semantic/pages-favorite
 +    (if e2ee?
@@ -202,12 +300,12 @@ index 9f8eb44..43df9ca 100644
 +                                          dry-run? (assoc :dry-run true)))))))))))
 +
 +(def ^:private favorite-handlers
-+  #{:semantic/favorites-list :semantic/pages-favorite})
++  #{:semantic/favorites-list :semantic/pages-favorite :semantic/favorites-reorder})
 +
  (def ^:private page-handlers
    #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
      :semantic/pages-references :semantic/pages-get
-@@ -5209,6 +5397,7 @@
+@@ -5209,6 +5495,7 @@
      (contains? block-handlers handler) (handle-blocks context)
      (contains? block-property-handlers handler) (handle-block-properties context)
      (contains? capture-and-tag-handlers handler) (handle-capture-and-tags context)
@@ -216,10 +314,10 @@ index 9f8eb44..43df9ca 100644
      (contains? asset-handlers handler) (handle-assets context)
      (contains? property-and-search-handlers handler) (handle-properties-and-search context)
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 74d0061..9caa669 100644
+index 74d0061..50137de 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -30,6 +30,10 @@
+@@ -30,6 +30,12 @@
      :handler :semantic/pages-update :operation-id "updatePage" :scope "logseq/write" :rate-class :write}
     {:method "POST" :path "/api/v1/graphs/:graph-id/pages/:page-id/promote-to-tag" :internal-path "/semantic/pages/:page-id/promote-to-tag"
      :handler :semantic/pages-promote-to-tag :operation-id "promotePageToTag" :scope "logseq/write" :rate-class :write}
@@ -227,19 +325,22 @@ index 74d0061..9caa669 100644
 +    :handler :semantic/favorites-list :operation-id "listFavorites" :scope "logseq/read" :rate-class :read}
 +   {:method "PUT" :path "/api/v1/graphs/:graph-id/pages/:page-id/favorite" :internal-path "/semantic/pages/:page-id/favorite"
 +    :handler :semantic/pages-favorite :operation-id "setPageFavorite" :scope "logseq/write" :rate-class :write}
++   {:method "PUT" :path "/api/v1/graphs/:graph-id/favorites" :internal-path "/semantic/favorites"
++    :handler :semantic/favorites-reorder :operation-id "reorderFavorites" :scope "logseq/write" :rate-class :write}
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
      :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
-@@ -171,6 +175,8 @@
+@@ -171,6 +177,9 @@
     "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
     "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by page-id (its UUID or title), into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
 +   "listFavorites" ["List favourites" "Returns the graph's favourites, the pages in the sidebar's Favorites list, in sidebar order, each with its uuid, title and kind (page, journal, tag or property; block or asset for one the app favourited from a zoomed-in block). Left out: a slot that links nothing, a slot whose page is hidden or in the Recycle bin (deletePage leaves the favourite in place; restoring the page brings it back in its place), and a later slot linking a page an earlier one links. The list is empty when the graph has no favourites page. Works on E2EE graphs: the favourites page is found by its fixed uuid, and titles come back as stored (ciphertext), as listPages returns them."]
 +   "setPageFavorite" ["Add or remove a favourite" "Adds the page page-id names (its UUID, or a page's or journal's title; a tag or property by its UUID) to the sidebar's Favorites list with favorite=true, or removes it with favorite=false. A new favourite is appended at the bottom of the list, unlike the app, which adds a new favourite at the top. Add takes a page, journal, tag or property, built-in ones included while visible, as the app's page menu does; a remove takes every slot linking the page, duplicates included, and never touches the page itself. Re-sends are no-ops answering 200 and writing nothing: result already a favourite on an add, was not a favourite on a remove. Refuses, writing nothing and naming page-id or the field: with 404 an id that names nothing, or something hidden; with 400 (add only) a page in the Recycle bin (a remove by UUID clears a favourite deletePage left behind; deletePage hides a favourite and restoring the page brings it back), a block (only pages can be favourites), an asset or a page whose name is a UUID; with 400 any body field but favorite and dry-run, and a favorite that isn't true or false; with 409 a title several pages share (candidates names them) or, when the graph has no favourites page and something else holds its name, $$$favorites under an unexpected uuid. When the graph has no favourites page an add creates it as a new graph has it, in the same transaction. Every write is one transaction, read back afterwards (500 when the list doesn't hold what was asked). Returns result (added, removed, already a favourite or was not a favourite), the page, and the whole list as listFavorites returns it. With dry-run=true in the body the same checks and write run on a throwaway copy of the graph and the same answer comes back with dry-run: true, with nothing written. Unavailable for E2EE graphs (400): the favourites page and its blocks are encrypted."]
++   "reorderFavorites" ["Reorder the favourites" "Puts the sidebar's Favorites list in the order page-ids gives. Pass the full list, every favourite once, in the new order: call listFavorites first and reorder what it returns (a page or journal by its UUID or title, a journal also by its YYYY-MM-DD date; a tag, property or block by its UUID). Anything else is refused with one 400 that names every problem, writing nothing: an entry that is not a favourite (or names nothing, or something hidden or in the Recycle bin), an entry that is a duplicate of an earlier one (by UUID or by title), every favourite missing from the list, an entry that isn't a string, and any body field but page-ids and dry-run. As the app does, each favourite slot keeps its place and its order keys are unchanged; the slots whose page changes are re-pointed at their new pages. Hidden slots (one that links nothing, one whose page is hidden or in the Recycle bin, a later duplicate) are kept as they are and never deleted, so a reorder removes nothing. The current order, and an empty list on a graph with no favourites, answer the list and write nothing. Every write is one transaction, read back afterwards (500 when the list isn't in the order given). Returns the whole list as listFavorites returns it. With dry-run=true in the body the same checks and write run on a throwaway copy of the graph and the same answer comes back with dry-run: true, with nothing written. Unavailable for E2EE graphs (400): the favourites page and its blocks are encrypted."]
     "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
     "getTag" ["Get a tag" "Returns one tag by UUID or ident (as updateTag takes it), with the tags it extends and its tag properties. Answers 404 for an id that names no visible tag."]
     "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
-@@ -430,6 +436,11 @@
+@@ -430,6 +439,17 @@
                                                :description "The tags this tag extends, each by UUID, ident or title. Omit to extend Root. Built-in tags the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like) are refused.")
                                :properties (assoc property-selectors-schema
                                                   :description "The tag's properties, each by UUID, ident or title.")}}
@@ -248,29 +349,37 @@ index 74d0061..9caa669 100644
 +                                               :description "true adds the page at the bottom of the favourites; false removes every slot linking it."}
 +                                    :dry-run dry-run-schema}
 +                       :additionalProperties false}
++    "reorderFavorites" {:required ["page-ids"]
++                        :properties {:page-ids {:type "array"
++                                                :items {:type "string"}
++                                                :description "Every favourite once, in the new order, each by UUID or title as listFavorites returns them."}
++                                     :dry-run dry-run-schema}
++                        :additionalProperties false}
      "promotePageToTag" {:properties {:extends (assoc tag-selectors-schema
                                                       :minItems 1
                                                       :description "The tags the new tag extends, each by UUID, ident or title, set in the same transaction. Omit to extend Root. Built-in tags the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), a page that isn't a tag, and the page itself are refused.")}
-@@ -628,6 +639,8 @@
+@@ -628,6 +648,9 @@
                    "getTag" (entity-response "TagResponse" "A tag")
                    "updateTag" (entity-response "TagResponse" "The updated tag")
                    "promotePageToTag" (entity-response "PromotedTagResponse" "The page, now a tag, and what it kept")
 +                  "listFavorites" (entity-response "FavoritesResponse" "The favourites in sidebar order")
 +                  "setPageFavorite" (entity-response "FavoriteWriteResponse" "What was done, the page, and the list read back")
++                  "reorderFavorites" (entity-response "FavoritesResponse" "The favourites in the new order, read back")
                    "getProperty"
                    (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
                    "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
-@@ -648,6 +661,9 @@
+@@ -648,6 +671,10 @@
             {"201" (entity-response "BatchInsertResponse" "Each entry's target and inserted block trees")}
             "promotePageToTag" {"404" {:description "No visible page has that page-id"}
                                 "409" {:description "The page is already a tag, or another tag uses its title (existing names it); nothing was changed"}}
 +           "setPageFavorite" {"404" {:description "No visible page has that page-id (a remove also finds one in the Recycle bin)"}
 +                              "409" {:description "A title several pages share (candidates names them), or a $$$favorites page under an unexpected uuid; nothing was changed"}
 +                              "500" {:description "The favourites list didn't read back as asked after the write"}}
++           "reorderFavorites" {"500" {:description "The favourites didn't read back in the order given after the write"}}
             "createTag" {"201" (entity-response "TagResponse" "The created tag")
                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created. A page promote_page_to_tag can convert is named in the error and has promote: true")}
             "deletePage"
-@@ -987,6 +1003,21 @@
+@@ -987,6 +1014,22 @@
                                                                        :properties {:blocks {:type "integer" :description "The page's own blocks, kept on the tag."}
                                                                                     :references {:type "integer" :description "Other blocks and pages that link to it, embed it, alias it or hold it as a property value; they still point at it."}}}
                                                             :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written, and ident is left out because the real call generates it."}}}]}
@@ -288,16 +397,17 @@ index 74d0061..9caa669 100644
 +               :FavoritesResponse {:type "object" :required ["favorites"]
 +                                   :properties {:favorites {:type "array"
 +                                                            :description "In sidebar order; empty when the graph has none."
-+                                                            :items {:$ref "#/components/schemas/Favorite"}}}}
++                                                            :items {:$ref "#/components/schemas/Favorite"}}
++                                                :dry-run {:type "boolean" :description "reorderFavorites with dry-run=true: true; nothing was written."}}}
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
 new file mode 100644
-index 0000000..8ea14e2
+index 0000000..2f2c0ef
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,1108 @@
 +(ns logseq.db-sync.semantic-favorites-test
 +  "Page favourites (patch 0038). Favourites are child blocks of the hidden page $$$favorites, each
 +  linking a page with :block/link; the app's db worker reads and writes them, and deps/db-sync had
@@ -1033,6 +1143,379 @@ index 0000000..8ea14e2
 +    (is (every? #(contains? (:responses operation) %) ["400" "404" "409" "500"]))
 +    (is (every? #(string/includes? (:description operation) %)
 +                ["bottom" "top" "E2EE" "Recycle bin" "already a favourite" "was not a favourite" "dry-run"]))))
++
++;; ---------------------------------------------------------------------------------------------
++;; reorderFavorites (stage 3): PUT /favorites with {page-ids, dry-run?}, the full list in the new
++;; order. Anything but a permutation of the visible favourites is refused in one 400 naming every
++;; problem; the write rewrites :block/link on the visible slots whose page changes (save-block, as
++;; the app does), keeping every order key and every hidden slot, in one transaction, read back.
++;; Before stage 3 there is no such route and every request below answered 404 {:error "not found"}.
++
++(defn- reorder!
++  [self body & {:keys [e2ee? headers]}]
++  (request! self "PUT" "/semantic/favorites" body e2ee? headers))
++
++(defn- slot-keys
++  "Each slot's uuid and order key, in sibling order: what a reorder must leave byte-equal."
++  [conn]
++  (mapv (juxt :block/uuid :block/order) (slots conn)))
++
++(defn- app-refs!
++  "Gives each linking slot the :block/refs the app's refs pipeline gives it (the linked page), as a
++  favourite the app wrote and synced carries."
++  [conn]
++  (d/transact! conn (keep #(when-let [link (:block/link %)] [:db/add (:db/id %) :block/refs (:db/id link)]) (slots conn))))
++
++(defn- slot-refs
++  "Each slot's refs, as uuids, in sibling order."
++  [conn]
++  (mapv #(set (map :block/uuid (:block/refs %))) (slots conn)))
++
++;; Pins (spec section 8 item 9, reorder half; risk 3). Settled before the connector entry.
++
++;; save-block keeps the new :block/link, and the handler gives each rewritten slot the refs the app's
++;; pipeline would (the linked page only), so the old page's ref goes with its link. A slot the server
++;; added (no refs) gains its new page's ref; a slot the call doesn't rewrite is untouched.
++(deftest reorder-save-block-keeps-link-and-refs-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta delta]}]
++        (add-favourites! conn [alpha beta])
++        (app-refs! conn)
++        (p/let [added (favorite! self delta {:favorite true})
++                _ (is (= [#{alpha} #{beta} #{}] (slot-refs conn)) "the server's add leaves refs empty")
++                response (reorder! self {:page-ids [(str delta) (str beta) (str alpha)]})]
++          (is (= 200 (:status added)) (pr-str added))
++          (is (= [200 (ids delta beta alpha)] (listed response)) (pr-str response))
++          (is (= [delta beta alpha] (slot-links conn)) "each slot links its new page")
++          (is (= [#{delta} #{beta} #{alpha}] (slot-refs conn)) "refs follow the link: the old page out, the new in")
++          (is (empty? (filter #(contains? #{alpha delta} (:block/uuid %))
++                              (map #(d/entity @conn (:e %)) (d/datoms @conn :avet :block/link (:db/id (entity conn beta))))))
++              "sanity: Beta is linked by its own slot only"))))))
++
++;; Neither page's :block/updated-at moves: only the slots and their parent are written. (Spec
++;; section 5's stop point: if this moved, the build would stop for the owner.)
++(deftest reorder-does-not-bump-targets-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (add-favourites! conn [alpha beta gamma])
++        (app-refs! conn)
++        (p/let [response (reorder! self {:page-ids [(str gamma) (str beta) (str alpha)]})]
++          (is (= [200 (ids gamma beta alpha)] (listed response)) (pr-str response))
++          (is (= [1 1 1] (mapv #(:block/updated-at (entity conn %)) [alpha beta gamma]))
++              "no target's updated-at moved"))))))
++
++;; getPageBacklinks on both swapped pages answers the same before and after (the slots are blocks of
++;; a hidden page), and the block-changes feed lists no slot and never re-lists a page or its blocks.
++(deftest reorder-backlinks-and-feed-test
++  (async done
++    (with-memory-sql done
++      (fn [sql]
++        (storage/init-schema! sql)
++        (let [conn (storage/open-conn sql)
++              self #js {:sql sql :conn conn :schema-ready true}
++              [alpha beta note-a note-b] (repeatedly 4 random-uuid)]
++          (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
++          (d/transact! conn [(page-tx alpha "Alpha") (page-tx beta "Beta")])
++          ;; A visible reference to each page, so the backlinks have something to compare.
++          (d/transact! conn [{:block/uuid note-a :block/title (str "See [[" alpha "]]") :block/refs #{[:block/uuid alpha]}
++                              :block/page [:block/uuid beta] :block/parent [:block/uuid beta] :block/order "a0"
++                              :block/created-at 1 :block/updated-at 1}
++                             {:block/uuid note-b :block/title (str "See [[" beta "]]") :block/refs #{[:block/uuid beta]}
++                              :block/page [:block/uuid alpha] :block/parent [:block/uuid alpha] :block/order "a1"
++                              :block/created-at 1 :block/updated-at 1}])
++          (add-favourites! conn [alpha beta])
++          (app-refs! conn)
++          (p/let [backlinks #(p/all (map (fn [id] (request! self "GET" (str "/semantic/pages/" id "/backlinks") nil)) [alpha beta]))
++                  before (backlinks)
++                  start (feed! self "")
++                  response (reorder! self {:page-ids [(str beta) (str alpha)]})
++                  after (backlinks)
++                  since (feed! self (str "since=" (get-in start [:body :t]) "&epoch=" (get-in start [:body :epoch])))
++                  full (feed! self "")]
++            (is (= [200 (ids beta alpha)] (listed response)) (pr-str response))
++            (is (= [200 200] (mapv :status before)) (pr-str before))
++            (is (= (mapv :body before) (mapv :body after)) "both pages' backlinks are unchanged")
++            (is (= #{(str note-a) (str note-b)} (set (mapv :uuid (get-in start [:body :blocks])))))
++            (is (> (get-in since [:body :t]) (get-in start [:body :t])) "the reorder is in the tx log")
++            (is (= [200 []] [(:status since) (get-in since [:body :blocks])]) (pr-str since))
++            (is (not-any? (set (map str [alpha beta note-a note-b])) (get-in since [:body :removed]))
++                "never a page or its blocks")
++            (is (= #{(str note-a) (str note-b)} (set (mapv :uuid (get-in full [:body :blocks]))))
++                "no slot is ever a feed block")))))))
++
++;; Review focus 15: with the edit-stamp header on, no rewritten slot carries editedBy or
++;; claudeEditedAt, and the reorder writes nothing but the slots and their page: a stamped write
++;; would also create the stamp properties and the Claude Activity page.
++(deftest reorder-no-edit-stamp-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma block]}]
++        (add-favourites! conn [alpha beta gamma])
++        (p/let [stop (record-reports! conn)
++                response (reorder! self {:page-ids [(str gamma) (str alpha) (str beta)]} :headers stamped)
++                touched (set (map :e (mapcat :tx-data (stop))))
++                stamp-schema (d/entity @conn :user.property/claude-editedAt)
++                control (request! self "PATCH" (str "/semantic/blocks/" block) {:title "Edited"} false stamped)
++                stamped-ids (stamped-ids conn)]
++          (is (= [200 (ids gamma alpha beta)] (listed response)) (pr-str response))
++          (is (= (conj (set (map :db/id (slots conn))) (:db/id (favorites-page conn))) touched)
++              "only the slots and the favourites page were written")
++          (is (nil? stamp-schema) "the reorder made no stamp schema (the creator's :stamp? is dropped)")
++          (is (= 200 (:status control)) (pr-str control))
++          (is (contains? stamped-ids (:db/id (entity conn block))) "the header is on: an ordinary edit is stamped")
++          (is (not-any? (set (map :db/id (slots conn))) stamped-ids) "no favourite slot is stamped"))))))
++
++;; Spec section 8 item 8: a permutation rewrites the links, keeps every slot's key byte-equal, reads
++;; back as asked, in one transaction with one tx id. Reversed, a chain (each page moves one place)
++;; and a swap of two, with entries by uuid, by title in another case and by journal date.
++(deftest reorder-permutation-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (let [journal (random-uuid)]
++          (d/transact! conn [{:block/uuid journal :block/name "nov 9th, 2026" :block/title "Nov 9th, 2026"
++                              :block/journal-day 20261109 :block/tags #{:logseq.class/Journal}
++                              :block/created-at 1 :block/updated-at 1}])
++          (add-favourites! conn [alpha beta gamma journal])
++          (p/let [keys-before (slot-keys conn)
++                  run (fn [page-ids]
++                        (let [stop (record-reports! conn)]
++                          (p/let [response (reorder! self {:page-ids page-ids})
++                                  reports (stop)
++                                  listed-after (list! self)]
++                            {:response response :reports reports :read listed-after
++                             :links (slot-links conn) :slot-keys (slot-keys conn)})))
++                  reversed (run [(str journal) (str gamma) (str beta) (str alpha)])
++                  chain (run ["2026-11-09" "GAMMA" "beta" (str alpha)])
++                  _ (is (= [journal gamma beta alpha] (:links chain)) "sanity: the chain's starting order")
++                  chain (run [(str gamma) (str beta) (str alpha) (str journal)])
++                  swap (run [(str beta) (str gamma) (str alpha) (str journal)])]
++            (doseq [[label {:keys [response reports read links slot-keys]} expected]
++                    [["reversed" reversed [journal gamma beta alpha]]
++                     ["chain" chain [gamma beta alpha journal]]
++                     ["swap" swap [beta gamma alpha journal]]]]
++              (testing label
++                (is (= [200 (apply ids expected)] (listed response)) (pr-str response))
++                (is (= (:body read) (:body response)) "the answer is the list as listFavorites reads it")
++                (is (= expected links) "each slot links its new page")
++                (is (= keys-before slot-keys) "every slot keeps its uuid and its order key, byte-equal")
++                (is (= [1 1] [(count reports) (count (tx-ids reports))]) "one transaction, one tx id")))
++            (is (= {:favorites [{:uuid (str beta) :title "Beta" :kind "page"}
++                                {:uuid (str gamma) :title "Gamma" :kind "page"}
++                                {:uuid (str alpha) :title "Alpha" :kind "page"}
++                                {:uuid (str journal) :title "Nov 9th, 2026" :kind "journal"}]}
++                   (:body (:response swap))))
++            (is (= 2 (count (filter (fn [{:keys [a added]}] (and added (= :block/link a))) (mapcat :tx-data (:reports swap)))))
++                "a swap rewrites two slots' links, and no other slot's")))))))
++
++;; Spec section 8 item 8, review focus 12 and 13: every problem in one 400, entries numbered from 0,
++;; with the db unchanged; an empty list is refused when there are favourites.
++(deftest reorder-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma delta secret]}]
++        (add-favourites! conn [alpha beta gamma secret])
++        (let [{:keys [old twin-a twin-b]} (seed-refusal-kinds conn)
++              missing (random-uuid)
++              named (fn [id] (str "\"" (:block/title (entity conn id)) "\" (" id ")"))]
++          (p/do
++           (p/doseq [[kind body error]
++                    [["not a favourite, a duplicate by uuid and by title, missing"
++                      {:page-ids [(str alpha) (str delta) (str alpha) "BETA" (str beta)]}
++                      (str "page-ids: entry 1: " (named delta) " is not a favourite; entry 2: duplicate of entry 0; "
++                           "entry 4: duplicate of entry 3; missing: " (named gamma))]
++                     ["entries naming nothing, something hidden, a recycled page, $$$favorites, an ambiguous title"
++                      {:page-ids [(str missing) (str secret) (str old) "Nowhere" "$$$favorites" (str favorites-uuid) "example"
++                                  (str alpha) (str beta) (str gamma)]}
++                      (str "page-ids: entry 0: no page " missing "; entry 1: no page " secret "; entry 2: no page " old
++                           "; entry 3: no page titled \"Nowhere\"; entry 4: no page titled \"$$$favorites\""
++                           "; entry 5: no page " favorites-uuid
++                           "; entry 6: \"example\" names 2 pages: " (named twin-a) ", " (named twin-b) "; pass one of their UUIDs")]
++                     ["entries that aren't strings"
++                      {:page-ids [(str alpha) 7 nil {:uuid (str beta)} (str beta) (str gamma)]}
++                      "page-ids: entry 1: must be a page UUID or title; entry 2: must be a page UUID or title; entry 3: must be a page UUID or title"]
++                     ["a short list" {:page-ids [(str gamma) (str alpha)]} (str "page-ids: missing: " (named beta))]
++                     ["an empty list while there are favourites" {:page-ids []}
++                      (str "page-ids: missing: " (named alpha) ", " (named beta) ", " (named gamma))]
++                     ["a uuid-shaped title with a typo" {:page-ids [(str alpha) (str beta) (str gamma) "not-a-uuid-0000"]}
++                      "page-ids: entry 3: no page titled \"not-a-uuid-0000\""]
++                     ["the UK spelling of a field" {:page-ids [(str alpha) (str beta) (str gamma)] :favourites []}
++                      "favourites: not a field; the body takes page-ids and dry-run"]
++                     ["page-ids missing" {:dry-run true} "page-ids: give the full list of favourites, each a page UUID or title"]
++                     ["page-ids a string" {:page-ids (str alpha)} "page-ids: give the full list of favourites, each a page UUID or title"]
++                     ["page-ids an object" {:page-ids {:a 1}} "page-ids: give the full list of favourites, each a page UUID or title"]
++                     ["no body" nil "page-ids: give the full list of favourites, each a page UUID or title"]
++                     ["a body that isn't an object" alpha "body: give an object with page-ids"]
++                     ["dry-run as a string" {:page-ids [(str gamma) (str beta) (str alpha)] :dry-run "yes"}
++                      "dry-run: must be true or false"]]]
++             (p/let [before (snapshot conn)
++                     response (reorder! self (if (uuid? body) (str body) body))]
++               (testing kind
++                 (is (= [400 error] [(:status response) (get-in response [:body :error])]) (pr-str response))
++                 (is (= before (snapshot conn)) "nothing is written"))))
++           (is (= [alpha beta gamma secret] (slot-links conn)))))))))
++
++;; Review focus 13 and the inputs a refusal could catch: with no favourites (or no favourites page)
++;; an empty list is a 200 no-op; a re-send of the current order and a replace-style call that
++;; repeats it with dry-run false both answer the list and write nothing, and tell no client that
++;; anything changed (a real reorder does).
++(deftest reorder-same-order-writes-nothing-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (p/let [sent (atom [])
++                _ (set! (.-state self) #js {:getWebSockets (fn [] #js [#js {:readyState 1 :send #(swap! sent conj %)}])})
++                before (snapshot conn)
++                empty-none (reorder! self {:page-ids []})
++                _ (is (= before (snapshot conn)) "an empty list on an empty favourites page writes nothing")
++                _ (add-favourites! conn [alpha :no-link beta gamma])
++                before (snapshot conn)
++                same (reorder! self {:page-ids [(str alpha) (str beta) (str gamma)]})
++                same-by-title (reorder! self {:page-ids ["alpha" "Beta" "GAMMA"] :dry-run false})
++                same-dry (reorder! self {:page-ids [(str alpha) (str beta) (str gamma)] :dry-run true})
++                after (snapshot conn)
++                sent-by-no-ops (count @sent)
++                moved (reorder! self {:page-ids [(str beta) (str alpha) (str gamma)]})
++                sent-by-move (count @sent)
++                _ (d/transact! conn [[:db/retractEntity (:db/id (favorites-page conn))]])
++                missing-before (snapshot conn)
++                empty-missing (reorder! self {:page-ids []})
++                one-missing (reorder! self {:page-ids [(str alpha)]})]
++          (is (= [200 {:favorites []}] [(:status empty-none) (:body empty-none)]) (pr-str empty-none))
++          (is (= [200 (ids alpha beta gamma)] (listed same)) (pr-str same))
++          (is (= (:body same) (:body same-by-title)))
++          (is (= (assoc (:body same) :dry-run true) (:body same-dry)))
++          (is (= before after) "no tx was written")
++          (is (= 0 sent-by-no-ops) "no client was told of a change")
++          (is (= [200 (ids beta alpha gamma) 1] (conj (listed moved) sent-by-move)) "a real reorder tells the clients once")
++          (is (= [200 {:favorites []}] [(:status empty-missing) (:body empty-missing)]) (pr-str empty-missing))
++          (is (= [400 (str "page-ids: entry 0: \"Alpha\" (" alpha ") is not a favourite")]
++                 [(:status one-missing) (get-in one-missing [:body :error])])
++              (pr-str one-missing))
++          (is (= missing-before (snapshot conn)))
++          (is (nil? (favorites-page conn)) "a reorder never creates the page"))))))
++
++;; Review focus 14: hidden slots (link-less, a hidden page's, a recycled page's, a later duplicate)
++;; keep their uuid, link and key; only the visible slots are rewritten, in their own places.
++(deftest reorder-keeps-hidden-slots-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma delta secret]}]
++        (add-favourites! conn [alpha :no-link beta secret gamma delta alpha])
++        (p/let [deleted (request! self "DELETE" (str "/semantic/pages/" delta "?acknowledge-references=true") nil)
++                keys-before (slot-keys conn)
++                response (reorder! self {:page-ids [(str gamma) (str alpha) (str beta)]})]
++          (is (= 200 (:status deleted)) (pr-str deleted))
++          (is (= [200 (ids gamma alpha beta)] (listed response)) (pr-str response))
++          (is (= [gamma :no-link alpha secret beta delta alpha] (slot-links conn))
++              "visible slots rewritten in their places; the hidden ones keep their links")
++          (is (= keys-before (slot-keys conn)) "no slot was added, deleted or re-keyed"))))))
++
++;; Spec section 3.5: refused on an E2EE graph before the body is read, writing nothing.
++(deftest reorder-e2ee-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta]}]
++        (add-favourites! conn [alpha beta])
++        (p/let [message "favourites can't be changed on E2EE graphs; the favourites page and its blocks are encrypted"
++                before (snapshot conn)
++                responses (p/all [(reorder! self {:page-ids [(str beta) (str alpha)]} :e2ee? true)
++                                  (reorder! self {:page-ids [(str alpha) (str beta)]} :e2ee? true)
++                                  (reorder! self {:page-ids [(str beta) (str alpha)] :dry-run true} :e2ee? true)
++                                  (reorder! self {:page-ids []} :e2ee? true)
++                                  (reorder! self {:pages []} :e2ee? true)])]
++          (is (= (repeat 5 [400 message]) (mapv (juxt :status (comp :error :body)) responses)) (pr-str responses))
++          (is (= before (snapshot conn)))
++          (is (= [alpha beta] (slot-links conn))))))))
++
++;; Spec section 8 item 10 for reorder: a dry run answers the real body with dry-run: true and writes
++;; nothing.
++(deftest reorder-dry-run-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (add-favourites! conn [alpha beta gamma])
++        (p/let [before (snapshot conn)
++                dry (reorder! self {:page-ids [(str gamma) (str beta) (str alpha)] :dry-run true})
++                _ (is (= before (snapshot conn)) "the dry run wrote nothing")
++                _ (is (= [alpha beta gamma] (slot-links conn)))
++                real (reorder! self {:page-ids [(str gamma) (str beta) (str alpha)]})]
++          (is (= {:dry-run true
++                  :favorites [{:uuid (str gamma) :title "Gamma" :kind "page"}
++                              {:uuid (str beta) :title "Beta" :kind "page"}
++                              {:uuid (str alpha) :title "Alpha" :kind "page"}]}
++                 (:body dry)))
++          (is (= (assoc (:body real) :dry-run true) (:body dry)) "the dry run answers the real body"))))))
++
++;; Read-back (STUBS A STEP: the outliner's save-block! is redefined to a raw link write that skips
++;; the first slot it is given, so the handler's own re-read must catch it). A real write that
++;; doesn't store the order asked answers 500.
++(deftest reorder-read-back-mismatch-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (add-favourites! conn [alpha beta gamma])
++        (let [calls (atom 0)]
++          (p/let [response (p/with-redefs [outliner-core/save-block!
++                                           (fn [tx-conn block & _]
++                                             (when (< 1 (swap! calls inc))
++                                               (d/transact! tx-conn [(select-keys block [:block/uuid :block/link])])))]
++                             (reorder! self {:page-ids [(str gamma) (str beta) (str alpha)]}))]
++            (is (= [500 "favourites did not read back in the order given"]
++                   [(:status response) (get-in response [:body :error])])
++                (pr-str response))
++            (is (= 2 @calls) "two slots were to be rewritten")
++            (is (= [alpha beta alpha] (slot-links conn)) "the stub skipped the first slot")))))))
++
++;; Kinds a favourite can be, each named as page-ids takes it: a page by uuid and by title, a journal
++;; by uuid and by date, a tag and a property by uuid, and a block the app favourited from a zoomed-in
++;; block, by uuid.
++(deftest reorder-kinds-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta block]}]
++        (p/let [journal (random-uuid)
++                _ (d/transact! conn [{:block/uuid journal :block/name "nov 9th, 2026" :block/title "Nov 9th, 2026"
++                                      :block/journal-day 20261109 :block/tags #{:logseq.class/Journal}
++                                      :block/created-at 1 :block/updated-at 1}])
++                tag (request! self "POST" "/semantic/tags" {:title "Projects"})
++                property (request! self "POST" "/semantic/properties" {:title "Rating" :type "number"})
++                tag-id (uuid (get-in tag [:body :uuid]))
++                property-id (uuid (get-in property [:body :uuid]))
++                _ (add-favourites! conn [alpha beta journal tag-id property-id block])
++                response (reorder! self {:page-ids [(str block) (str property-id) (str tag-id) "2026-11-09" "Beta" (str alpha)]})
++                links (slot-links conn)
++                by-uuid (reorder! self {:page-ids [(str alpha) (str beta) (str journal) (str tag-id) (str property-id) (str block)]})]
++          (is (= [200 ["block" "property" "tag" "journal" "page" "page"]]
++                 [(:status response) (mapv :kind (get-in response [:body :favorites]))])
++              (pr-str response))
++          (is (= [block property-id tag-id journal beta alpha] links))
++          (is (= [200 (ids alpha beta journal tag-id property-id block)] (listed by-uuid)) (pr-str by-uuid)))))))
++
++;; The connector generates reorder_favorites from this operation.
++(deftest reorder-route-and-openapi-test
++  (let [public (semantic-routes/match-public "PUT" "/api/v1/graphs/graph-1/favorites")
++        document (semantic-routes/openapi-document "https://issuer.example")
++        operation (get-in document [:paths "/api/v1/graphs/{graph-id}/favorites" :put])
++        body (get-in operation [:requestBody :content "application/json" :schema])]
++    (is (= ["reorderFavorites" :semantic/favorites-reorder "logseq/write" :write "/semantic/favorites"]
++           ((juxt :operation-id :handler :scope :rate-class :internal-path) public)))
++    (is (= "listFavorites" (:operation-id (semantic-routes/match-public "GET" "/api/v1/graphs/graph-1/favorites")))
++        "the read keeps its route")
++    (is (= [{:oauth ["logseq/write"]}] (:security operation)))
++    (is (= ["graph-id"] (map :name (:parameters operation))))
++    (is (true? (get-in operation [:requestBody :required])))
++    (is (= ["page-ids"] (:required body)))
++    (is (= #{:page-ids :dry-run} (set (keys (:properties body)))))
++    (is (= "string" (get-in body [:properties :page-ids :items :type])))
++    (is (false? (:additionalProperties body)))
++    (is (= "#/components/schemas/FavoritesResponse"
++           (get-in operation [:responses "200" :content "application/json" :schema :$ref])))
++    (is (every? #(contains? (:responses operation) %) ["400" "500"]))
++    (is (every? #(string/includes? (:description operation) %)
++                ["full list" "listFavorites" "hidden" "order keys" "E2EE" "dry-run" "missing" "duplicate" "not a favourite"]))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 73c58da..f8de330 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

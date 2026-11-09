@@ -97,6 +97,7 @@ export const NO_CONTEXT_TOOLS: Readonly<Record<string, string>> = Object.freeze(
   save_document: "the response already names the asset and its journal or page",
   save_file_from_url: "the response already names the asset and its journal or page",
   set_page_favorite: "the response names the page and returns the whole list",
+  reorder_favorites: "the response returns the whole list in its new order",
 });
 
 /** Whether a write tool's response names what it touched. Throws for a tool in neither table. */
