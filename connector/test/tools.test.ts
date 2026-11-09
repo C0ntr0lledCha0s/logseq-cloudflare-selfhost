@@ -2521,6 +2521,7 @@ describe("queries help", () => {
     ["aggregates and collections", "aggregates other than count, count-distinct and distinct refuse collection values"],
     ["the text cap's number", "5,000,000 characters of text per query (the text cap"],
     ["what the text cap counts", "text the functions and aggregates return counts toward"],
+    ["the call cap's number", "every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap"],
     ["the Recycle bin", "and so is anything in the Recycle bin"],
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
     ["the 422", "is refused with 422, never answered in part"],
@@ -2555,6 +2556,7 @@ describe("queries help", () => {
     ["row cap", /more than ([\d,]+) rows \(the row cap/],
     ["join cap", /more than ([\d,]+) rows while joining \(the join cap/],
     ["text cap", /([\d,]+) characters of text per query \(the text cap/],
+    ["call cap", /([\d,]+) function calls per query \(the call cap/],
   ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
     const query = (await listTools()).find((t) => t.name === "datalog_query");
     const server = query.description.match(pattern)?.[1];
