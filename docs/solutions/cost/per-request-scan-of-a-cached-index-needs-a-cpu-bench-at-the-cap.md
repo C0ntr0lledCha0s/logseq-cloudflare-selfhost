@@ -4,6 +4,7 @@ area: cost
 tags: [cpu, 10ms, worker, cold-start, kb-index, suggest_links, bench, json-parse, text-limit]
 seen:
   - 2026-11-08 – item 22 (suggest_links), review rounds 1 and 2 (r1-light-1, still open at the end, left to the backlog)
+  - 2026-11-09 – item 40 (datalog_query), stages 3 and 4: the bench at 5,000 pages showed a join-fan-out shape (7,034 datoms scanned) costing more than one that scanned the full 20,000, and a named query hit the scan cap only with thousands of filler blocks; see api/a-scan-cap-alone-does-not-bound-a-caller-supplied-query.md
 promoted_to: ["REVIEW.md"]
 ---
 
