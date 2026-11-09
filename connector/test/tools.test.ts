@@ -1117,6 +1117,10 @@ describe("hand-written tools", () => {
     for (const phrase of ["read-only", "Private", "E2EE", ":block/uuid", "share a variable", "default 50"]) {
       expect(query.description, phrase).toContain(phrase);
     }
+    // Patch 0039 stage 2: the caps Claude has to work within, and how a cut result says so.
+    for (const phrase of ["scan cap", "50,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values"]) {
+      expect(query.description, phrase).toContain(phrase);
+    }
     // A read never needs a delete rule, a snapshot plan or a context class: those tables throw only for write tools.
     for (const table of [DELETE_RULES, DRY_RUN_TOOLS, SNAPSHOT_PLAN, CONTEXT_TOOLS, NO_CONTEXT_TOOLS]) {
       expect(Object.hasOwn(table, "datalog_query")).toBe(false);

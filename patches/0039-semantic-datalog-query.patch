@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..2719a1c
+index 0000000..2ce09d8
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,755 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -15,12 +15,20 @@ index 0000000..2719a1c
 +  (any case) or a class extending one, every block on a private page or under a private block, and
 +  every ref to one of those, so neither results, pulls (reverse refs included), missing?, get-else
 +  nor aggregates can see it. Rows are sorted with a type rank, so mixed types never make compare
-+  throw, and cut to limit."
++  throw, and cut to limit.
++
++  Bounded by work, not time (the Worker clock does not move during synchronous CPU work): the filter
++  counts every datom it is asked about, kept or dropped, and past the scan cap the query stops and
++  answers 422. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
++  no recursion, at most 50 values per many attribute) is pulled only for the rows kept after the
++  limit. Rows are added to the response until its JSON would pass the byte cap, so the connector
++  never cuts it mid-row."
 +  (:require [cljs.reader :as reader]
 +            [cljs.tools.reader.edn :as edn]
 +            [cljs.tools.reader.reader-types :as reader-types]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
++            [datascript.pull-parser :as pull-parser]
 +            [logseq.db-sync.common :as common]
 +            [logseq.db-sync.worker.graph-insights :as graph-insights]
 +            [logseq.db-sync.worker.http :as http]
@@ -65,9 +73,9 @@ index 0000000..2719a1c
 +  #{:db/add :db/retract :db/retractEntity :db/retractAttribute :db/cas})
 +
 +(def last-run
-+  "What the latest request did, for tests: whether it built the private set and how many datoms the
-+  filter was asked about. Reset at the start of every request."
-+  (atom {:private-set-built? false :scanned 0}))
++  "What the latest request did, for tests: whether it built the private set, how many datoms the
++  filter was asked about and how many pulls ran. Reset at the start of every request."
++  (atom {:private-set-built? false :scanned 0 :pulled 0}))
 +
 +(defn- refusal [status message] {::status status ::error message})
 +
@@ -233,12 +241,82 @@ index 0000000..2719a1c
 +      (let [[a b] (sort (vals firsts))]
 +        (str "where: clauses " a " and " b " share no variable (a cross product); join them through a shared variable")))))
 +
++(defn- recursion-limit? [v] (or (= '... v) (= "..." v) (number? v)))
++
++(defn- legacy-expr? [spec head] (and (sequential? spec) (contains? #{head (name head)} (first spec))))
++
++(defn- spec-attr
++  "The attribute an attr-spec names: the keyword itself, the attribute of (limit a n) or
++  (default a v), or the head of [a :opt v …]."
++  [spec]
++  (cond
++    (or (legacy-expr? spec 'limit) (legacy-expr? spec 'default)) (spec-attr (second spec))
++    (sequential? spec) (spec-attr (first spec))
++    :else spec))
++
++(defn- many-limit-error [label attr n]
++  (when-not (and (integer? n) (<= 1 n many-attr-limit))
++    (str label ": " (pr-str (spec-attr attr)) " takes a limit from 1 to " many-attr-limit " (got " (pr-str n) ")")))
++
++(defn- recursion-error [label what]
++  (str label ": " what " is a recursive pull (... or a recursion number); nest a pattern instead, at most "
++       max-pull-depth " levels deep"))
++
++(defn- attr-spec-errors
++  "Why an attr-spec can't be pulled: a many-attribute limit outside 1 to 50 (or nil, no limit), an
++  :xform (a function call), or ... in the place of an attribute."
++  [label spec]
++  (cond
++    (= '... spec) [(recursion-error label "...")]
++    (legacy-expr? spec 'limit) (let [[_ attr n] spec]
++                                 (concat (attr-spec-errors label attr) (keep identity [(many-limit-error label attr n)])))
++    (legacy-expr? spec 'default) (attr-spec-errors label (second spec))
++    (sequential? spec) (concat (attr-spec-errors label (first spec))
++                               (keep (fn [[k v]]
++                                       (case k
++                                         :limit (many-limit-error label (first spec) v)
++                                         :xform (str label ": :xform on " (pr-str (spec-attr spec)) " is not allowed")
++                                         nil))
++                                     (partition 2 (rest spec))))
++    :else nil))
++
++(defn validate-pull-pattern
++  "Why `pattern` can't be pulled, each prefixed with `label`: it is not a literal vector, it nests
++  deeper than max-pull-depth, it recurses (... or a recursion number), or a many attribute's limit
++  is outside 1 to many-attr-limit."
++  [label pattern]
++  (letfn [(walk [pattern depth via]
++            (if (> depth max-pull-depth)
++              [(str label ": " (pr-str via) " nests the pattern " depth " levels deep (at most " max-pull-depth ")")]
++              (mapcat (fn [spec]
++                        (if (map? spec)
++                          (mapcat (fn [[k v]]
++                                    (concat (attr-spec-errors label k)
++                                            (cond
++                                              (recursion-limit? v) [(recursion-error label (pr-str {k v}))]
++                                              (sequential? v) (walk v (inc depth) (spec-attr k)))))
++                                  spec)
++                          (attr-spec-errors label spec)))
++                      pattern)))]
++    (if (vector? pattern)
++      (distinct (walk pattern 1 nil))
++      [(str label ": the pattern must be a literal vector, e.g. [:block/title :block/uuid] (got " (pr-str pattern) ")")])))
++
++(defn- pull-errors [args]
++  (let [[v pattern & extra] (if (source? (first args)) (rest args) args)
++        label (str "find: pull " (pr-str v))]
++    (concat (source-errors "find" args)
++            (cond
++              (not (variable? v)) [(str label ": the pulled entity must be a ?variable")]
++              (seq extra) [(str label ": pull takes a ?variable and a pattern")]
++              :else (validate-pull-pattern label pattern)))))
++
 +(defn- find-errors [find]
 +  (for [element find
 +        :when (seq? element)
 +        :let [[f & args] element]
 +        error (cond
-+                (= 'pull f) (source-errors "find" args)
++                (= 'pull f) (pull-errors args)
 +                (variable? f) [(str "find: " f " is a variable in function position; functions can't be passed as inputs")]
 +                (not (contains? allowed-aggregates f))
 +                [(str "find: aggregate " (pr-str f) " is not allowed (allowed: pull, "
@@ -340,10 +418,12 @@ index 0000000..2719a1c
 +
 +(defn query-filter
 +  "`db` filtered to hide `private` entities and refs to them; `counter` (a volatile) counts every
-+  datom the filter is asked about."
-+  [db private refs counter]
++  datom the filter is asked about, kept or dropped, and past `cap` the filter throws
++  {::scan-cap cap}."
++  [db private refs counter cap]
 +  (d/filter db (fn [_ datom]
-+                 (vswap! counter inc)
++                 (when (> (vswap! counter inc) cap)
++                   (throw (ex-info "scan cap" {::scan-cap cap})))
 +                 (not (or (contains? private (:e datom))
 +                          (and (contains? refs (:a datom)) (contains? private (:v datom))))))))
 +
@@ -382,10 +462,12 @@ index 0000000..2719a1c
 +(defn- keyword-text [k] (subs (str k) 1))
 +
 +(defn serialise
-+  "A result value as JSON-ready data: keywords as text without the colon, uuids as text."
++  "A result value as JSON-ready data: keywords as text without the colon, uuids as text and a ref
++  ({:db/id n}, as a pull gives one) as its number."
 +  [v]
 +  (cond
 +    (keyword? v) (keyword-text v)
++    (and (map? v) (= [:db/id] (keys v))) (:db/id v)
 +    (uuid? v) (str v)
 +    (symbol? v) (str v)
 +    (instance? js/Date v) (.getTime v)
@@ -408,37 +490,189 @@ index 0000000..2719a1c
 +    (when (keyword? (:error data))
 +      (str "query: " (ex-message e)))))
 +
++(defn- scan-cap-message [cap]
++  (str "query stopped after scanning " (format-count cap) " datoms (the scan cap); narrow it with a tag, page or"
++       " attribute value, or use a named query"))
++
++(defn- run-refusal
++  "An error raised while running the caller's query or its pulls: the scan cap as 422, anything
++  else as a 400 naming it. Never a 500."
++  [e]
++  (if-let [cap (::scan-cap (ex-data e))]
++    (refusal 422 (scan-cap-message cap))
++    (refusal 400 (or (query-error-message e) (str "query: failed while running: " (ex-message e))))))
++
++(defn rewrite-pulls
++  "The relation find `find` with each (pull ?x pattern) replaced by ?x: {:find [...] :pulls {column
++  pattern}}."
++  [find]
++  (reduce (fn [acc el]
++            (if (and (seq? el) (= 'pull (first el)))
++              (let [[v pattern] (if (source? (second el)) (drop 2 el) (rest el))]
++                (-> acc
++                    (assoc-in [:pulls (count (:find acc))] pattern)
++                    (update :find conj v)))
++              (update acc :find conj el)))
++          {:find [] :pulls {}}
++          find))
++
++(defn- reverse-attr? [attr] (and (keyword? attr) (string/starts-with? (name attr) "_")))
++
++(defn- many-attr? [schema attr]
++  (and (keyword? attr) (= :db.cardinality/many (get-in schema [attr :db/cardinality]))))
++
++(defn- take-many
++  "A reverse ref's values cut to many-attr-limit: Datascript takes no :limit on the reverse of a
++  cardinality-one attribute (:block/_parent), so the pull cuts it."
++  [v]
++  (if (sequential? v) (vec (take many-attr-limit v)) v))
++
++(defn- bound-attr-spec
++  "`spec` with many-attr-limit as the limit of a many attribute (or a reverse ref) that has none."
++  [schema spec]
++  (let [bounded (fn [attr opts]
++                  (cond
++                    (reverse-attr? attr)
++                    (let [forward (keyword (namespace attr) (subs (name attr) 1))]
++                      (if (many-attr? schema forward)
++                        (into [attr :limit many-attr-limit] opts)
++                        (into [attr :xform take-many] opts)))
++                    (many-attr? schema attr) (into [attr :limit many-attr-limit] opts)
++                    :else nil))]
++    (cond
++      (keyword? spec) (or (bounded spec []) spec)
++      (legacy-expr? spec 'limit) spec
++      (legacy-expr? spec 'default) (let [[_ attr v] spec] (list 'default (bound-attr-spec schema attr) v))
++      (and (sequential? spec) (keyword? (first spec)))
++      (let [opts (vec (rest spec))]
++        (if (some #{:limit} (take-nth 2 opts)) spec (or (bounded (first spec) opts) spec)))
++      :else spec)))
++
++(defn- spec-key
++  "The key an attr-spec's value comes back under: its :as, else its attribute."
++  [spec]
++  (cond
++    (or (legacy-expr? spec 'limit) (legacy-expr? spec 'default)) (spec-key (second spec))
++    (sequential? spec) (get (into {} (map vec (partition 2 (rest spec)))) :as (first spec))
++    :else spec))
++
++(def ^:private wildcard? #{'* "*" :*})
++
++(defn- bound-pattern
++  "{:pattern :shape}: `pattern` with every many attribute limited to many-attr-limit, including
++  those * pulls, and with * added to every level that lacks it, and the shape that trims the pull
++  back to what `pattern` asked for. On a filtered db Datascript reads a level without * by seeking
++  from the entity to the end of the index (the scan cap would count every datom after it); with *
++  it reads the entity's own datoms only."
++  [schema many-attrs pattern]
++  (let [specs (mapcat #(if (map? %) (keys %) [%]) (remove wildcard? pattern))
++        named (set (map spec-attr specs))
++        nested (into {} (for [spec pattern :when (map? spec), [k v] spec :when (sequential? v)]
++                          [k (bound-pattern schema many-attrs v)]))
++        bounded (mapv (fn [spec]
++                        (if (map? spec)
++                          (into {} (map (fn [[k v]] [(bound-attr-spec schema k) (if-let [n (get nested k)] (:pattern n) v)]))
++                                spec)
++                          (bound-attr-spec schema spec)))
++                      pattern)]
++    {:pattern (-> bounded
++                  (cond-> (not (some wildcard? pattern)) (conj '*))
++                  (into (for [attr many-attrs :when (not (contains? named attr))] [attr :limit many-attr-limit])))
++     :shape {:keys (when-not (some wildcard? pattern) (set (map spec-key specs)))
++             :nested (into {} (map (fn [[k n]] [(spec-key k) (:shape n)])) nested)}}))
++
++(defn- trim-pulled
++  "A pulled value cut back to `shape`: only the keys the caller's pattern named (all of them at a
++  level with *), an empty map as nil, as Datascript answers a pull that finds nothing."
++  [shape v]
++  (cond
++    (map? v) (not-empty
++              (into {} (keep (fn [[k x]]
++                               (when (or (nil? (:keys shape)) (contains? (:keys shape) k))
++                                 (when-some [x (if-let [s (get-in shape [:nested k])] (trim-pulled s x) x)]
++                                   [k x]))))
++                    v))
++    (sequential? v) (not-empty (into [] (keep #(trim-pulled shape %)) v))
++    :else v))
++
++(defn- json-length [x] (.-length (js/JSON.stringify (clj->js x))))
++
++(defn- limit-note [kept total limit]
++  (str "returned " (format-count kept) " of " (format-count total) " rows (limit " limit ", maximum " max-limit
++       "); narrow the query or add a :where clause"))
++
++(defn- byte-cap-note [kept total]
++  (str "returned " (format-count kept) " of " (format-count total) " rows (the byte cap, about "
++       (format-count byte-cap) " characters of JSON); pull fewer attributes, narrow the query or lower limit"))
++
++(defn- cut-to-byte-cap
++  "The leading whole `rows` whose JSON, with `base` (the response without rows, its notes at their
++  longest), stays within byte-cap."
++  [base rows]
++  (let [budget (- byte-cap (json-length (assoc base :rows [])))]
++    (loop [kept (transient []) used 0 rows rows]
++      (if-let [[row & more] (seq rows)]
++        (let [used' (+ used (json-length row) (if (pos? (count kept)) 1 0))]
++          (if (> used' budget)
++            (persistent! kept)
++            (recur (conj! kept row) used' more)))
++        (persistent! kept)))))
++
 +(defn run-query
-+  "Runs the normalised, validated query `q` on `db` filtered for privacy; returns {:columns :rows
-+  :total-rows :returned :truncated?}, or a refusal."
-+  [db {:keys [query inputs rules limit]}]
-+  (let [private (private-ids db)
-+        _ (swap! last-run assoc :private-set-built? true)
-+        counter (volatile! 0)
-+        fdb (query-filter db private (ref-attrs db) counter)
-+        find (relation-find (:find query))
-+        runnable (-> query (dissoc :keys :strs :syms) (assoc :find find))
-+        columns (or (some->> (or (:keys query) (:strs query) (:syms query)) (mapv str))
-+                    (mapv pr-str find))
-+        result (try
-+                 (apply d/q runnable (query-args (:in query) fdb rules inputs))
-+                 (catch :default e
-+                   (refusal 400 (or (query-error-message e) (str "query: failed while running: " (ex-message e)))))
-+                 (finally (swap! last-run assoc :scanned @counter)))]
-+    (if (refusal? result)
-+      result
-+      (let [rows (sort-rows (map vec result))
-+            total (count rows)
-+            kept (subvec rows 0 (min limit total))]
-+        (cond-> {:columns columns
-+                 :rows (mapv serialise kept)
-+                 :total-rows total
-+                 :returned (count kept)}
-+          (> total limit)
-+          (assoc :truncated {:by "limit"
-+                             :note (str "returned " (format-count (count kept)) " of " (format-count total)
-+                                        " rows (limit " limit ", maximum " max-limit
-+                                        "); narrow the query or add a :where clause")}))))))
++  "Runs the normalised, validated query `q` on `db` filtered for privacy, with pulls run on the kept
++  rows only; returns {:columns :rows :total-rows :returned :truncated?} merged with `echo` (the
++  fields the response repeats, counted in the byte cap), or a refusal. `scan-cap` replaces the
++  constant (tests)."
++  [db {:keys [query inputs rules limit echo] :as opts}]
++  (let [cap (or (:scan-cap opts) scan-cap)
++        original (relation-find (:find query))
++        {find :find pulls :pulls} (rewrite-pulls original)
++        schema (d/schema db)
++        many-attrs (sort (keep (fn [[attr props]] (when (many-attr? schema attr) attr)) schema))
++        pulls (update-vals pulls #(bound-pattern schema many-attrs %))
++        pull-problem (some (fn [[i {:keys [pattern]}]]
++                             (try (pull-parser/parse-pattern db pattern) nil
++                                  (catch :default e (str "find: pull " (nth find i) ": " (ex-message e)))))
++                           pulls)]
++    (if pull-problem
++      (refusal 400 pull-problem)
++      (let [private (private-ids db)
++            _ (swap! last-run assoc :private-set-built? true)
++            counter (volatile! 0)
++            fdb (query-filter db private (ref-attrs db) counter cap)
++            runnable (-> query (dissoc :keys :strs :syms) (assoc :find find))
++            columns (or (some->> (or (:keys query) (:strs query) (:syms query)) (mapv str))
++                        (mapv pr-str original))
++            result (try
++                     (let [rows (sort-rows (map vec (apply d/q runnable (query-args (:in query) fdb rules inputs))))
++                           kept (subvec rows 0 (min limit (count rows)))]
++                       {:total (count rows)
++                        :kept (mapv (fn [row]
++                                      (reduce-kv (fn [row i {:keys [pattern shape]}]
++                                                   (swap! last-run update :pulled inc)
++                                                   (assoc row i (trim-pulled shape (d/pull fdb pattern (nth row i)))))
++                                                 row pulls))
++                                    kept)})
++                     (catch :default e (run-refusal e))
++                     (finally (swap! last-run assoc :scanned @counter)))]
++        (if (refusal? result)
++          result
++          (let [{:keys [total kept]} result
++                rows (mapv serialise kept)
++                base (merge echo {:columns columns :total-rows total :returned total
++                                  :truncated {:by "byte-cap"
++                                              :note (max-key count (byte-cap-note total total) (limit-note total total limit))}})
++                fitted (cut-to-byte-cap base rows)]
++            (merge echo
++                   (cond-> {:columns columns
++                            :rows fitted
++                            :total-rows total
++                            :returned (count fitted)}
++                     (< (count fitted) (count rows))
++                     (assoc :truncated {:by "byte-cap" :note (byte-cap-note (count fitted) total)})
++
++                     (and (= (count fitted) (count rows)) (> total limit))
++                     (assoc :truncated {:by "limit" :note (limit-note (count fitted) total limit)})))))))))
 +
 +;; The handler
 +;; ===========
@@ -495,11 +729,18 @@ index 0000000..2719a1c
 +    (http/error-response (::error result) (::status result))
 +    (http/json-response :semantic/datalog-query result)))
 +
++(defn- test-scan-cap
++  "The scan cap a test set on the Durable Object (`datalogScanCap`), in place of the constant. No
++  request can set it."
++  [^js self]
++  (let [cap (some-> self (unchecked-get "datalogScanCap"))]
++    (when (and (integer? cap) (not (neg? cap))) cap)))
++
 +(defn handle-query
 +  "POST /query: refuses an E2EE graph first, then a body, query, inputs or rules that can't run,
 +  and otherwise answers the dry run or the rows."
-+  [{:keys [request db e2ee?]}]
-+  (reset! last-run {:private-set-built? false :scanned 0})
++  [{:keys [request db e2ee? self]}]
++  (reset! last-run {:private-set-built? false :scanned 0 :pulled 0})
 +  (if e2ee?
 +    (http/error-response "datalog_query is unavailable on an E2EE graph (titles are ciphertext)" 409)
 +    (p/let [body (-> (p/let [json (common/read-json request)] (js->clj json :keywordize-keys true))
@@ -514,9 +755,10 @@ index 0000000..2719a1c
 +                                      :query (pr-str (:given parsed))
 +                                      :inputs (pr-str (:inputs parsed))
 +                                      :rules (pr-str (or (:rules parsed) []))}
-+             :else (merge (run-query db {:query (:query parsed) :inputs (:inputs parsed) :rules (:rules parsed)
-+                                         :limit (or (:limit body) default-limit)})
-+                          {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}))))))))
++             :else (run-query db {:query (:query parsed) :inputs (:inputs parsed) :rules (:rules parsed)
++                                  :limit (or (:limit body) default-limit)
++                                  :scan-cap (test-scan-cap self)
++                                  :echo {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}}))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 index d8e3144..1d0fb1f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
@@ -538,7 +780,7 @@ index d8e3144..1d0fb1f 100644
  
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..fa47834 100644
+index 1365b0a..02bf458 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,9 @@
@@ -559,8 +801,8 @@ index 1365b0a..fa47834 100644
 +                   (str "Runs a read-only Datalog query against the graph and returns the rows. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible."
-+                        " Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50); total-rows counts every row, and truncated says when the limit cut them. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title) and uuids as text."
-+                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, :in) and the reason; a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
++                        " Work is capped, not timed: a query that scans more than 50,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
++                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
     "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
     "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
     "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
@@ -591,7 +833,15 @@ index 1365b0a..fa47834 100644
                    "getProperty"
                    (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
                    "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
-@@ -1030,6 +1052,21 @@
+@@ -662,6 +684,7 @@
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
+            "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
++           "datalogQuery" {"422" {:description "The query scanned more than 50,000 datoms (the scan cap) and was stopped; the error names the cap. Narrow it with a tag, page or attribute value"}}
+            "createPage" {"201" (entity-response "PageResponse" "The created page")
+                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+            "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
+@@ -1030,6 +1053,21 @@
                                                              :description "In sidebar order; empty when the graph has none."
                                                              :items {:$ref "#/components/schemas/Favorite"}}
                                                  :dry-run {:type "boolean" :description "reorderFavorites with dry-run=true: true; nothing was written."}}}
@@ -599,12 +849,12 @@ index 1365b0a..fa47834 100644
 +                                      :properties {:columns {:type "array" :items {:type "string"}
 +                                                             :description "One name per :find element: its :keys name, else the element as written."}
 +                                                   :rows {:type "array" :items {:type "array" :items {}}
-+                                                          :description "Sorted rows, each one value per column; keywords as text without the colon, uuids as text."}
++                                                          :description "Sorted rows, each one value per column; keywords as text without the colon, uuids as text, refs as numbers, a pull as an object."}
 +                                                   :total-rows {:type "integer" :description "Every row the query matched."}
 +                                                   :returned {:type "integer" :description "The rows in rows."}
 +                                                   :truncated {:type "object" :required ["by" "note"]
-+                                                               :description "Present when rows holds fewer than total-rows."
-+                                                               :properties {:by {:enum ["limit"]}
++                                                               :description "Present when rows holds fewer than total-rows: by limit (the limit field) or byte-cap (about 100,000 characters of JSON, whole rows only), and a note naming the cap."
++                                                               :properties {:by {:enum ["limit" "byte-cap"]}
 +                                                                            :note {:type "string"}}}
 +                                                   :query {:type "string" :description "The query as EDN."}
 +                                                   :inputs {:type "string" :description "The inputs as EDN."}
@@ -615,10 +865,10 @@ index 1365b0a..fa47834 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..6a11d06
+index 0000000..b00f82a
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,1096 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -766,6 +1016,17 @@ index 0000000..6a11d06
 +  [response & parts]
 +  (and (= 400 (:status response))
 +       (every? #(string/includes? (str (get-in response [:body :error])) %) parts)))
++
++(defn- ref-values
++  "Every value under a ref attribute's key in pulled `rows` (as JSON answers them: keys without the
++  colon, refs as numbers)."
++  [conn rows]
++  (let [refs (set (map #(subs (str %) 1) (datalog/ref-attrs @conn)))]
++    (->> (tree-seq coll? seq rows)
++         (filter map?)
++         (mapcat (fn [m] (for [[k v] m :when (contains? refs (if (keyword? k) (subs (str k) 1) k))] v)))
++         (mapcat #(if (sequential? %) % [%]))
++         (filter number?))))
 +
 +(def ^:private zq-titles '[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]])
 +
@@ -1081,7 +1342,8 @@ index 0000000..6a11d06
 +            (testing "(pull ?e [*]) holds no private title and no ref to the private page"
 +              (is (= 200 (:status pulled)) (pr-str pulled))
 +              (is (= [] (leaks (:text pulled))))
-+              (is (not (string/includes? (:text pulled) (str "{\"db/id\":" private-id "}")))))
++              (is (= #{} (set (filter #{private-id} (ref-values conn (get-in pulled [:body :rows])))))
++                  "no ref attribute in any pulled row holds the private page's id"))
 +            (testing "a public block's title keeps the private page's uuid, never its title"
 +              (is (string/includes? see-title (str private-plans))))
 +            (testing "the Private tag itself stays visible"
@@ -1165,7 +1427,7 @@ index 0000000..6a11d06
 +                         :inputs "[\"zq Notes\"]"
 +                         :rules "[]"}]
 +                   [(:status response) (:body response)]) (pr-str response))
-+            (is (= {:private-set-built? false :scanned 0} after-dry-run))))))))
++            (is (= {:private-set-built? false :scanned 0 :pulled 0} after-dry-run))))))))
 +
 +(deftest parse-errors-test
 +  (async done
@@ -1286,6 +1548,423 @@ index 0000000..6a11d06
 +        (p/let [response (query! self zq-titles :limit 200)]
 +          (is (= 200 (:status response)) (pr-str response))
 +          (is (not (string/includes? (:text response) "zq stale private block")) (:text response)))))))
++
++
++;; Caps (stage 2): the scan cap, bounded pulls and the byte cap
++;; =============================================================
++
++(defn- cap-message [n]
++  (str "query stopped after scanning " n " datoms (the scan cap); narrow it with a tag, page or attribute value,"
++       " or use a named query"))
++
++(defn- set-scan-cap!
++  "The test-only scan cap the handler reads from the Durable Object (`self`), in place of the
++  constant; nil restores the constant. No request can set it."
++  [self n]
++  (unchecked-set self "datalogScanCap" n))
++
++(defn- bulk!
++  "`n` blocks under `parent`, titled by `title-fn` of their index, in one block-trees batch."
++  [self parent n title-fn]
++  (insert! self parent (vec (for [i (range n)] {:title (title-fn i)}))))
++
++(defn- pad2 [i] (.padStart (str i) 2 "0"))
++
++(deftest scan-cap-test
++  ;; About 49,000 datoms added through the real outliner put the graph above the 50,000 scan cap.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [_ (bulk! self notes 7000 #(str "zq filler " %))
++                before (snapshot conn)
++                _ (assert (> (:datoms before) 50000) (pr-str before))
++                everything (query! self '[:find ?e ?a ?v :where [?e ?a ?v]])
++                scanned (:scanned @datalog/last-run)
++                titles (query! self '[:find ?b :where [?b :block/title]])]
++          (testing "an unconstrained query over a graph above the cap answers 422 naming the cap, never 500"
++            (is (= [422 (cap-message "50,000")] [(:status everything) (get-in everything [:body :error])])
++                (pr-str (:status everything) (subs (:text everything) 0 (min 300 (count (:text everything))))))
++            (is (= 50001 scanned) "it stops at the first datom past the cap")
++            (is (= before (snapshot conn))))
++          (testing "a query under the cap on the same graph still answers rows"
++            (is (= 200 (:status titles)) (pr-str (:status titles)))
++            (is (= 50 (get-in titles [:body :returned])))))))))
++
++(deftest scan-cap-exact-test
++  ;; The cap counts every datom the filter is asked about across the whole query, kept or dropped.
++  (async done
++    (with-graph done
++      (fn [{:keys [self private-plans]}]
++        (p/let [q '[:find ?t :where [?p :block/title "zq Notes"] [?b :block/parent ?p] [?b :block/title ?t]]
++                uncapped (query! self q)
++                scanned (:scanned @datalog/last-run)
++                _ (set-scan-cap! self scanned)
++                at-cap (query! self q)
++                _ (set-scan-cap! self (dec scanned))
++                over-cap (query! self q)
++                over-scanned (:scanned @datalog/last-run)
++                _ (set-scan-cap! self nil)
++                private-only '[:find ?t :in $ ?u :where [?e :block/uuid ?u] [?e :block/title ?t]]
++                hidden (query! self private-only :inputs (str "[#uuid \"" private-plans "\"]"))
++                hidden-scanned (:scanned @datalog/last-run)
++                _ (set-scan-cap! self 0)
++                hidden-capped (query! self private-only :inputs (str "[#uuid \"" private-plans "\"]"))
++                _ (set-scan-cap! self nil)]
++          (is (= 200 (:status uncapped)) (pr-str uncapped))
++          (is (> scanned 3) "the three clauses scan more than one datom each between them")
++          (testing "a query that scans exactly the cap answers its rows"
++            (is (= [200 (get-in uncapped [:body :rows])] [(:status at-cap) (get-in at-cap [:body :rows])]) (pr-str at-cap)))
++          (testing "one datom over the cap answers 422 naming the cap"
++            (is (= [422 (cap-message (str (dec scanned)))] [(:status over-cap) (get-in over-cap [:body :error])])
++                (pr-str over-cap))
++            (is (= scanned over-scanned)))
++          (testing "datoms the private filter drops count too"
++            (is (= [200 []] [(:status hidden) (get-in hidden [:body :rows])]) (pr-str hidden))
++            (is (pos? hidden-scanned))
++            (is (= [422 (cap-message "0")] [(:status hidden-capped) (get-in hidden-capped [:body :error])])
++                (pr-str hidden-capped))))))))
++
++(deftest scan-cap-is-per-request-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [first-run (query! self zq-titles :limit 200)
++                scanned (:scanned @datalog/last-run)
++                _ (set-scan-cap! self scanned)
++                second-run (query! self zq-titles :limit 200)
++                third-run (query! self zq-titles :limit 200)
++                _ (set-scan-cap! self nil)]
++          (is (= 200 (:status first-run)))
++          (testing "two calls in a row, each under the cap, both answer rows: the count starts again per request"
++            (is (= [200 200] [(:status second-run) (:status third-run)]) (pr-str third-run))
++            (is (= (get-in first-run [:body :rows]) (get-in third-run [:body :rows])))))))))
++
++(deftest rule-recursion-test
++  ;; A recursive rule runs under the scan cap: it answers rows or 422, never 500.
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [self-rec (query! self '[:find ?e :in $ % :where [?e :block/title "zq Notes"] (r ?e)]
++                                 :rules '[[(r ?x) (r ?x)]])
++                mutual (query! self '[:find ?e :in $ % :where [?e :block/title "zq Notes"] (a ?e)]
++                               :rules '[[(a ?x) (b ?x)] [(b ?x) (a ?x)]])
++                closure-rules '[[(under ?b ?p) [?b :block/parent ?p]]
++                                [(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]]
++                closure '[:find ?t :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?t]]
++                closed (query! self closure :rules closure-rules)
++                _ (set-scan-cap! self 5)
++                capped (query! self closure :rules closure-rules)
++                _ (set-scan-cap! self nil)]
++          (doseq [[label response] [["self-recursive" self-rec] ["mutually recursive" mutual] ["transitive closure" closed]]]
++            (testing label
++              (is (contains? #{200 422} (:status response)) (pr-str response))))
++          (testing "the closure finds the blocks under the page"
++            (is (contains? (set (map first (get-in closed [:body :rows]))) "zq Public child")))
++          (testing "the same closure under a low cap answers 422, not 500"
++            (is (= [422 (cap-message "5")] [(:status capped) (get-in capped [:body :error])]) (pr-str capped))))))))
++
++(deftest pull-star-bounded-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [_ (bulk! self notes 60 #(str "zq bulk " (pad2 %)))
++                response (query! self '[:find (pull ?b [*]) :where [?b :block/title ?t]
++                                        [(clojure.string/starts-with? ?t "zq bulk")]])
++                pulled (:pulled @datalog/last-run)]
++          (testing "(pull ?b [*]) across 60 blocks: 50 rows, the limit named, and every row counted"
++            (is (= 200 (:status response)) (pr-str (:status response)))
++            (is (= {:total-rows 60 :returned 50
++                    :truncated {:by "limit" :note "returned 50 of 60 rows (limit 50, maximum 200); narrow the query or add a :where clause"}}
++                   (select-keys (:body response) [:total-rows :returned :truncated])))
++            (is (= 50 (count (get-in response [:body :rows])))))
++          (testing "only the kept rows are pulled, on the filtered db"
++            (is (= 50 pulled)))
++          (testing "rows are sorted by entity id, the pull follows its variable"
++            (is (= (sort (map #(get-in % [0 :db/id]) (get-in response [:body :rows])))
++                   (map #(get-in % [0 :db/id]) (get-in response [:body :rows]))))
++            (is (= (mapv #(str "zq bulk " (pad2 %)) (range 50))
++                   (mapv #(get-in % [0 :block/title]) (get-in response [:body :rows])))))
++          (testing "the pulled maps are the blocks"
++            (is (every? #(= :block/uuid (some #{:block/uuid} (keys (first %)))) (get-in response [:body :rows])))
++            (is (some? (d/entity @conn [:block/uuid (uuid (get-in response [:body :rows 0 0 :block/uuid]))])))))))))
++
++(deftest pull-pattern-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (let [find-notes (fn [pattern] (list '[:find] (list 'pull '?b pattern) :where '[?b :block/title "zq Notes"]))
++              form (fn [pattern] (vec (concat [:find (list 'pull '?b pattern)] '[:where [?b :block/title "zq Notes"]])))
++              cases [["depth 3" (form '[{:block/parent [{:block/parent [:block/title]}]}])
++                      "find: pull ?b: :block/parent nests the pattern 3 levels deep (at most 2)"]
++                     ["depth 3 through a reverse ref" (form '[{:block/_parent [{:block/_parent [:block/title]}]}])
++                      "find: pull ?b: :block/_parent nests the pattern 3 levels deep (at most 2)"]
++                     ["... as a map value" (form '[{:block/parent ...}])
++                      "find: pull ?b: {:block/parent ...} is a recursive pull"]
++                     ["\"...\" as a map value" (form '[{:block/parent "..."}])
++                      "find: pull ?b: {:block/parent \"...\"} is a recursive pull"]
++                     ["... as an element" (form '[:block/parent ...])
++                      "find: pull ?b: ... is a recursive pull"]
++                     ["a recursion number" (form '[{:block/_parent 3}])
++                      "find: pull ?b: {:block/_parent 3} is a recursive pull"]
++                     ["(limit :block/refs 51)" (form '[(limit :block/refs 51)])
++                      "find: pull ?b: :block/refs takes a limit from 1 to 50 (got 51)"]
++                     ["[:block/refs :limit 51]" (form '[[:block/refs :limit 51]])
++                      "find: pull ?b: :block/refs takes a limit from 1 to 50 (got 51)"]
++                     ["[\"limit\" :block/refs 51]" (form '[["limit" :block/refs 51]])
++                      "find: pull ?b: :block/refs takes a limit from 1 to 50 (got 51)"]
++                     ["(limit :block/refs nil), no limit" (form '[(limit :block/refs nil)])
++                      "find: pull ?b: :block/refs takes a limit from 1 to 50 (got nil)"]
++                     ["a limit on a map key" (form '[{(limit :block/refs 51) [:block/title]}])
++                      "find: pull ?b: :block/refs takes a limit from 1 to 50 (got 51)"]
++                     ["a limit at depth 2" (form '[{:block/page [(limit :block/tags 51)]}])
++                      "find: pull ?b: :block/tags takes a limit from 1 to 50 (got 51)"]
++                     [":xform" (form '[[:block/title :xform clojure.string/upper-case]])
++                      "find: pull ?b: :xform on :block/title is not allowed"]
++                     ["a pattern from inputs" '[:find (pull ?b ?p) :in $ ?p :where [?b :block/title "zq Notes"]]
++                      "find: pull ?b: the pattern must be a literal vector"]
++                     ["a pattern that is a keyword" (form :block/title)
++                      "find: pull ?b: the pattern must be a literal vector"]
++                     ["a pull of a constant" '[:find (pull 1 [:block/title]) :where [?b :block/title "zq Notes"]]
++                      "find: pull 1: the pulled entity must be a ?variable"]
++                     ;; Datascript's own pattern errors, checked before anything runs.
++                     ["a limit on a single attribute" (form '[[:block/title :limit 5]])
++                      "find: pull ?b: Expected limit attribute having :db.cardinality/many, got: :block/title"]
++                     ["a limit on the reverse of a single attribute" (form '[(limit :block/_parent 5)])
++                      "find: pull ?b: Expected limit attribute having :db.cardinality/many, got: :block/parent"]
++                     ["an option with no value" (form '[[:block/title :as]])
++                      "find: pull ?b: Expected even number of opts"]
++                     ["an unknown option" (form '[[:block/title :sort 1]])
++                      "find: pull ?b: Expected one of :as, :limit, :default, :xform"]
++                     ["a nested pattern on a value attribute" (form '[{:block/title [:block/uuid]}])
++                      "find: pull ?b: Expected attribute having :db.type/ref"]]]
++          (p/doseq [[label q message] cases]
++            (p/let [before (snapshot conn)
++                    response (query! self q :inputs (when (some #{'?p} (flatten q)) '[[:block/title]]))]
++              (testing label
++                (is (refused? response message) (pr-str response))
++                (is (= before (snapshot conn)))
++                (is (false? (:private-set-built? @datalog/last-run)) "refused before the private set is built"))))
++          (is (some? find-notes)))))))
++
++(deftest pull-many-attributes-bounded-test
++  ;; Each way of naming a many attribute returns at most 50 values, and each pattern the refusals
++  ;; sit next to still runs.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [[many] (insert! self notes [{:title (str "zq many " (string/join " " (map #(str "[[zq r" (pad2 %) "]]") (range 60))))}])
++                [parent] (insert! self notes [{:title "zq parent of 60"}])
++                _ (bulk! self (:uuid parent) 60 #(str "zq kid " (pad2 %)))
++                _ (bulk! self notes 60 #(str "zq citing " (pad2 %) " [[zq Cited]]"))
++                _ (assert (= 60 (count (:block/refs (d/entity @conn [:block/uuid (uuid (:uuid many))])))))
++                by-title (fn [pattern title]
++                           (query! self (vec (concat [:find (list 'pull '?b pattern)]
++                                                     [:where ['?b :block/title '?t] [(list 'clojure.string/starts-with? '?t title)]]))))
++                bare (by-title '[:block/refs] "zq many")
++                star (by-title '[*] "zq many")
++                nested (by-title '[{:block/refs [:block/title]}] "zq many")
++                renamed (by-title '[[:block/refs :as "r"]] "zq many")
++                defaulted (by-title '[(default :block/refs [])] "zq many")
++                limited (by-title '[(limit :block/refs 50)] "zq many")
++                limited-5 (by-title '[[:block/refs :limit 5]] "zq many")
++                star-nested (by-title '[{:block/refs [*]}] "zq many")
++                kids (by-title '[{:block/_parent [:block/title]}] "zq parent of 60")
++                kids-renamed (by-title '[[:block/_parent :as "kids"]] "zq parent of 60")
++                cited (by-title '[{:block/_refs [:block/title]}] "zq Cited")
++                depth-2 (by-title '[:block/title {:block/parent [:block/title :block/order]}] "zq kid 00")]
++          (doseq [[label response k n] [["a bare many attribute" bare :block/refs 50]
++                                        ["a many attribute under *" star :block/refs 50]
++                                        ["a many attribute with a nested pattern" nested :block/refs 50]
++                                        ["a many attribute renamed with :as" renamed :r 50]
++                                        ["a many attribute with a default" defaulted :block/refs 50]
++                                        ["(limit :block/refs 50)" limited :block/refs 50]
++                                        ["[:block/refs :limit 5]" limited-5 :block/refs 5]
++                                        ["a many attribute pulled with [*]" star-nested :block/refs 50]
++                                        ["a reverse ref of a single attribute" kids :block/_parent 50]
++                                        ["a renamed reverse ref" kids-renamed :kids 50]
++                                        ["a reverse ref of a many attribute" cited :block/_refs 50]]]
++            (testing label
++              (is (= 200 (:status response)) (pr-str (:status response) (:body response)))
++              (is (= n (count (get-in response [:body :rows 0 0 k]))) (pr-str (keys (get-in response [:body :rows 0 0]))))))
++          (testing "depth 2 runs"
++            (is (= [200 [[{:block/title "zq kid 00"
++                           :block/parent {:block/title "zq parent of 60" :block/order (:block/order (d/entity @conn [:block/uuid (uuid (:uuid parent))]))}}]]]
++                   [(:status depth-2) (get-in depth-2 [:body :rows])])
++                (pr-str depth-2))))))))
++
++(deftest pull-shapes-still-run-test
++  ;; Pull forms next to the new refusals run as before: an explicit $, two pulls, a pull beside its
++  ;; own variable or an aggregate, and the pull in either column.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes public-note]}]
++        (let [notes-id (:db/id (d/entity @conn [:block/uuid notes]))
++              note-id (:db/id (d/entity @conn [:block/uuid public-note]))
++              cases [["an explicit $" '[:find (pull $ ?b [:block/title]) :where [?b :block/title "zq Notes"]]
++                      [[{:block/title "zq Notes"}]]]
++                     ["the pull and its variable" '[:find ?b (pull ?b [:block/title]) :where [?b :block/title "zq Notes"]]
++                      [[notes-id {:block/title "zq Notes"}]]]
++                     ["the pull first, then a value" '[:find (pull ?b [:block/title]) ?t :where [?b :block/title "zq Public note"]
++                                                       [?b :block/page ?p] [?p :block/title ?t]]
++                      [[{:block/title "zq Public note"} "zq Notes"]]]
++                     ["a value first, then the pull" '[:find ?t (pull ?b [:block/title]) :where [?b :block/title "zq Public note"]
++                                                       [?b :block/page ?p] [?p :block/title ?t]]
++                      [["zq Notes" {:block/title "zq Public note"}]]]
++                     ["two pulls, swapped" '[:find (pull ?p [:block/title]) (pull ?b [:db/id]) :where [?b :block/title "zq Public note"]
++                                             [?b :block/page ?p]]
++                      [[{:block/title "zq Notes"} note-id]]]
++                     ["a pull beside an aggregate" '[:find (pull ?p [:block/title]) (count ?b) :where [?p :block/title "zq Notes"]
++                                                     [?b :block/parent ?p]]
++                      [[{:block/title "zq Notes"} 2]]]
++                     ["a pull with :keys" '[:find (pull ?b [:block/title]) ?t :keys page title :where [?b :block/title "zq Notes"]
++                                            [?b :block/title ?t]]
++                      [[{:block/title "zq Notes"} "zq Notes"]]]
++                     ["a pull of a ref, at the depth limit" '[:find (pull ?b [{:block/page [:block/title]}]) :where
++                                                               [?b :block/title "zq Public note"]]
++                      [[{:block/page {:block/title "zq Notes"}}]]]]]
++          (p/doseq [[label q rows] cases]
++            (p/let [response (query! self q)]
++              (testing label
++                (is (= [200 rows] [(:status response) (get-in response [:body :rows])]) (pr-str response))))))))))
++
++(defn- long-title [i] (str "zq long " (pad2 i) " " (apply str (repeat 3000 "x"))))
++
++(deftest byte-cap-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self notes]}]
++        (p/let [_ (bulk! self notes 60 long-title)
++                _ (insert! self notes [{:title (str "zq huge " (apply str (repeat 120000 "y")))}])
++                long-q '[:find ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq long")]]
++                response (query! self long-q :limit 200)
++                pulled (query! self '[:find (pull ?e [:block/title]) :where [?e :block/title ?t]
++                                      [(clojure.string/starts-with? ?t "zq long")]]
++                               :limit 200)
++                huge (query! self '[:find ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq huge")]])
++                ;; [["zq edge yyy…"]] is 99,900 characters: under the cap alone, over it with the response around it.
++                _ (insert! self notes [{:title (str "zq edge " (apply str (repeat (- 99900 4 8) "y")))}])
++                edge (query! self '[:find ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq edge")]])]
++          (testing "60 titles of 3,000 characters stop before 100,000 characters, whole rows only"
++            (is (= 200 (:status response)) (pr-str (:status response)))
++            (is (<= (count (:text response)) 100000) (count (:text response)))
++            (let [{:keys [rows returned total-rows truncated]} (:body response)]
++              (is (= 60 total-rows))
++              (is (< 20 returned 60) returned)
++              (is (= returned (count rows)))
++              (is (= (mapv #(vector (long-title %)) (range returned)) rows) "each row is whole, in order")
++              (is (= "byte-cap" (:by truncated)))
++              (is (= (str "returned " returned " of 60 rows (the byte cap, about 100,000 characters of JSON);"
++                          " pull fewer attributes, narrow the query or lower limit")
++                     (:note truncated)))))
++          (testing "pulled rows are cut the same way"
++            (is (= 200 (:status pulled)))
++            (is (<= (count (:text pulled)) 100000) (count (:text pulled)))
++            (is (= "byte-cap" (get-in pulled [:body :truncated :by])))
++            (is (= (mapv #(vector {:block/title (long-title %)}) (range (get-in pulled [:body :returned])))
++                   (get-in pulled [:body :rows]))))
++          (testing "a row that fits alone but not with the rest of the response is left out: the cap counts the whole JSON"
++            (is (= 200 (:status edge)) (pr-str (:status edge)))
++            (is (<= (count (:text edge)) 100000) (count (:text edge)))
++            (is (= [0 "byte-cap"] [(get-in edge [:body :returned]) (get-in edge [:body :truncated :by])])))
++          (testing "a single row over the cap gives zero rows and the note, not a cut row"
++            (is (= 200 (:status huge)) (pr-str (:status huge)))
++            (is (<= (count (:text huge)) 100000))
++            (is (= {:rows [] :returned 0 :total-rows 1
++                    :truncated {:by "byte-cap"
++                                :note (str "returned 0 of 1 rows (the byte cap, about 100,000 characters of JSON);"
++                                           " pull fewer attributes, narrow the query or lower limit")}}
++                   (select-keys (:body huge) [:rows :returned :total-rows :truncated])))))))))
++
++(deftest find-shapes-test
++  ;; Scalar, collection and aggregate finds go through the same sort, limit and byte cap as a relation.
++  (async done
++    (with-graph done
++      (fn [{:keys [self notes]}]
++        (p/let [_ (bulk! self notes 60 #(str "zq bulk " (pad2 %)))
++                _ (bulk! self notes 60 long-title)
++                where '[:where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq bulk")]]
++                long-where '[:where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq long")]]
++                shape (fn [find w & {:as more}] (apply query! self (vec (concat [:find] find w)) (mapcat identity more)))
++                relation (shape '[?t] where)
++                scalar (shape '[?t .] where)
++                collection (shape '[[?t ...]] where)
++                aggregate (shape '[?t (count ?e)] where)
++                long-relation (shape '[?t] long-where :limit 200)
++                long-scalar (shape '[?t .] long-where :limit 200)
++                long-collection (shape '[[?t ...]] long-where :limit 200)
++                long-aggregate (shape '[?t (count ?e)] long-where :limit 200)
++                cut (fn [r] (select-keys (:body r) [:total-rows :returned :truncated]))]
++          (testing "the limit cuts each shape alike"
++            (is (= [200 200 200 200] (map :status [relation scalar collection aggregate])))
++            (is (= (cut relation) (cut scalar) (cut collection)))
++            (is (= 50 (get-in relation [:body :returned])))
++            (is (= (get-in relation [:body :rows]) (get-in scalar [:body :rows]) (get-in collection [:body :rows])))
++            (is (= (mapv #(vector (str "zq bulk " (pad2 %)) 1) (range 50)) (get-in aggregate [:body :rows])))
++            (is (= (cut relation) (cut aggregate))))
++          (testing "the byte cap cuts each shape alike"
++            (is (= "byte-cap" (get-in long-relation [:body :truncated :by])))
++            (is (= (cut long-relation) (cut long-scalar) (cut long-collection)))
++            (is (= "byte-cap" (get-in long-aggregate [:body :truncated :by])))
++            (doseq [r [long-relation long-scalar long-collection long-aggregate]]
++              (is (<= (count (:text r)) 100000)))))))))
++
++(deftest serialisation-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes public-note public-plans]}]
++        (p/let [attrs (query! self '[:find ?a :where [?e :block/title "zq Notes"] [?e ?a]] :limit 200)
++                uuids (query! self '[:find ?u :where [?e :block/title "zq Notes"] [?e :block/uuid ?u]])
++                idents (query! self '[:find ?i :where [?c :db/ident ?i] [?c :block/title "Tag"]])
++                pulled (query! self '[:find (pull ?b [:block/uuid :block/page :block/parent])
++                                      :where [?b :block/title "zq Public note"]])
++                tags (query! self '[:find (pull ?p [:block/tags]) :where [?p :block/title "zq Public Plans"]])
++                notes-id (:db/id (d/entity @conn [:block/uuid notes]))
++                tag-ids (sort (map :db/id (:block/tags (d/entity @conn [:block/uuid public-plans]))))]
++          (testing "keywords come back as text without the colon"
++            (is (contains? (set (map first (get-in attrs [:body :rows]))) "block/title") (pr-str attrs))
++            (is (= [["logseq.class/Tag"]] (get-in idents [:body :rows])) (pr-str idents)))
++          (testing "uuids come back as text"
++            (is (= [[(str notes)]] (get-in uuids [:body :rows])) (pr-str uuids)))
++          (testing "refs come back as numbers"
++            (is (= [[{:block/uuid (str public-note) :block/page notes-id :block/parent notes-id}]]
++                   (get-in pulled [:body :rows]))
++                (pr-str pulled)))
++          (testing "a many ref comes back as a vector of numbers"
++            (is (= 2 (count tag-ids)) "Project and Page")
++            (is (= tag-ids (sort (get-in tags [:body :rows 0 0 :block/tags]))) (pr-str tags))))))))
++
++
++(deftest caps-documented-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        post (get-in document [:paths "/api/v1/graphs/{graph-id}/query" :post])
++        truncated (get-in document [:components :schemas :DatalogQueryResponse :properties :truncated])]
++    (doseq [phrase ["scan cap" "50,000 datoms" "422" "truncated" "byte-cap" "100,000 characters" "at most 2 levels deep"
++                    "at most 50 values" "refs as numbers"]]
++      (is (string/includes? (:description post) phrase) phrase))
++    (is (= ["limit" "byte-cap"] (get-in truncated [:properties :by :enum])))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "scan cap"))))
++
++
++(deftest pull-reads-only-its-entity-test
++  ;; On a filtered db Datascript pulls a pattern without * by seeking from the entity to the end of
++  ;; the index, so a pull of an early entity would count every later datom against the scan cap.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [plain (query! self '[:find ?c :where [?c :db/ident :logseq.class/Tag]])
++                plain-scanned (:scanned @datalog/last-run)
++                titled (query! self '[:find (pull ?c [:block/title]) :where [?c :db/ident :logseq.class/Tag]])
++                titled-scanned (:scanned @datalog/last-run)
++                nested (query! self '[:find (pull ?c [:block/title {:block/tags [:block/title]}])
++                                      :where [?c :db/ident :logseq.class/Tag]])
++                nested-scanned (:scanned @datalog/last-run)
++                tag-datoms (count (d/datoms @conn :eavt (d/entid @conn :logseq.class/Tag)))]
++          (is (= [200 200 200] (map :status [plain titled nested])))
++          (is (= [[{:block/title "Tag"}]] (get-in titled [:body :rows])) (pr-str titled))
++          (is (= [[{:block/title "Tag" :block/tags [{:block/title "Tag"}]}]] (get-in nested [:body :rows])) (pr-str nested))
++          (testing "the pull reads the entity's own datoms, not the rest of the index"
++            (is (<= (- titled-scanned plain-scanned) tag-datoms) [plain-scanned titled-scanned tag-datoms])
++            (is (< nested-scanned 100) nested-scanned)))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
