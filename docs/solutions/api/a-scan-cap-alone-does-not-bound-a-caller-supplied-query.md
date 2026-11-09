@@ -4,7 +4,8 @@ area: api
 tags: [datalog_query, run_named_query, caps, join-fanout, recursion, allow-list, cpu, 1102, private, read-only, scale-test]
 seen:
   - 2026-11-09 – item 40, patch 0039, stages 1 to 4 and review rounds 1 and 2 (s-2-1, s-3-1, s-4-1, r1-correctness-1; r1-correctness-1 closed in round 2)
-promoted_to: []
+  - 2026-11-09 – item 40, review rounds 3 and 4 (not, rule and rule-tree routes past the per-construct caps) and the safe-caller-datalog-queries spike, which measured the rule-tree route and a one-budget fuel counter
+promoted_to: ["REVIEW.md Cost"]
 ---
 
 ## Symptom
@@ -42,3 +43,12 @@ r1-correctness-1, `(str ?x)` on a whole-collection input repeated per joined row
 - Count find elements structurally, not with `flatten`, when comparing against `:keys`.
 - Private filtering by `d/filter` hides rows from the query. Other read tools (`list_tags`, `get_tag`) already show private-tagged tags' titles, so an echo of a tag title in `run_named_query` params is not a new leak (one skeptic refuted it as pre-existing; one refutation, not yet a known false positive).
 - Reads logged to the audit log cost 2 D1 rows written and none read per call (hash of the query text, never the text); that is the arithmetic to repeat if another read tool is logged.
+
+## Measured by the spike (patch 0039 at `7d04944`)
+
+Full numbers and the options compared are in `docs/spikes/2026-11-09-safe-caller-datalog-queries.md`.
+
+- Rule trees are the route the caps do not see. `expand-rule` costs 50 to 65 microseconds per frame, while the work cap charges about 0.25 microseconds per leaf. A 5x10 tree (10^5 leaves) took 5.5 s with 1 datom scanned, and larger trees ran about 10 s to the work cap. Refusing caller `rules` removes it, and the four named queries still work because their rules are server data.
+- A prototype single fuel counter (rule frames 250, clauses 20, one per relation row, 5 per function call) stopped every hostile case tried in 24 to 192 ms with overhead between -10 % and +8 % (15 cases, Node, dev build). A 60-deep ancestors chain used half the 200,000 budget, so the weights need calibrating. That it closes the class is inferred, not proved; value amplification was not run against it.
+- Cooperative yielding does not work: `d/q` is one synchronous reduce with no resumable state, so no input gate opens until it ends. Wall-clock deadlines do not work either, because `Date.now()` is frozen.
+- Count work at the engine's own steps (frames, clauses, relation ops, calls) in one budget, then keep the scan, value and text caps for the per-step cost.
