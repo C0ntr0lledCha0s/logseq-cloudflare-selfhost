@@ -817,6 +817,10 @@ async function auditRows(): Promise<{ tool: string; alias: string; status: strin
   return (await env.DB.prepare("SELECT tool, alias, status, client, error FROM audit_log ORDER BY id").all<any>()).results;
 }
 
+async function auditKinds(): Promise<{ tool: string; kind: string; status: string }[]> {
+  return (await env.DB.prepare("SELECT tool, kind, status FROM audit_log ORDER BY id").all<any>()).results;
+}
+
 const WRITES_IN_MANIFEST = committedManifest.filter((e) => !e.annotations.readOnlyHint).map((e) => e.name).sort();
 
 describe("scope", () => {
@@ -871,18 +875,19 @@ describe("scope", () => {
     expect(await auditRows()).toEqual([]);
   });
 
-  it("read-only scope runs a Datalog query: datalog_query reaches the sync server with one POST and writes no audit row", async () => {
+  it("read-only scope runs a Datalog query: datalog_query reaches the sync server with one POST and leaves one read row, no write row", async () => {
     const result = await call("datalog_query", { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } }, READ_CI);
     expect(result.isError, result.text).toBe(false);
     expect(syncCalls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([["POST", `/api/v1/graphs/${WORK}/query`]]);
-    expect(await auditRows()).toEqual([]);
+    // Plan 2026-11-09 stage 5: each query leaves one kind='read' row (spec §3.10).
+    expect(await auditKinds()).toEqual([{ tool: "datalog_query", kind: "read", status: "ok" }]);
   });
 
-  it("read-only scope runs a named query: run_named_query reaches the sync server with one POST and writes no audit row", async () => {
+  it("read-only scope runs a named query: run_named_query reaches the sync server with one POST and leaves one read row, no write row", async () => {
     const result = await call("run_named_query", { graph: "work", name: "projects-untouched", body: { params: { days: 30 } } }, READ_CI);
     expect(result.isError, result.text).toBe(false);
     expect(syncCalls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([["POST", `/api/v1/graphs/${WORK}/named-queries/projects-untouched`]]);
-    expect(await auditRows()).toEqual([]);
+    expect(await auditKinds()).toEqual([{ tool: "run_named_query", kind: "read", status: "ok" }]);
   });
 
   it("out of scope: a read and a write tool are refused listing the covered aliases; the write's audit row is refused", async () => {

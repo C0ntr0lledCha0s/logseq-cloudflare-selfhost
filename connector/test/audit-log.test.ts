@@ -157,6 +157,31 @@ describe("AuditLog costs and rows", () => {
     expect(results[0]).toMatchObject({ dry_run: 1, graph_id: null, status: "refused", error: "unknown graph 'nope'", pages: null, targets: null });
   });
 
+  it("recordRead binds the tool and status it is given: one INSERT, 2 written and 0 read, holding what it was told and nothing else", async () => {
+    const { db, measured } = metered();
+    const log = new AuditLog(db);
+    const query = await log.recordRead("datalog_query", "ok", WORK_ID, "work", ["datalog:0123456789ab"], 0);
+    const named = await log.recordRead("run_named_query", "error", WORK_ID, "work", ["named:projects-untouched", "param:days"], 0);
+    const unresolved = await log.recordRead("datalog_query", "error", null, "nope", ["datalog:0123456789ab"], 0);
+    const activity = await log.recordRead("get_activity_log", "ok", OTHER_ID, "home", ["id:7"], 3);
+    expect(measured.map((m) => [m.rowsWritten, m.rowsRead])).toEqual([
+      [2, 0],
+      [2, 0],
+      [2, 0],
+      [2, 0],
+    ]);
+    const { results } = await env.DB.prepare(
+      "SELECT id, graph_id, alias, tool, kind, status, addressed, rows_written, rows_read, reason, client, session, before, targets, error FROM audit_log ORDER BY id",
+    ).all();
+    const rest = { kind: "read", rows_written: 2, reason: null, client: null, session: null, before: null, targets: null, error: null };
+    expect(results).toEqual([
+      { id: query, graph_id: WORK_ID, alias: "work", tool: "datalog_query", status: "ok", addressed: '["datalog:0123456789ab"]', rows_read: 0, ...rest },
+      { id: named, graph_id: WORK_ID, alias: "work", tool: "run_named_query", status: "error", addressed: '["named:projects-untouched","param:days"]', rows_read: 0, ...rest },
+      { id: unresolved, graph_id: null, alias: "nope", tool: "datalog_query", status: "error", addressed: '["datalog:0123456789ab"]', rows_read: 0, ...rest },
+      { id: activity, graph_id: OTHER_ID, alias: "home", tool: "get_activity_log", status: "ok", addressed: '["id:7"]', rows_read: 3, ...rest },
+    ]);
+  });
+
   it("the table refuses a kind or status outside its CHECKs", async () => {
     const insert = (kind: string, status: string) =>
       env.DB.prepare("INSERT INTO audit_log (at, alias, tool, kind, status) VALUES (1, 'work', 'update_block', ?, ?)")

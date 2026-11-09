@@ -19,7 +19,8 @@ import { type Snapshot, SnapshotRefusal, refreshRefsBefore, snapshotClassFor, ta
  *           then at most `limit` rows by primary key: at most QUERY_SCAN_CAP read. With
  *           includeSnapshot the scan is `limit` rows shorter, and the snapshots that fit the result
  *           are read by primary key after the page: still at most QUERY_SCAN_CAP
- *   recordRead INSERT of a kind = 'read' row, 2 written (READ_ROW_WRITES), 0 read
+ *   recordRead INSERT of a kind = 'read' row (get_activity_log, datalog_query, run_named_query),
+ *           2 written (READ_ROW_WRITES), 0 read
  *   recordTokenEdit INSERT of a token_edit row with graph_id NULL, 2 written, 0 read; the
  *           wizard's form (tokenEditStatement with `applied`) also reads the token row: 1 read
  *   probe   SELECT … LIMIT 0      0 read
@@ -430,16 +431,19 @@ export class AuditLog {
   }
 
   /**
-   * Records one get_activity_log call as a `kind = 'read'` row: the graph, the window or id it
-   * read (`addressed`) and the rows its query read, so the usage report sees the log's read cost.
+   * Records one read call as a `kind = 'read'` row: the tool, its status, the graph (null when the
+   * alias didn't resolve), what it read (`addressed`) and the D1 rows it read, so the usage report
+   * sees the read's cost. get_activity_log records the window or id it read; datalog_query and
+   * run_named_query (registerGraphTools' LOGGED_READS) record a hash or the query's name, never the
+   * query text or param values, and 0 rows read, since the query reads the Durable Object.
    */
-  async recordRead(graphId: string, alias: string, addressed: string[], rowsRead: number): Promise<number> {
+  async recordRead(tool: string, status: "ok" | "error", graphId: string | null, alias: string, addressed: string[], rowsRead: number): Promise<number> {
     const result = await this.db
       .prepare(
         `INSERT INTO audit_log (at, graph_id, alias, tool, kind, status, addressed, rows_written, rows_read)
-         VALUES (?, ?, ?, 'get_activity_log', 'read', 'ok', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, 'read', ?, ?, ?, ?)`,
       )
-      .bind(Date.now(), graphId, alias, JSON.stringify(addressed), READ_ROW_WRITES, rowsRead)
+      .bind(Date.now(), graphId, alias, tool, status, JSON.stringify(addressed), READ_ROW_WRITES, rowsRead)
       .run();
     return result.meta.last_row_id;
   }

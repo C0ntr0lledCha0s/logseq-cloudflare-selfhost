@@ -11,6 +11,8 @@ import { createConnector } from "../src/index";
 import { mcpHandler } from "../src/mcp";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS } from "../src/tools/readable";
+import { LOGGED_READS } from "../src/tools/semantic";
+import { ANNOTATIONS } from "../src/tools/spec.mjs";
 import outline from "./fixtures/audit/get-blocks-outline.json";
 import summary from "./fixtures/audit/get-blocks-summary.json";
 
@@ -35,7 +37,7 @@ let writeResponse: () => Response;
 let readResponse: (path: string) => Response | undefined;
 let consoleSpies: MockInstance[];
 
-function testEnv(): Env {
+function testEnv(overrides: Partial<Env> = {}): Env {
   const sync = {
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -50,7 +52,7 @@ function testEnv(): Env {
       return writeResponse();
     },
   } as unknown as Fetcher;
-  return { ...env, SYNC: sync } as Env;
+  return { ...env, SYNC: sync, ...overrides } as Env;
 }
 
 beforeEach(async () => {
@@ -73,8 +75,8 @@ afterEach(() => {
   for (const spy of consoleSpies) spy.mockRestore();
 });
 
-async function rpc(method: string, params: Record<string, unknown>): Promise<any> {
-  const e = testEnv();
+async function rpc(method: string, params: Record<string, unknown>, overrides: Partial<Env> = {}): Promise<any> {
+  const e = testEnv(overrides);
   const request = new Request("https://mcp.example.com/mcp", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" },
@@ -96,8 +98,12 @@ async function rpc(method: string, params: Record<string, unknown>): Promise<any
 }
 
 /** tools/call on graph `work` (or the given one), as the connector serves it. */
-async function call(name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string; content: string[] }> {
-  const result = await rpc("tools/call", { name, arguments: { graph: "work", ...args } });
+async function call(
+  name: string,
+  args: Record<string, unknown>,
+  overrides: Partial<Env> = {},
+): Promise<{ isError: boolean; text: string; content: string[] }> {
+  const result = await rpc("tools/call", { name, arguments: { graph: "work", ...args } }, overrides);
   const content = result.content.map((c: { text: string }) => c.text);
   return { isError: result.isError === true, text: content.join("\n"), content };
 }
@@ -892,9 +898,188 @@ describe("its own cost", () => {
         return wrap(env.DB.prepare(sql));
       },
     } as unknown as D1Database;
-    await new AuditLog(db).recordRead(WORK_ID, "work", ["id:1"], 1);
+    await new AuditLog(db).recordRead("get_activity_log", "ok", WORK_ID, "work", ["id:1"], 1);
     expect(written).toBe(READ_ROW_WRITES);
     expect(READ_ROW_WRITES).toBe(2);
+    expect(await readRows()).toEqual([
+      expect.objectContaining({ tool: "get_activity_log", status: "ok", addressed: '["id:1"]', rows_read: 1, rows_written: READ_ROW_WRITES }),
+    ]);
+  });
+});
+
+// Plan 2026-11-09-datalog-query-named-queries stage 5 (spec §3.10): each datalog_query and
+// run_named_query call leaves one kind='read' row naming the tool, the status and a hash or the
+// query's name, never the query text or param values.
+describe("query reads", () => {
+  const QUERY = '[:find ?t :where [?e :block/title ?t] [(= ?t "Business Meeting")]]';
+  const ROWS = { columns: ["?t"], rows: [["Business Meeting"]], "total-rows": 1, returned: 1, query: QUERY, inputs: "[]" };
+
+  async function hash12(text: string): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 12);
+  }
+
+  async function allRows(): Promise<any[]> {
+    return (await env.DB.prepare("SELECT * FROM audit_log ORDER BY id").all<any>()).results;
+  }
+
+  it("one datalog_query call inserts exactly one read row: tool, status ok, datalog:<12 hex of SHA-256>, no query text", async () => {
+    writeResponse = () => Response.json(ROWS);
+    const result = await call("datalog_query", { body: { query: QUERY, inputs: '["Projets secrets"]', rules: "[]", limit: 10 } });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual(ROWS);
+    const rows = await allRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      graph_id: WORK_ID,
+      alias: "work",
+      tool: "datalog_query",
+      kind: "read",
+      status: "ok",
+      rows_written: READ_ROW_WRITES,
+      rows_read: 0,
+    });
+    expect(JSON.parse(rows[0].addressed)).toEqual([`datalog:${await hash12(QUERY)}`]);
+    expect(rows[0].addressed).toMatch(/^\["datalog:[0-9a-f]{12}"\]$/);
+    // No column holds any part of the query, its inputs or its rules.
+    const stored = JSON.stringify(rows[0]);
+    for (const part of ["block/title", "Business Meeting", ":find", "Projets secrets"]) expect(stored, part).not.toContain(part);
+  });
+
+  it("the same query text gives the same hash on two quick calls (review focus 19); another text, the map form or a dry run is hashed on its own text", async () => {
+    writeResponse = () => Response.json(ROWS);
+    const map = '{:find [?t] :where [[?e :block/title ?t]]}';
+    await call("datalog_query", { body: { query: QUERY } });
+    await call("datalog_query", { body: { query: QUERY, limit: 5 } });
+    await call("datalog_query", { body: { query: map } });
+    await call("datalog_query", { body: { query: QUERY, "dry-run": true } });
+    const rows = await readRows();
+    expect(rows.map((r) => [r.tool, r.status, JSON.parse(r.addressed)])).toEqual([
+      ["datalog_query", "ok", [`datalog:${await hash12(QUERY)}`]],
+      ["datalog_query", "ok", [`datalog:${await hash12(QUERY)}`]],
+      ["datalog_query", "ok", [`datalog:${await hash12(map)}`]],
+      ["datalog_query", "ok", [`datalog:${await hash12(QUERY)}`]],
+    ]);
+    expect(await hash12(map)).not.toBe(await hash12(QUERY));
+  });
+
+  it("run_named_query records named:<name> and its param names, never their values; with no params, the name alone", async () => {
+    writeResponse = () => Response.json({ name: "x", params: {}, columns: [], rows: [], "total-rows": 0, returned: 0, query: "{}", inputs: "[]", rules: "[]" });
+    const withParams = await call("run_named_query", { name: "pages-missing-property", body: { params: { tag: "Projets secrets", property: "forClient" }, limit: 5 } });
+    expect(withParams.isError, withParams.text).toBe(false);
+    await call("run_named_query", { name: "projects-untouched", body: { params: { days: 4321 } } });
+    await call("run_named_query", { name: "open-tasks-by-client" });
+    await call("run_named_query", { name: "meetings-without-decision", body: { params: {} } });
+    const rows = await allRows();
+    expect(rows.map((r) => [r.tool, r.kind, r.status, JSON.parse(r.addressed), r.rows_read, r.rows_written])).toEqual([
+      ["run_named_query", "read", "ok", ["named:pages-missing-property", "param:property", "param:tag"], 0, READ_ROW_WRITES],
+      ["run_named_query", "read", "ok", ["named:projects-untouched", "param:days"], 0, READ_ROW_WRITES],
+      ["run_named_query", "read", "ok", ["named:open-tasks-by-client"], 0, READ_ROW_WRITES],
+      ["run_named_query", "read", "ok", ["named:meetings-without-decision"], 0, READ_ROW_WRITES],
+    ]);
+    const stored = JSON.stringify(rows);
+    for (const value of ["Projets secrets", "forClient", "4321"]) expect(stored, value).not.toContain(value);
+  });
+
+  it("a server error records status 'error' and leaves the tool's error result unchanged: 400, 404 (review focus 20), 409 and 422", async () => {
+    const cases: [string, Record<string, unknown>, number, string, string[]][] = [
+      ["datalog_query", { body: { query: QUERY } }, 400, "where 2: function transact! is not allowed (allowed: =, <)", [`datalog:${await hash12(QUERY)}`]],
+      ["run_named_query", { name: "projects_untouched", body: { params: { days: 30 } } }, 404, "no named query projects_untouched", ["named:projects_untouched", "param:days"]],
+      ["datalog_query", { body: { query: QUERY } }, 409, "datalog_query is unavailable on an E2EE graph (titles are ciphertext)", [`datalog:${await hash12(QUERY)}`]],
+      ["run_named_query", { name: "projects-untouched" }, 422, "query stopped after scanning 20,000 datoms (the scan cap)", ["named:projects-untouched"]],
+    ];
+    for (const [tool, args, status, error, addressed] of cases) {
+      await env.DB.exec("DELETE FROM audit_log");
+      writeResponse = () => Response.json({ error }, { status });
+      const result = await call(tool, args);
+      expect(result.isError, tool).toBe(true);
+      expect(result.text, tool).toContain(error);
+      // The text is the one the connector maps any sync error to: get_page's 404 reads the same way.
+      readResponse = () => Response.json({ error }, { status });
+      const plain = await call("get_page", { "page-id": B1 });
+      readResponse = () => undefined;
+      const named = (text: string) => text.replace(/datalog_query|run_named_query|get_page/g, "T");
+      expect(named(result.text), tool).toBe(named(plain.text));
+      const rows = await allRows();
+      expect(rows.map((r) => [r.tool, r.kind, r.status, JSON.parse(r.addressed), r.error]), `${tool} ${status}`).toEqual([[tool, "read", "error", addressed, null]]);
+    }
+  });
+
+  it("a call refused before the sync server (an unknown alias) still records one row, status error, with no graph", async () => {
+    const result = await call("datalog_query", { graph: "nope", body: { query: QUERY } });
+    expect(result).toMatchObject({ isError: true, text: "unknown graph 'nope' — call list_graphs for the connected aliases" });
+    expect(syncCalls).toEqual([]);
+    const rows = await allRows();
+    expect(rows.map((r) => [r.graph_id, r.alias, r.tool, r.kind, r.status])).toEqual([[null, "nope", "datalog_query", "read", "error"]]);
+  });
+
+  it("an audit insert failure is logged and the result, or the error result, is still returned unchanged", async () => {
+    const failing = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (sql.includes("INSERT INTO audit_log")) {
+              return {
+                bind() {
+                  return this;
+                },
+                run: () => Promise.reject(new Error("D1_ERROR: network connection lost")),
+              };
+            }
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    writeResponse = () => Response.json(ROWS);
+    const ok = await call("datalog_query", { body: { query: QUERY } }, { DB: failing });
+    expect(ok.isError, ok.text).toBe(false);
+    expect(JSON.parse(ok.text)).toEqual(ROWS);
+    writeResponse = () => Response.json({ error: "no named query x" }, { status: 404 });
+    const refused = await call("run_named_query", { name: "x" }, { DB: failing });
+    expect(refused).toMatchObject({ isError: true });
+    expect(refused.text).toContain("no named query x");
+    expect(await allRows()).toEqual([]);
+    const logged = consoleSpies.flatMap((spy) => spy.mock.calls.map((c) => c.join(" ")));
+    expect(logged.filter((l) => l.includes("audit-read-failed"))).toEqual([
+      expect.stringMatching(/^audit-read-failed tool=datalog_query graph=work .*network connection lost/),
+      expect.stringMatching(/^audit-read-failed tool=run_named_query graph=work .*network connection lost/),
+    ]);
+  });
+
+  it("a read tool outside LOGGED_READS records no row: get_page (an error), list_favorites and get_blocks", async () => {
+    readResponse = (path) => (path === "/favorites" ? Response.json({ favorites: [] }) : undefined);
+    expect((await call("get_page", { "page-id": B1 })).isError).toBe(true);
+    expect((await call("list_favorites", {})).isError).toBe(false);
+    expect((await call("get_blocks", { ids: B1 })).isError).toBe(false);
+    expect(await allRows()).toEqual([]);
+  });
+
+  it("every LOGGED_READS name is a READ tool in ANNOTATIONS and the manifest, and only datalog_query and run_named_query are logged", () => {
+    expect([...LOGGED_READS].sort()).toEqual(["datalog_query", "run_named_query"]);
+    for (const name of LOGGED_READS) {
+      expect(ANNOTATIONS[name as keyof typeof ANNOTATIONS], name).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+      expect(committedManifest.find((e) => e.name === name)?.annotations.readOnlyHint, name).toBe(true);
+    }
+  });
+
+  it("get_activity_log listings and id lookups still show only write rows, so a query's read row never appears", async () => {
+    await row({ at: Date.now() - 2000 });
+    writeResponse = () => Response.json(ROWS);
+    await call("datalog_query", { body: { query: QUERY } });
+    await call("run_named_query", { name: "projects-untouched" });
+    const [query, named] = await readRows();
+    expect([query.tool, named.tool]).toEqual(["datalog_query", "run_named_query"]);
+    expect((await activity()).json.entries.map((e) => e.tool)).toEqual(["update_block"]);
+    expect((await activity({ tool: "datalog_query" })).json.entries).toEqual([]);
+    expect((await activity({ status: "ok", tool: "run_named_query" })).json.entries).toEqual([]);
+    expect(await call("get_activity_log", { id: query.id })).toEqual({
+      isError: true,
+      text: `id ${query.id}: no such entry for graph work`,
+      content: [`id ${query.id}: no such entry for graph work`],
+    });
   });
 });
 

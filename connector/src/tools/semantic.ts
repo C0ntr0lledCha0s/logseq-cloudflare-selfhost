@@ -4,7 +4,7 @@ import { registerSemanticApiTools } from "../../vendor/semantic_api_tools.mjs";
 import { connectorHostname } from "../config";
 import type { ResolvedGraph } from "../graphs";
 import { SyncError, type SyncRequest, syncFetch } from "../sync";
-import { ToolError, aliasArg, resolveGraph, runTool } from "./common";
+import { ToolError, aliasArg, lookupGraph, resolveGraph, runTool, withCallGraphs } from "./common";
 
 export { resolveGraph };
 import { type AuditContext, audited } from "../audit/log";
@@ -274,8 +274,55 @@ export function buildGraphTools(spec: OpenApiSpec, access: GraphAccess): GraphTo
 }
 
 /**
+ * The reads that each leave one `kind = 'read'` audit row (spec 2026-11-09-datalog-query-named-queries
+ * §3.10): a query can read anything that is not private, so the owner gets a record of each one.
+ * Each name must be READ in ANNOTATIONS (a test checks it).
+ */
+export const LOGGED_READS: ReadonlySet<string> = new Set(["datalog_query", "run_named_query"]);
+
+/**
+ * What a logged read's row says it addressed: `named:<name>` and `param:<name>` for each param it
+ * gave, sorted, or `datalog:<first 12 hex of the SHA-256 of the query text>`. Never the query text
+ * or a param value, keeping migration 0004's rule against storing raw arguments.
+ */
+async function readAddressed(tool: string, args: Record<string, unknown>): Promise<string[]> {
+  const body = args.body !== null && typeof args.body === "object" ? (args.body as Record<string, unknown>) : {};
+  if (tool === "run_named_query") {
+    const params = body.params !== null && typeof body.params === "object" ? Object.keys(body.params).sort() : [];
+    return [`named:${String(args.name)}`, ...params.map((p) => `param:${p}`)];
+  }
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(body.query))));
+  return [`datalog:${Array.from(digest.subarray(0, 6), (b) => b.toString(16).padStart(2, "0")).join("")}`];
+}
+
+/**
+ * Runs one LOGGED_READS call and records its read row, status `ok` or `error`, with 0 D1 rows read
+ * (the query reads the Durable Object). The graph is looked up once per call (`withCallGraphs`), so
+ * the row's graph id costs no extra D1 read. A row that can't be stored is logged to Workers Logs
+ * and the result, or the error, is returned unchanged.
+ */
+function loggedRead(audit: AuditContext, tool: string, alias: string, args: Record<string, unknown>, run: () => Promise<CallToolResult>): Promise<CallToolResult> {
+  return withCallGraphs(async () => {
+    let status: "ok" | "error" = "error";
+    try {
+      const result = await run();
+      status = "ok";
+      return result;
+    } finally {
+      try {
+        const graphId = (await lookupGraph(audit.access, alias))?.graphId ?? null;
+        await audit.log.recordRead(tool, status, graphId, alias, await readAddressed(tool, args), 0);
+      } catch (error) {
+        console.error(`audit-read-failed tool=${tool} graph=${alias} ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  });
+}
+
+/**
  * Registers built graph tools on one request's server, with the connector's logging, error mapping
- * and result cap. Every write runs through `audited()`, which logs it (refusals and failures too),
+ * and result cap. A read in LOGGED_READS leaves one read row (`loggedRead`); other reads leave none.
+ * Every write runs through `audited()`, which logs it (refusals and failures too),
  * takes its `reason` out of the arguments before the handler sees them, so it never reaches the sync
  * server, and leads the result with a plain summary: what the write touched, by page, breadcrumb and
  * snippet, then the reason, then the audit entry. `onSuccess` runs after each call the sync server
@@ -291,9 +338,11 @@ export function registerGraphTools(server: McpServer, tools: GraphTool[], onSucc
         alias,
         async () => {
           if (!write) {
-            const result = await tool.handler(args);
             // The input schema requires a well-formed alias, so a call that got this far has one.
             if (alias === undefined) throw new Error("graph tool ran without a valid alias");
+            const result = LOGGED_READS.has(tool.name)
+              ? await loggedRead(audit, tool.name, alias, args, () => tool.handler(args))
+              : await tool.handler(args);
             onSuccess(tool.name, alias);
             return result;
           }
