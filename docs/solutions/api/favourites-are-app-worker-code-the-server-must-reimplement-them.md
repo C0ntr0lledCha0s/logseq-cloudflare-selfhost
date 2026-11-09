@@ -29,5 +29,6 @@ None yet. The spike's call is build, as patch 0038 plus `list_favorites`, `set_p
 ## How to catch it next time
 
 - Before searching for an upstream function to call, grep `src/main/frontend/worker` as well as `deps/`; some app behaviour only exists there.
-- Reimplement with `atomic-write!`, seeded order keys and `:bottom? true` on the insert (the app's insert position is *unverified*), and refuse what the app skips silently.
+- Reimplement with `atomic-write!` and seeded order keys, and refuse what the app skips silently. The app's `{}` insert opts put a new favourite at the top (`get-target-block`, `core.cljs:933-938`, and `get-block-orders`, `:715-722`); `:bottom? true` would append, the opposite order.
+- On E2EE graphs the page's name and title are encrypted: find `$$$favorites` by its deterministic uuid, never by name, and never create it there (an upsert by that uuid would overwrite the encrypted name with plaintext).
 - Test on a graph built by `create_graph` with the real outliner. Still *unverified*: whether the target's `:block/updated-at` changes (it would re-embed the page), whether `stamp-tx` stamps the block, and whether older or uploaded graphs lack `$$$favorites`.

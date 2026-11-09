@@ -26,7 +26,7 @@ Date: 2026-11-09. Stacked on patch 0037 (code blocks, PR 46), so a build would b
 ### 2. Safe server writes
 
 - **One tx id.** `atomic-write!` (`handler/semantic.cljs:2481`) wraps `authored-write!` (:1933) and `ldb/batch-transact-with-temp-conn!`, the path batch writes already use (`docs/solutions/sync/batch-replayed-with-mixed-tx-ids.md`). Changes reach clients as ordinary sync txs (`broadcast-change!`, :477).
-- **Order key.** `handle` runs `(db-order/reset-max-key! (db-order/get-max-order db))` before every dispatch (:5239), so a new favourite takes a key above the graph-wide max (`docs/solutions/sync/order-key-not-seeded-for-server-writes.md`). Whether the app's `{}` insert opts append or prepend is **not verified** (`deps/outliner/src/logseq/outliner/core.cljs:898-935`). The handler should pass `:bottom? true`, as `insert-tree!` (:1546) does, and a test must pin it.
+- **Order key.** `handle` runs `(db-order/reset-max-key! (db-order/get-max-order db))` before every dispatch (:5239), so new keys never collide with existing ones (`docs/solutions/sync/order-key-not-seeded-for-server-writes.md`). Insert position, corrected by the challenge: with the app's `{}` opts, `get-target-block` (`core.cljs:933-938`) returns the page with no sibling, and `get-block-orders` (`core.cljs:715-722`) makes a key between nil and the first child, so **the app puts a new favourite at the top**. `:bottom? true` would append instead, the opposite of the app. The spec must choose, and a test must check sibling order, not the graph-wide max.
 - **Reorder.** The app does not move blocks. It walks the existing blocks in order and, where slot *i* links to a different page from the requested *i*th page, rewrites that block's `:block/link` with `:save-block`. Order keys never change, so no seeding is needed. The app silently skips unresolvable uuids and does not check the list is a permutation of the current favourites; the server must refuse that up front.
 - **Remove.** `delete-blocks` hard-retracts the link block (`core.cljs:575-587`), with no Recycle step. The page is untouched. The block is not built-in, so the built-in refusal (`core.cljs:1317-1345`) does not fire.
 - **Missing `$$$favorites`.** The app silently does nothing (`when-let` in `graph.cljs:68-73` and `:100-117`). Here that would be a silent success. The handler should create the page on the write's tx-conn with the `create_graph` attributes, following `ensure-activity-page!` (:1868), and reads should return an empty list. That is a raw transact, so its checks are hand-written (`docs/solutions/api/handler-writes-skip-outliner-guards-and-implicit-holders.md`). Whether uploaded or older graphs ever lack the page is **unknown** (`docs/solutions/sync/uploaded-graph-keeps-the-apps-schema-drift.md` says drift happens).
@@ -83,6 +83,18 @@ Per write call (add, remove, reorder), from the audit log's pinned costs (`conne
 5. Remove as a delete needs dry-run support and a new snapshot source, or the audit log cannot show what was removed.
 6. Target policy is unknown from the app side; a wrong policy would let Claude favourite something the app never offers.
 7. E2EE graphs: behaviour unknown. Refuse title resolution there like other handlers, or accept uuids only.
+
+## Challenge
+
+The adversarial challenge judged the call sound (build) and found these gaps. They are open questions for the spec, not settled here.
+
+- **Insert position** (corrected above): the app prepends. Matching the app is the default unless the owner prefers newest last.
+- **E2EE graphs, blocker for the create path.** On E2EE graphs `:block/name` and `:block/title` are encrypted (`src/main/frontend/worker/sync/const.cljs:25-27`; `crypt_test.cljs:1348` encrypts `$$$favorites`). A lookup by name finds nothing, and creating the page with its deterministic uuid would upsert onto the existing page and overwrite its encrypted name with plaintext. Look the page up by its deterministic uuid, and never create it on an E2EE graph.
+- **Does `$$$favorites` exist on real graphs?** Unanswered. If it is on every graph, drop the create path (the riskiest code).
+- **Untested flip conditions.** Whether add or the link-rewrite reorder bumps the target's `:block/updated-at`, whether `save-block` keeps a changed `:block/link` and updates `:block/refs`, and whether clients mishandle a server-created page. Patch 0038's first tests should settle these.
+- **Target policy** is partly answerable from code: the app offers favourite from the page menu (`page_menu.cljs:106-111`, needs `entity/page?`, a `:block/name` and a name that is not a uuid) and the header (`header.cljs:186-201`).
+- **Read path.** A purged target leaves a link-less block, and a client add racing a server reorder can leave two blocks linking one page. `list_favorites` should skip link-less blocks and dedupe, and the reorder permutation check should allow for duplicates.
+- **Use.** Whether the owner will use favourites from Claude enough to justify three tools is not researchable; it is the owner's call.
 
 ## What would change the answer
 
