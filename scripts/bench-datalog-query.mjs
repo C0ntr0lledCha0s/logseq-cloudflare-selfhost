@@ -330,7 +330,12 @@ export function runShape(ns, shape, db, scanCap) {
   const refused = get(result, status);
   if (refused != null) {
     const error = get(result, kw("logseq.db-sync.worker.handler.datalog", "error"));
-    const outcome = refused !== 422 ? "refused" : error.includes("the row cap of") ? "row-cap" : "scan-cap";
+    const outcome =
+      refused !== 422 ? "refused"
+      : error.includes("the row cap of") ? "row-cap"
+      : error.includes("(the join cap)") ? "join-cap"
+      : error.includes("(the value cap)") ? "value-cap"
+      : "scan-cap";
     return { ms, scanned, outcome, rows: 0, error };
   }
   return { ms, scanned, outcome: "rows", rows: get(result, kw("returned")), total: get(result, kw("total-rows")) };

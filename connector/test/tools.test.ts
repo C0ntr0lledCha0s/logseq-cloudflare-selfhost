@@ -1900,6 +1900,31 @@ describe("audit log", () => {
     expect(lookups).toBe(1);
   });
 
+  it("one graph lookup per logged read: datalog_query and run_named_query reuse the graph loggedRead resolved", async () => {
+    // loggedRead wraps the call in withCallGraphs, so request() and the audit row share one lookup;
+    // without it each query reads the graphs row from D1 twice.
+    syncHandler = () => Response.json({ columns: ["?t"], rows: [], "total-rows": 0, returned: 0 });
+    let lookups = 0;
+    const counting = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (/FROM graphs WHERE alias = \?/.test(sql)) lookups += 1;
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const e = testEnv({ DB: counting });
+    await callContent("datalog_query", { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } }, connector(e));
+    expect(lookups).toBe(1);
+    lookups = 0;
+    await callContent("run_named_query", { graph: "work", name: "projects-untouched" }, connector(e));
+    expect(lookups).toBe(1);
+  });
+
   it("no secrets: the PAT, the Authorization header, GRAPH_TOKEN_KEY and sent block text appear in no column", async () => {
     const BLOCK_TEXT = "CANARY-BLOCK-TEXT-7f3a";
     const BEARER = "CANARY-OAUTH-TOKEN-91c2";
@@ -2447,6 +2472,12 @@ describe("queries help", () => {
     ["total-rows", "total-rows counts every row"],
     ["the scan cap's number", "scans more than 20,000 datoms (the scan cap)"],
     ["the row cap's number", "matches more than 2,500 rows (the row cap)"],
+    ["the join cap's number", "builds more than 20,000 rows while joining (the join cap"],
+    ["the aggregate doesn't fold a join", "(which folds rows for the row cap, not the join cap)"],
+    ["no collection constructors", "no vector, list, set, hash-map, array-map or tuple"],
+    ["joining functions take one variable", "str, + and keyword take at most one ?variable"],
+    ["the Recycle bin", "and so is anything in the Recycle bin"],
+    ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
     ["the 422", "is refused with 422, never answered in part"],
     ["how to narrow", "narrow it with a tag, page or attribute value"],
     ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
@@ -2454,7 +2485,7 @@ describe("queries help", () => {
     ["handles", "Pull :block/uuid and :block/title to get handles for the other tools"],
     ["pure functions only", "Only pure functions are allowed"],
     ["the allowed functions", "(comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like"],
-    ["no regex, range or rand", "no regex, range or rand)"],
+    ["no regex, range or rand", "no regex, range or rand, and no vector"],
     ["clauses share variables", "clauses must share variables (a cross product is refused)"],
     ["no left recursion", "a rule must read data before it calls itself"],
     ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
@@ -2477,6 +2508,7 @@ describe("queries help", () => {
   it.each([
     ["scan cap", /more than ([\d,]+) datoms \(the scan cap/],
     ["row cap", /more than ([\d,]+) rows \(the row cap/],
+    ["join cap", /more than ([\d,]+) rows while joining \(the join cap/],
   ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
     const query = (await listTools()).find((t) => t.name === "datalog_query");
     const server = query.description.match(pattern)?.[1];

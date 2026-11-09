@@ -72,7 +72,7 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
       assert.ok(r[k] >= 0, `${where}: ${k}`);
     }
     assert.ok(Number.isInteger(r.datoms_scanned), `${where}: datoms_scanned`);
-    assert.ok(["rows", "scan-cap", "row-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
+    assert.ok(["rows", "scan-cap", "join-cap", "value-cap", "row-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
     // The filter throws on the datom after the cap, so no run counts more than cap + 1.
     assert.ok(r.datoms_scanned <= 3001, `${where}: scanned ${r.datoms_scanned}`);
   }

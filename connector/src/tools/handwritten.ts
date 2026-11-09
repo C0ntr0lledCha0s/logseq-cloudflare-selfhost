@@ -17,17 +17,17 @@ export const FAVOURITES_HELP =
 
 /**
  * connector_help's Queries paragraph (patch 0039, spec 2026-11-09-datalog-query-named-queries §4). The
- * caps repeat the server's (datalog.cljs scan-cap and row-cap); a test checks them against the
+ * caps repeat the server's (datalog.cljs scan-cap, join-cap and row-cap); a test checks them against the
  * vendored openapi text. The audit sentence says what LOGGED_READS does in semantic.ts.
  */
 export const QUERIES_HELP =
   "Queries: datalog_query runs a read-only Datalog query (EDN, at most 4,000 characters) against the graph. " +
   "Prefer run_named_query when one fits: projects-untouched, meetings-without-decision, open-tasks-by-client and pages-missing-property, each with defaults you can override in params; a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param, so pass the graph's own tag or property. " +
   "Results are cut to limit rows (default 50, maximum 200) and then to about 100,000 characters (the byte cap), and truncated says which cap applied; total-rows counts every row. " +
-  "A query that scans more than 20,000 datoms (the scan cap) or matches more than 2,500 rows (the row cap) is refused with 422, never answered in part: narrow it with a tag, page or attribute value, or count with an aggregate such as (count ?b). projects-untouched can reach the scan cap on a large graph. " +
+  "A query that scans more than 20,000 datoms (the scan cap), builds more than 20,000 rows while joining (the join cap: a join through a shared value, such as two blocks with the same tag, matches every pair) or matches more than 2,500 rows (the row cap) is refused with 422, never answered in part: narrow it with a tag, page or attribute value, bind one side of a join, or count with an aggregate such as (count ?b) (which folds rows for the row cap, not the join cap). projects-untouched can reach the scan cap on a large graph. " +
   "Pull :block/uuid and :block/title to get handles for the other tools. " +
-  "Only pure functions are allowed (comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like; no regex, range or rand), clauses must share variables (a cross product is refused), and a rule must read data before it calls itself. " +
-  "Anything tagged Private, on a private page or under a private block is left out. Unavailable on E2EE graphs (409). " +
+  "Only pure functions are allowed (comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like; no regex, range or rand, and no vector, list, set, hash-map, array-map or tuple); str, + and keyword take at most one ?variable, the others literals; clauses must share variables (a cross product is refused), and a rule must read data before it calls itself. " +
+  "Anything tagged Private, on a private page or under a private block is left out, and so is anything in the Recycle bin, as list_tasks leaves it out. open-tasks-by-client lists a task with two clients under each. Unavailable on E2EE graphs (409). " +
   "dry-run: true checks the query and shows it without running it. " +
   "Each call is recorded in the audit log as a read (a hash of the query, or the named query and the names of its params; never the rows); get_activity_log lists writes, so it doesn't show them.";
 
