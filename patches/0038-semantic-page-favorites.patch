@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 9f8eb44..9e7c638 100644
+index 9f8eb44..43df9ca 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -3,9 +3,11 @@
@@ -14,7 +14,7 @@ index 9f8eb44..9e7c638 100644
              [logseq.db :as ldb]
              [logseq.db.common.order :as db-order]
              [logseq.db-sync.common :as common]
-@@ -5122,6 +5124,188 @@
+@@ -5122,6 +5124,192 @@
            (http/json-response nil (assoc feed :epoch epoch :t t))
            (http/error-response "changes since that point are no longer available; list again without since" 410))))))
  
@@ -176,7 +176,11 @@ index 9f8eb44..9e7c638 100644
 +                        (seq body-errors) {:status 400 :error (string/join "; " body-errors)}
 +                        (:error selected) selected
 +                        favorite? (favourite-refusal page-id target)
-+                        (nil? target) {:status 404 :error (str "page-id: no page " page-id)})
++                        ;; A remove 404s a hidden target ($$$favorites included) as an add does, but
++                        ;; still takes a recycled page, to clear the favourite deletePage left behind.
++                        (or (nil? target)
++                            (and (entity-util/hidden? target) (not (entity-util/recycled? target))))
++                        {:status 404 :error (str "page-id: no page " page-id)})
 +              noop (when-not refusal
 +                     (if favorite?
 +                       (when (favorite-stored? db (:db/id target) true) "already a favourite")
@@ -203,7 +207,7 @@ index 9f8eb44..9e7c638 100644
  (def ^:private page-handlers
    #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
      :semantic/pages-references :semantic/pages-get
-@@ -5209,6 +5393,7 @@
+@@ -5209,6 +5397,7 @@
      (contains? block-handlers handler) (handle-blocks context)
      (contains? block-property-handlers handler) (handle-block-properties context)
      (contains? capture-and-tag-handlers handler) (handle-capture-and-tags context)
@@ -290,10 +294,10 @@ index 74d0061..9caa669 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
 new file mode 100644
-index 0000000..bec3898
+index 0000000..8ea14e2
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
-@@ -0,0 +1,730 @@
+@@ -0,0 +1,735 @@
 +(ns logseq.db-sync.semantic-favorites-test
 +  "Page favourites (patch 0038). Favourites are child blocks of the hidden page $$$favorites, each
 +  linking a page with :block/link; the app's db worker reads and writes them, and deps/db-sync had
@@ -773,7 +777,8 @@ index 0000000..bec3898
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self alpha secret block]}]
-+        (add-favourites! conn [alpha])
++        ;; Secret, a hidden page, holds a slot too: a remove must 404 rather than clear it.
++        (add-favourites! conn [alpha secret])
 +        (let [{:keys [old uuid-named asset board twin-a twin-b]} (seed-refusal-kinds conn)
 +              missing (random-uuid)
 +              label (fn [id] (str "page-id: \"" (:block/title (entity conn id)) "\" (" id ") "))]
@@ -782,6 +787,10 @@ index 0000000..bec3898
 +                    [["the favourites page by uuid" favorites-uuid {:favorite true} 404 (str "page-id: no page " favorites-uuid)]
 +                     ["the favourites page by title" "$$$favorites" {:favorite true} 404 "page-id: no page titled \"$$$favorites\""]
 +                     ["a hidden page" secret {:favorite true} 404 (str "page-id: no page " secret)]
++                     ["the favourites page by uuid, remove" favorites-uuid {:favorite false} 404 (str "page-id: no page " favorites-uuid)]
++                     ["the favourites page by title, remove" "$$$favorites" {:favorite false} 404 "page-id: no page titled \"$$$favorites\""]
++                     ["a hidden page with a slot, remove" secret {:favorite false} 404 (str "page-id: no page " secret)]
++                     ["a hidden page by title, remove" "Secret" {:favorite false} 404 "page-id: no page titled \"Secret\""]
 +                     ["a missing uuid" missing {:favorite true} 404 (str "page-id: no page " missing)]
 +                     ["a missing uuid, remove" missing {:favorite false} 404 (str "page-id: no page " missing)]
 +                     ["a missing title" "Nowhere" {:favorite true} 404 "page-id: no page titled \"Nowhere\""]
@@ -811,7 +820,7 @@ index 0000000..bec3898
 +               (is (= 409 (:status ambiguous)) (pr-str ambiguous))
 +               (is (= #{(str twin-a) (str twin-b)} (set (map :uuid (get-in ambiguous [:body :candidates])))))
 +               (is (= before (snapshot conn))))
-+             (is (= [alpha] (slot-links conn))))))))))
++             (is (= [alpha secret] (slot-links conn))))))))))
 +
 +;; Review focus 2: what the app's page menu offers is accepted: a visible built-in page, a journal
 +;; (by uuid and by its date), a tag and a property.
