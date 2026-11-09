@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..f8c32c8
+index 0000000..a0b0e4f
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,855 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -19,9 +19,11 @@ index 0000000..f8c32c8
 +
 +  Bounded by work, not time (the Worker clock does not move during synchronous CPU work): the filter
 +  counts every datom it is asked about, kept or dropped, and past the scan cap the query stops and
-+  answers 422. A rule that calls back into itself (directly or through other rules) before a data
-+  pattern binds one of the call's variables would expand without reading datoms, so the cap could
-+  not stop it; it is refused with 400 before the query runs. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
++  answers 422. A join can return far more rows than it reads datoms (a self-join through one tag
++  on n entities gives n² rows), and every row is sorted before limit applies, so past the row cap
++  the query answers 422 before the sort. A rule that calls back into itself (directly or through
++  other rules) before a data pattern binds one of the call's variables would expand without reading
++  datoms, so the cap could not stop it; it is refused with 400 before the query runs. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
 +  no recursion, at most 50 values per many attribute) is pulled only for the rows kept after the
 +  limit. Rows are added to the response until its JSON would pass the byte cap, so the connector
 +  never cuts it mid-row."
@@ -41,6 +43,12 @@ index 0000000..f8c32c8
 +  from scripts/bench-datalog-query.mjs: at 5,000 pages a counted shape at the cap, plus the private
 +  set, takes about 92 ms warm under Node, the slowest request README records as tolerated."
 +  20000)
++(def row-cap
++  "Rows the query may match before they are sorted; past it the query answers 422. Set from
++  scripts/bench-datalog-query.mjs: the sort costs about 10 µs a row (up to 22 µs on a two-column
++  self-join), so 2,500 rows add about 25 ms to the 47 ms private set at 5,000 pages, under the
++  92 ms tail. The rows are counted after d/q has built them, so this bounds the sort, not the join."
++  2500)
 +(def byte-cap 100000)
 +(def default-limit 50)
 +(def max-limit 200)
@@ -576,6 +584,11 @@ index 0000000..f8c32c8
 +  (str "query stopped after scanning " (format-count cap) " datoms (the scan cap); narrow it with a tag, page or"
 +       " attribute value, or use a named query"))
 +
++(defn- row-cap-message [rows cap]
++  (str "query matched " (format-count rows) " rows, more than the row cap of " (format-count cap)
++       "; every row is sorted before limit applies, so narrow it with a tag, page or attribute value,"
++       " or count them with an aggregate such as (count ?b)"))
++
 +(defn- run-refusal
 +  "An error raised while running the caller's query or its pulls: the scan cap as 422, anything
 +  else as a 400 naming it. Never a 500."
@@ -704,9 +717,10 @@ index 0000000..f8c32c8
 +  "Runs the normalised, validated query `q` on `db` filtered for privacy, with pulls run on the kept
 +  rows only; returns {:columns :rows :total-rows :returned :truncated?} merged with `echo` (the
 +  fields the response repeats, counted in the byte cap), or a refusal. `scan-cap` replaces the
-+  constant (tests)."
++  constant, and `row-cap` the row cap (tests)."
 +  [db {:keys [query inputs rules limit echo] :as opts}]
 +  (let [cap (or (:scan-cap opts) scan-cap)
++        max-rows (or (:row-cap opts) row-cap)
 +        original (relation-find (:find query))
 +        {find :find pulls :pulls} (rewrite-pulls original)
 +        schema (d/schema db)
@@ -726,15 +740,18 @@ index 0000000..f8c32c8
 +            columns (or (some->> (or (:keys query) (:strs query) (:syms query)) (mapv str))
 +                        (mapv pr-str original))
 +            result (try
-+                     (let [rows (sort-rows (map vec (apply d/q runnable (query-args (:in query) fdb rules inputs))))
-+                           kept (subvec rows 0 (min limit (count rows)))]
-+                       {:total (count rows)
-+                        :kept (mapv (fn [row]
-+                                      (reduce-kv (fn [row i {:keys [pattern shape]}]
-+                                                   (swap! last-run update :pulled inc)
-+                                                   (assoc row i (trim-pulled shape (d/pull fdb pattern (nth row i)))))
-+                                                 row pulls))
-+                                    kept)})
++                     (let [matched (apply d/q runnable (query-args (:in query) fdb rules inputs))]
++                       (if (> (count matched) max-rows)
++                         (refusal 422 (row-cap-message (count matched) max-rows))
++                         (let [rows (sort-rows (map vec matched))
++                               kept (subvec rows 0 (min limit (count rows)))]
++                           {:total (count rows)
++                            :kept (mapv (fn [row]
++                                          (reduce-kv (fn [row i {:keys [pattern shape]}]
++                                                       (swap! last-run update :pulled inc)
++                                                       (assoc row i (trim-pulled shape (d/pull fdb pattern (nth row i)))))
++                                                     row pulls))
++                                        kept)})))
 +                     (catch :default e (run-refusal e))
 +                     (finally (swap! last-run assoc :scanned @counter)))]
 +        (if (refusal? result)
@@ -811,11 +828,11 @@ index 0000000..f8c32c8
 +    (http/error-response (::error result) (::status result))
 +    (http/json-response :semantic/datalog-query result)))
 +
-+(defn- test-scan-cap
-+  "The scan cap a test set on the Durable Object (`datalogScanCap`), in place of the constant. No
-+  request can set it."
-+  [^js self]
-+  (let [cap (some-> self (unchecked-get "datalogScanCap"))]
++(defn- test-cap
++  "A cap a test set on the Durable Object (`datalogScanCap`, `datalogRowCap`), in place of the
++  constant. No request can set it."
++  [^js self field]
++  (let [cap (some-> self (unchecked-get field))]
 +    (when (and (integer? cap) (not (neg? cap))) cap)))
 +
 +(defn handle-query
@@ -839,7 +856,8 @@ index 0000000..f8c32c8
 +                                      :rules (pr-str (or (:rules parsed) []))}
 +             :else (run-query db {:query (:query parsed) :inputs (:inputs parsed) :rules (:rules parsed)
 +                                  :limit (or (:limit body) default-limit)
-+                                  :scan-cap (test-scan-cap self)
++                                  :scan-cap (test-cap self "datalogScanCap")
++                                  :row-cap (test-cap self "datalogRowCap")
 +                                  :echo {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}}))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 index d8e3144..1d0fb1f 100644
@@ -862,7 +880,7 @@ index d8e3144..1d0fb1f 100644
  
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..d8335e5 100644
+index 1365b0a..03a6634 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,9 @@
@@ -883,7 +901,7 @@ index 1365b0a..d8335e5 100644
 +                   (str "Runs a read-only Datalog query against the graph and returns the rows. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, tuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions and a function passed in through inputs (a ?variable in function position) are refused. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p))."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible."
-+                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
++                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
     "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
     "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
@@ -919,7 +937,7 @@ index 1365b0a..d8335e5 100644
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
-+           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) and was stopped; the error names the cap. Narrow it with a tag, page or attribute value"}}
++           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) and was stopped, or matched more than 2,500 rows (the row cap) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
@@ -947,10 +965,10 @@ index 1365b0a..d8335e5 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..1957717
+index 0000000..e9b0249
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,1173 @@
+@@ -0,0 +1,1259 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -1663,14 +1681,15 @@ index 0000000..1957717
 +                _ (assert (> (:datoms before) 20000) (pr-str before))
 +                everything (query! self '[:find ?e ?a ?v :where [?e ?a ?v]])
 +                scanned (:scanned @datalog/last-run)
-+                titles (query! self '[:find ?b :where [?b :block/title]])]
++                ;; Every title datom is read (under the scan cap); 1,111 rows match (under the row cap).
++                titles (query! self '[:find ?b :where [?b :block/title ?t] [(clojure.string/starts-with? ?t "zq filler 1")]])]
 +          (testing "an unconstrained query over a graph above the cap answers 422 naming the cap, never 500"
 +            (is (= [422 (cap-message "20,000")] [(:status everything) (get-in everything [:body :error])])
 +                (pr-str (:status everything) (subs (:text everything) 0 (min 300 (count (:text everything))))))
 +            (is (= 20001 scanned) "it stops at the first datom past the cap")
 +            (is (= before (snapshot conn))))
 +          (testing "a query under the cap on the same graph still answers rows"
-+            (is (= 200 (:status titles)) (pr-str (:status titles)))
++            (is (= [200 1111] [(:status titles) (get-in titles [:body :total-rows])]) (pr-str (:status titles)))
 +            (is (= 50 (get-in titles [:body :returned])))))))))
 +
 +(deftest scan-cap-exact-test
@@ -1820,6 +1839,90 @@ index 0000000..1957717
 +              (is (= 200 (:status response)) (pr-str response))
 +              (is (contains? (set (map first (get-in response [:body :rows]))) "zq Public child")
 +                  (pr-str response)))))))))
++
++;; The row cap: a join that fans out from few datoms
++;; =================================================
++
++(defn- row-cap-message [rows cap]
++  (str "query matched " rows " rows, more than the row cap of " cap "; every row is sorted before limit"
++       " applies, so narrow it with a tag, page or attribute value, or count them with an aggregate such as"
++       " (count ?b)"))
++
++(defn- set-row-cap!
++  "The test-only row cap the handler reads from the Durable Object (`self`), in place of the
++  constant; nil restores the constant. No request can set it."
++  [self n]
++  (unchecked-set self "datalogRowCap" n))
++
++(def ^:private fanout-blocks
++  "Blocks tagged Topic the row-cap tests add: 51 × 51 = 2,601 rows from a self-join, over the
++  2,500-row cap, from a few hundred datoms, so the scan cap never fires."
++  51)
++
++(deftest row-cap-test
++  ;; A self-join through one tag reads few datoms but returns n² rows, and every row was sorted
++  ;; before limit applied: a tag on 500 pages gave 260,100 rows and 6.6 s of sort. Each shape
++  ;; that can fan out like that (a plain join, a join whose rows are pulled, a rule, an or-join)
++  ;; is refused with 422 before the sort; an aggregate that folds the fan-out into few rows is not.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [_ (bulk! self notes fanout-blocks #(str "zq fan " (pad2 %) " #Topic"))
++                before (snapshot conn)
++                topic '[?t :block/title "Topic"]
++                cases [["a self-join through one tag"
++                        {:q [:find '?a '?c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]
++                       ["the same join with a pull in :find (pulls run after the cap)"
++                        {:q [:find '(pull ?a [:block/title]) '?c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]
++                       ["the join inside a rule"
++                        {:q '[:find ?a ?c :in $ % :where [?t :block/title "Topic"] (tagged ?a ?t) (tagged ?c ?t)]
++                         :rules '[[(tagged ?b ?t) [?b :block/tags ?t]]]}]
++                       ["the join through an or-join"
++                        {:q [:find '?a '?c :where topic '[?a :block/tags ?t]
++                             '(or-join [?t ?c] [?c :block/tags ?t] [?c :block/refs ?t])]}]
++                       ["the join with :keys"
++                        {:q [:find '?a '?c :keys 'a 'c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]]
++                responses (p/all (for [[_ {:keys [q rules]}] cases]
++                                   (p/let [r (if rules (query! self q :rules rules) (query! self q))]
++                                     (assoc r :last-run @datalog/last-run))))
++                folded (query! self [:find '?a '(count ?c) :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]
++                               :limit 200)
++                one-side (query! self [:find '?c :where topic '[?a :block/tags ?t] '[?a :block/title ?at]
++                                       '[(clojure.string/starts-with? ?at "zq fan 00 ")]
++                                       '[?c :block/tags ?t]]
++                                 :limit 200)]
++          (doseq [[[label] response] (map vector cases responses)]
++            (testing (str label ": 422 naming the rows and the cap, never 500")
++              (is (= [422 (row-cap-message "2,601" "2,500")] [(:status response) (get-in response [:body :error])])
++                  (pr-str (:status response) (subs (:text response) 0 (min 300 (count (:text response))))))
++              (is (< (get-in response [:last-run :scanned]) 20000) "the scan cap did not fire")
++              (is (zero? (get-in response [:last-run :pulled])) "nothing was pulled")))
++          (testing "an aggregate that folds the fan-out into one row per block still answers"
++            (is (= [200 fanout-blocks] [(:status folded) (get-in folded [:body :total-rows])]) (pr-str (:status folded)))
++            (is (every? #(= fanout-blocks (second %)) (get-in folded [:body :rows]))))
++          (testing "the join with one side bound answers its rows"
++            (is (= [200 fanout-blocks] [(:status one-side) (get-in one-side [:body :total-rows])]) (pr-str one-side)))
++          (is (= before (snapshot conn))))))))
++
++(deftest row-cap-exact-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self notes]}]
++        (p/let [_ (bulk! self notes 3 #(str "zq fan " % " #Topic"))
++                q '[:find ?a ?c :where [?t :block/title "Topic"] [?a :block/tags ?t] [?c :block/tags ?t]]
++                _ (set-row-cap! self 9)
++                at-cap (query! self q)
++                _ (set-row-cap! self 8)
++                over-cap (query! self q)
++                _ (set-row-cap! self nil)
++                restored (query! self q)]
++          (testing "a query that matches exactly the cap answers its rows"
++            (is (= [200 9] [(:status at-cap) (get-in at-cap [:body :total-rows])]) (pr-str at-cap)))
++          (testing "one row over the cap answers 422 naming the rows and the cap"
++            (is (= [422 (row-cap-message "9" "8")] [(:status over-cap) (get-in over-cap [:body :error])])
++                (pr-str over-cap)))
++          (testing "the override cleared, the constant applies again"
++            (is (= 200 (:status restored)) (pr-str restored))))))))
 +
 +(deftest pull-star-bounded-test
 +  (async done
@@ -2097,11 +2200,12 @@ index 0000000..1957717
 +        post (get-in document [:paths "/api/v1/graphs/{graph-id}/query" :post])
 +        truncated (get-in document [:components :schemas :DatalogQueryResponse :properties :truncated])]
 +    (doseq [phrase ["scan cap" "20,000 datoms" "422" "truncated" "byte-cap" "100,000 characters" "at most 2 levels deep"
-+                    "at most 50 values" "refs as numbers" "left recursion"]]
++                    "at most 50 values" "refs as numbers" "left recursion" "row cap" "2,500 rows"]]
 +      (is (string/includes? (:description post) phrase) phrase))
 +    (is (= ["limit" "byte-cap"] (get-in truncated [:properties :by :enum])))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "scan cap"))
-+    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 datoms"))))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 datoms"))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "2,500 rows (the row cap)"))))
 +
 +
 +(deftest pull-reads-only-its-entity-test

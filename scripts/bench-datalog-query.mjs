@@ -78,7 +78,8 @@ export const BODIES = {
              (not-join [?p] [?b :block/page ?p] [?b :block/refs ?r] [?r :block/tags ?t])]`,
   },
   // A self-join on the 60 blocks tagged Bench Chain: not a cross product, as ?t joins every
-  // clause, but it returns 60 × 60 rows from the few datoms it reads.
+  // clause, but it matches 60 × 60 rows from the few datoms it reads, over the row cap (2,500),
+  // so it times d/q and the refusal before the sort.
   "join-fanout": {
     query: `[:find ?a ?c :where [?t :block/name "bench chain"] [?a :block/tags ?t] [?c :block/tags ?t]]`,
   },
@@ -328,7 +329,9 @@ export function runShape(ns, shape, db, scanCap) {
   const scanned = get(cljs.deref(datalog.last_run), kw("scanned"));
   const refused = get(result, status);
   if (refused != null) {
-    return { ms, scanned, outcome: refused === 422 ? "scan-cap" : "refused", rows: 0, error: get(result, kw("logseq.db-sync.worker.handler.datalog", "error")) };
+    const error = get(result, kw("logseq.db-sync.worker.handler.datalog", "error"));
+    const outcome = refused !== 422 ? "refused" : error.includes("the row cap of") ? "row-cap" : "scan-cap";
+    return { ms, scanned, outcome, rows: 0, error };
   }
   return { ms, scanned, outcome: "rows", rows: get(result, kw("returned")), total: get(result, kw("total-rows")) };
 }

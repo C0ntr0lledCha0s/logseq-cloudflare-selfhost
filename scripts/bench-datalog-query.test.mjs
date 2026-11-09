@@ -72,7 +72,7 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
       assert.ok(r[k] >= 0, `${where}: ${k}`);
     }
     assert.ok(Number.isInteger(r.datoms_scanned), `${where}: datoms_scanned`);
-    assert.ok(["rows", "scan-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
+    assert.ok(["rows", "scan-cap", "row-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
     // The filter throws on the datom after the cap, so no run counts more than cap + 1.
     assert.ok(r.datoms_scanned <= 3001, `${where}: scanned ${r.datoms_scanned}`);
   }
@@ -86,14 +86,15 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
   // The pull returns rows on the tagged pages and is cut to limit 200 only when there are more.
   assert.equal(at("pull-star-200", 150).outcome, "rows");
   assert.ok(at("pull-star-200", 150).rows <= 200);
-  // Work the cap does not count: a recursive rule down a 60-block chain reads a few datoms per
-  // level, and a self-join on the chain's tag returns far more rows than the datoms it reads.
+  // Work the scan cap does not count: a recursive rule down a 60-block chain reads a few datoms
+  // per level, and a self-join on the chain's tag matches far more rows than the datoms it reads,
+  // which the row cap (2,500) refuses before the sort.
   assert.equal(at("rule-deep-chain", 300).outcome, "rows");
   assert.equal(at("rule-deep-chain", 300).total_rows, 60);
   assert.ok(at("rule-deep-chain", 300).datoms_scanned < 1000, "the chain reads few datoms");
-  assert.equal(at("join-fanout", 300).outcome, "rows");
-  assert.equal(at("join-fanout", 300).total_rows, 3600, "60 × 60 rows");
-  assert.ok(at("join-fanout", 300).total_rows > at("join-fanout", 300).datoms_scanned, "rows outgrow the datoms read");
+  assert.equal(at("join-fanout", 300).outcome, "row-cap");
+  assert.match(at("join-fanout", 300).error, /^query matched 3,600 rows, more than the row cap of 2,500;/, "60 × 60 rows");
+  assert.ok(at("join-fanout", 300).datoms_scanned < 3600, "rows outgrow the datoms read");
 });
 
 test("each shape's cold run starts from a freshly restored conn, whatever ran before it", { skip }, () => {
