@@ -14,8 +14,29 @@ if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
   exit 1
 fi
 
+created=0
+[ -e "$dest" ] || created=1
 mkdir -p "$dest"
 dest="$(cd "$dest" && pwd)"
+
+# On any failure (fetch, checkout, a patch that doesn't apply, a signal), leave
+# nothing behind: remove dest if this run created it, or empty it if it was an
+# empty dir we were given. Success keeps dest, since it is the output.
+cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$created" -eq 1 ]; then
+      rm -rf "$dest"
+    else
+      find "$dest" -mindepth 1 -delete 2>/dev/null || true
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 git -C "$dest" init -q
 git -C "$dest" remote add origin "$upstream_url"
 git -C "$dest" fetch -q --depth 1 origin "$ref"
@@ -26,7 +47,6 @@ for patch in "$patches_dir"/*.patch; do
   name="$(basename "$patch")"
   if ! git -C "$dest" apply --check "$patch" 2>&1 || ! git -C "$dest" apply "$patch"; then
     echo "patch failed: $name" >&2
-    rm -rf "$dest"
     exit 1
   fi
   echo "applied $name"
