@@ -1,0 +1,115 @@
+{
+  "operationId": "insertBlockTree",
+  "status": "201",
+  "tool": "insert_block_tree",
+  "response": {
+    "blocks": [
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb1",
+        "title": "#include <stdio.h>",
+        "display-type": "code",
+        "lang": "c",
+        "children": [
+          {
+            "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb2",
+            "title": "print(1)",
+            "display-type": "code",
+            "lang": "python"
+          }
+        ]
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb3",
+        "title": "E=mc^2",
+        "display-type": "math",
+        "converted": "fence"
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb4",
+        "title": "Example",
+        "display-type": "quote"
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb5",
+        "title": "```query\n{{query todo}}\n```"
+      }
+    ],
+    "count": 5,
+    "kept": [
+      {
+        "path": "blocks[3]",
+        "reason": "query fences stay text; a Query block is not supported yet"
+      }
+    ],
+    "target": {
+      "uuid": "8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d05",
+      "kind": "block",
+      "page": {
+        "uuid": "00000001-2026-1105-0000-000000000000",
+        "title": "Nov 5th, 2026"
+      },
+      "breadcrumb": [
+        "Meeting"
+      ],
+      "snippet": "Agenda"
+    },
+    "affected": [
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb1",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "#include <stdio.h>",
+        "descendants": 1
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb3",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "E=mc^2",
+        "descendants": 0
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb4",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "Example",
+        "descendants": 0
+      },
+      {
+        "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb5",
+        "kind": "block",
+        "page": {
+          "uuid": "00000001-2026-1105-0000-000000000000",
+          "title": "Nov 5th, 2026"
+        },
+        "breadcrumb": [
+          "Meeting",
+          "Agenda"
+        ],
+        "snippet": "```query",
+        "descendants": 0
+      }
+    ]
+  }
+}

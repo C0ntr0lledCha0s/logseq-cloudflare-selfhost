@@ -190,6 +190,8 @@ export const DRY_RUN_TOOLS = Object.freeze({
   delete_blocks: "body",
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
+  insert_block_children: "body",
+  insert_block_tree: "body",
 });
 
 /**

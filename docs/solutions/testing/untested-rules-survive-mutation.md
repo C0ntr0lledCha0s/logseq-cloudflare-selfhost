@@ -14,6 +14,7 @@ seen:
   - 2026-11-08 – edit-service-token-scope, round 1 (r1-tests-1): the expired-token edit refusal at exactly `expires_at` (`<=`, matching verification) survived `<=` to `<`; a test with the clock standing on the boundary and the millisecond before killed it. Boundary operators are rules too
   - 2026-11-07 – service-token-cloud-sessions, round 1 (r1-tests-1, r1-tests-2): the wizard read-back check compared only the length of `graph_ids`, so a swapped, duplicated or different single graph passed, and nothing pinned that a token shows as expired at exactly `expires_at`; tests that tamper without changing the length and sit on the boundary killed both
   - 2026-11-08 – item 22 (suggest_links), stage 2 (s-2-1): the builder reported 58 of 58 mutations killed, yet `taken = c.words.length` to `taken = 1` (a shorter title inside a longer match was also suggested, giving overlapping spans) and removing the once-only `already_linked` check left 72 tests green; the stage's own re-run of mutations caught it, so verify a builder's kill count rather than quote it
+  - 2026-11-08 – item 31, patch 0037, stage 1 check (s-1-1): the `final-tags` rule that keeps Code, Math and Quote under an `isResetExistingValues` tag list left 323 tests green when mutated, while four other mutations each failed tests; the lane's stage check (a scratch-copy mutation run) found it and a test where the kept class alone decided a class-restricted property closed it
 promoted_to: ["REVIEW.md"]
 ---
 

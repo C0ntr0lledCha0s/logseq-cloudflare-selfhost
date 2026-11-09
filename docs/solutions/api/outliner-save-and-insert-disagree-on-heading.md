@@ -4,7 +4,8 @@ area: api
 tags: [heading, markdown-prefix, save-block, insert-blocks, clear-markdown-heading, display-type, two-write-paths, update_block, patch-0024]
 seen:
   - 2026-11-06 – item 32 (update_block dropped a leading "## "), patch 0024
-promoted_to: []
+  - 2026-11-08 – item 31, patch 0037: the display-type exemption covered only the heading step; `escape-unresolved-inline-tags` still turned `#include` into `\#include` on update_block of a code block, and tree inserts ran the title steps before the node's display type existed. Every title-rewriting step needs the exemption, and the type must be known before the title is prepared
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom

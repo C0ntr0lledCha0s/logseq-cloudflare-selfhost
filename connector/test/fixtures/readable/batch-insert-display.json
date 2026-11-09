@@ -1,0 +1,78 @@
+{
+  "operationId": "batchInsertBlockTrees",
+  "status": "201",
+  "tool": "batch_insert_block_trees",
+  "response": {
+    "entries": [
+      {
+        "target-id": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+        "blocks": [
+          {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000005",
+            "title": "Example",
+            "display-type": "quote"
+          }
+        ],
+        "target": {
+          "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+          "kind": "page",
+          "page": {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+            "title": "Ideas"
+          },
+          "breadcrumb": [],
+          "snippet": "Ideas"
+        },
+        "affected": [
+          {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000005",
+            "kind": "block",
+            "page": {
+              "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+              "title": "Ideas"
+            },
+            "breadcrumb": [],
+            "snippet": "Example",
+            "descendants": 0
+          }
+        ]
+      },
+      {
+        "target-id": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+        "blocks": [
+          {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000006",
+            "title": "graph TD\nA-->B",
+            "display-type": "code",
+            "lang": "mermaid",
+            "converted": "fence"
+          }
+        ],
+        "target": {
+          "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+          "kind": "page",
+          "page": {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+            "title": "Ideas"
+          },
+          "breadcrumb": [],
+          "snippet": "Ideas"
+        },
+        "affected": [
+          {
+            "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000006",
+            "kind": "block",
+            "page": {
+              "uuid": "5d0f4c7a-2222-4b4e-8c1e-000000000003",
+              "title": "Ideas"
+            },
+            "breadcrumb": [],
+            "snippet": "graph TD",
+            "descendants": 0
+          }
+        ]
+      }
+    ],
+    "count": 2
+  }
+}

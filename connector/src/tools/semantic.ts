@@ -81,6 +81,16 @@ export const HOLDER_STAMP_HINT =
   "When edit stamps are on for the graph, each other block whose property value this call removes or converts (a value pointing at a deleted block, a retired choice, a text value converted to a choice) is stamped editedBy=claude and claudeEditedAt (hidden properties, listed on the Claude Activity page).";
 const HOLDER_STAMPING_TOOLS = new Set(["delete_block", "delete_blocks", "update_property"]);
 
+/** The pointer each tool that writes a title adds on code, math and quote blocks (patch 0037). */
+export const FENCE_HINT =
+  "Write code, math and quotes with display-type (and lang for code), not as fence text; a block whose whole title is one ``` or $$ fence is converted unless convert-fences=false, and ```query fences stay text, listed under kept. connector_help's Code, math and quote blocks section has the rules.";
+const FENCE_TOOLS = new Set(["insert_block_tree", "insert_block_children", "batch_insert_block_trees", "capture_to_today", "update_block"]);
+
+/** The pointer the property-set tools add on display-type (patch 0037). */
+export const DISPLAY_TYPE_HINT =
+  "Setting display-type keeps the stored title: to make a text block code or math with its title stored verbatim, call update_block with the title and display-type together. connector_help's Code, math and quote blocks section has the rules.";
+const DISPLAY_TYPE_TOOLS = new Set(["set_block_property", "batch_set_block_property"]);
+
 /** Usage conventions added to the generated descriptions of the tools they concern. */
 const HINTS: Record<string, string> = {
   insert_block_tree:
@@ -106,6 +116,8 @@ function description(op: GraphOperation): string {
   const parts = [op.operation.summary ?? `${op.method} ${op.path}`];
   if (op.operation.description) parts.push(op.operation.description);
   if (HINTS[op.name]) parts.push(HINTS[op.name]);
+  if (FENCE_TOOLS.has(op.name)) parts.push(FENCE_HINT);
+  if (DISPLAY_TYPE_TOOLS.has(op.name)) parts.push(DISPLAY_TYPE_HINT);
   if (STAMPING_TOOLS.has(op.name)) parts.push(STAMP_HINT);
   if (HOLDER_STAMPING_TOOLS.has(op.name)) parts.push(HOLDER_STAMP_HINT);
   return parts.join("\n\n");

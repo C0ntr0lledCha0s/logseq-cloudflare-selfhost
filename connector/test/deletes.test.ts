@@ -333,6 +333,9 @@ describe("dry runs", () => {
       delete_blocks: "body",
       batch_move_blocks: "body",
       batch_insert_block_trees: "body",
+      // Patch 0037 (code blocks) gives the two tree inserts a dry run; both are `never` deletes.
+      insert_block_children: "body",
+      insert_block_tree: "body",
     });
     expect(Object.isFrozen(DRY_RUN_TOOLS)).toBe(true);
   });
