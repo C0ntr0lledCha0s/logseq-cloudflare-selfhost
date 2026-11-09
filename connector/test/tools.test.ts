@@ -9,7 +9,7 @@ import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
-import { CODE_BLOCKS_HELP, CONNECTOR_HELP } from "../src/tools/handwritten";
+import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
 import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
@@ -2422,6 +2422,79 @@ describe("favourites", () => {
     ["list_favorites", ["in sidebar order", "Works on E2EE graphs"]],
     ["set_page_favorite", ["appended at the bottom of the list, unlike the app", "Unavailable for E2EE graphs (400)", "deletePage hides a favourite and restoring the page brings it back"]],
     ["reorder_favorites", ["Pass the full list", "call listFavorites first", "Unavailable for E2EE graphs (400)"]],
+  ])("%s's generated description carries the openapi text", async (name, phrases) => {
+    const tool = (await listTools()).find((t) => t.name === name);
+    for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
+  });
+});
+
+// Patch 0039: datalog_query and run_named_query, as Claude reads about them in connector_help.
+describe("queries help", () => {
+  // One assertion per point, so dropping any one of them from the paragraph fails.
+  it.each([
+    ["datalog_query", "datalog_query runs a read-only Datalog query"],
+    ["the query's length", "(EDN, at most 4,000 characters)"],
+    ["run_named_query, preferred", "Prefer run_named_query when one fits"],
+    ["projects-untouched", "when one fits: projects-untouched,"],
+    ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
+    ["open-tasks-by-client", "meetings-without-decision, open-tasks-by-client and"],
+    ["pages-missing-property", "open-tasks-by-client and pages-missing-property, each"],
+    ["defaults can be overridden", "each with defaults you can override in params"],
+    ["a missing default is a 400", "a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param"],
+    ["limit", "cut to limit rows (default 50, maximum 200)"],
+    ["the byte cap", "about 100,000 characters (the byte cap)"],
+    ["truncated", "truncated says which cap applied"],
+    ["total-rows", "total-rows counts every row"],
+    ["the scan cap's number", "scans more than 20,000 datoms (the scan cap)"],
+    ["the row cap's number", "matches more than 2,500 rows (the row cap)"],
+    ["the 422", "is refused with 422, never answered in part"],
+    ["how to narrow", "narrow it with a tag, page or attribute value"],
+    ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
+    ["projects-untouched on a large graph", "projects-untouched can reach the scan cap on a large graph"],
+    ["handles", "Pull :block/uuid and :block/title to get handles for the other tools"],
+    ["pure functions only", "Only pure functions are allowed"],
+    ["the allowed functions", "(comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like"],
+    ["no regex, range or rand", "no regex, range or rand)"],
+    ["clauses share variables", "clauses must share variables (a cross product is refused)"],
+    ["no left recursion", "a rule must read data before it calls itself"],
+    ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
+    ["E2EE", "Unavailable on E2EE graphs (409)"],
+    ["dry-run", "dry-run: true checks the query and shows it without running it"],
+    ["the audit row", "Each call is recorded in the audit log as a read"],
+    ["what the row holds", "(a hash of the query, or the named query and the names of its params; never the rows)"],
+    ["not in get_activity_log", "get_activity_log lists writes, so it doesn't show them"],
+  ])("the Queries paragraph says %s", (_point, phrase) => {
+    expect(QUERIES_HELP).toContain(phrase);
+  });
+
+  it("connector_help holds the Queries paragraph once", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help.split(QUERIES_HELP).length).toBe(2);
+    expect(CONNECTOR_HELP.split(QUERIES_HELP).length).toBe(2);
+  });
+
+  // The help repeats the server's caps, so it must name the same numbers as the vendored openapi text.
+  it.each([
+    ["scan cap", /more than ([\d,]+) datoms \(the scan cap/],
+    ["row cap", /more than ([\d,]+) rows \(the row cap/],
+  ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
+    const query = (await listTools()).find((t) => t.name === "datalog_query");
+    const server = query.description.match(pattern)?.[1];
+    expect(server).toBeDefined();
+    expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
+  });
+
+  it("the help's scan cap matches run_named_query's description", async () => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    const server = named.description.match(/the scan cap \(([\d,]+) datoms/)?.[1];
+    expect(server).toBeDefined();
+    expect(QUERIES_HELP.match(/more than ([\d,]+) datoms \(the scan cap/)?.[1]).toBe(server);
+  });
+
+  // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
+  it.each([
+    ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
+    ["run_named_query", ["the scan cap (20,000 datoms, 422)", "the row cap and limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
   ])("%s's generated description carries the openapi text", async (name, phrases) => {
     const tool = (await listTools()).find((t) => t.name === name);
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);

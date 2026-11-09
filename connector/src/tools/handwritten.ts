@@ -15,6 +15,22 @@ export const CODE_BLOCKS_HELP =
 export const FAVOURITES_HELP =
   "Favourites are the pages in the sidebar's Favorites list. list_favorites reads them in sidebar order, each with its uuid, title and kind. set_page_favorite with favorite: true adds a page (a page, journal, tag or property, never a block; a tag or property by its UUID) at the bottom of the list, unlike the app, which adds at the top; favorite: false removes it, which counts as a delete, so a write-no-delete token can't do it (a dry run can). A re-send writes nothing and answers already a favourite or was not a favourite. reorder_favorites takes the full list in the new order: call list_favorites first and pass every favourite once; anything else is refused naming each problem. Deleting a page with delete_page hides its favourite (list_favorites leaves it out), and restoring the page from the Recycle bin brings it back in its place; to drop it for good, remove a deleted page's favourite by its UUID. Adding, removing and reordering favourites are unavailable on E2EE graphs; list_favorites still reads them there, with titles as stored.";
 
+/**
+ * connector_help's Queries paragraph (patch 0039, spec 2026-11-09-datalog-query-named-queries §4). The
+ * caps repeat the server's (datalog.cljs scan-cap and row-cap); a test checks them against the
+ * vendored openapi text. The audit sentence says what LOGGED_READS does in semantic.ts.
+ */
+export const QUERIES_HELP =
+  "Queries: datalog_query runs a read-only Datalog query (EDN, at most 4,000 characters) against the graph. " +
+  "Prefer run_named_query when one fits: projects-untouched, meetings-without-decision, open-tasks-by-client and pages-missing-property, each with defaults you can override in params; a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param, so pass the graph's own tag or property. " +
+  "Results are cut to limit rows (default 50, maximum 200) and then to about 100,000 characters (the byte cap), and truncated says which cap applied; total-rows counts every row. " +
+  "A query that scans more than 20,000 datoms (the scan cap) or matches more than 2,500 rows (the row cap) is refused with 422, never answered in part: narrow it with a tag, page or attribute value, or count with an aggregate such as (count ?b). projects-untouched can reach the scan cap on a large graph. " +
+  "Pull :block/uuid and :block/title to get handles for the other tools. " +
+  "Only pure functions are allowed (comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like; no regex, range or rand), clauses must share variables (a cross product is refused), and a rule must read data before it calls itself. " +
+  "Anything tagged Private, on a private page or under a private block is left out. Unavailable on E2EE graphs (409). " +
+  "dry-run: true checks the query and shows it without running it. " +
+  "Each call is recorded in the audit log as a read (a hash of the query, or the named query and the names of its params; never the rows); get_activity_log lists writes, so it doesn't show them.";
+
 /** Usage conventions (design §7), so Claude writes well-formed Logseq content. */
 export const CONNECTOR_HELP = [
   "Address a graph by its alias from list_graphs; graphs marked read-only refuse every write.",
@@ -44,6 +60,7 @@ export const CONNECTOR_HELP = [
   "Make a block a heading by starting its title with # to ###### and a space (## Section), in update_block, create_task or any insert tool: it is stored as the app stores a heading, the title without the prefix and the level in logseq.property/heading, which get_block and get_blocks show as a property and get_page_outline shows as the ## prefix (list_page_blocks titles don't show it). update_block with a title that has no prefix keeps the block's heading. A code, math or quote block has no heading: its # lines are kept as given (see Code, math and quote blocks below). Seven or more #, or # with nothing after it, is not a heading and stays as text (the first # stored escaped as \\#).",
   CODE_BLOCKS_HELP,
   FAVOURITES_HELP,
+  QUERIES_HELP,
   "Create tasks and action items with create_task, never as TODO text.",
   "Add to today's journal with capture_to_today. Today is the date in the owner's time zone, which the sync server is configured with (timeZone in config/settings.json, for example Pacific/Auckland; UTC when unset), not the server's UTC clock. capture_to_today, create_task with no page-id, and save_document and save_file_from_url with no page all use it, and their results name the journal they wrote to (page-id and page-title, or pageId and pageTitle). capture_to_today always writes to today and takes no page; to write to another day's journal, use insert_block_tree with that journal's date (YYYY-MM-DD) or UUID as target-id, create_task with page-id, or save_document or save_file_from_url with page. delete_page on today's journal (in the same time zone) clears its blocks and keeps the page, as the app does, and says so (truncated: true, with cleared, the number of blocks deleted; the summary starts Cleared today's journal); any other journal moves to the Recycle bin with its blocks.",
   "Make flashcards by tagging each card block with the Card tag.",
