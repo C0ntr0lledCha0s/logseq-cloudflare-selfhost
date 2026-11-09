@@ -2515,6 +2515,12 @@ describe("queries help", () => {
     ["the aggregate doesn't fold a join", "(which folds rows for the row cap, not the join cap)"],
     ["no collection constructors", "no vector, list, set, hash-map, array-map or tuple"],
     ["joining functions take one variable", "str, + and keyword take at most one ?variable"],
+    ["a collection given to a function is a 422", "A function given a collection from inputs is refused with 422 naming it"],
+    ["the functions that take a collection", "unless it only looks into one (count, contains?, get, empty?, not-empty, identity and the like)"],
+    ["how to use a collection", "bind its items with [?x ...] in :in, or test membership with (contains? ?x ?v)"],
+    ["aggregates and collections", "aggregates other than count, count-distinct and distinct refuse collection values"],
+    ["the text cap's number", "5,000,000 characters of text per query (the text cap"],
+    ["what the text cap counts", "text the functions and aggregates return counts toward"],
     ["the Recycle bin", "and so is anything in the Recycle bin"],
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
     ["the 422", "is refused with 422, never answered in part"],
@@ -2548,6 +2554,7 @@ describe("queries help", () => {
     ["scan cap", /more than ([\d,]+) datoms \(the scan cap/],
     ["row cap", /more than ([\d,]+) rows \(the row cap/],
     ["join cap", /more than ([\d,]+) rows while joining \(the join cap/],
+    ["text cap", /([\d,]+) characters of text per query \(the text cap/],
   ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
     const query = (await listTools()).find((t) => t.name === "datalog_query");
     const server = query.description.match(pattern)?.[1];

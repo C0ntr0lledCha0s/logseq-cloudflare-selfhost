@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..0798414
+index 0000000..633d0cd
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1159 @@
+@@ -0,0 +1,1262 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -28,7 +28,10 @@ index 0000000..0798414
 +  character of text inside them. query, inputs and rules are each at most 4,000 characters, refused
 +  before they are parsed, and the left-recursion check is linear in the rules' size. No allowed function
 +  builds a value larger than its arguments: the collection constructors are refused, and str, +
-+  and keyword (which join strings) take at most one variable. A rule that calls back into itself (directly or through
++  and keyword (which join strings) take at most one variable. While a query runs, every allowed
++  function and aggregate is guarded: one given a collection from inputs answers 422 unless it only
++  looks into it (`collection-fns`, `collection-aggregates`), and the text they return counts toward
++  the text cap. A rule that calls back into itself (directly or through
 +  other rules) before a data pattern binds one of the call's variables would expand without reading
 +  datoms, so the cap could not stop it; it is refused with 400 before the query runs. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
 +  no recursion, at most 50 values per many attribute) is pulled only for the rows kept after the
@@ -38,6 +41,7 @@ index 0000000..0798414
 +            [cljs.tools.reader.edn :as edn]
 +            [cljs.tools.reader.reader-types :as reader-types]
 +            [clojure.string :as string]
++            [datascript.built-ins :as built-ins]
 +            [datascript.core :as d]
 +            [datascript.pull-parser :as pull-parser]
 +            [datascript.query :as dq]
@@ -70,6 +74,12 @@ index 0000000..0798414
 +  answers 422 before the sort, which prints each collection once per row. Only inputs supply
 +  collections, since no allowed function builds one."
 +  20000)
++(def text-cap
++  "Characters of text the allowed functions and aggregates may return per query, all calls together;
++  past it the query stops and answers 422. A function builds its text once per joined row, so a
++  3,990-character input lower-cased on 1,400 rows builds 5.6 million characters: the cap stops that
++  after about 1,250 rows. Functions that pass a value through (`pass-through-fns`) build none."
++  5000000)
 +(def byte-cap 100000)
 +(def default-limit 50)
 +(def max-limit 200)
@@ -115,6 +125,26 @@ index 0000000..0798414
 +  '#{sum avg median variance stddev distinct min max count count-distinct})
 +
 +(def ^:private allowed-list (string/join ", " (sort-by str allowed-fns)))
++
++(def ^:private collection-fns
++  "The allowed functions that may be given a collection (only inputs supply one): each looks into it
++  or passes it on rather than printing or walking it whole. Any other function given one answers
++  422, deny by default, so a function a Datascript bump adds is covered."
++  '#{count contains? get empty? not-empty identity ground untuple get-else get-some missing? nil? some?
++     true? false? identical? type and or not})
++
++(def ^:private collection-aggregates
++  "The allowed aggregates that may fold collection values: they count or gather them, never print them."
++  '#{count count-distinct distinct})
++
++(def ^:private pass-through-fns
++  "The allowed functions and aggregates that return one of their arguments (or a value they look
++  up) rather than build text, so what they return does not count toward the text cap."
++  '#{identity ground untuple get get-else get-some not-empty max min})
++
++(defn- and-list [xs]
++  (let [xs (sort-by str xs)]
++    (str (string/join ", " (butlast xs)) " and " (last xs))))
 +
 +(def ^:private query-keys [:find :in :where :keys :strs :syms :with])
 +
@@ -610,6 +640,55 @@ index 0000000..0798414
 +            (eduction (map (fn [tuple] (count-join!) tuple)) (collect-tuples acc rel len copy-map))))
 +    true))
 +
++(def ^:private text-limit
++  "The text cap while run-query's d/q runs, else nil: the guarded functions check only then."
++  (volatile! nil))
++
++(def ^:private text-built (volatile! 0))
++
++(defn- text-length [x]
++  (cond
++    (string? x) (.-length x)
++    (keyword? x) (.-length (.-fqn x))
++    (symbol? x) (.-length (.-str x))
++    :else 0))
++
++(defn- count-text! [cap x]
++  (let [n (text-length x)]
++    (when (and (pos? n) (> (vswap! text-built + n) cap))
++      (throw (ex-info "text cap" {::text-cap cap})))))
++
++(defn- guarded
++  "`f`, the query function or aggregate `sym`, checked while a query runs: given a collection
++  (`collections` picks the values to check from the arguments) when `takes-collection?` is false it
++  throws {::collection-arg [kind sym]}, and the text it returns counts toward the text cap unless
++  `passes-through?`. Outside run-query it calls straight through."
++  [kind sym f collections takes-collection? passes-through?]
++  (fn [& args]
++    (if-some [cap @text-limit]
++      (do
++        (when (and (not takes-collection?) (some coll? (collections args)))
++          (throw (ex-info "collection argument" {::collection-arg [kind sym]})))
++        (let [result (apply f args)]
++          (when-not passes-through? (count-text! cap result))
++          result))
++      (apply f args))))
++
++(defonce ^:private guard-functions
++  ;; Datascript looks up query-fns and aggregates by symbol each time a clause or :find runs, so
++  ;; replacing the allowed entries guards every call; the refused ones never run.
++  (let [wrap (fn [table syms kind collections takers]
++               (reduce (fn [m sym]
++                         (update m sym #(guarded kind sym % collections (contains? takers sym)
++                                                 (contains? pass-through-fns sym))))
++                       table syms))]
++    (set! built-ins/query-fns (wrap built-ins/query-fns allowed-fns :function identity collection-fns))
++    ;; An aggregate takes its column's values last, after any constant arguments.
++    (set! built-ins/aggregates (wrap built-ins/aggregates allowed-aggregates :aggregate
++                                     (fn [args] (concat (butlast args) (last args)))
++                                     collection-aggregates))
++    true))
++
 +(defn- item-weight
 +  "What one item inside a collection counts toward the value cap: a string, keyword or symbol each
 +  character of its text (the sort prints it whole, once per row), anything else 1."
@@ -723,14 +802,29 @@ index 0000000..0798414
 +       " each character of text as a value); return the"
 +       " parts you need rather than the whole collection, or narrow the query"))
 +
++(defn- text-cap-message [cap]
++  (str "query stopped after functions built " (format-count cap) " characters of text (the text cap); return the"
++       " values themselves rather than text built from them, or narrow the query"))
++
++(defn- collection-arg-message [[kind sym]]
++  (if (= :aggregate kind)
++    (str "aggregate " sym " was given a collection from inputs, which it would print or walk whole once per row"
++         " (only " (and-list collection-aggregates) " take one); bind its items with [?x ...] in :in")
++    (str "function " sym " was given a collection from inputs, which it would print or walk whole once per joined"
++         " row (only " (and-list collection-fns) " take one); bind its items with [?x ...] in :in, or test"
++         " membership with (contains? ?x ?v)")))
++
 +(defn- run-refusal
-+  "An error raised while running the caller's query or its pulls: the scan cap and the join cap as
-+  422, anything else as a 400 naming it. Never a 500."
++  "An error raised while running the caller's query or its pulls: the scan cap, the join cap, the
++  text cap and a collection given to a function that would print or walk it as 422, anything else
++  as a 400 naming it. Never a 500."
 +  [e]
 +  (let [data (ex-data e)]
 +    (cond
 +      (::scan-cap data) (refusal 422 (scan-cap-message (::scan-cap data)))
 +      (::join-cap data) (refusal 422 (join-cap-message (::join-cap data)))
++      (::text-cap data) (refusal 422 (text-cap-message (::text-cap data)))
++      (::collection-arg data) (refusal 422 (collection-arg-message (::collection-arg data)))
 +      :else (refusal 400 (or (query-error-message e) (str "query: failed while running: " (ex-message e)))))))
 +
 +(defn rewrite-pulls
@@ -853,11 +947,12 @@ index 0000000..0798414
 +  "Runs the normalised, validated query `q` on `db` filtered for privacy, with pulls run on the kept
 +  rows only; returns {:columns :rows :total-rows :returned :truncated?} merged with `echo` (the
 +  fields the response repeats, counted in the byte cap), or a refusal. `scan-cap` replaces the
-+  constant, and `row-cap` and `join-cap` the other caps (tests)."
++  constant, and `row-cap`, `join-cap` and `text-cap` the other caps (tests)."
 +  [db {:keys [query inputs rules limit echo] :as opts}]
 +  (let [cap (or (:scan-cap opts) scan-cap)
 +        max-rows (or (:row-cap opts) row-cap)
 +        max-joined (or (:join-cap opts) join-cap)
++        max-text (or (:text-cap opts) text-cap)
 +        original (relation-find (:find query))
 +        {find :find pulls :pulls} (rewrite-pulls original)
 +        schema (d/schema db)
@@ -880,9 +975,14 @@ index 0000000..0798414
 +                     (let [matched (try
 +                                     (vreset! joined 0)
 +                                     (vreset! join-limit max-joined)
-+                                     (apply d/q runnable (query-args (:in query) fdb rules inputs))
++                                     (vreset! text-built 0)
++                                     (vreset! text-limit max-text)
++                                     ;; Datascript returns aggregates lazily: realise them while
++                                     ;; the guards are on.
++                                     (doall (apply d/q runnable (query-args (:in query) fdb rules inputs)))
 +                                     (finally
 +                                       (vreset! join-limit nil)
++                                       (vreset! text-limit nil)
 +                                       (swap! last-run assoc :joined @joined)))]
 +                       (cond
 +                         (> (count matched) max-rows)
@@ -999,7 +1099,8 @@ index 0000000..0798414
 +    (http/json-response :semantic/datalog-query (rows-last result))))
 +
 +(defn- test-cap
-+  "A cap a test set on the Durable Object (`datalogScanCap`, `datalogRowCap`, `datalogJoinCap`), in place of the
++  "A cap a test set on the Durable Object (`datalogScanCap`, `datalogRowCap`, `datalogJoinCap`,
++  `datalogTextCap`), in place of the
 +  constant. No request can set it."
 +  [^js self field]
 +  (let [cap (some-> self (unchecked-get field))]
@@ -1029,6 +1130,7 @@ index 0000000..0798414
 +                                  :scan-cap (test-cap self "datalogScanCap")
 +                                  :row-cap (test-cap self "datalogRowCap")
 +                                  :join-cap (test-cap self "datalogJoinCap")
++                                  :text-cap (test-cap self "datalogTextCap")
 +                                  :echo {:query (pr-str (:given parsed)) :inputs (pr-str (:inputs parsed))}}))))))))
 +
 +;; Named queries
@@ -1162,6 +1264,7 @@ index 0000000..0798414
 +                                      :scan-cap (test-cap self "datalogScanCap")
 +                                      :row-cap (test-cap self "datalogRowCap")
 +                                      :join-cap (test-cap self "datalogJoinCap")
++                                      :text-cap (test-cap self "datalogTextCap")
 +                                      :echo echo}))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 index d8e3144..ea2f038 100644
@@ -1311,7 +1414,7 @@ index 0000000..ff97074
 +    :params [{:name "tag" :type :tag :required true}
 +             {:name "property" :type :property :required true}]}))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..361562f 100644
+index 1365b0a..a84aea1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1332,7 +1435,7 @@ index 1365b0a..361562f 100644
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "datalogQuery" ["Run a read-only Datalog query"
 +                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each reads a few datoms per row rather than scanning an attribute, except projects-untouched, which can reach the scan cap on a large graph (see run_named_query). query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in (at most 4,000 characters)."
-+                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern or a get-some binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p)). A data pattern joined to two or more bound rows scans its whole attribute, so to walk up from bound blocks use get-some, which reads one datom per row ([(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]); get-else, ground and identity don't count as reading data, since they bind a value whether or not a datom exists."
++                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern or a get-some binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p)). A data pattern joined to two or more bound rows scans its whole attribute, so to walk up from bound blocks use get-some, which reads one datom per row ([(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]); get-else, ground and identity don't count as reading data, since they bind a value whether or not a datom exists."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join, not-join and rule bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too; each character of text inside them counts as a value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
@@ -1413,8 +1516,8 @@ index 1365b0a..361562f 100644
 +           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
 +                            "404" {:description "No named query has that name; the error lists the names"}
 +                            "409" {:description "The graph is E2EE"}
-+                            "422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap) or matched more than 2,500 rows (the row cap); narrow it with a more specific tag or fewer days"}}
-+           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) or built more than 20,000 rows while joining (the join cap) and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
++                            "422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap) or matched more than 2,500 rows (the row cap); narrow it with a more specific tag or fewer days"}}
++           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
@@ -1458,10 +1561,10 @@ index 1365b0a..361562f 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..a54afbc
+index 0000000..3f53e51
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,2066 @@
+@@ -0,0 +1,2294 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -2254,6 +2357,227 @@ index 0000000..a54afbc
 +            (is (= [200 1] [(:status one-row) (get-in one-row [:body :total-rows])]) (pr-str (:status one-row)))
 +            (is (= [200 1] [(:status one-row-text) (get-in one-row-text [:body :total-rows])]) (pr-str (:status one-row-text)))))))))
 +
++(defn- one-by-one!
++  "Runs each of `thunks` (each a function returning a promise of a response) after the one before
++  has answered, so each elapsed time is its own; the responses, each with :ms."
++  [thunks]
++  (reduce (fn [acc thunk]
++            (p/let [responses acc
++                    start (.now js/Date)
++                    response (thunk)]
++              (conj responses (assoc response :ms (- (.now js/Date) start)))))
++          (p/resolved [])
++          thunks))
++
++(defn- head-of [response]
++  (pr-str (:status response) (:ms response) "ms" (subs (str (:text response)) 0 (min 300 (count (str (:text response)))))))
++
++(def ^:private collection-takers
++  "and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple")
++
++(defn- collection-message [f]
++  (str "function " f " was given a collection from inputs, which it would print or walk whole once per joined row"
++       " (only " collection-takers " take one); bind its items with [?x ...] in :in, or test membership with"
++       " (contains? ?x ?v)"))
++
++(defn- aggregate-collection-message [f]
++  (str "aggregate " f " was given a collection from inputs, which it would print or walk whole once per row"
++       " (only count, count-distinct and distinct take one); bind its items with [?x ...] in :in"))
++
++(defn- ca-query
++  "A query over the `zq ca` blocks that binds the collection inputs `colls` (symbols) to every row
++  through get-else, finds `find` and adds `more` where clauses."
++  [find colls more]
++  (vec (concat [:find] find [:in '$] colls
++               [:where '[?e :block/title ?t] '[(clojure.string/starts-with? ?t "zq ca ")]]
++               (for [[i c] (map-indexed vector colls)] [(list 'get-else '$ '?e :block/uuid c) (symbol (str "?u" i))])
++               more)))
++
++(def ^:private collection-taker-cases
++  "Each function that may take a collection, with clauses that give it one and bind ?n."
++  [["count" '[[(count ?x) ?n]]]
++   ["contains?" '[[(contains? ?x 0)] [(count ?x) ?n]]]
++   ["get" '[[(get ?x 0) ?n]]]
++   ["empty?" '[[(empty? ?x) ?n]]]
++   ["not-empty" '[[(not-empty ?x) ?y] [(count ?y) ?n]]]
++   ["identity" '[[(identity ?x) ?y] [(count ?y) ?n]]]
++   ["ground" '[[(ground ?x) ?y] [(count ?y) ?n]]]
++   ["untuple" '[[(untuple ?x) ?y] [(count ?y) ?n]]]
++   ["get-else" '[[(get-else $ ?e :block/title ?x) ?y] [(count ?y) ?n]]]
++   ["get-some" '[[(get-some $ ?e :block/title ?x) ?y] [(count ?y) ?n]]]
++   ["nil?" '[[(nil? ?x) ?n]]]
++   ["some?" '[[(some? ?x)] [(count ?x) ?n]]]
++   ["true?" '[[(true? ?x) ?n]]]
++   ["false?" '[[(false? ?x) ?n]]]
++   ["identical?" '[[(identical? ?x ?x) ?n]]]
++   ["type" '[[(type ?x) ?y] [(some? ?y) ?n]]]
++   ["and" '[[(and ?x true) ?n]]]
++   ["or" '[[(or ?x false) ?y] [(count ?y) ?n]]]
++   ["not" '[[(not ?x) ?n]]]])
++
++(deftest collection-arguments-refused-test
++  ;; A collection from inputs, given to a function that prints or walks it (str, arithmetic,
++  ;; comparison, the string functions), costs its size once per joined row: [(str ?x) ?s] over
++  ;; 1,900 numbers on 2,400 blocks took about 2 s, and 3.6 s with :find ?s . on 7,000 blocks before
++  ;; the join cap fired, while the value cap counts only the collections the rows return. Any
++  ;; function given one answers 422 naming it, unless it only looks into one; aggregates other
++  ;; than count, count-distinct and distinct refuse collection values the same way.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [_ (bulk! self notes 2400 #(str "zq ca " %))
++                before (snapshot conn)
++                big [(vec (repeat 1900 0))]
++                pair [(vec (repeat 950 0)) (vec (repeat 950 0))]
++                one (fn [label f clause & {:keys [find] :or {find '[?t ?s]}}]
++                      [label (collection-message f) (ca-query find '[?x] [clause]) big])
++                two (fn [f clause] [(str f " on two collections") (collection-message f) (ca-query '[?t] '[?x ?y] [clause]) pair])
++                agg (fn [f] [(str "aggregate " f) (aggregate-collection-message f)
++                             (ca-query ['?t (list f '?x)] '[?x] []) big])
++                cases [(one "str in :find ?t ?s" "str" '[(str ?x) ?s])
++                       (one "str in :find ?s ." "str" '[(str ?x) ?s] :find '[?s .])
++                       (one "keyword" "keyword" '[(keyword ?x) ?s])
++                       (one "+" "+" '[(+ ?x 1) ?s])
++                       (one "-" "-" '[(- ?x 1) ?s])
++                       (one "*" "*" '[(* ?x 2) ?s])
++                       (one "/" "/" '[(/ ?x 2) ?s])
++                       (one "inc" "inc" '[(inc ?x) ?s])
++                       (one "dec" "dec" '[(dec ?x) ?s])
++                       (one "max" "max" '[(max ?x 1) ?s])
++                       (one "min" "min" '[(min ?x 1) ?s])
++                       (one "quot" "quot" '[(quot ?x 2) ?s])
++                       (one "rem" "rem" '[(rem ?x 2) ?s])
++                       (one "mod" "mod" '[(mod ?x 2) ?s])
++                       (one "pos?" "pos?" '[(pos? ?x)] :find '[?t])
++                       (one "neg?" "neg?" '[(neg? ?x)] :find '[?t])
++                       (one "blank?" "clojure.string/blank?" '[(clojure.string/blank? ?x)] :find '[?t])
++                       (one "index-of" "clojure.string/index-of" '[(clojure.string/index-of ?x "1") ?s])
++                       (one "last-index-of" "clojure.string/last-index-of" '[(clojure.string/last-index-of ?x "1") ?s])
++                       (two "=" '[(= ?x ?y)])
++                       (two "not=" '[(not= ?x ?y)])
++                       (two "compare" '[(compare ?x ?y) ?s])
++                       (two "<" '[(< ?x ?y)])
++                       (two "-differ?" '[(-differ? ?x ?y)])
++                       (agg 'sum) (agg 'avg) (agg 'median) (agg 'variance) (agg 'stddev) (agg 'min) (agg 'max)]
++                refused (one-by-one! (for [[_ _ q inputs] cases] #(query! self q :inputs inputs)))
++                takers (one-by-one!
++                        (for [[_ clauses] collection-taker-cases]
++                          #(query! self (ca-query '[?t ?n] '[?x] clauses) :inputs big)))
++                counted (query! self (ca-query '[?t (count ?x) (count-distinct ?x)] '[?x] []) :inputs big)
++                missing (query! self '[:find ?n :in $ ?x :where [?e :block/title "zq Notes"] [(missing? $ ?e :block/uuid ?x) ?n]]
++                                :inputs big)
++                gathered (query! self (ca-query '[(distinct ?x)] '[?x] []) :inputs big)
++                items (query! self '[:find (count ?v) (count-distinct ?v) (sum ?v) :in $ [?v ...]
++                                     :where [?e :block/title "zq Notes"] [(get-else $ ?e :block/uuid ?v) ?u]]
++                              :inputs [(vec (range 900))])
++                outside (d/q '[:find ?s . :in $ ?x :where [(str ?x) ?s]] @conn [1 2])
++                outside-sum (d/q '[:find (sum ?x) . :in $ [?x ...]] @conn [[1 2]])]
++          (doseq [[[label message _ inputs] response] (map vector cases refused)]
++            (testing (str label ": 422 naming the function, under 500 ms")
++              (is (<= (count (pr-str inputs)) 4000) label)
++              (is (= [422 message] [(:status response) (get-in response [:body :error])]) (head-of response))
++              (is (< (:ms response) 500) (head-of response))))
++          (doseq [[[f] response] (map vector collection-taker-cases takers)]
++            (testing (str f " still takes a collection")
++              (is (= [200 2400] [(:status response) (get-in response [:body :total-rows])]) (head-of response))))
++          (testing "missing? still takes a collection (on one block: missing? on all 2,400 reaches the scan cap)"
++            (is (= [200 [[false]]] [(:status missing) (get-in missing [:body :rows])]) (head-of missing)))
++          (testing "count and count-distinct still take collection values, and distinct gathers them"
++            (is (= [200 2400] [(:status counted) (get-in counted [:body :total-rows])]) (head-of counted))
++            (is (= [200 [[[(vec (repeat 1900 0))]]]] [(:status gathered) (get-in gathered [:body :rows])]) (head-of gathered)))
++          (testing "count, count-distinct and sum over items bound with [?v ...] answer"
++            (is (= [200 [[900 900 404550]]] [(:status items) (get-in items [:body :rows])]) (head-of items)))
++          (testing "outside the handler Datascript calls the functions as before"
++            (is (= "[1 2]" outside))
++            (is (= "0[1 2]" outside-sum) (pr-str outside-sum)))
++          (is (= before (snapshot conn))))))))
++
++(defn- text-cap-message [n]
++  (str "query stopped after functions built " n " characters of text (the text cap); return the values"
++       " themselves rather than text built from them, or narrow the query"))
++
++(defn- set-text-cap!
++  "The test-only text cap the handler reads from the Durable Object (`self`), in place of the
++  constant; nil restores the constant. No request can set it."
++  [self n]
++  (unchecked-set self "datalogTextCap" n))
++
++(def ^:private pass-through-cases
++  "Each function or aggregate that passes a value through, with :find, clauses over the ten
++  `zq bound` titles (?e, ?t) and the rows it answers."
++  [["identity" '[?y] '[[(identity ?t) ?y]] 10]
++   ["ground" '[?y] '[[(ground ?t) ?y]] 10]
++   ["untuple" '[?y] '[[(untuple ?t) ?y]] 10]
++   ["get" '[?t ?y] '[[(get ?t 0) ?y]] 10]
++   ["get-else" '[?y] '[[(get-else $ ?e :block/title "") ?y]] 10]
++   ["get-some" '[?y] '[[(get-some $ ?e :block/title) [?a ?y]]] 10]
++   ["not-empty" '[?y] '[[(not-empty ?t) ?y]] 10]
++   ["the max aggregate" '[(max ?t)] '[] 1]
++   ["the min aggregate" '[(min ?t)] '[] 1]])
++
++(deftest text-cap-test
++  ;; Text a function builds costs its length once per joined row: str, keyword, subs, + and the
++  ;; case and trim functions over a 3,990-character input on 1,400 blocks build 5.6 million
++  ;; characters. Every character a function or aggregate returns counts toward the text cap of
++  ;; 5,000,000 per query; past it the query stops with 422. Functions that pass a value through
++  ;; (identity, ground, untuple, get, get-else, get-some, not-empty, max, min) build none.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [_ (bulk! self notes 1400 #(str "zq tc " %))
++                _ (bulk! self notes 10 #(str "zq bound " %))
++                before (snapshot conn)
++                text (apply str (repeat 1995 "aB"))
++                tc (fn [find clauses] (vec (concat [:find] find '[:in $ ?x :where [?e :block/title ?t]
++                                                                 [(clojure.string/starts-with? ?t "zq tc ")]
++                                                                 [(get-else $ ?e :block/uuid ?x) ?u]]
++                                                   clauses)))
++                cases [["str" '[[(str ?x) ?s]]]
++                       ["keyword" '[[(keyword ?x) ?s]]]
++                       ["subs" '[[(subs ?x 1) ?s]]]
++                       ["+ on text" '[[(+ ?x "!") ?s]]]
++                       ["lower-case" '[[(clojure.string/lower-case ?x) ?s]]]
++                       ["upper-case" '[[(clojure.string/upper-case ?x) ?s]]]
++                       ["capitalize" '[[(clojure.string/capitalize ?x) ?s]]]
++                       ["trim" '[[(clojure.string/trim ?x) ?s]]]]
++                over (one-by-one! (concat (for [[_ clauses] cases] #(query! self (tc '[?t ?s] clauses) :inputs [text]))
++                                          [#(query! self (tc '[?t (sum ?x)] []) :inputs [text])]))
++                short (query! self '[:find ?t ?l :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq tc ")]
++                                     [(clojure.string/lower-case ?t) ?l]])
++                bound '[:find ?l :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq bound ")]
++                        [(clojure.string/lower-case ?t) ?l]]
++                _ (set-text-cap! self 100)
++                at-cap (query! self bound)
++                _ (set-text-cap! self 99)
++                over-cap (query! self bound)
++                passed (query! self '[:find ?g ?i :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq bound ")]
++                                      [(get-else $ ?e :block/title "") ?g] [(identity ?t) ?i]])
++                _ (set-text-cap! self 0)
++                pass-through (one-by-one!
++                              (for [[_ find clauses] pass-through-cases]
++                                #(query! self (vec (concat [:find] find '[:where [?e :block/title ?t]
++                                                                          [(clojure.string/starts-with? ?t "zq bound ")]]
++                                                           clauses)))))
++                _ (set-text-cap! self nil)]
++          (is (<= (count (pr-str [text])) 4000))
++          (doseq [[label response] (map vector (concat (map first cases) ["(sum ?x) over text"]) over)]
++            (testing (str label ": 422 naming the text cap, under 500 ms")
++              (is (= [422 (text-cap-message "5,000,000")] [(:status response) (get-in response [:body :error])])
++                  (head-of response))
++              (is (< (:ms response) 500) (head-of response))))
++          (testing "lower-casing short titles answers"
++            (is (= [200 1400] [(:status short) (get-in short [:body :total-rows])]) (head-of short)))
++          (testing "ten 10-character titles build exactly 100 characters: they answer at a cap of 100"
++            (is (= [200 10] [(:status at-cap) (get-in at-cap [:body :total-rows])]) (head-of at-cap)))
++          (testing "and stop at a cap of 99"
++            (is (= [422 (text-cap-message "99")] [(:status over-cap) (get-in over-cap [:body :error])]) (head-of over-cap)))
++          (testing "get-else and identity pass values through and build no text"
++            (is (= [200 10] [(:status passed) (get-in passed [:body :total-rows])]) (head-of passed)))
++          (doseq [[[label _ _ rows] response] (map vector pass-through-cases pass-through)]
++            (testing (str label " builds no text: it answers at a text cap of 0")
++              (is (= [200 rows] [(:status response) (get-in response [:body :total-rows])]) (head-of response))))
++          (is (= before (snapshot conn))))))))
++
 +(deftest scan-cap-test
 +  ;; About 49,000 datoms added through the real outliner put the graph above the 20,000 scan cap
 +  ;; (set from scripts/bench-datalog-query.mjs).
@@ -2991,7 +3315,12 @@ index 0000000..a54afbc
 +                    "at most 50 values" "refs as numbers" "left recursion" "row cap" "2,500 rows"
 +                    "20,000 rows while joining (the join cap" "(the value cap)" "Recycle bin"
 +                    "str, + and keyword take at most one ?variable" "at most 20 values and 4,000 characters"
-+                    "(at most 4,000 characters)" "each character of text inside them counts as a value"]]
++                    "(at most 4,000 characters)" "each character of text inside them counts as a value"
++                    "A function given a collection from inputs answers 422 naming it"
++                    "bind its items with [?x ...] in :in or test membership with (contains? ?x ?v)"
++                    "aggregates other than count, count-distinct and distinct refuse collection values"
++                    "5,000,000 characters of text per query (the text cap)"
++                    "identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through"]]
 +      (is (string/includes? (:description post) phrase) phrase))
 +    (testing "query, inputs and rules each carry the 4,000-character cap, so the connector refuses a longer one early"
 +      (let [props (get-in post [:requestBody :content "application/json" :schema :properties])]
@@ -3000,6 +3329,8 @@ index 0000000..a54afbc
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "scan cap"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 datoms"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "2,500 rows (the row cap)"))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "5,000,000 characters of text (the text cap)"))
++    (is (string/includes? (get-in post [:responses "422" :description] "") "gave a function a collection from inputs"))
 +    (testing "the tool text says which named query can reach the scan cap, and how a walk up stays under it"
 +      (let [named (get-in document [:paths "/api/v1/graphs/{graph-id}/named-queries/{name}" :post :description])]
 +        (is (not (string/includes? (:description post) "stay within the caps")))

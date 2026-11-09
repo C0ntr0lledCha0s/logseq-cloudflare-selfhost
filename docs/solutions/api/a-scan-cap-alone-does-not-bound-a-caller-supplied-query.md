@@ -3,7 +3,7 @@ title: A scan cap alone does not bound a caller-supplied Datalog query; each cos
 area: api
 tags: [datalog_query, run_named_query, caps, join-fanout, recursion, allow-list, cpu, 1102, private, read-only, scale-test]
 seen:
-  - 2026-11-09 – item 40, patch 0039, stages 1 to 4 and review rounds 1 and 2 (s-2-1, s-3-1, s-4-1, r1-correctness-1; r1-correctness-1 still open at the end)
+  - 2026-11-09 – item 40, patch 0039, stages 1 to 4 and review rounds 1 and 2 (s-2-1, s-3-1, s-4-1, r1-correctness-1; r1-correctness-1 closed in round 2)
 promoted_to: []
 ---
 
@@ -28,12 +28,13 @@ The second cause is test data. Caps and named queries were tuned on fixtures of 
 
 Patch 0039 now has, each with a test where that rule alone decides the outcome: a scan cap (20,000 datoms), a join cap (20,000 rows counted by hooking Datascript's `join-tuples` and `-collect-tuples` while a query runs), a refusal of rules that recurse before a data pattern (one SCC pass), a row cap checked before the sort, a value cap that counts text inside input collections, 4,000-character limits on `query`, `inputs` and `rules`, collection constructors removed from the allow-list, and `str`, `+` and `keyword` limited to one variable. `meetings-without-decision` walks up from the (small) Decision-tagged set instead of down `:block/parent` per meeting. `scripts/bench-datalog-query.mjs` benches the worst shapes at 5,000 and 20,000 pages.
 
-Still open at the end of the lane (r1-correctness-1): `(str ?x)` on a whole-collection input, repeated per joined row, is allowed and the value cap does not see it. Refuse `str`, `keyword` and `name` on a variable bound from an input collection, or give function results a character budget.
+r1-correctness-1, `(str ?x)` on a whole-collection input repeated per joined row, was closed with both remedies, because the value cap only sees the collections rows return. While `run-query`'s `d/q` runs, the allowed entries of Datascript's `query-fns` and `aggregates` are wrapped (the `join-tuples` pattern: outside a query they call straight through). A function given a collection answers 422 naming it unless it only looks into one (`count`, `contains?`, `get` and 17 others, deny by default), and aggregates other than `count`, `count-distinct` and `distinct` refuse collection values. Every character of text a function or aggregate returns counts toward a text cap of 5,000,000 per query, except from functions that pass a value through (`identity`, `get-else`, `max` and the like). Datascript returns aggregates lazily, so the result is realised inside the guarded window; without that, the aggregate guards never fire. The 2 s query now stops in about 50 ms. Read-only text predicates on long text (`includes?`, `index-of`) still cost their length per row, about 60 ms at 2,400 rows (README backlog item 25).
 
 ## How to catch it next time
 
 - For any endpoint that runs caller-written queries, list every cost driver (read, join, recursion, value size, sort, serialise) and ask which cap bounds each. Try one adversarial query per driver that is cheap on the others, and record the time and rows next to the cap.
-- Treat every allow-listed function as a size question: can its result be larger than its arguments, and can it be chained in a loop? Probe with 20 chained clauses.
+- Treat every allow-listed function as a size question: can its result be larger than its arguments, and can it be chained in a loop? Probe with 20 chained clauses. Then ask what it costs on its own, once per joined row, with the largest argument an input can carry: a function that returns something small (`=`, `pos?`, `index-of`) can still print or walk a large argument.
+- A guard installed in a library's lookup table fires only when the library calls through it inside the guarded window. Check what the library returns lazily (Datascript's aggregates) and realise it inside.
 - Before claiming a vetted query "stays within the caps", run it against a graph with thousands of unrelated blocks, not only the fixtures that exercise it.
 - Count find elements structurally, not with `flatten`, when comparing against `:keys`.
 - Private filtering by `d/filter` hides rows from the query. Other read tools (`list_tags`, `get_tag`) already show private-tagged tags' titles, so an echo of a tag title in `run_named_query` params is not a new leak (one skeptic refuted it as pre-existing; one refutation, not yet a known false positive).
