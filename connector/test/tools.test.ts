@@ -1118,7 +1118,7 @@ describe("hand-written tools", () => {
       expect(query.description, phrase).toContain(phrase);
     }
     // Patch 0039 stage 2: the caps Claude has to work within, and how a cut result says so.
-    for (const phrase of ["scan cap", "50,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values"]) {
+    for (const phrase of ["scan cap", "50,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values", "left recursion"]) {
       expect(query.description, phrase).toContain(phrase);
     }
     // A read never needs a delete rule, a snapshot plan or a context class: those tables throw only for write tools.
