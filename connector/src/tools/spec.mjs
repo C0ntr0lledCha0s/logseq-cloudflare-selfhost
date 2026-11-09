@@ -84,6 +84,7 @@ export const ANNOTATIONS = Object.freeze({
   insert_block_tree: ADDITIVE,
   kb_index: READ,
   list_assets: READ,
+  list_favorites: READ,
   list_graphs: READ,
   list_page_blocks: READ,
   list_page_references: READ,
@@ -103,6 +104,10 @@ export const ANNOTATIONS = Object.freeze({
   semantic_search: READ,
   suggest_links: READ,
   set_block_property: DESTRUCTIVE_IDEMPOTENT,
+  // Patch 0038: favorite=false removes the page from the list; a re-send changes nothing.
+  set_page_favorite: DESTRUCTIVE_IDEMPOTENT,
+  // Patch 0038: overwrites the favourites' order (which page each slot links); a re-send changes nothing.
+  reorder_favorites: DESTRUCTIVE_IDEMPOTENT,
   update_block: DESTRUCTIVE,
   update_page: DESTRUCTIVE,
   update_property: DESTRUCTIVE,

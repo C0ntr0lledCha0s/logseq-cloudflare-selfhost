@@ -46,6 +46,10 @@ const DESTRUCTIVE_KINDS: Record<string, "always" | "when" | "never"> = {
   promote_page_to_tag: "never",
   refresh_refs: "never",
   set_block_property: "when",
+  // Patch 0038: a remove takes the page off the favourites list; an add removes nothing.
+  set_page_favorite: "when",
+  // Patch 0038: a reorder rewrites which page each slot links and keeps every slot.
+  reorder_favorites: "never",
   update_block: "never",
   update_page: "never",
   update_property: "when",
@@ -133,6 +137,7 @@ describe("the delete table", () => {
       update_tag: { graph: "notes", "tag-id": "Event", body: { properties: { remove: ["Venue"] } } },
       // Step 0: an empty value in an entry's properties leaves the target's value.
       batch_insert_block_trees: { graph: "notes", body: { entries: [{ "target-id": "b1", properties: { Venue: [] } }] } },
+      reorder_favorites: { graph: "notes", body: { "page-ids": ["Ideas", "Plans"] } },
     };
     const never = writeTools.filter((t) => kindOf(t) === "never").sort();
     expect(Object.keys(representative).sort()).toEqual(never);
@@ -304,6 +309,55 @@ describe("a tags list or placeholder that sets nothing (review r1-integrity-1)",
   });
 });
 
+describe("reorder_favorites (patch 0038)", () => {
+  const args = (body: unknown) => ({ graph: "notes", body, reason: "tidy the sidebar" });
+
+  it("is never a delete: a full list, a shorter one, an empty one or a dry run (the server refuses a list that isn't the whole set, and keeps every slot)", () => {
+    for (const body of [
+      { "page-ids": ["Plans", "Ideas"] },
+      { "page-ids": ["Ideas", "Plans"], "dry-run": false },
+      { "page-ids": ["Plans"] },
+      { "page-ids": [] },
+      { "page-ids": ["Plans", "Ideas"], "dry-run": true },
+      {},
+      undefined,
+    ]) {
+      expect(deleteReason("reorder_favorites", args(body)), JSON.stringify(body)).toBeNull();
+    }
+    expect(DELETE_RULES.reorder_favorites).toEqual({ never: "rewrites which page each favourite slot links; the permutation check removes nothing" });
+  });
+
+  it("declares its dry run in the body", () => {
+    expect(declaredDryRun("reorder_favorites", args({ "page-ids": [], "dry-run": true }))).toBe(true);
+    expect(declaredDryRun("reorder_favorites", { ...args({ "page-ids": [] }), "dry-run": true })).toBe(false);
+  });
+});
+
+describe("set_page_favorite (patch 0038)", () => {
+  const args = (body: unknown) => ({ graph: "notes", "page-id": "Plans", body, reason: "tidy the sidebar" });
+
+  it("is a delete with favorite: false, whatever else the body holds", () => {
+    expect(deleteReason("set_page_favorite", args({ favorite: false }))).toBe("removes the page from the favourites list");
+    expect(deleteReason("set_page_favorite", args({ favorite: false, "dry-run": true }))).toBe("removes the page from the favourites list");
+    expect(deleteReason("set_page_favorite", args({ "dry-run": false, favorite: false }))).toBe("removes the page from the favourites list");
+  });
+
+  it("is not a delete with favorite: true, a missing body or a missing or non-boolean favorite (the server refuses the shape)", () => {
+    for (const body of [{ favorite: true }, { favorite: true, "dry-run": true }, undefined, null, {}, { "dry-run": true }, { favourite: false }, { favorite: "false" }, { favorite: 0 }, { favorite: null }, [false], "false"]) {
+      expect(deleteReason("set_page_favorite", args(body)), JSON.stringify(body)).toBeNull();
+    }
+    expect(deleteReason("set_page_favorite", { graph: "notes", "page-id": "Plans" })).toBeNull();
+    // favorite outside the body is not the body's.
+    expect(deleteReason("set_page_favorite", { graph: "notes", "page-id": "Plans", favorite: false })).toBeNull();
+  });
+
+  it("declares its dry run in the body, so a no-delete token may dry-run a remove", () => {
+    expect(declaredDryRun("set_page_favorite", args({ favorite: false, "dry-run": true }))).toBe(true);
+    expect(declaredDryRun("set_page_favorite", { ...args({ favorite: false }), "dry-run": true })).toBe(false);
+    expect(declaredDryRun("set_page_favorite", args({ favorite: false, "dry-run": "true" }))).toBe(false);
+  });
+});
+
 describe("dry runs", () => {
   /** The write operations that declare `dry-run`, by where, read from the vendored openapi. */
   function declared(): Record<string, "query" | "body"> {
@@ -336,6 +390,9 @@ describe("dry runs", () => {
       // Patch 0037 (code blocks) gives the two tree inserts a dry run; both are `never` deletes.
       insert_block_children: "body",
       insert_block_tree: "body",
+      // Patch 0038: a favourite's remove is a delete, so a no-delete token can still dry-run it.
+      set_page_favorite: "body",
+      reorder_favorites: "body",
     });
     expect(Object.isFrozen(DRY_RUN_TOOLS)).toBe(true);
   });

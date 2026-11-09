@@ -24,7 +24,7 @@ const GET_BLOCKS_MAX_IDS = 100;
 /** batch_insert_block_trees: the most pages named by title or date read with getPage, one GET each. */
 export const PAGE_READS_MAX = 10;
 
-export type SnapshotSource = "getBlocks" | "getPageOutline" | "getPage" | "getTag" | "getProperty" | "refresh_refs";
+export type SnapshotSource = "getBlocks" | "getPageOutline" | "getPage" | "getTag" | "getProperty" | "getFavorites" | "refresh_refs";
 
 /** One GET under the graph's path. */
 export interface SnapshotRequest {
@@ -123,6 +123,13 @@ const page = (args: Record<string, unknown>) => entityRead("getPage", "pages", a
 const tag = (args: Record<string, unknown>) => entityRead("getTag", "tags", args["tag-id"]);
 const property = (args: Record<string, unknown>) => entityRead("getProperty", "properties", args["property-id"]);
 
+/**
+ * The whole favourites list (patch 0038's listFavorites). The server finds the hidden favourites page by
+ * its fixed uuid, as the write does, so this reads what the write changes on any graph; getPage can't
+ * read a hidden page.
+ */
+const favorites = (): SnapshotRequest => ({ source: "getFavorites", path: "/favorites" });
+
 const NOTHING_OVERWRITTEN = "it adds new blocks, pages or files and overwrites nothing";
 
 /** What each write tool reads before it writes (§3.4's table). Every non-read tool has an entry. */
@@ -162,6 +169,11 @@ export const SNAPSHOT_PLAN: Readonly<Record<string, SnapshotPlanEntry>> = Object
   delete_tag: { source: "getTag", read: tag, delete: { e2ee: () => null }, keep: "title, extends and tag properties" },
   update_property: { source: "getProperty", read: property, keep: "type, cardinality, choices and classes" },
   delete_property: { source: "getProperty", read: property, delete: { e2ee: () => null }, keep: "type, cardinality, choices and classes" },
+  // A remove is a delete, so its read must succeed; listFavorites answers on E2EE graphs too, so there
+  // is no fallback read (the server refuses the write there).
+  set_page_favorite: { source: "getFavorites", read: favorites, delete: { e2ee: () => null }, keep: "the ordered favourites list" },
+  // Not a delete (every slot is kept), so a failed read is kept as the snapshot's error.
+  reorder_favorites: { source: "getFavorites", read: favorites, keep: "the ordered favourites list" },
   refresh_refs: { source: "refresh_refs", keep: "each changed block's text before the refresh, from its own response" },
   insert_block_children: { source: "none", why: NOTHING_OVERWRITTEN },
   insert_block_tree: { source: "none", why: NOTHING_OVERWRITTEN },

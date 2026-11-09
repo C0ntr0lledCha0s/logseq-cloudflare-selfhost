@@ -319,6 +319,17 @@
     }
   },
   {
+    "name": "list_favorites",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/favorites",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "list_graphs",
     "method": null,
     "path": null,
@@ -451,6 +462,17 @@
     }
   },
   {
+    "name": "reorder_favorites",
+    "method": "PUT",
+    "path": "/api/v1/graphs/{graph-id}/favorites",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "save_document",
     "method": null,
     "path": null,
@@ -509,6 +531,17 @@
     "name": "set_block_property",
     "method": "PUT",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "set_page_favorite",
+    "method": "PUT",
+    "path": "/api/v1/graphs/{graph-id}/pages/{page-id}/favorite",
     "annotations": {
       "readOnlyHint": false,
       "destructiveHint": true,

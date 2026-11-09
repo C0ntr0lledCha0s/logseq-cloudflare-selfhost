@@ -864,6 +864,13 @@ describe("scope", () => {
     expect(syncCalls.map((c) => c.method)).toEqual(["GET"]);
   });
 
+  it("read-only scope reads the favourites list: list_favorites reaches the sync server with one GET and writes no audit row", async () => {
+    const result = await call("list_favorites", { graph: "work" }, READ_CI);
+    expect(result.isError, result.text).toBe(false);
+    expect(syncCalls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK}/favorites`]]);
+    expect(await auditRows()).toEqual([]);
+  });
+
   it("out of scope: a read and a write tool are refused listing the covered aliases; the write's audit row is refused", async () => {
     const message = "graph 'notes' is outside service token 'ci''s scope (it covers: work)";
     expect(await call("get_page", { graph: "notes", "page-id": PAGE }, READ_CI)).toEqual({ isError: true, text: message });
@@ -1686,6 +1693,13 @@ const REFUSED: [string, string, Record<string, unknown>, string][] = [
     },
     `${by} batch_set_block_property on graph 'notes' entry 2: an empty value removes the property. ${LEAVE}`,
   ],
+  // Patch 0038: removing a favourite takes the page off the list.
+  [
+    "set_page_favorite",
+    "favorite: false",
+    { "page-id": PAGE, body: { favorite: false } },
+    `${by} set_page_favorite on graph 'notes' removes the page from the favourites list. ${DRY}`,
+  ],
 ];
 
 /** A batch_set entry: an empty one, or one holding a value. */
@@ -1794,6 +1808,16 @@ describe("write-no-delete", () => {
       ["create_page", { body: { title: "Standup" } }],
       ["create_tag", { body: { title: "Meeting" } }],
       ["create_property", { body: { title: "Venue" } }],
+      // Patch 0038: an add, its re-send, and an add with dry-run false are not deletes.
+      ["set_page_favorite", { "page-id": PAGE, body: { favorite: true } }],
+      ["set_page_favorite", { "page-id": PAGE, body: { favorite: true } }],
+      ["set_page_favorite", { "page-id": PAGE, body: { favorite: true, "dry-run": false } }],
+      // A reorder keeps every slot: a full list, its re-send, an empty list and a dry run aren't deletes.
+      ["reorder_favorites", { body: { "page-ids": [PAGE, B1] } }],
+      ["reorder_favorites", { body: { "page-ids": [PAGE, B1] } }],
+      ["reorder_favorites", { body: { "page-ids": [B1, PAGE], "dry-run": false } }],
+      ["reorder_favorites", { body: { "page-ids": [] } }],
+      ["reorder_favorites", { body: { "page-ids": [B1, PAGE], "dry-run": true } }],
     ];
     const listed = new Map((await tools(WORKER)).map((t) => [t.name, t]));
     for (const [tool, args] of cases) {
@@ -1824,6 +1848,7 @@ describe("write-no-delete", () => {
     ["delete_blocks", { body: { "block-ids": [B1], "dry-run": true } }, "DELETE", "body"],
     ["update_property", { "property-id": "Venue", "dry-run": true, body: { convert_values: true } }, "PATCH", "query"],
     ["update_property", { "property-id": "Venue", "dry-run": true, body: { choices: { retire: ["Old hall"] } } }, "PATCH", "query"],
+    ["set_page_favorite", { "page-id": PAGE, body: { favorite: false, "dry-run": true } }, "PUT", "body"],
   ] as const)("a declared dry run of %s passes: it reaches sync with dry-run=true and is audited dry_run = 1", async (tool, args, method, where) => {
     const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
     expect(result.text).not.toContain("may not delete");
@@ -1841,6 +1866,8 @@ describe("write-no-delete", () => {
     ["set_block_property, which declares no dry run", "set_block_property", { "block-id": B1, "property-id": "Venue", "dry-run": true, body: { value: [] } }],
     ["update_property with dry-run in the body", "update_property", { "property-id": "Venue", body: { convert_values: true, "dry-run": true } }],
     ["delete_page with dry-run false", "delete_page", { "page-id": PAGE, "dry-run": false }],
+    ["set_page_favorite with dry-run outside the body", "set_page_favorite", { "page-id": PAGE, "dry-run": true, body: { favorite: false } }],
+    ["set_page_favorite with dry-run false", "set_page_favorite", { "page-id": PAGE, body: { favorite: false, "dry-run": false } }],
   ] as const)("an undeclared dry run is refused: %s", async (_label, tool, args) => {
     const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
     expect(result.isError).toBe(true);
@@ -1856,6 +1883,66 @@ describe("write-no-delete", () => {
       const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
       expect(result.isError, tool).toBe(true);
     }
+    expect(ndSync).toEqual([]);
+  });
+
+  it("set_page_favorite: a read token is refused both add and remove as read-only, with 0 sync calls and refused rows", async () => {
+    const message = "graph 'notes' is read-only (service token 'ci' is read-only)";
+    for (const favorite of [true, false]) {
+      expect(await ndCall("set_page_favorite", { graph: "notes", "page-id": PAGE, body: { favorite } }, READ_NOTES), String(favorite)).toEqual({
+        isError: true,
+        text: message,
+      });
+    }
+    expect(ndSync).toEqual([]);
+    expect((await ndAuditRows()).map((r) => [r.tool, r.status, r.error])).toEqual([
+      ["set_page_favorite", "refused", message],
+      ["set_page_favorite", "refused", message],
+    ]);
+  });
+
+  it("reorder_favorites: a write-no-delete token reorders (the list read first, then the PUT, audited ok); a read token is refused with 0 sync calls", async () => {
+    const result = await ndCall("reorder_favorites", { graph: "notes", body: { "page-ids": [B1, PAGE] } }, WORKER);
+    expect(result.text).not.toContain("may not delete");
+    expect(ndSync.map((s) => [s.method, new URL(s.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${NOTES}/favorites`],
+      ["PUT", `/api/v1/graphs/${NOTES}/favorites`],
+    ]);
+    expect(JSON.parse(ndSync[1].body)).toEqual({ "page-ids": [B1, PAGE], "dry-run": false });
+    ndSync = [];
+    const message = "graph 'notes' is read-only (service token 'ci' is read-only)";
+    expect(await ndCall("reorder_favorites", { graph: "notes", body: { "page-ids": [B1, PAGE] } }, READ_NOTES)).toEqual({ isError: true, text: message });
+    expect(ndSync).toEqual([]);
+    expect((await ndAuditRows()).map((r) => [r.tool, r.status])).toEqual([
+      ["reorder_favorites", expect.not.stringMatching(/refused/)],
+      ["reorder_favorites", "refused"],
+    ]);
+  });
+
+  it("set_page_favorite: a write-no-delete add reads the list, then sends the add; a write token's remove reaches sync", async () => {
+    expect((await ndCall("set_page_favorite", { graph: "notes", "page-id": PAGE, body: { favorite: true } }, WORKER)).text).not.toContain("may not delete");
+    expect(ndSync.map((s) => [s.method, new URL(s.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${NOTES}/favorites`],
+      ["PUT", `/api/v1/graphs/${NOTES}/pages/${PAGE}/favorite`],
+    ]);
+    expect(JSON.parse(ndSync[1].body)).toEqual({ favorite: true, "dry-run": false });
+    ndSync = [];
+    expect((await ndCall("set_page_favorite", { graph: "notes", "page-id": PAGE, body: { favorite: false } }, WRITE_NOTES)).text).not.toContain("may not delete");
+    expect(ndSync.map((s) => s.method)).toEqual(["GET", "PUT"]);
+    expect(JSON.parse(ndSync[1].body)).toEqual({ favorite: false, "dry-run": false });
+  });
+
+  it("set_page_favorite: a body the table doesn't class as a delete but the tool's schema refuses (review focus 16) is refused as invalid input, never as a delete, with 0 sync calls", async () => {
+    for (const body of [{}, { favourite: false }, { favorite: "false" }, { favorite: false, "dry-run": "true" }, { favorite: null }]) {
+      ndSync = [];
+      const result = await ndCall("set_page_favorite", { graph: "notes", "page-id": PAGE, body }, WORKER);
+      expect(result.isError, JSON.stringify(body)).toBe(true);
+      expect(result.text, JSON.stringify(body)).toMatch(/^Input validation error: /);
+      expect(result.text, JSON.stringify(body)).not.toContain("may not delete");
+      expect(ndSync, JSON.stringify(body)).toEqual([]);
+    }
+    const missing = await ndCall("set_page_favorite", { graph: "notes", "page-id": PAGE }, WORKER);
+    expect(missing.text).toMatch(/^Input validation error: /);
     expect(ndSync).toEqual([]);
   });
 
@@ -1960,6 +2047,9 @@ describe("write-no-delete", () => {
       expect(help, tool).toContain(tool);
     }
     expect(help).toContain("Don't retry a refused delete: report what it would delete and leave the delete to the owner.");
+    // Patch 0038: removing a favourite is a delete, and its dry run is in the body.
+    expect(help).toContain("set_page_favorite with favorite: false");
+    expect(help).toContain("in the body for delete_blocks and set_page_favorite");
     const listGraphs = (await tools(WORKER)).find((t) => t.name === "list_graphs");
     expect(listGraphs.description).toContain("read, write-no-delete or write");
   });

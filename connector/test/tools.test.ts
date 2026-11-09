@@ -245,6 +245,10 @@ const DESTRUCTIVE_NAMED = [
   "batch_set_block_property",
   "refresh_refs",
   "promote_page_to_tag",
+  // favorite=false removes the page from the favourites list (patch 0038).
+  "set_page_favorite",
+  // It overwrites which page each favourite slot links (patch 0038).
+  "reorder_favorites",
   // Its entries' properties replace an existing target's values.
   "batch_insert_block_trees",
 ];
@@ -266,7 +270,8 @@ function expectedHints(name: string, method: string | null) {
   const openWorldHint = name === "save_file_from_url";
   if (classes[0] === "read") return { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint };
   if (classes[0] === "additive") return { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint };
-  const idempotentHint = /^(batch_)?(delete|set)_/.test(name);
+  // reorder_favorites overwrites the whole order: repeating it changes nothing (spec 2026-11-09 §3.7).
+  const idempotentHint = /^(batch_)?(delete|set)_/.test(name) || name === "reorder_favorites";
   return { readOnlyHint: false, destructiveHint: true, idempotentHint, openWorldHint };
 }
 
@@ -1065,6 +1070,81 @@ describe("hand-written tools", () => {
     );
   });
 
+  it("list_favorites is generated from listFavorites: a GET read on {graph} alone, annotated READ, reaching /favorites", async () => {
+    const tools = await listTools();
+    const list = tools.find((t) => t.name === "list_favorites");
+    expect(list).toBeDefined();
+    expect(Object.keys(list.inputSchema.properties)).toEqual(["graph"]);
+    expect(list.inputSchema.required).toEqual(["graph"]);
+    expect(list.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(list.description).toContain("in sidebar order");
+    expect(list.description).toContain("Recycle bin");
+    expect(committedManifest.find((e) => e.name === "list_favorites")).toMatchObject({
+      method: "GET",
+      path: "/api/v1/graphs/{graph-id}/favorites",
+    });
+    syncHandler = () => Response.json({ favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] });
+    const result = await callTool("list_favorites", { graph: "work" });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({ favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
+  });
+
+  it("set_page_favorite is generated from setPageFavorite: a PUT of {favorite, dry-run?} on page-id, annotated destructive and idempotent", async () => {
+    const tools = await listTools();
+    const set = tools.find((t) => t.name === "set_page_favorite");
+    expect(set).toBeDefined();
+    expect(set.inputSchema.required).toEqual(expect.arrayContaining(["graph", "page-id", "body"]));
+    expect(set.inputSchema.properties.body.required).toEqual(["favorite"]);
+    expect(Object.keys(set.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "favorite"]);
+    expect(set.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["appended at the bottom", "adds a new favourite at the top", "Unavailable for E2EE graphs", "already a favourite", "was not a favourite"]) {
+      expect(set.description, phrase).toContain(phrase);
+    }
+    expect(committedManifest.find((e) => e.name === "set_page_favorite")).toMatchObject({
+      method: "PUT",
+      path: "/api/v1/graphs/{graph-id}/pages/{page-id}/favorite",
+    });
+    const listed = { favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] };
+    syncHandler = (request) =>
+      request.method === "GET" ? Response.json(listed) : Response.json({ result: "added", page: listed.favorites[0], ...listed });
+    const result = await callTool("set_page_favorite", { graph: "work", "page-id": PAGE_UUID, body: { favorite: true } });
+    expect(result.isError, result.text).toBe(false);
+    expect(writeJson(result.text)).toMatchObject({ result: "added", favorites: listed.favorites });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${WORK_ID}/favorites`],
+      ["PUT", `/api/v1/graphs/${WORK_ID}/pages/${PAGE_UUID}/favorite`],
+    ]);
+    // The generated schema fills dry-run's default.
+    expect(JSON.parse(syncRequests[1].body)).toEqual({ favorite: true, "dry-run": false });
+  });
+
+  it("reorder_favorites is generated from reorderFavorites: a PUT of {page-ids, dry-run?} on the graph, annotated destructive and idempotent", async () => {
+    const tools = await listTools();
+    const reorder = tools.find((t) => t.name === "reorder_favorites");
+    expect(reorder).toBeDefined();
+    expect(reorder.inputSchema.required).toEqual(expect.arrayContaining(["graph", "body"]));
+    expect(Object.keys(reorder.inputSchema.properties).sort()).toEqual(expect.not.arrayContaining(["page-id"]));
+    expect(reorder.inputSchema.properties.body.required).toEqual(["page-ids"]);
+    expect(Object.keys(reorder.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "page-ids"]);
+    expect(reorder.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["full list", "call listFavorites first", "order keys are unchanged", "never deleted", "not a favourite", "duplicate", "missing", "Unavailable for E2EE graphs"]) {
+      expect(reorder.description, phrase).toContain(phrase);
+    }
+    expect(committedManifest.find((e) => e.name === "reorder_favorites")).toMatchObject({ method: "PUT", path: "/api/v1/graphs/{graph-id}/favorites" });
+    const listed = { favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }, { uuid: NOTES_PAGE, title: "Notes", kind: "page" }] };
+    syncHandler = (request) => (request.method === "GET" ? Response.json(listed) : Response.json({ favorites: [...listed.favorites].reverse() }));
+    const result = await callTool("reorder_favorites", { graph: "work", body: { "page-ids": [NOTES_PAGE, PAGE_UUID] } });
+    expect(result.isError, result.text).toBe(false);
+    expect(writeJson(result.text)).toMatchObject({ favorites: [...listed.favorites].reverse() });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["GET", `/api/v1/graphs/${WORK_ID}/favorites`],
+      ["PUT", `/api/v1/graphs/${WORK_ID}/favorites`],
+    ]);
+    // The generated schema fills dry-run's default; the list goes as given, in order.
+    expect(JSON.parse(syncRequests[1].body)).toEqual({ "page-ids": [NOTES_PAGE, PAGE_UUID], "dry-run": false });
+  });
+
   it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
     syncHandler = () =>
       Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],
@@ -1307,6 +1387,8 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   create_property: { body: { title: "Venue" } },
   update_property: { "property-id": "Venue", body: {} },
   delete_property: { "property-id": "Venue" },
+  set_page_favorite: { "page-id": PAGE_UUID, body: { favorite: true } },
+  reorder_favorites: { body: { "page-ids": [PAGE_UUID, NOTES_PAGE] } },
 };
 
 /** The selectors each call above names, as `addressed` stores them. */
@@ -1336,6 +1418,9 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   create_property: [],
   update_property: ["Venue"],
   delete_property: ["Venue"],
+  set_page_favorite: [PAGE_UUID],
+  // page-ids is not one of the audit log's address keys, so the entries aren't recorded as addressed.
+  reorder_favorites: [],
 };
 
 /** Where each tool with a dry run takes its flag. */
@@ -1349,6 +1434,8 @@ const DRY_RUN_IN: Record<string, "query" | "body"> = {
   delete_blocks: "body",
   batch_move_blocks: "body",
   batch_insert_block_trees: "body",
+  set_page_favorite: "body",
+  reorder_favorites: "body",
 };
 
 /** A response naming one target and one affected block, as patch 0028's BlockContext does. */
@@ -2202,5 +2289,44 @@ describe("code, math and quote blocks", () => {
   it("the heading sentence agrees with the section: no heading for a code, math or quote block, and quote keeps tag handling", () => {
     expect(CONNECTOR_HELP).toContain("A code, math or quote block has no heading: its # lines are kept as given");
     expect(CONNECTOR_HELP).not.toContain("keeps its title as given, # lines included");
+  });
+});
+
+// Patch 0038: favourites, as Claude reads about them in connector_help and the generated descriptions.
+describe("favourites", () => {
+  // One assertion per point, so dropping any one of them from the paragraph fails.
+  it.each([
+    ["list_favorites", "list_favorites reads them in sidebar order"],
+    ["set_page_favorite", "set_page_favorite with favorite: true adds a page"],
+    ["reorder_favorites", "reorder_favorites takes the full list in the new order"],
+    ["what can be a favourite", "(a page, journal, tag or property, never a block; a tag or property by its UUID)"],
+    ["bottom, unlike the app", "at the bottom of the list, unlike the app, which adds at the top"],
+    ["remove is a delete", "favorite: false removes it, which counts as a delete, so a write-no-delete token can't do it"],
+    ["a dry run is allowed", "(a dry run can)"],
+    ["re-sends write nothing", "A re-send writes nothing"],
+    ["list first", "call list_favorites first and pass every favourite once"],
+    ["delete_page hides", "Deleting a page with delete_page hides its favourite"],
+    ["restore brings back", "restoring the page from the Recycle bin brings it back in its place"],
+    ["remove a deleted page's favourite", "remove a deleted page's favourite by its UUID"],
+    ["writes refused on E2EE", "Adding, removing and reordering favourites are unavailable on E2EE graphs"],
+    ["the list still reads on E2EE", "list_favorites still reads them there, with titles as stored"],
+  ])("connector_help's Favourites paragraph says %s", async (_point, phrase) => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(phrase);
+  });
+
+  it("connector_help holds the Favourites paragraph once", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help.split("Favourites are the pages in the sidebar's Favorites list.").length).toBe(2);
+  });
+
+  // These carry the openapi text vendored in Stages 1 to 3, so they passed before this stage.
+  it.each([
+    ["list_favorites", ["in sidebar order", "Works on E2EE graphs"]],
+    ["set_page_favorite", ["appended at the bottom of the list, unlike the app", "Unavailable for E2EE graphs (400)", "deletePage hides a favourite and restoring the page brings it back"]],
+    ["reorder_favorites", ["Pass the full list", "call listFavorites first", "Unavailable for E2EE graphs (400)"]],
+  ])("%s's generated description carries the openapi text", async (name, phrases) => {
+    const tool = (await listTools()).find((t) => t.name === name);
+    for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
   });
 });
