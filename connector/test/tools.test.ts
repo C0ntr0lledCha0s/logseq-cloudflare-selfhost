@@ -1065,6 +1065,26 @@ describe("hand-written tools", () => {
     );
   });
 
+  it("list_favorites is generated from listFavorites: a GET read on {graph} alone, annotated READ, reaching /favorites", async () => {
+    const tools = await listTools();
+    const list = tools.find((t) => t.name === "list_favorites");
+    expect(list).toBeDefined();
+    expect(Object.keys(list.inputSchema.properties)).toEqual(["graph"]);
+    expect(list.inputSchema.required).toEqual(["graph"]);
+    expect(list.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(list.description).toContain("in sidebar order");
+    expect(list.description).toContain("Recycle bin");
+    expect(committedManifest.find((e) => e.name === "list_favorites")).toMatchObject({
+      method: "GET",
+      path: "/api/v1/graphs/{graph-id}/favorites",
+    });
+    syncHandler = () => Response.json({ favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] });
+    const result = await callTool("list_favorites", { graph: "work" });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({ favorites: [{ uuid: PAGE_UUID, title: "Projects", kind: "page" }] });
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
+  });
+
   it("promote_page_to_tag sends extends in the body and dry-run in the query", async () => {
     syncHandler = () =>
       Response.json({ uuid: "p1", ident: "user.class/Recipe-x", title: "Recipe", extends: [], properties: [],

@@ -1,0 +1,346 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 9f8eb44..522efd6 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -3,9 +3,11 @@
+             [clojure.walk :as walk]
+             [datascript.core :as d]
+             [datascript.impl.entity :as de]
++            [logseq.common.config :as common-config]
+             [logseq.common.util :as common-util]
+             [logseq.common.util.date-time :as date-time-util]
+             [logseq.common.util.page-ref :as page-ref]
++            [logseq.common.uuid :as common-uuid]
+             [logseq.db :as ldb]
+             [logseq.db.common.order :as db-order]
+             [logseq.db-sync.common :as common]
+@@ -5122,6 +5124,54 @@
+           (http/json-response nil (assoc feed :epoch epoch :t t))
+           (http/error-response "changes since that point are no longer available; list again without since" 410))))))
+ 
++;; Page favourites (patch 0038). The sidebar's Favorites list is the hidden page $$$favorites, whose
++;; children each link one favourite with :block/link (ldb/build-favorite-tx); sibling order is the
++;; list's order. The app's db worker reads and writes it, and deps/db-sync has no copy of that code,
++;; so this reimplements it. The page is found by the deterministic uuid create_graph gives it, never
++;; by name: on an E2EE graph its name is ciphertext, and a page named $$$favorites under another uuid
++;; is not the list the app shows.
++(def ^:private favorites-page-uuid
++  (common-uuid/gen-uuid :builtin-block-uuid common-config/favorites-page-name))
++
++(defn- favorites-page [db]
++  (d/entity db [:block/uuid favorites-page-uuid]))
++
++(defn- favorite-slots
++  "The favourite blocks under $$$favorites in sidebar order; empty when the page is missing."
++  [db]
++  (when-let [page (favorites-page db)]
++    (ldb/sort-by-order (map #(d/entity db (:e %)) (d/datoms db :avet :block/parent (:db/id page))))))
++
++(defn- visible-favorites
++  "The favourites the sidebar shows, in its order, as [{:slot :target}]: a slot counts only when its
++  :block/link names an entity that is neither hidden nor in the Recycle bin, and a later slot
++  linking a target an earlier slot links is left out. Slots left out stay in the graph."
++  [db]
++  (let [seen (volatile! #{})]
++    (into []
++          (keep (fn [slot]
++                  (when-let [target (:block/link slot)]
++                    (when-not (or (entity-util/hidden? target) (contains? @seen (:db/id target)))
++                      (vswap! seen conj (:db/id target))
++                      {:slot slot :target target}))))
++          (favorite-slots db))))
++
++(defn- favorite-response
++  "A favourite named as the other endpoints name a page: its title as stored (ciphertext on an
++  E2EE graph, as listPages returns it) and its kind."
++  [target]
++  {:uuid (uuid-string (:block/uuid target))
++   :title (:block/title target)
++   :kind (title-holder-kind target)})
++
++(defn- handle-favorites [{:keys [db handler]}]
++  (case handler
++    :semantic/favorites-list
++    (http/json-response nil {:favorites (mapv (comp favorite-response :target) (visible-favorites db))})))
++
++(def ^:private favorite-handlers
++  #{:semantic/favorites-list})
++
+ (def ^:private page-handlers
+   #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
+     :semantic/pages-references :semantic/pages-get
+@@ -5209,6 +5259,7 @@
+     (contains? block-handlers handler) (handle-blocks context)
+     (contains? block-property-handlers handler) (handle-block-properties context)
+     (contains? capture-and-tag-handlers handler) (handle-capture-and-tags context)
++    (contains? favorite-handlers handler) (handle-favorites context)
+     (contains? task-handlers handler) (handle-tasks context)
+     (contains? asset-handlers handler) (handle-assets context)
+     (contains? property-and-search-handlers handler) (handle-properties-and-search context)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 74d0061..d1c7a7f 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -30,6 +30,8 @@
+     :handler :semantic/pages-update :operation-id "updatePage" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/pages/:page-id/promote-to-tag" :internal-path "/semantic/pages/:page-id/promote-to-tag"
+     :handler :semantic/pages-promote-to-tag :operation-id "promotePageToTag" :scope "logseq/write" :rate-class :write}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/favorites" :internal-path "/semantic/favorites"
++    :handler :semantic/favorites-list :operation-id "listFavorites" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
+     :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
+@@ -171,6 +173,7 @@
+    "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
+    "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by page-id (its UUID or title), into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
++   "listFavorites" ["List favourites" "Returns the graph's favourites, the pages in the sidebar's Favorites list, in sidebar order, each with its uuid, title and kind (page, journal, tag or property; block or asset for one the app favourited from a zoomed-in block). Left out: a slot that links nothing, a slot whose page is hidden or in the Recycle bin (deletePage leaves the favourite in place; restoring the page brings it back in its place), and a later slot linking a page an earlier one links. The list is empty when the graph has no favourites page. Works on E2EE graphs: the favourites page is found by its fixed uuid, and titles come back as stored (ciphertext), as listPages returns them."]
+    "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
+    "getTag" ["Get a tag" "Returns one tag by UUID or ident (as updateTag takes it), with the tags it extends and its tag properties. Answers 404 for an id that names no visible tag."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+@@ -628,6 +631,7 @@
+                   "getTag" (entity-response "TagResponse" "A tag")
+                   "updateTag" (entity-response "TagResponse" "The updated tag")
+                   "promotePageToTag" (entity-response "PromotedTagResponse" "The page, now a tag, and what it kept")
++                  "listFavorites" (entity-response "FavoritesResponse" "The favourites in sidebar order")
+                   "getProperty"
+                   (entity-response "PropertyResponse" "A property definition and its user-extensible choices")
+                   "updateProperty" (entity-response "PropertyResponse" "The updated property definition")
+@@ -987,6 +991,14 @@
+                                                                       :properties {:blocks {:type "integer" :description "The page's own blocks, kept on the tag."}
+                                                                                    :references {:type "integer" :description "Other blocks and pages that link to it, embed it, alias it or hold it as a property value; they still point at it."}}}
+                                                            :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written, and ident is left out because the real call generates it."}}}]}
++               :Favorite {:type "object" :required ["uuid" "title" "kind"]
++                          :properties {:uuid {:type "string"}
++                                       :title {:type "string"}
++                                       :kind {:enum ["page" "journal" "tag" "property" "block" "asset"]}}}
++               :FavoritesResponse {:type "object" :required ["favorites"]
++                                   :properties {:favorites {:type "array"
++                                                            :description "In sidebar order; empty when the graph has none."
++                                                            :items {:$ref "#/components/schemas/Favorite"}}}}
+                :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
+                                       :properties {:uuid {:type "string"}
+                                                    :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
+new file mode 100644
+index 0000000..6c49b5f
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_favorites_test.cljs
+@@ -0,0 +1,205 @@
++(ns logseq.db-sync.semantic-favorites-test
++  "Page favourites (patch 0038). Favourites are child blocks of the hidden page $$$favorites, each
++  linking a page with :block/link; the app's db worker reads and writes them, and deps/db-sync had
++  no favourites API. listFavorites finds the page by its deterministic uuid (never by name, so it
++  works on E2EE graphs and after a rename) and returns the favourites in sidebar order (sibling
++  order), leaving out a slot with no link, a slot whose page is hidden or in the Recycle bin, and a
++  later slot linking a page an earlier one links. Favourites are built here as the app builds them:
++  ldb/build-favorite-tx through the real outliner's insert-blocks! with the app's {} options, which
++  put each new favourite at the top."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.common.uuid :as common-uuid]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [promesa.core :as p]))
++
++(def ^:private favorites-uuid (common-uuid/gen-uuid :builtin-block-uuid "$$$favorites"))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}. With e2ee?, the
++  request carries graph-e2ee=true as the index's flag reaches the DO."
++  ([self method path body] (request! self method path body false))
++  ([self method path body e2ee?]
++   (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1"
++                    (when e2ee? "&graph-e2ee=true"))
++           response (sync-handler/handle-http
++                     self
++                     (js/Request. url (clj->js (cond-> {:method method
++                                                        :headers {"content-type" "application/json"}}
++                                                 body (assoc :body (js/JSON.stringify (clj->js body)))))))
++           text (.text response)]
++     {:status (.-status response)
++      :body (when (seq text)
++              (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                   (catch :default _ text)))})))
++
++(defn- list! [self & [e2ee?]] (request! self "GET" "/semantic/favorites" nil e2ee?))
++
++(defn- favorites-page [conn] (d/entity @conn [:block/uuid favorites-uuid]))
++
++(defn- add-favourites!
++  "Adds favourite slots so that the sidebar shows them in `entries` order: each entry is a uuid the
++  slot links, or :no-link for a slot without a link. Inserted as the app inserts (each at the top),
++  last entry first, so the slots' db ids run opposite to their sidebar order."
++  [conn entries]
++  (doseq [entry (reverse entries)]
++    (outliner-core/insert-blocks! conn
++                                  [(if (= :no-link entry)
++                                     {:block/title ""}
++                                     (ldb/build-favorite-tx entry))]
++                                  (favorites-page conn)
++                                  {})))
++
++(defn- page-tx [id title & [extra]]
++  (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++         extra))
++
++(defn- seed-graph
++  "A conn from the initial data (create_graph's $$$favorites included) with pages Alpha, Beta,
++  Gamma, Delta, a hidden page Secret and a block in Alpha."
++  []
++  (let [conn (sqlite-export/create-conn)
++        self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++        [alpha beta gamma delta secret block] (repeatedly 6 random-uuid)]
++    (d/transact! conn [(page-tx alpha "Alpha") (page-tx beta "Beta") (page-tx gamma "Gamma")
++                       (page-tx delta "Delta") (page-tx secret "Secret" {:logseq.property/hide? true})])
++    (d/transact! conn [{:block/uuid block :block/title "An Alpha block"
++                        :block/page [:block/uuid alpha] :block/parent [:block/uuid alpha]
++                        :block/order "a0" :block/created-at 1 :block/updated-at 1}])
++    {:conn conn :self self :alpha alpha :beta beta :gamma gamma :delta delta :secret secret :block block}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(defn- listed [response] [(:status response) (mapv :uuid (get-in response [:body :favorites]))])
++
++(defn- ids [& uuids] (mapv str uuids))
++
++;; Before patch 0038 there is no such route: 404 {:error "not found"}.
++(deftest list-in-sidebar-order-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (add-favourites! conn [beta gamma alpha])
++        (p/let [response (list! self)]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= {:favorites [{:uuid (str beta) :title "Beta" :kind "page"}
++                              {:uuid (str gamma) :title "Gamma" :kind "page"}
++                              {:uuid (str alpha) :title "Alpha" :kind "page"}]}
++                 (:body response))
++              "sibling order under $$$favorites, not the order the slots were created in"))))))
++
++(deftest list-skips-hidden-slots-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma delta secret]}]
++        (add-favourites! conn [alpha :no-link beta secret gamma alpha delta beta])
++        (p/let [before (list! self)
++                deleted (request! self "DELETE" (str "/semantic/pages/" gamma "?acknowledge-references=true") nil)
++                recycled? (some? (:logseq.property/deleted-at (d/entity @conn [:block/uuid gamma])))
++                slots-after-delete (count (:block/_parent (favorites-page conn)))
++                after-delete (list! self)
++                restored (request! self "POST" "/semantic/pages" {:title "Gamma"})
++                after-restore (list! self)]
++          (testing "a link-less slot, a hidden page's slot and later duplicates are left out"
++            (is (= [200 (ids alpha beta gamma delta)] (listed before)) (pr-str before)))
++          (testing "deletePage puts the page in the Recycle bin; its favourite is left out, the slot kept"
++            (is (= 200 (:status deleted)) (pr-str deleted))
++            (is recycled?)
++            (is (= [200 (ids alpha beta delta)] (listed after-delete)) (pr-str after-delete))
++            (is (= 8 slots-after-delete) "no slot is removed by a page delete"))
++          (testing "restoring the page brings its favourite back in its place"
++            (is (= [201 (str gamma)] [(:status restored) (get-in restored [:body :uuid])]) (pr-str restored))
++            (is (= [200 (ids alpha beta gamma delta)] (listed after-restore)) (pr-str after-restore))))))))
++
++(deftest list-missing-page-is-empty-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha]}]
++        (add-favourites! conn [alpha])
++        (d/transact! conn [[:db/retractEntity (:db/id (favorites-page conn))]])
++        (is (nil? (favorites-page conn)))
++        (p/let [response (list! self)]
++          (is (= [200 {:favorites []}] [(:status response) (:body response)]) (pr-str response)))))))
++
++(deftest list-by-uuid-not-name-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha beta gamma]}]
++        (add-favourites! conn [alpha beta])
++        ;; The real page under another name, then an impostor holding the name under another uuid,
++        ;; with a favourite of its own.
++        (d/transact! conn [{:db/id (:db/id (favorites-page conn)) :block/name "renamed" :block/title "renamed"}])
++        (let [impostor (random-uuid)]
++          (d/transact! conn [(page-tx impostor "$$$favorites" {:logseq.property/hide? true})])
++          (d/transact! conn [{:block/uuid (random-uuid) :block/title "" :block/link [:block/uuid gamma]
++                              :block/page [:block/uuid impostor] :block/parent [:block/uuid impostor]
++                              :block/order "a0"}]))
++        (p/let [response (list! self)]
++          (is (= [200 (ids alpha beta)] (listed response)) (pr-str response)))))))
++
++(deftest list-e2ee-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha]}]
++        (let [journal (random-uuid)
++              cipher "[\"~#iv\",\"ciphertext\"]"]
++          (d/transact! conn [{:block/uuid journal :block/name cipher :block/title cipher
++                              :block/journal-day 20261109 :block/tags #{:logseq.class/Journal}
++                              :block/created-at 1 :block/updated-at 1}])
++          ;; On an E2EE graph the favourites page's name and title are ciphertext too.
++          (d/transact! conn [{:db/id (:db/id (favorites-page conn)) :block/name cipher :block/title cipher}
++                             {:block/uuid alpha :block/name cipher :block/title cipher}])
++          (add-favourites! conn [journal alpha])
++          (p/let [response (list! self true)]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= [{:uuid (str journal) :kind "journal" :title (:block/title (d/entity @conn [:block/uuid journal]))}
++                    {:uuid (str alpha) :kind "page" :title cipher}]
++                   (get-in response [:body :favorites]))
++                "found by uuid; uuids and kinds, with titles as stored, as listPages returns them")))))))
++
++(deftest list-kinds-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self alpha block]}]
++        (p/let [journal (random-uuid)
++                _ (d/transact! conn [{:block/uuid journal :block/name "nov 9th, 2026" :block/title "Nov 9th, 2026"
++                                      :block/journal-day 20261109 :block/tags #{:logseq.class/Journal}
++                                      :block/created-at 1 :block/updated-at 1}])
++                tag (request! self "POST" "/semantic/tags" {:title "Projects"})
++                property (request! self "POST" "/semantic/properties" {:title "Rating" :type "number"})
++                tag-id (uuid (get-in tag [:body :uuid]))
++                property-id (uuid (get-in property [:body :uuid]))
++                _ (add-favourites! conn [journal tag-id property-id alpha block])
++                response (list! self)]
++          (is (= [201 201] [(:status tag) (:status property)]))
++          (is (= [["journal" "Nov 9th, 2026"] ["tag" "Projects"] ["property" "Rating"] ["page" "Alpha"]
++                  ["block" "An Alpha block"]]
++                 (mapv (juxt :kind :title) (get-in response [:body :favorites])))
++              (pr-str response)))))))
++
++;; The connector generates list_favorites from this operation.
++(deftest list-route-and-openapi-test
++  (let [public (semantic-routes/match-public "GET" "/api/v1/graphs/graph-1/favorites")
++        document (semantic-routes/openapi-document "https://issuer.example")
++        operation (get-in document [:paths "/api/v1/graphs/{graph-id}/favorites" :get])
++        item (get-in document [:components :schemas :Favorite])]
++    (is (= ["listFavorites" :semantic/favorites-list "logseq/read" :read "/semantic/favorites"]
++           ((juxt :operation-id :handler :scope :rate-class :internal-path) public)))
++    (is (= "listFavorites" (:operationId operation)))
++    (is (= [{:oauth ["logseq/read"]}] (:security operation)))
++    (is (= ["graph-id"] (map :name (:parameters operation))))
++    (is (= "#/components/schemas/FavoritesResponse"
++           (get-in operation [:responses "200" :content "application/json" :schema :$ref])))
++    (is (= ["uuid" "title" "kind"] (:required item)))
++    (is (every? #(string/includes? (:description operation) %)
++                ["sidebar order" "Recycle bin" "empty" "E2EE"]))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 73c58da..f8de330 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -29,6 +29,7 @@
+             [logseq.db-sync.semantic-signals-view-test]
+             [logseq.db-sync.semantic-knowledge-index-aliases-test]
+             [logseq.db-sync.semantic-display-type-test]
++            [logseq.db-sync.semantic-favorites-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

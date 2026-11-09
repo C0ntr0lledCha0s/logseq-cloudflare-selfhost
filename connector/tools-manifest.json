@@ -319,6 +319,17 @@
     }
   },
   {
+    "name": "list_favorites",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/favorites",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "list_graphs",
     "method": null,
     "path": null,

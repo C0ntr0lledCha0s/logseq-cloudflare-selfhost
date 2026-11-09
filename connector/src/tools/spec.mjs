@@ -84,6 +84,7 @@ export const ANNOTATIONS = Object.freeze({
   insert_block_tree: ADDITIVE,
   kb_index: READ,
   list_assets: READ,
+  list_favorites: READ,
   list_graphs: READ,
   list_page_blocks: READ,
   list_page_references: READ,
