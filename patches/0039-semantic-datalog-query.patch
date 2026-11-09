@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..dfd4ea6
+index 0000000..2719a1c
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,513 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -273,6 +273,15 @@ index 0000000..dfd4ea6
 +                            (range) (rest rule)))))
 +              (range) rules))))
 +
++(defn- relation-find
++  "A :find in any of Datascript's shapes as a relation find: [?x .] and [[?x ...]] become [?x], and
++  [[?x ?y]] becomes [?x ?y]."
++  [find]
++  (cond
++    (and (= 2 (count find)) (= '. (second find))) [(first find)]
++    (and (= 1 (count find)) (vector? (first find))) (vec (remove #{'...} (first find)))
++    :else find))
++
 +(defn validate-query
 +  "nil when `q` (normalised) may run with `rules` and `inputs`, else one message listing every
 +  clause's refusal."
@@ -287,8 +296,11 @@ index 0000000..dfd4ea6
 +                        bound " after $")])
 +                (when (empty? (:find q)) ["query: :find is required"])
 +                (find-errors (:find q))
-+                (when (and (:keys q) (not= (count (:keys q)) (count (remove '#{. ...} (flatten (:find q))))))
-+                  [(str "query: :keys names " (count (:keys q)) " columns for " (count (:find q)) " find elements")])
++                (let [columns (count (relation-find (:find q)))]
++                  (for [k [:keys :strs :syms]
++                        :let [names (get q k)]
++                        :when (and names (not= (count names) columns))]
++                    (str "query: " k " names " (count names) " columns for " columns " find elements")))
 +                (mapcat (fn [i clause] (clause-errors (str "where " (inc i)) names clause)) (range) where)
 +                (when rules (rules-errors rules)))]
 +    (if (seq errors)
@@ -380,15 +392,6 @@ index 0000000..dfd4ea6
 +    (map? v) (into {} (map (fn [[k x]] [(if (keyword? k) (keyword-text k) (str k)) (serialise x)])) v)
 +    (coll? v) (mapv serialise v)
 +    :else v))
-+
-+(defn- relation-find
-+  "A :find in any of Datascript's shapes as a relation find: [?x .] and [[?x ...]] become [?x], and
-+  [[?x ?y]] becomes [?x ?y]."
-+  [find]
-+  (cond
-+    (and (= 2 (count find)) (= '. (second find))) [(first find)]
-+    (and (= 1 (count find)) (vector? (first find))) (vec (remove #{'...} (first find)))
-+    :else find))
 +
 +(defn- query-args [in fdb rules inputs]
 +  (loop [[b & more] (or (seq in) '[$]) inputs inputs args []]
@@ -612,10 +615,10 @@ index 1365b0a..fa47834 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..4cc58e6
+index 0000000..6a11d06
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,599 @@
+@@ -0,0 +1,667 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -784,6 +787,16 @@ index 0000000..4cc58e6
 +                     ["a nested :db/add in an inputs collection" "inputs: :db/add is a write form"
 +                      {:form '[:find ?t :in $ [?x ...] :where [?e :block/title ?t] [(= ?t ?x)]]
 +                       :inputs '[[[:db/add 1 :block/title "x"]]]}]
++                     [":db/cas in inputs" "inputs: :db/cas is a write form; datalog_query is read-only"
++                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
++                       :inputs '[[:db/cas 1 :block/title "x" "y"]]}]
++                     [":db/retractAttribute in inputs" "inputs: :db/retractAttribute is a write form; datalog_query is read-only"
++                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
++                       :inputs '[[:db/retractAttribute 1 :block/title]]}]
++                     [":db/cas in the query" "query: :db/cas is a write form"
++                      {:form '[:find ?e :where [?e :block/title :db/cas]]}]
++                     [":db/cas in a rule body" "rules: :db/cas is a write form"
++                      {:form '[:find ?e :in $ % :where (w ?e)] :rules '[[(w ?e) [?e :db/cas ?x]]]}]
 +                     ["a :db/id map in inputs" "inputs: a map with :db/id is a write form"
 +                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
 +                       :inputs '[{:db/id 1 :block/title "x"}]}]
@@ -857,6 +870,8 @@ index 0000000..4cc58e6
 +      (fn [{:keys [self]}]
 +        (p/let [two-sources (query! self '[:find ?t :in $ $2 :where [?e :block/title ?t]] :inputs '[[]])
 +                clause-source (query! self '[:find ?t :where [$2 ?e :block/title ?t]])
++                pull-source (query! self '[:find (pull $2 ?e [*]) :where [?e :block/title "zq Notes"]])
++                aggregate-source (query! self '[:find (count $2 ?e) :where [?e :block/title "zq Notes"]])
 +                pct-no-rules (query! self '[:find ?t :in $ % :where [?e :block/title ?t]])
 +                rules-no-pct (query! self '[:find ?t :where [?e :block/title ?t]]
 +                                     :rules '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
@@ -871,6 +886,10 @@ index 0000000..4cc58e6
 +                                           [(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]])]
 +          (is (refused? two-sources ":in: source $2 is not allowed; only the default source $") (pr-str two-sources))
 +          (is (refused? clause-source "where 1: source $2 is not allowed; only the default source $") (pr-str clause-source))
++          (testing "a source inside a pull or an aggregate in :find is refused by name"
++            (is (refused? pull-source "find: source $2 is not allowed; only the default source $") (pr-str pull-source))
++            (is (refused? aggregate-source "find: source $2 is not allowed; only the default source $")
++                (pr-str aggregate-source)))
 +          (is (refused? pct-no-rules ":in: % needs rules") (pr-str pct-no-rules))
 +          (is (refused? rules-no-pct "rules: given, but :in has no %") (pr-str rules-no-pct))
 +          (is (refused? undefined "where 2: rule linked is not defined in rules") (pr-str undefined))
@@ -926,6 +945,29 @@ index 0000000..4cc58e6
 +                                             [(clojure.string/starts-with? ?t "zq Public")]])
 +                  map-form (query! self '{:find [?t] :with [?e] :keys [title]
 +                                          :where [[?e :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]})
++                  count-keys (query! self '[:find (count ?e) :keys n :where [?e :block/title ?t]
++                                            [(clojure.string/starts-with? ?t "zq Public")]])
++                  scalar-count-keys (query! self '[:find (count ?e) . :keys n :where [?e :block/title ?t]
++                                                   [(clojure.string/starts-with? ?t "zq Public")]])
++                  pull-keys (query! self '[:find (pull ?e [:block/title :block/uuid]) :keys page
++                                           :where [?e :block/title "zq Notes"]])
++                  coll-pull-keys (query! self '[:find [(pull ?e [:block/title]) ...] :keys page
++                                                :where [?e :block/title "zq Notes"]])
++                  var-and-count-keys (query! self '[:find ?t (count ?e) :keys title n :where [?e :block/title ?t]
++                                                    [(clojure.string/starts-with? ?t "zq Public")]])
++                  tuple-keys (query! self '[:find [?t ?e] :keys title id :where [?e :block/title "zq Notes"]
++                                            [?e :block/title ?t]])
++                  map-count-keys (query! self '{:find [(count ?e)] :keys [n]
++                                                :where [[?e :block/title ?t] [(clojure.string/starts-with? ?t "zq Public")]]})
++                  too-few-keys (query! self '[:find ?t ?e :keys title :where [?e :block/title ?t]])
++                  too-many-keys (query! self '[:find (count ?e) :keys n m :where [?e :block/title ?t]])
++                  pull-too-many-keys (query! self '[:find (pull ?e [:block/title :block/uuid]) :keys a b
++                                                    :where [?e :block/title ?t]])
++                  strs-count (query! self '[:find (count ?e) :strs n :where [?e :block/title ?t]
++                                            [(clojure.string/starts-with? ?t "zq Public")]])
++                  syms-pull (query! self '[:find (pull ?e [:block/title]) :syms page :where [?e :block/title "zq Notes"]])
++                  strs-too-few (query! self '[:find ?t ?e :strs title :where [?e :block/title ?t]])
++                  syms-too-many (query! self '[:find (count ?e) :syms n m :where [?e :block/title ?t]])
 +                  rules-key (query! self '{:find [?t] :where [[?e :block/title ?t]] :rules []})
 +                  timeout-key (query! self '[:find ?t :timeout 5 :where [?e :block/title ?t]])
 +                  at-limit (query! self (pad base 4000))
@@ -946,6 +988,35 @@ index 0000000..4cc58e6
 +                  "sorted as compare sorts strings: upper case first")
 +              (is (= (select-keys (:body vector-form) [:columns :rows :total-rows])
 +                     (select-keys (:body map-form) [:columns :rows :total-rows]))))
++            (testing ":keys names one column per find element, an aggregate or a pull counting as one"
++              (is (= [200 ["n"] [[3]]] [(:status count-keys) (get-in count-keys [:body :columns]) (get-in count-keys [:body :rows])])
++                  (pr-str count-keys))
++              (is (= [200 ["n"] [[3]]]
++                     [(:status scalar-count-keys) (get-in scalar-count-keys [:body :columns]) (get-in scalar-count-keys [:body :rows])])
++                  (pr-str scalar-count-keys))
++              (is (= [200 ["n"] [[3]]]
++                     [(:status map-count-keys) (get-in map-count-keys [:body :columns]) (get-in map-count-keys [:body :rows])])
++                  (pr-str map-count-keys))
++              (is (= [200 ["page"] 1] [(:status pull-keys) (get-in pull-keys [:body :columns]) (count (get-in pull-keys [:body :rows]))])
++                  (pr-str pull-keys))
++              (is (= [200 ["page"] 1]
++                     [(:status coll-pull-keys) (get-in coll-pull-keys [:body :columns]) (count (get-in coll-pull-keys [:body :rows]))])
++                  (pr-str coll-pull-keys))
++              (is (= [200 ["title" "n"] [["zq Public Plans" 1] ["zq Public child" 1] ["zq Public note" 1]]]
++                     [(:status var-and-count-keys) (get-in var-and-count-keys [:body :columns])
++                      (get-in var-and-count-keys [:body :rows])])
++                  (pr-str var-and-count-keys))
++              (is (= [200 ["title" "id"]] [(:status tuple-keys) (get-in tuple-keys [:body :columns])]) (pr-str tuple-keys)))
++            (testing "a :keys count that doesn't match the find elements is refused with both counts"
++              (is (refused? too-few-keys "query: :keys names 1 columns for 2 find elements") (pr-str too-few-keys))
++              (is (refused? too-many-keys "query: :keys names 2 columns for 1 find elements") (pr-str too-many-keys))
++              (is (refused? pull-too-many-keys "query: :keys names 2 columns for 1 find elements") (pr-str pull-too-many-keys)))
++            (testing ":strs and :syms name columns as :keys does, with the same count"
++              (is (= [200 ["n"] [[3]]] [(:status strs-count) (get-in strs-count [:body :columns]) (get-in strs-count [:body :rows])])
++                  (pr-str strs-count))
++              (is (= [200 ["page"]] [(:status syms-pull) (get-in syms-pull [:body :columns])]) (pr-str syms-pull))
++              (is (refused? strs-too-few "query: :strs names 1 columns for 2 find elements") (pr-str strs-too-few))
++              (is (refused? syms-too-many "query: :syms names 2 columns for 1 find elements") (pr-str syms-too-many)))
 +            (testing "unknown query keys are refused naming the key"
 +              (is (refused? rules-key "query: :rules is not a query key; pass rules in the rules field") (pr-str rules-key))
 +              (is (refused? timeout-key "query: :timeout is not a query key") (pr-str timeout-key)))
