@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,8 +20,10 @@ function run(dest, env = {}) {
   });
 }
 
-test("applies patches at UPSTREAM_REF", { skip }, () => {
-  const dest = join(mkdtempSync(join(tmpdir(), "fetch-up-")), "up");
+test("applies patches at UPSTREAM_REF", { skip }, (t) => {
+  const tmp = mkdtempSync(join(tmpdir(), "fetch-up-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const dest = join(tmp, "up");
   const r = run(dest);
   assert.equal(r.status, 0, r.stderr);
   const src = readFileSync(join(dest, patchedFile), "utf8");
@@ -29,8 +31,9 @@ test("applies patches at UPSTREAM_REF", { skip }, () => {
   assert.ok(!src.includes("api.logseq.com"));
 });
 
-test("fails cleanly when a patch does not apply", { skip }, () => {
+test("fails cleanly when a patch does not apply", { skip }, (t) => {
   const tmp = mkdtempSync(join(tmpdir(), "fetch-up-"));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
   const patches = join(tmp, "patches");
   cpSync(join(root, "patches"), patches, { recursive: true });
   writeFileSync(
