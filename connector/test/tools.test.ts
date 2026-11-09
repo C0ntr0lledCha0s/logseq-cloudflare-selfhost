@@ -2291,3 +2291,42 @@ describe("code, math and quote blocks", () => {
     expect(CONNECTOR_HELP).not.toContain("keeps its title as given, # lines included");
   });
 });
+
+// Patch 0038: favourites, as Claude reads about them in connector_help and the generated descriptions.
+describe("favourites", () => {
+  // One assertion per point, so dropping any one of them from the paragraph fails.
+  it.each([
+    ["list_favorites", "list_favorites reads them in sidebar order"],
+    ["set_page_favorite", "set_page_favorite with favorite: true adds a page"],
+    ["reorder_favorites", "reorder_favorites takes the full list in the new order"],
+    ["what can be a favourite", "(a page, journal, tag or property, never a block; a tag or property by its UUID)"],
+    ["bottom, unlike the app", "at the bottom of the list, unlike the app, which adds at the top"],
+    ["remove is a delete", "favorite: false removes it, which counts as a delete, so a write-no-delete token can't do it"],
+    ["a dry run is allowed", "(a dry run can)"],
+    ["re-sends write nothing", "A re-send writes nothing"],
+    ["list first", "call list_favorites first and pass every favourite once"],
+    ["delete_page hides", "Deleting a page with delete_page hides its favourite"],
+    ["restore brings back", "restoring the page from the Recycle bin brings it back in its place"],
+    ["remove a deleted page's favourite", "remove a deleted page's favourite by its UUID"],
+    ["writes refused on E2EE", "Adding, removing and reordering favourites are unavailable on E2EE graphs"],
+    ["the list still reads on E2EE", "list_favorites still reads them there, with titles as stored"],
+  ])("connector_help's Favourites paragraph says %s", async (_point, phrase) => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(phrase);
+  });
+
+  it("connector_help holds the Favourites paragraph once", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help.split("Favourites are the pages in the sidebar's Favorites list.").length).toBe(2);
+  });
+
+  // These carry the openapi text vendored in Stages 1 to 3, so they passed before this stage.
+  it.each([
+    ["list_favorites", ["in sidebar order", "Works on E2EE graphs"]],
+    ["set_page_favorite", ["appended at the bottom of the list, unlike the app", "Unavailable for E2EE graphs (400)", "deletePage hides a favourite and restoring the page brings it back"]],
+    ["reorder_favorites", ["Pass the full list", "call listFavorites first", "Unavailable for E2EE graphs (400)"]],
+  ])("%s's generated description carries the openapi text", async (name, phrases) => {
+    const tool = (await listTools()).find((t) => t.name === name);
+    for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
+  });
+});
