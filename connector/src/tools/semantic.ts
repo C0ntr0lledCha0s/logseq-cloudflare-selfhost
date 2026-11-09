@@ -4,11 +4,11 @@ import { registerSemanticApiTools } from "../../vendor/semantic_api_tools.mjs";
 import { connectorHostname } from "../config";
 import type { ResolvedGraph } from "../graphs";
 import { SyncError, type SyncRequest, syncFetch } from "../sync";
-import { ToolError, aliasArg, lookupGraph, resolveGraph, runTool, withCallGraphs } from "./common";
+import { RESULT_CHAR_LIMIT, ToolError, aliasArg, lookupGraph, resolveGraph, runTool, withCallGraphs } from "./common";
 
 export { resolveGraph };
 import { type AuditContext, audited } from "../audit/log";
-import { type OnSuccess, capWriteResult, reasonGiven, reasonSchema } from "./readable";
+import { type OnSuccess, capWriteResult, compact, reasonGiven, reasonSchema } from "./readable";
 import { DELETE_RULES, DRY_RUN_TOOLS, declaredDryRun, deleteReason, noDeleteMessage } from "./deletes.mjs";
 import { ALIAS_PATTERN, type GraphOperation, type OpenApiSpec, annotationsFor, graphOperations, transformSpec } from "./spec.mjs";
 
@@ -296,6 +296,18 @@ async function readAddressed(tool: string, args: Record<string, unknown>): Promi
 }
 
 /**
+ * A query's result, its JSON written without indentation when indented it would pass
+ * `RESULT_CHAR_LIMIT`. The server's byte cap keeps the compact JSON under 100,000 characters, but
+ * rows of many small values (a reverse-ref pull) grow 1.6 times or more when indented, and the read
+ * path's cap would then cut the JSON mid-row. Under the limit it stays indented.
+ */
+export function compactQueryResult(result: CallToolResult): CallToolResult {
+  const size = result.content.reduce((n, c) => n + (c.type === "text" ? c.text.length : 0), 0);
+  if (size <= RESULT_CHAR_LIMIT) return result;
+  return { ...result, content: result.content.map((c) => (c.type === "text" ? { ...c, text: compact(c.text) } : c)) };
+}
+
+/**
  * Runs one LOGGED_READS call and records its read row, status `ok` or `error`, with 0 D1 rows read
  * (the query reads the Durable Object). The graph is looked up once per call (`withCallGraphs`), so
  * the row's graph id costs no extra D1 read. A row that can't be stored is logged to Workers Logs
@@ -341,7 +353,7 @@ export function registerGraphTools(server: McpServer, tools: GraphTool[], onSucc
             // The input schema requires a well-formed alias, so a call that got this far has one.
             if (alias === undefined) throw new Error("graph tool ran without a valid alias");
             const result = LOGGED_READS.has(tool.name)
-              ? await loggedRead(audit, tool.name, alias, args, () => tool.handler(args))
+              ? compactQueryResult(await loggedRead(audit, tool.name, alias, args, () => tool.handler(args)))
               : await tool.handler(args);
             onSuccess(tool.name, alias);
             return result;

@@ -21,7 +21,7 @@ export const FAVOURITES_HELP =
  * vendored openapi text. The audit sentence says what LOGGED_READS does in semantic.ts.
  */
 export const QUERIES_HELP =
-  "Queries: datalog_query runs a read-only Datalog query (EDN, at most 4,000 characters) against the graph. " +
+  "Queries: datalog_query runs a read-only Datalog query (EDN, at most 4,000 characters) against the graph; inputs and rules are at most 4,000 characters each. " +
   "Prefer run_named_query when one fits: projects-untouched, meetings-without-decision, open-tasks-by-client and pages-missing-property, each with defaults you can override in params; a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param, so pass the graph's own tag or property. " +
   "Results are cut to limit rows (default 50, maximum 200) and then to about 100,000 characters (the byte cap), and truncated says which cap applied; total-rows counts every row. " +
   "A query that scans more than 20,000 datoms (the scan cap), builds more than 20,000 rows while joining (the join cap: a join through a shared value, such as two blocks with the same tag, matches every pair) or matches more than 2,500 rows (the row cap) is refused with 422, never answered in part: narrow it with a tag, page or attribute value, bind one side of a join, or count with an aggregate such as (count ?b) (which folds rows for the row cap, not the join cap). projects-untouched can reach the scan cap on a large graph. " +

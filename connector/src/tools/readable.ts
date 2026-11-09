@@ -367,7 +367,8 @@ export function withSummary(result: CallToolResult, summary: string): CallToolRe
   return { ...result, content: [{ type: "text", text: summary }, ...result.content] };
 }
 
-function compact(text: string): string {
+/** `text` as JSON without indentation, or unchanged when it is not JSON. */
+export function compact(text: string): string {
   try {
     return JSON.stringify(JSON.parse(text));
   } catch {

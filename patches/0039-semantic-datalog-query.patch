@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..ea78568
+index 0000000..0798414
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1096 @@
+@@ -0,0 +1,1159 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -24,14 +24,16 @@ index 0000000..ea78568
 +  n entities gives n² rows), so Datascript's join-tuples and -collect-tuples, through which every
 +  joined row is built, count them while a query runs, and past the join cap the query stops and answers 422. Every row
 +  is sorted before limit applies, so past the row cap the query answers 422 before the sort, and
-+  so do rows whose collections (from inputs) hold more than the value cap. No allowed function
++  so do rows whose collections (from inputs) hold more than the value cap, which counts each
++  character of text inside them. query, inputs and rules are each at most 4,000 characters, refused
++  before they are parsed, and the left-recursion check is linear in the rules' size. No allowed function
 +  builds a value larger than its arguments: the collection constructors are refused, and str, +
 +  and keyword (which join strings) take at most one variable. A rule that calls back into itself (directly or through
 +  other rules) before a data pattern binds one of the call's variables would expand without reading
 +  datoms, so the cap could not stop it; it is refused with 400 before the query runs. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
 +  no recursion, at most 50 values per many attribute) is pulled only for the rows kept after the
 +  limit. Rows are added to the response until its JSON would pass the byte cap, so the connector
-+  never cuts it mid-row."
++  never cuts it mid-row, and the response sets rows last, after the counts and the note."
 +  (:require [cljs.reader :as reader]
 +            [cljs.tools.reader.edn :as edn]
 +            [cljs.tools.reader.reader-types :as reader-types]
@@ -72,6 +74,11 @@ index 0000000..ea78568
 +(def default-limit 50)
 +(def max-limit 200)
 +(def max-query-chars 4000)
++(def max-field-chars
++  "Characters inputs and rules may each hold, like query: past it the field is refused before it is
++  parsed. Validation walks every rule, and the value cap counts every character of input text, so
++  neither field may grow without bound."
++  4000)
 +(def max-inputs 20)
 +(def max-pull-depth 2)
 +(def many-attr-limit 50)
@@ -440,44 +447,74 @@ index 0000000..ea78568
 +                     [(into calls more) bound']))
 +                 [[] bound] clauses)))
 +
++(defn- strongly-connected
++  "The strongly connected components of the graph `edges` (node → successors) reached from `nodes`,
++  each a set, by Tarjan's algorithm: one walk, so the check stays linear in the rules' size."
++  [nodes edges]
++  (let [index (volatile! {}) low (volatile! {}) stack (volatile! []) on-stack (volatile! #{})
++        counter (volatile! 0) components (volatile! [])
++        visit (fn visit [v]
++                (vswap! index assoc v @counter)
++                (vswap! low assoc v @counter)
++                (vswap! counter inc)
++                (vswap! stack conj v)
++                (vswap! on-stack conj v)
++                (doseq [w (edges v)]
++                  (cond
++                    (not (contains? @index w)) (do (visit w) (vswap! low update v min (get @low w)))
++                    (contains? @on-stack w) (vswap! low update v min (get @index w))))
++                (when (= (get @low v) (get @index v))
++                  (loop [component #{}]
++                    (let [w (peek @stack)]
++                      (vswap! stack pop)
++                      (vswap! on-stack disj w)
++                      (if (= w v)
++                        (vswap! components conj (conj component w))
++                        (recur (conj component w)))))))]
++    (doseq [v nodes :when (not (contains? @index v))] (visit v))
++    @components))
++
 +(defn- left-recursion-errors
 +  "One refusal per rule cycle whose every call comes before a data pattern binds one of its
-+  variables, named from the first rule defined in it."
++  variables, named from the first rule defined in it. Linear in the rules' size: one components
++  pass over the calls, one over the unguarded calls, and one search per cycle within its component."
 +  [rules]
 +  (let [branches (keep (fn [rule]
 +                         (when (and (vector? rule) (seq? (first rule)) (symbol? (ffirst rule)))
 +                           [(ffirst rule) (rest rule)]))
 +                       rules)
++        order (distinct (map first branches))
 +        callees (reduce (fn [m [r body]] (update m r (fnil into #{}) (map first (body-calls body #{} (constantly false)))))
 +                        {} branches)
-+        reach (memoize (fn [from]
-+                         (loop [seen #{} todo (vec (callees from))]
-+                           (if-let [r (peek todo)]
-+                             (recur (conj seen r) (into (pop todo) (remove (conj seen r) (callees r))))
-+                             seen))))
++        ;; A callee reaches back to its caller exactly when both are in one component.
++        component-of (into {} (for [c (strongly-connected order callees), r c] [r c]))
 +        unguarded (reduce (fn [m [r body]]
-+                            (let [settled? #(not (contains? (reach %) r))]
++                            (let [settled? #(not (contains? (component-of %) r))]
 +                              (update m r (fnil into #{})
 +                                      (keep (fn [[callee guarded?]] (when-not guarded? callee))
 +                                            (body-calls body #{} settled?)))))
 +                          {} branches)
-+        cycle-from (fn [r]
-+                     (loop [queue [[r]] seen #{}]
-+                       (when-let [[path & more] (seq queue)]
-+                         (let [nexts (sort-by str (unguarded (peek path)))]
++        position (into {} (map-indexed (fn [i r] [r i]) order))
++        cycle-from (fn [r within]
++                     ;; Breadth first from r inside its component, each rule's calls in name order.
++                     (loop [queue (conj cljs.core/PersistentQueue.EMPTY r) parent {}]
++                       (when-let [v (peek queue)]
++                         (let [nexts (filter within (sort-by str (unguarded v)))]
 +                           (if (some #{r} nexts)
-+                             (conj path r)
-+                             (let [fresh (remove seen nexts)]
-+                               (recur (into (vec more) (map #(conj path %) fresh)) (into seen fresh))))))))]
-+    (first (reduce (fn [[errors covered] r]
-+                     (if-let [cycle (and (not (covered r)) (cycle-from r))]
-+                       [(conj errors (str "rules: rule " r " recurses (" (string/join " → " cycle) ") before a data"
-+                                          " pattern binds any of the call's variables; the scan cap can't stop that,"
-+                                          " so start the rule with a data pattern (or a get-some) that binds one, e.g."
-+                                          " [?b :block/parent ?x] (under ?x ?p)"))
-+                        (into covered cycle)]
-+                       [errors covered]))
-+                   [[] #{}] (distinct (map first branches))))))
++                             (conj (vec (reverse (take-while some? (iterate parent v)))) r)
++                             (let [fresh (remove #(or (= r %) (contains? parent %)) nexts)]
++                               (recur (into (pop queue) fresh) (into parent (map (fn [w] [w v])) fresh))))))))
++        cyclic (for [c (strongly-connected order unguarded)
++                     :let [r (apply min-key #(get position % js/Infinity) c)]
++                     :when (or (next c) (contains? (unguarded r) r))]
++                 [r c])]
++    (for [[r c] (sort-by #(get position (first %) js/Infinity) cyclic)
++          :let [cycle (cycle-from r c)]
++          :when cycle]
++      (str "rules: rule " r " recurses (" (string/join " → " cycle) ") before a data"
++           " pattern binds any of the call's variables; the scan cap can't stop that,"
++           " so start the rule with a data pattern (or a get-some) that binds one, e.g."
++           " [?b :block/parent ?x] (under ?x ?p)"))))
 +
 +(defn- relation-find
 +  "A :find in any of Datascript's shapes as a relation find: [?x .] and [[?x ...]] become [?x], and
@@ -573,13 +610,23 @@ index 0000000..ea78568
 +            (eduction (map (fn [tuple] (count-join!) tuple)) (collect-tuples acc rel len copy-map))))
 +    true))
 +
++(defn- item-weight
++  "What one item inside a collection counts toward the value cap: a string, keyword or symbol each
++  character of its text (the sort prints it whole, once per row), anything else 1."
++  [x]
++  (cond
++    (string? x) (max 1 (count x))
++    (or (keyword? x) (symbol? x)) (max 1 (count (str x)))
++    :else 1))
++
 +(defn- collection-items
-+  "Items inside the collections among `rows`' values, all rows together, counted until past `cap`."
++  "Items inside the collections among `rows`' values, nested ones included and text by its length
++  (`item-weight`), all rows together, counted until past `cap`."
 +  [rows cap]
 +  (let [n (volatile! 0)
 +        walk (fn walk [v]
 +               (when (coll? v)
-+                 (reduce (fn [_ x] (if (> (vswap! n inc) cap) (reduced nil) (walk x))) nil v)))]
++                 (reduce (fn [_ x] (if (> (vswap! n + (item-weight x)) cap) (reduced nil) (walk x))) nil v)))]
 +    (doseq [row rows, v row :while (<= @n cap)] (walk v))
 +    @n))
 +
@@ -672,7 +719,8 @@ index 0000000..ea78568
 +       " or attribute value"))
 +
 +(defn- value-cap-message [cap]
-+  (str "query rows hold more than " (format-count cap) " values inside collections (the value cap); return the"
++  (str "query rows hold more than " (format-count cap) " values inside collections (the value cap, which counts"
++       " each character of text as a value); return the"
 +       " parts you need rather than the whole collection, or narrow the query"))
 +
 +(defn- run-refusal
@@ -889,7 +937,11 @@ index 0000000..ea78568
 +        (and (string? query) (> (count query) max-query-chars))
 +        (conj (str "query: at most " (format-count max-query-chars) " characters (got " (format-count (count query)) ")"))
 +        (and (contains? body :inputs) (not (string? inputs))) (conj "inputs: must be an EDN string")
++        (and (string? inputs) (> (count inputs) max-field-chars))
++        (conj (str "inputs: at most " (format-count max-field-chars) " characters (got " (format-count (count inputs)) ")"))
 +        (and (contains? body :rules) (not (string? rules))) (conj "rules: must be an EDN string")
++        (and (string? rules) (> (count rules) max-field-chars))
++        (conj (str "rules: at most " (format-count max-field-chars) " characters (got " (format-count (count rules)) ")"))
 +        (and (contains? body :limit) (not (and (integer? limit) (<= 1 limit max-limit))))
 +        (conj (str "limit: must be an integer from 1 to " max-limit))
 +        (and (contains? body :dry-run) (not (boolean? (:dry-run body)))) (conj "dry-run: must be true or false")))))
@@ -930,10 +982,21 @@ index 0000000..ea78568
 +          (refusal 400 (string/join "; " (concat parse-problems shape-problems)))
 +          (checked-query query (or inputs []) rules))))))
 +
++(defn- rows-last
++  "`result` as a JS object with rows set last, so its JSON ends with them: the connector cuts a long
++  result from the end, and total-rows, returned and truncated must survive any cut. A map is no
++  use here: past 8 keys (a named query's echo) it keeps no order, and the response's postwalk
++  rebuilds it."
++  [result]
++  (let [o #js {}]
++    (doseq [[k v] (dissoc result :rows)] (unchecked-set o (name k) (clj->js v)))
++    (when (contains? result :rows) (unchecked-set o "rows" (clj->js (:rows result))))
++    o))
++
 +(defn- respond [result]
 +  (if (refusal? result)
 +    (http/error-response (::error result) (::status result))
-+    (http/json-response :semantic/datalog-query result)))
++    (http/json-response :semantic/datalog-query (rows-last result))))
 +
 +(defn- test-cap
 +  "A cap a test set on the Durable Object (`datalogScanCap`, `datalogRowCap`, `datalogJoinCap`), in place of the
@@ -1058,7 +1121,7 @@ index 0000000..ea78568
 +(defn- named-response [result]
 +  (if (refusal? result)
 +    (http/error-response (::error result) (::status result))
-+    (http/json-response :semantic/named-query result)))
++    (http/json-response :semantic/named-query (rows-last result))))
 +
 +(defn handle-named-query
 +  "POST /named-queries/:name: refuses an E2EE graph first, then a name that isn't one (404 listing
@@ -1248,7 +1311,7 @@ index 0000000..ff97074
 +    :params [{:name "tag" :type :tag :required true}
 +             {:name "property" :type :property :required true}]}))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..cd5c686 100644
+index 1365b0a..361562f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1268,10 +1331,10 @@ index 1365b0a..cd5c686 100644
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "datalogQuery" ["Run a read-only Datalog query"
-+                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each reads a few datoms per row rather than scanning an attribute, except projects-untouched, which can reach the scan cap on a large graph (see run_named_query). query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in."
++                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each reads a few datoms per row rather than scanning an attribute, except projects-untouched, which can reach the scan cap on a large graph (see run_named_query). query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work), and rules an EDN vector of rules bound to % in :in (at most 4,000 characters)."
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query, inputs or rules is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. The only source is $, and % only with rules. Every where clause must share a variable with the others, through a data pattern, a function binding, a rule call, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A rule that calls itself, directly or through other rules, before a data pattern or a get-some binds one of the call's variables (left recursion, such as [(under ?b ?p) (under ?b ?x) (under ?x ?p)]) is refused too, because it expands without reading data and the scan cap can't stop it: put the data pattern first ([?b :block/parent ?x] (under ?x ?p)). A data pattern joined to two or more bound rows scans its whole attribute, so to walk up from bound blocks use get-some, which reads one datom per row ([(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]); get-else, ground and identity don't count as reading data, since they bind a value whether or not a datom exists."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
-+                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join, not-join and rule bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
++                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join, not-join and rule bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too; each character of text inside them counts as a value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, rules: rule name clause 1, find, find: pull ?b, :in) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query, inputs and rules come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
 +   "runNamedQuery" ["Run a named read-only query"
 +                    (str "Runs one of four vetted read-only queries by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
@@ -1303,9 +1366,9 @@ index 1365b0a..cd5c686 100644
 +    "datalogQuery" {:required ["query"]
 +                    :properties {:query {:type "string" :maxLength 4000
 +                                         :description "The query as EDN, the vector form [:find ?t :where [?e :block/title ?t]] or the map form {:find [?t] :where [[?e :block/title ?t]]}."}
-+                                 :inputs {:type "string"
++                                 :inputs {:type "string" :maxLength 4000
 +                                          :description "An EDN vector of the values bound to :in after $, in order, at most 20, e.g. [\"Project\" #uuid \"…\"]."}
-+                                 :rules {:type "string"
++                                 :rules {:type "string" :maxLength 4000
 +                                         :description "An EDN vector of rules, bound to % in :in, e.g. [[(tagged ?e ?tag) [?e :block/tags ?t] [?t :block/title ?tag]]]."}
 +                                 :limit {:type "integer" :minimum 1 :maximum 200 :default 50
 +                                         :description "Most rows returned, 1 to 200; total-rows always counts every row."}
@@ -1351,7 +1414,7 @@ index 1365b0a..cd5c686 100644
 +                            "404" {:description "No named query has that name; the error lists the names"}
 +                            "409" {:description "The graph is E2EE"}
 +                            "422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap) or matched more than 2,500 rows (the row cap); narrow it with a more specific tag or fewer days"}}
-+           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) or built more than 20,000 rows while joining (the join cap) and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
++           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap) or built more than 20,000 rows while joining (the join cap) and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
@@ -1395,10 +1458,10 @@ index 1365b0a..cd5c686 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..cfe0039
+index 0000000..a54afbc
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,1968 @@
+@@ -0,0 +1,2066 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -1415,7 +1478,8 @@ index 0000000..cfe0039
 +  holds a block that refs zq Public Plans and a rating value; zq Notes holds zq Hidden note (tagged
 +  Private) with a child tagged Topic, zq Public note with a child, and a block that refs zq Private
 +  Plans. Every fixture title holds zq, so a query can pick them out."
-+  (:require [cljs.test :refer [async deftest is testing]]
++  (:require [cljs.reader :as reader]
++            [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.built-ins :as built-ins]
 +            [datascript.core :as d]
@@ -1698,35 +1762,6 @@ index 0000000..cfe0039
 +            (is (= 200 (:status one-var)) (pr-str one-var))
 +            (is (= "<zq Notes>" (ffirst (get-in one-var [:body :rows]))) (pr-str (:body one-var))))
 +          (is (= before (snapshot conn))))))))
-+
-+(deftest value-cap-test
-+  ;; A collection from inputs, bound to a variable that every row returns, is printed once per row
-+  ;; by the sort and the serialiser. Past the value cap (items inside the rows' collections, all
-+  ;; rows together) the query answers 422 before the sort.
-+  (async done
-+    (with-graph done
-+      (fn [{:keys [self]}]
-+        (p/let [q '[:find ?t ?x :in $ ?x :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]
-+                    [(get-else $ ?e :block/uuid ?x) ?u]]
-+                rows (query! self '[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t "zq")]])
-+                n (get-in rows [:body :total-rows])
-+                big (vec (range (inc (quot 20000 n))))
-+                small (vec (range 10))
-+                over (query! self q :inputs [big])
-+                under (query! self q :inputs [small])
-+                one-row (query! self '[:find ?x . :in $ ?x :where [?e :block/title "zq Notes"]
-+                                       [(get-else $ ?e :block/uuid ?x) ?u]]
-+                                :inputs [big])]
-+          (is (< 1 n) (pr-str rows))
-+          (testing "a collection repeated across the rows past the cap answers 422 naming the cap"
-+            (is (= [422 (str "query rows hold more than 20,000"
-+                             " values inside collections (the value cap); return the parts you need rather than the"
-+                             " whole collection, or narrow the query")]
-+                   [(:status over) (get-in over [:body :error])])
-+                (pr-str (:status over) (subs (:text over) 0 (min 300 (count (:text over)))))))
-+          (testing "the same query with a small collection, and the large one in one row, answer"
-+            (is (= [200 n] [(:status under) (get-in under [:body :total-rows])]) (pr-str (:status under)))
-+            (is (= [200 1] [(:status one-row) (get-in one-row [:body :total-rows])]) (pr-str (:status one-row)))))))))
 +
 +(deftest source-and-rules-test
 +  (async done
@@ -2174,6 +2209,51 @@ index 0000000..cfe0039
 +
 +(defn- pad2 [i] (.padStart (str i) 2 "0"))
 +
++(defn- value-cap-message []
++  (str "query rows hold more than 20,000 values inside collections (the value cap, which counts each character"
++       " of text as a value); return the parts you need rather than the whole collection, or narrow the query"))
++
++(deftest value-cap-test
++  ;; A collection from inputs, bound to a variable that every row returns, is printed once per row
++  ;; by the sort and the serialiser. Past the value cap (items inside the rows' collections, nested
++  ;; ones included, and each character of text inside them, all rows together) the query answers
++  ;; 422 before the sort. Inputs are at most 4,000 characters, so each case below fits in them and
++  ;; reaches the cap only through the 40 rows that repeat it.
++  (async done
++    (with-graph done
++      (fn [{:keys [self notes]}]
++        (p/let [_ (bulk! self notes 40 #(str "zq vc " (pad2 %)))
++                q '[:find ?t ?x :in $ ?x :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq vc")]
++                    [(get-else $ ?e :block/uuid ?x) ?u]]
++                text (apply str (repeat 3000 "y"))
++                cases [["600 numbers (24,000 in all)" [(vec (repeat 600 0))]]
++                       ["20 vectors of 30 numbers (800 at the top level, 24,800 in all)" [(vec (repeat 20 (vec (repeat 30 0))))]]
++                       ["a map of 10 keys to vectors of 50 numbers" [(into {} (for [i (range 10)] [i (vec (repeat 50 0))]))]]
++                       ["a set of 600 numbers" [(set (range 600))]]
++                       ["one string of 3,000 characters" [[text]]]
++                       ["one keyword of 3,000 characters" [[(keyword text)]]]
++                       ["one symbol of 3,000 characters" [[(symbol text)]]]
++                       ["a string of 3,000 characters nested two deep" [[[text]]]]]
++                over (p/all (for [[_ inputs] cases] (query! self q :inputs inputs)))
++                under (query! self q :inputs [(vec (range 10))])
++                short-text (query! self q :inputs [(vec (repeat 10 "zq"))])
++                one-row (query! self '[:find ?x . :in $ ?x :where [?e :block/title "zq Notes"]
++                                       [(get-else $ ?e :block/uuid ?x) ?u]]
++                                :inputs [(vec (repeat 600 0))])
++                one-row-text (query! self '[:find ?x . :in $ ?x :where [?e :block/title "zq Notes"]
++                                            [(get-else $ ?e :block/uuid ?x) ?u]]
++                                     :inputs [[text]])]
++          (doseq [[[label inputs] response] (map vector cases over)]
++            (testing (str label ", repeated across 40 rows, answers 422 naming the cap")
++              (is (<= (count (pr-str inputs)) 4000) label)
++              (is (= [422 (value-cap-message)] [(:status response) (get-in response [:body :error])])
++                  (pr-str (:status response) (subs (:text response) 0 (min 300 (count (:text response))))))))
++          (testing "the same query with a small collection, and a large one in one row, answer"
++            (is (= [200 40] [(:status under) (get-in under [:body :total-rows])]) (pr-str (:status under)))
++            (is (= [200 40] [(:status short-text) (get-in short-text [:body :total-rows])]) (pr-str (:status short-text)))
++            (is (= [200 1] [(:status one-row) (get-in one-row [:body :total-rows])]) (pr-str (:status one-row)))
++            (is (= [200 1] [(:status one-row-text) (get-in one-row-text [:body :total-rows])]) (pr-str (:status one-row-text)))))))))
++
 +(deftest scan-cap-test
 +  ;; About 49,000 datoms added through the real outliner put the graph above the 20,000 scan cap
 +  ;; (set from scripts/bench-datalog-query.mjs).
@@ -2317,6 +2397,78 @@ index 0000000..cfe0039
 +            (is (not (string/includes? (get-in (second responses) [:body :error]) "rule over recurses"))
 +                (pr-str (second responses))))
 +          (is (= before after)))))))
++
++(defn- rule-chain
++  "Rules r0 → r1 → … → r`n`, each calling the next before reading anything; the last reads a title,
++  or, with `cycle?`, calls r0 back."
++  [n cycle?]
++  (str "[" (string/join " " (for [i (range n)] (str "[(r" i " ?a) (r" (inc i) " ?a)]")))
++       " [(r" n " ?a) " (if cycle? "(r0 ?a)" "[?a :block/title \"zq Notes\"]") "]]"))
++
++(def ^:private chain-q "[:find ?a :in $ % :where (r0 ?a)]")
++
++(deftest request-size-caps-test
++  ;; Only query was held to 4,000 characters: a 70,000-character rules string ran the left-recursion
++  ;; check for 24 s, and an inputs string of any size was parsed, walked and repeated in every row.
++  ;; rules and inputs are held to 4,000 characters each, like query, refused with 400 naming the
++  ;; field before anything is parsed.
++  (async done
++    (with-graph done
++      (fn [{:keys [self conn]}]
++        (let [pad (fn [s n] (str (subs s 0 (dec (count s))) (apply str (repeat (- n (count s)) " ")) "]"))
++              chain (rule-chain 185 false)
++              in-q '[:find ?t :in $ ?x :where [?e :block/title ?x] [?e :block/title ?t]]
++              text-input (fn [n] (pad "[\"zq Notes\"]" n))]
++          (p/let [before (snapshot conn)
++                  rules-at (query! self chain-q :rules (pad chain 4000))
++                  rules-over (query! self chain-q :rules (pad chain 4001))
++                  rules-huge (query! self chain-q :rules (rule-chain 3000 false))
++                  inputs-at (query! self in-q :inputs (text-input 4000))
++                  inputs-over (query! self in-q :inputs (text-input 4001))
++                  dry-over (query! self chain-q :rules (pad chain 4001) :dry-run true)]
++            (is (< 3800 (count chain) 4000) (count chain))
++            (testing "4,000 characters of rules run; 4,001 are refused naming the field and the cap"
++              (is (= [200 1] [(:status rules-at) (get-in rules-at [:body :total-rows])]) (pr-str rules-at))
++              (is (refused? rules-over "rules: at most 4,000 characters (got 4,001)") (pr-str rules-over))
++              (is (refused? rules-huge "rules: at most 4,000 characters (got ") (pr-str (:status rules-huge)))
++              (is (refused? dry-over "rules: at most 4,000 characters (got 4,001)") (pr-str dry-over)))
++            (testing "4,000 characters of inputs run; 4,001 are refused naming the field and the cap"
++              (is (= [200 [["zq Notes"]]] [(:status inputs-at) (get-in inputs-at [:body :rows])]) (pr-str inputs-at))
++              (is (refused? inputs-over "inputs: at most 4,000 characters (got 4,001)") (pr-str inputs-over)))
++            (is (= before (snapshot conn)))))))))
++
++(deftest left-recursion-check-is-linear-test
++  ;; The left-recursion check found each rule's reach and searched for a cycle once per rule, so a
++  ;; chain of n rules cost n² steps: 800 rules took 1.6 s. One strongly connected components pass
++  ;; finds the same cycles in one walk.
++  (let [q (:ok (datalog/normalise-query (reader/read-string chain-q)))
++        timed (fn [rules]
++                (let [start (.now js/Date)
++                      result (datalog/validate-query q (reader/read-string rules) [])]
++                  [result (- (.now js/Date) start)]))
++        [ok ok-ms] (timed (rule-chain 800 false))
++        [cycle cycle-ms] (timed (rule-chain 800 true))]
++    (testing "a chain of 800 rules without a cycle is accepted quickly"
++      (is (nil? ok) ok)
++      (is (< ok-ms 250) (str ok-ms " ms")))
++    (testing "the same chain closed into a cycle is refused once, from r0, quickly"
++      (is (string/includes? (str cycle) "rules: rule r0 recurses (r0 → r1 → r2 →") (subs (str cycle) 0 200))
++      (is (string/includes? (str cycle) "→ r800 → r0)") (subs (str cycle) 0 200))
++      (is (= 1 (count (re-seq #"recurses" (str cycle)))))
++      (is (< cycle-ms 250) (str cycle-ms " ms")))))
++
++(deftest response-counts-before-rows-test
++  ;; The connector prints a result indented and cuts it at 150,000 characters. Whatever cuts it,
++  ;; total-rows, returned and truncated come before rows, so the counts and the note survive.
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [response (query! self zq-titles :limit 1)]
++          (let [text (:text response)
++                at (fn [k] (string/index-of text (str "\"" k "\":")))]
++            (is (= [200 "limit"] [(:status response) (get-in response [:body :truncated :by])]) (pr-str response))
++            (doseq [k ["columns" "total-rows" "returned" "truncated" "query" "inputs"]]
++              (is (< (at k) (at "rows")) (str k " before rows: " text)))))))))
 +
 +(deftest rule-recursion-after-data-runs-test
 +  ;; Recursion the refusal must leave alone: each call back into the rule follows a data pattern that
@@ -2838,8 +2990,12 @@ index 0000000..cfe0039
 +    (doseq [phrase ["scan cap" "20,000 datoms" "422" "truncated" "byte-cap" "100,000 characters" "at most 2 levels deep"
 +                    "at most 50 values" "refs as numbers" "left recursion" "row cap" "2,500 rows"
 +                    "20,000 rows while joining (the join cap" "(the value cap)" "Recycle bin"
-+                    "str, + and keyword take at most one ?variable"]]
++                    "str, + and keyword take at most one ?variable" "at most 20 values and 4,000 characters"
++                    "(at most 4,000 characters)" "each character of text inside them counts as a value"]]
 +      (is (string/includes? (:description post) phrase) phrase))
++    (testing "query, inputs and rules each carry the 4,000-character cap, so the connector refuses a longer one early"
++      (let [props (get-in post [:requestBody :content "application/json" :schema :properties])]
++        (is (= [4000 4000 4000] (mapv #(get-in props [% :maxLength]) [:query :inputs :rules])) (pr-str props))))
 +    (is (= ["limit" "byte-cap"] (get-in truncated [:properties :by :enum])))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "scan cap"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 datoms"))
@@ -3336,7 +3492,12 @@ index 0000000..cfe0039
 +          (is (= [200 1 3 "limit"]
 +                 [(:status response) (get-in response [:body :returned]) (get-in response [:body :total-rows])
 +                  (get-in response [:body :truncated :by])]) (pr-str response))
-+          (is (= 3 (get-in most [:body :returned]))))))))
++          (is (= 3 (get-in most [:body :returned])))
++          (testing "the counts and the note come before rows, though the echo makes the response a large map"
++            (let [text (:text response)
++                  at (fn [k] (string/index-of text (str "\"" k "\":")))]
++              (doseq [k ["name" "params" "columns" "total-rows" "returned" "truncated"]]
++                (is (< (at k) (at "rows")) (str k " before rows: " text))))))))))
 +
 +(deftest named-queries-at-scale-test
 +  ;; Datascript joins a pattern to two or more bound rows by scanning its whole attribute, and the

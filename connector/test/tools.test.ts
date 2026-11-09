@@ -1141,6 +1141,44 @@ describe("hand-written tools", () => {
     ]);
   });
 
+  it.each([
+    ["datalog_query", { graph: "work", body: { query: "[:find (pull ?b [:block/title {:block/_parent [:block/uuid :block/title]}]) :where [?b :block/title ?t]]", limit: 200 } }],
+    ["run_named_query", { graph: "work", name: "open-tasks-by-client", body: { limit: 200 } }],
+  ])("%s: a result the server's byte cap kept under 100,000 characters of compact JSON reaches Claude whole, though indented it would pass the 150,000-character limit", async (tool, args) => {
+    // 25 pulled parents with 50 children each, the shape a reverse-ref pull returns: the server counts
+    // 98,000-odd characters of compact JSON, but indented it is 1.6 times longer.
+    const rows = Array.from({ length: 25 }, (_, i) => [
+      {
+        "block/title": `zqpar ${i}`,
+        "block/_parent": Array.from({ length: 50 }, (_, j) => ({ "block/uuid": `00000000-0000-4000-8000-${String(i * 100 + j).padStart(12, "0")}`, "block/title": `c${j}` })),
+      },
+    ]);
+    const response = {
+      query: "[:find (pull ?b [...])]",
+      inputs: "[]",
+      columns: ["(pull ?b [...])"],
+      "total-rows": 30,
+      returned: 25,
+      truncated: { by: "byte-cap", note: "returned 25 of 30 rows (the byte cap, about 100,000 characters of JSON); pull fewer attributes, narrow the query or lower limit" },
+      rows,
+    };
+    expect(JSON.stringify(response).length).toBeLessThanOrEqual(100_000);
+    expect(JSON.stringify(response, null, 2).length).toBeGreaterThan(RESULT_CHAR_LIMIT);
+    syncHandler = () => Response.json(response);
+    const result = await callTool(tool, args);
+    expect(result.isError, result.text.slice(-300)).toBe(false);
+    expect(result.text.length).toBeLessThanOrEqual(RESULT_CHAR_LIMIT);
+    expect(result.text, "never the read path's generic notice").not.toContain("[truncated:");
+    expect(JSON.parse(result.text)).toEqual(response);
+  });
+
+  it("datalog_query: a result that fits indented stays indented", async () => {
+    const response = { columns: ["?t"], rows: [["Projects"]], "total-rows": 1, returned: 1, query: "[:find ?t]", inputs: "[]" };
+    syncHandler = () => Response.json(response);
+    const result = await callTool("datalog_query", { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } });
+    expect(result.text).toBe(JSON.stringify(response, null, 2));
+  });
+
   it("run_named_query is generated from runNamedQuery: a POST of {params?, limit?, dry-run?} on name, annotated READ, with no reason and no write tables", async () => {
     const tools = await listTools();
     const named = tools.find((t) => t.name === "run_named_query");
@@ -2459,6 +2497,7 @@ describe("queries help", () => {
   it.each([
     ["datalog_query", "datalog_query runs a read-only Datalog query"],
     ["the query's length", "(EDN, at most 4,000 characters)"],
+    ["the inputs' and rules' length", "inputs and rules are at most 4,000 characters each"],
     ["run_named_query, preferred", "Prefer run_named_query when one fits"],
     ["projects-untouched", "when one fits: projects-untouched,"],
     ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
