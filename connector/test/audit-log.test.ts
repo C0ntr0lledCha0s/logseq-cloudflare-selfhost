@@ -4,6 +4,7 @@ import { AUDIT_UPDATE_ROWS, AuditLog, PURGE_BATCH, purgeAuditLog } from "../src/
 import { ConfigError, auditRetentionDays } from "../src/config";
 import { KB_INDEX_CRON } from "../src/crons";
 import { GraphStore } from "../src/graphs";
+import { ServiceTokenStore, type TokenScope, hashServiceToken } from "../src/auth/service-tokens";
 import { createConnector } from "../src/index";
 
 const DAY_MS = 86_400_000;
@@ -213,6 +214,142 @@ describe("AuditLog costs and rows", () => {
     expect(await log.get(WORK_ID, theirs)).toBeNull();
     expect(await log.get(WORK_ID, 999_999)).toBeNull();
     expect(measured.map((m) => m.rowsRead)).toEqual([1, 1, 1]);
+  });
+});
+
+describe("recordTokenEdit", () => {
+  // Spec 2026-11-08-edit-service-token-scope §3.6: one row per applied edit, outside every graph's log.
+  const OWNER = 1001;
+  const THIRD_ID = "33333333-3333-3333-3333-333333333333";
+  const BEFORE: TokenScope = { graphIds: [WORK_ID, OTHER_ID], access: "write", expiresAt: NOW + 30 * DAY_MS };
+  const AFTER: TokenScope = { graphIds: [THIRD_ID, WORK_ID], access: "read", expiresAt: NOW + 7 * DAY_MS };
+
+  async function rawRow(id: number): Promise<Record<string, unknown>> {
+    const { results } = await env.DB.prepare("SELECT * FROM audit_log WHERE id = ?").bind(id).all<Record<string, unknown>>();
+    expect(results).toHaveLength(1);
+    return results[0]!;
+  }
+
+  it("writes one row as spec §3.6, reading 0 rows and writing 2", async () => {
+    const { db, measured } = metered();
+    const id = await new AuditLog(db).recordTokenEdit({ at: NOW, name: "ci", ownerId: OWNER, before: BEFORE, after: AFTER });
+    expect(measured.map((m) => [m.rowsRead, m.rowsWritten])).toEqual([[0, 2]]);
+    const { results } = await env.DB.prepare("SELECT count(*) AS n FROM audit_log").all<{ n: number }>();
+    expect(results[0]!.n).toBe(1);
+    expect(await rawRow(id)).toEqual({
+      id,
+      at: NOW,
+      graph_id: null,
+      alias: "service:ci",
+      tool: "token_edit",
+      kind: "write",
+      status: "ok",
+      dry_run: 0,
+      reason: null,
+      client: "wizard",
+      session: `github:${OWNER}`,
+      addressed: null,
+      pages: null,
+      targets: null,
+      before: JSON.stringify({
+        source: "service_tokens",
+        data: {
+          before: { graphIds: [WORK_ID, OTHER_ID], access: "write", expiresAt: NOW + 30 * DAY_MS },
+          after: { graphIds: [THIRD_ID, WORK_ID], access: "read", expiresAt: NOW + 7 * DAY_MS },
+          added: [THIRD_ID],
+          removed: [OTHER_ID],
+        },
+      }),
+      error: null,
+      rows_written: null,
+      rows_read: null,
+    });
+  });
+
+  it("added and removed are computed by set, in the order given, for each kind of graph change", async () => {
+    const scope = (graphIds: string[]): TokenScope => ({ graphIds, access: "read", expiresAt: NOW + DAY_MS });
+    const cases: [string, string[], string[], string[], string[]][] = [
+      ["add one", [WORK_ID], [WORK_ID, OTHER_ID], [OTHER_ID], []],
+      ["remove one", [WORK_ID, OTHER_ID], [WORK_ID], [], [OTHER_ID]],
+      ["swap", [WORK_ID], [OTHER_ID], [OTHER_ID], [WORK_ID]],
+      ["reorder only", [WORK_ID, OTHER_ID, THIRD_ID], [THIRD_ID, OTHER_ID, WORK_ID], [], []],
+      ["add two, in the after order", [WORK_ID], [THIRD_ID, WORK_ID, OTHER_ID], [THIRD_ID, OTHER_ID], []],
+      ["remove two, in the before order", [THIRD_ID, WORK_ID, OTHER_ID], [WORK_ID], [], [THIRD_ID, OTHER_ID]],
+      ["chain: add and remove in reversed order", [OTHER_ID, WORK_ID], [THIRD_ID, OTHER_ID], [THIRD_ID], [WORK_ID]],
+      ["a repeated id counts once", [WORK_ID, WORK_ID], [WORK_ID, OTHER_ID, OTHER_ID], [OTHER_ID], []],
+      ["no graph change (access or expiry only)", [WORK_ID], [WORK_ID], [], []],
+    ];
+    const log = new AuditLog(env.DB);
+    for (const [label, before, after, added, removed] of cases) {
+      const id = await log.recordTokenEdit({ at: NOW, name: "ci", ownerId: OWNER, before: scope(before), after: scope(after) });
+      const data = JSON.parse((await rawRow(id)).before as string).data;
+      expect([data.added, data.removed], label).toEqual([added, removed]);
+      expect([data.before.graphIds, data.after.graphIds], label).toEqual([before, after]);
+    }
+  });
+
+  it("keeps only graphIds, access and expiresAt from each scope", async () => {
+    const row = { ...BEFORE, id: "x", tokenHash: "f".repeat(64), token: "lsct_extra" } as TokenScope;
+    const id = await new AuditLog(env.DB).recordTokenEdit({ at: NOW, name: "ci", ownerId: OWNER, before: row, after: row });
+    const data = JSON.parse((await rawRow(id)).before as string).data;
+    expect(Object.keys(data.before)).toEqual(["graphIds", "access", "expiresAt"]);
+    expect(Object.keys(data.after)).toEqual(["graphIds", "access", "expiresAt"]);
+  });
+
+  it("holds no secret: no column contains the token or its hash", async () => {
+    await env.DB.exec("DELETE FROM service_tokens");
+    const store = new ServiceTokenStore(env.DB);
+    const { id: tokenId, token } = await store.create({
+      name: "nightly",
+      ownerId: OWNER,
+      graphIds: BEFORE.graphIds,
+      access: BEFORE.access,
+      createdAt: NOW - DAY_MS,
+      expiresAt: BEFORE.expiresAt,
+    });
+    const hash = await hashServiceToken(token);
+    const stored = await store.get(tokenId);
+    const id = await new AuditLog(env.DB).recordTokenEdit({ at: NOW, name: stored!.name, ownerId: stored!.ownerId, before: stored!, after: AFTER });
+    const row = await rawRow(id);
+    expect(row.alias).toBe("service:nightly");
+    for (const [column, value] of Object.entries(row)) {
+      const text = String(value);
+      expect(text, column).not.toContain(token);
+      expect(text, column).not.toContain(token.slice(5));
+      expect(text, column).not.toContain(hash);
+      expect(text, column).not.toMatch(/lsct_/);
+    }
+  });
+
+  it("targets stays NULL, so a reader parsing targets as AffectedTarget[] sees none", async () => {
+    const id = await new AuditLog(env.DB).recordTokenEdit({ at: NOW, name: "ci", ownerId: OWNER, before: BEFORE, after: AFTER });
+    const { results } = await env.DB.prepare("SELECT targets, addressed, pages FROM audit_log WHERE id = ?").bind(id).all();
+    expect(results[0]).toEqual({ targets: null, addressed: null, pages: null });
+  });
+
+  it("no reader returns it: get, lookup and query for every graph it names, and any other", async () => {
+    const log = new AuditLog(env.DB);
+    const id = await log.recordTokenEdit({ at: NOW, name: "ci", ownerId: OWNER, before: BEFORE, after: AFTER });
+    // A neighbour on each graph, so the readers are seen to return rows.
+    const neighbours = new Map<string, number>();
+    for (const graphId of [WORK_ID, OTHER_ID, THIRD_ID]) neighbours.set(graphId, await log.begin({ ...PENDING, graphId, at: NOW }));
+    for (const graphId of [WORK_ID, OTHER_ID, THIRD_ID, "44444444-4444-4444-4444-444444444444", ""]) {
+      expect(await log.get(graphId, id), graphId).toBeNull();
+      expect((await log.lookup(graphId, id)).row, graphId).toBeNull();
+      for (const status of [undefined, "ok", "pending"] as const) {
+        const page = await log.query(graphId, { since: 0, until: NOW + DAY_MS, limit: 50, status, includeSnapshot: true });
+        expect(page.entries.map((e) => e.id), `${graphId} ${status}`).not.toContain(id);
+      }
+      for (const filter of [{ tool: "token_edit" }, { session: `github:${OWNER}` }]) {
+        const page = await log.query(graphId, { since: 0, until: NOW + DAY_MS, limit: 50, ...filter });
+        expect(page.entries, `${graphId} ${JSON.stringify(filter)}`).toEqual([]);
+      }
+      const neighbour = neighbours.get(graphId);
+      if (neighbour !== undefined) {
+        const page = await log.query(graphId, { since: 0, until: NOW + DAY_MS, limit: 50 });
+        expect(page.entries.map((e) => e.id), graphId).toEqual([neighbour]);
+      }
+    }
   });
 });
 

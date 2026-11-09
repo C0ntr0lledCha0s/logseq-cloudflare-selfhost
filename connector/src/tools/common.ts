@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "@modelcontextprotocol/server";
-import type { GraphStore, ResolvedGraph } from "../graphs";
+import { type ServiceTokenAccess, rank } from "../auth/access";
+import type { GraphMode, GraphStore, ResolvedGraph } from "../graphs";
 import type { GraphAccess } from "./semantic";
 import { ALIAS_PATTERN } from "./spec.mjs";
 
@@ -104,11 +105,12 @@ export function withCallGraphs<T>(fn: () => Promise<T>): Promise<T> {
 
 /**
  * Who a request acts for. OAuth reaches every connected graph at its own mode; a service token
- * reaches only the graphs whose ids it lists, and `access: "read"` lowers each to read-only.
+ * reaches only the graphs whose ids it lists, each at the lower of its own mode and the token's
+ * access (`effectiveMode`).
  */
 export type RequestScope =
   | { kind: "oauth" }
-  | { kind: "service"; name: string; graphIds: ReadonlySet<string>; access: "read" | "write" };
+  | { kind: "service"; name: string; graphIds: ReadonlySet<string>; access: ServiceTokenAccess };
 
 /** The scope of the MCP request being served; `mcpHandler` runs every request inside `requestScope.run`. */
 export const requestScope = new AsyncLocalStorage<RequestScope>();
@@ -124,10 +126,21 @@ export function currentScope(): RequestScope {
 }
 
 /**
+ * The mode a graph has under `scope`: the lower-ranked (MODE_RANK) of the graph's own mode and a
+ * service token's access. Under OAuth it is the graph's own mode.
+ */
+export function effectiveMode(graph: Pick<ResolvedGraph, "mode">, scope: RequestScope): GraphMode | "write-no-delete" {
+  if (scope.kind === "oauth") return graph.mode;
+  return rank(scope.access) < rank(graph.mode) ? scope.access : graph.mode;
+}
+
+/**
  * `store.resolve(alias)` under the current request's scope. A service scope refuses a graph whose id
- * it doesn't list (`out-of-scope`, naming the aliases it covers, read only on this refusal) and, when
- * read-only, returns the graph as read-only with `readOnlyBy` set. Null stays null (unknown alias).
- * It throws rather than returning, so `lookupGraph` never caches a graph the scope refused.
+ * it doesn't list (`out-of-scope`, naming the aliases it covers, read only on this refusal). At an
+ * effective mode of read it returns the graph as read-only with `readOnlyBy` set; at write-no-delete
+ * it keeps the mode and sets `deletesRefusedBy`, which `audited()` and `request()` refuse deletes by.
+ * Null stays null (unknown alias). It throws rather than returning, so `lookupGraph` never caches a
+ * graph the scope refused.
  */
 export async function scopedResolve(store: GraphStore, alias: string): Promise<ResolvedGraph | null> {
   const scope = currentScope();
@@ -140,7 +153,10 @@ export async function scopedResolve(store: GraphStore, alias: string): Promise<R
       "out-of-scope",
     );
   }
-  if (scope.access === "read") return { ...graph, mode: "read", readOnlyBy: `service token '${scope.name}'` };
+  const mode = effectiveMode(graph, scope);
+  // A write token on a read-only graph keeps the plain refusal; a read or write-no-delete token names itself (spec §3.3).
+  if (mode === "read" && scope.access !== "write") return { ...graph, mode: "read", readOnlyBy: `service token '${scope.name}'` };
+  if (mode === "write-no-delete") return { ...graph, deletesRefusedBy: `service token '${scope.name}'` };
   return graph;
 }
 

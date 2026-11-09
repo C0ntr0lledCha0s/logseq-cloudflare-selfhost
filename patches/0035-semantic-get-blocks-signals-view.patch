@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 4b4cc11..b2147ee 100644
+index e54885f..9b4d6b1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -3916,10 +3916,67 @@
+@@ -3924,10 +3924,67 @@
      (let [ids (mapv string/trim (string/split raw #","))]
        (when (every? common-util/uuid-string? ids) ids))))
  
@@ -72,7 +72,7 @@ index 4b4cc11..b2147ee 100644
                   ;; One outline budget for the whole response, as for a single page.
                   (:blocks (reduce (fn [{:keys [budget] :as result} entity]
                                      (let [outline (page-outline db entity budget)]
-@@ -4176,14 +4233,18 @@
+@@ -4184,14 +4241,18 @@
    (case handler
      :semantic/blocks-get-many
      (let [ids (parse-ids (.get (.-searchParams url) "ids"))
@@ -483,13 +483,13 @@ index 0000000..b910cbb
 +            (is (= ["at most 100 ids" "duplicate id" "ids must be a comma-separated list of UUIDs"]
 +                   (mapv #(get-in % [:body :error]) errors)))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 07f3b43..5392ac2 100644
+index 7517a78..30042a7 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -25,6 +25,7 @@
-             [logseq.db-sync.semantic-private-tags-test]
+@@ -26,6 +26,7 @@
              [logseq.db-sync.semantic-readable-writes-test]
              [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]
 +            [logseq.db-sync.semantic-signals-view-test]
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]

@@ -1439,91 +1439,93 @@ const GENERATED_WRITES = committedManifest.filter((e) => e.method !== null && !e
 const ALL_WRITES = committedManifest.filter((e) => !e.annotations.readOnlyHint).map((e) => e.name);
 
 describe("audit log", () => {
-  it("one row per write call: success, sync 409, refused reason, unknown alias, read-only graph and dry run", async () => {
+  it("lists a call for every generated write tool", () => {
     expect(Object.keys(AUDIT_CALLS).sort()).toEqual([...GENERATED_WRITES].sort());
-    for (const name of GENERATED_WRITES) {
-      const args: Record<string, unknown> = { graph: "work", ...AUDIT_CALLS[name] };
+  });
 
-      // Success: the row is ok, with the reason, the addressed selectors and describeWrite's targets.
-      syncRequests = [];
-      syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
-      const ok = await callAudited(name, { ...args, reason: REASON });
-      expect(ok.result.isError, name).toBe(false);
-      expect(writeRequests(), name).toHaveLength(1);
-      expect(ok.row, name).toMatchObject({
-        graph_id: WORK_ID,
-        alias: "work",
-        tool: name,
-        kind: "write",
-        status: "ok",
-        dry_run: 0,
-        reason: REASON,
-        error: null,
-        rows_written: 3,
-        rows_read: 1,
-      });
-      expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
-      expect(JSON.parse(ok.row.targets!), name).toEqual(toAffectedTargets(CONTEXT_RESPONSE));
-      // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
-      const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
-      expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID, ...named].sort());
+  // One test per tool: the loop as a single test took about 4 s locally and timed out on CI's 5 s default.
+  it.each(GENERATED_WRITES)("one row per write call (%s): success, sync 409, refused reason, unknown alias, read-only graph and dry run", async (name) => {
+    const args: Record<string, unknown> = { graph: "work", ...AUDIT_CALLS[name] };
 
-      // Sync 409: an error row carrying the server's message, not ok and not two rows.
-      syncRequests = [];
-      syncHandler = preReadsEmpty(() => Response.json({ error: "entry 0: block not found" }, { status: 409 }));
-      const conflict = await callAudited(name, args);
-      expect(conflict.result.isError, name).toBe(true);
-      expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, graph_id: WORK_ID });
-      // Only what the call and its snapshot named (activity-log.test.ts covers finding it by page):
-      // the page a page read returned, never a target the response would have named.
-      for (const page of conflict.row.pages?.split("\n") ?? []) expect(ok.row.pages!.split("\n"), name).toContain(page);
-      const known = conflict.row.targets === null ? [] : JSON.parse(conflict.row.targets);
-      expect(known.map((t: { uuid: string; kind: string }) => [t.uuid, t.kind]), name).toEqual(known.length === 0 ? [] : [[PAGE_UUID, "page"]]);
+    // Success: the row is ok, with the reason, the addressed selectors and describeWrite's targets.
+    syncRequests = [];
+    syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
+    const ok = await callAudited(name, { ...args, reason: REASON });
+    expect(ok.result.isError, name).toBe(false);
+    expect(writeRequests(), name).toHaveLength(1);
+    expect(ok.row, name).toMatchObject({
+      graph_id: WORK_ID,
+      alias: "work",
+      tool: name,
+      kind: "write",
+      status: "ok",
+      dry_run: 0,
+      reason: REASON,
+      error: null,
+      rows_written: 3,
+      rows_read: 1,
+    });
+    expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
+    expect(JSON.parse(ok.row.targets!), name).toEqual(toAffectedTargets(CONTEXT_RESPONSE));
+    // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
+    const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
+    expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID, ...named].sort());
 
-      // Refusals before the handler: nothing reaches the sync server.
-      syncRequests = [];
-      syncHandler = () => Response.json(CONTEXT_RESPONSE);
-      const long = await callAudited(name, { ...args, reason: "x".repeat(201) });
-      expect(long.row, name).toMatchObject({
-        status: "refused",
-        error: "reason is 201 characters; at most 200 are accepted — shorten it",
-        reason: null,
-        graph_id: WORK_ID,
-        dry_run: 0,
-      });
-      const unknown = await callAudited(name, { ...args, graph: "nope", reason: REASON });
-      expect(unknown.row, name).toMatchObject({
-        status: "refused",
-        error: "unknown graph 'nope' — call list_graphs for the connected aliases",
-        alias: "nope",
-        graph_id: null,
-        reason: REASON,
-      });
-      const readOnly = await callAudited(name, { ...args, graph: "notes" });
-      expect(readOnly.row, name).toMatchObject({
-        status: "refused",
-        error: "graph 'notes' is read-only",
-        alias: "notes",
-        graph_id: NOTES_ID,
-      });
-      expect(syncRequests, name).toHaveLength(0);
+    // Sync 409: an error row carrying the server's message, not ok and not two rows.
+    syncRequests = [];
+    syncHandler = preReadsEmpty(() => Response.json({ error: "entry 0: block not found" }, { status: 409 }));
+    const conflict = await callAudited(name, args);
+    expect(conflict.result.isError, name).toBe(true);
+    expect(conflict.row, name).toMatchObject({ status: "error", error: "entry 0: block not found", reason: null, graph_id: WORK_ID });
+    // Only what the call and its snapshot named (activity-log.test.ts covers finding it by page):
+    // the page a page read returned, never a target the response would have named.
+    for (const page of conflict.row.pages?.split("\n") ?? []) expect(ok.row.pages!.split("\n"), name).toContain(page);
+    const known = conflict.row.targets === null ? [] : JSON.parse(conflict.row.targets);
+    expect(known.map((t: { uuid: string; kind: string }) => [t.uuid, t.kind]), name).toEqual(known.length === 0 ? [] : [[PAGE_UUID, "page"]]);
 
-      // Dry run, where the tool has one: dry_run = 1, targets from the dry-run response.
-      const where = DRY_RUN_IN[name];
-      if (where !== undefined) {
-        const dry = { ...CONTEXT_RESPONSE, "dry-run": true };
-        // A delete's dry run reads first, as its real call does, so the read is answered too.
-        syncHandler = preReadsEmpty(() => Response.json(dry));
-        const dryArgs =
-          where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
-        const preview = await callAudited(name, dryArgs);
-        expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
-        expect(JSON.parse(preview.row.targets!), name).toEqual(toAffectedTargets(dry));
-        // dry-run: false is a real call.
-        const real =
-          where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };
-        expect((await callAudited(name, real)).row.dry_run, name).toBe(0);
-      }
+    // Refusals before the handler: nothing reaches the sync server.
+    syncRequests = [];
+    syncHandler = () => Response.json(CONTEXT_RESPONSE);
+    const long = await callAudited(name, { ...args, reason: "x".repeat(201) });
+    expect(long.row, name).toMatchObject({
+      status: "refused",
+      error: "reason is 201 characters; at most 200 are accepted — shorten it",
+      reason: null,
+      graph_id: WORK_ID,
+      dry_run: 0,
+    });
+    const unknown = await callAudited(name, { ...args, graph: "nope", reason: REASON });
+    expect(unknown.row, name).toMatchObject({
+      status: "refused",
+      error: "unknown graph 'nope' — call list_graphs for the connected aliases",
+      alias: "nope",
+      graph_id: null,
+      reason: REASON,
+    });
+    const readOnly = await callAudited(name, { ...args, graph: "notes" });
+    expect(readOnly.row, name).toMatchObject({
+      status: "refused",
+      error: "graph 'notes' is read-only",
+      alias: "notes",
+      graph_id: NOTES_ID,
+    });
+    expect(syncRequests, name).toHaveLength(0);
+
+    // Dry run, where the tool has one: dry_run = 1, targets from the dry-run response.
+    const where = DRY_RUN_IN[name];
+    if (where !== undefined) {
+      const dry = { ...CONTEXT_RESPONSE, "dry-run": true };
+      // A delete's dry run reads first, as its real call does, so the read is answered too.
+      syncHandler = preReadsEmpty(() => Response.json(dry));
+      const dryArgs =
+        where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
+      const preview = await callAudited(name, dryArgs);
+      expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
+      expect(JSON.parse(preview.row.targets!), name).toEqual(toAffectedTargets(dry));
+      // dry-run: false is a real call.
+      const real =
+        where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };
+      expect((await callAudited(name, real)).row.dry_run, name).toBe(0);
     }
   });
 

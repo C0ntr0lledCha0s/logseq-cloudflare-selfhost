@@ -486,6 +486,70 @@ test("usage errors exit 2, name LOGSEQ_SERVICE_TOKEN and send nothing", async ()
   }
 });
 
+test("LOGSEQ_TOKEN_FROM_PROXY=1 with no token calls the tool with no Authorization header, for the proxy to add", async () => {
+  // A cloud environment can hold the token as a network secret: its proxy adds the bearer to
+  // requests for the connector's host, so the session never sees the token.
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "work (read-write)")));
+  try {
+    const out = await run(["list_graphs"], {
+      LOGSEQ_TOKEN_FROM_PROXY: "1",
+      NODE_USE_ENV_PROXY: "1",
+      LOGSEQ_MCP_URL: s.url,
+    });
+    assert.equal(out.status, 0, out.stderr);
+    assert.equal(out.stdout, "work (read-write)\n");
+    assert.deepEqual(
+      s.requests.map((r) => r.rpc.method),
+      ["initialize", "notifications/initialized", "tools/call"],
+    );
+    for (const r of s.requests) assert.equal(r.headers.authorization, undefined, `${r.rpc.method} sent an Authorization header`);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a token in LOGSEQ_SERVICE_TOKEN is still sent when LOGSEQ_TOKEN_FROM_PROXY=1", async () => {
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "ok")));
+  try {
+    const out = await run(["list_graphs"], {
+      LOGSEQ_SERVICE_TOKEN: TOKEN,
+      LOGSEQ_TOKEN_FROM_PROXY: "1",
+      LOGSEQ_MCP_URL: s.url,
+    });
+    assert.equal(out.status, 0, out.stderr);
+    for (const r of s.requests) assert.equal(r.headers.authorization, `Bearer ${TOKEN}`);
+    assertNoToken(out, "token and proxy flag");
+  } finally {
+    await s.close();
+  }
+});
+
+test("LOGSEQ_TOKEN_FROM_PROXY=1 without NODE_USE_ENV_PROXY=1 exits 2 naming it and sends nothing", async () => {
+  // Node's fetch ignores HTTPS_PROXY unless NODE_USE_ENV_PROXY=1, so the request would bypass the
+  // proxy that adds the token. Values other than "1" do not turn proxy mode on.
+  const s = await stub((rpc, _req, res) => json(res, 200, textResult(rpc.id, "sent")));
+  try {
+    const cases = [
+      { label: "no NODE_USE_ENV_PROXY", env: { LOGSEQ_TOKEN_FROM_PROXY: "1" }, expect: /NODE_USE_ENV_PROXY=1/ },
+      {
+        label: "NODE_USE_ENV_PROXY=0",
+        env: { LOGSEQ_TOKEN_FROM_PROXY: "1", NODE_USE_ENV_PROXY: "0" },
+        expect: /NODE_USE_ENV_PROXY=1/,
+      },
+      { label: "flag not 1", env: { LOGSEQ_TOKEN_FROM_PROXY: "true", NODE_USE_ENV_PROXY: "1" }, expect: /LOGSEQ_TOKEN_FROM_PROXY=1/ },
+    ];
+    for (const c of cases) {
+      const out = await run(["list_graphs"], { LOGSEQ_MCP_URL: s.url, ...c.env });
+      assert.equal(out.status, 2, `${c.label}: ${out.stderr}`);
+      assert.match(out.stderr, c.expect, c.label);
+      assert.equal(out.stdout, "", c.label);
+    }
+    assert.equal(s.requests.length, 0, "no request was sent");
+  } finally {
+    await s.close();
+  }
+});
+
 test("redact replaces every occurrence of the token and any other token-shaped value", async () => {
   const { redact } = await import("./logseq-mcp.mjs");
   const other = "lsct_" + "z".repeat(43);
@@ -509,31 +573,32 @@ test("wiring: .mcp.json reads the host and token from the environment and holds 
   assert.doesNotMatch(raw, /lsct_/);
 });
 
-test("wiring: settings enable logseq-service and allow exactly the read tools allowed for mcp__Logseq__", () => {
+test("wiring: settings enable logseq-service and allow all of its tools; mcp__Logseq__ stays read-only", () => {
+  // Owner decision: cloud sessions run every logseq-service tool without a prompt. The service
+  // token, not the client, sets the limits (read, write without deletes, write), so a session
+  // whose token is write-no-delete can't delete however the client is configured. The claude.ai
+  // connector (mcp__Logseq__) has no such server-side limit, so only its read tools are allowed.
   const settings = JSON.parse(readFileSync(join(root, ".claude", "settings.json"), "utf8"));
   const manifest = JSON.parse(readFileSync(join(root, "connector", "tools-manifest.json"), "utf8"));
   const readOnly = new Map(manifest.map((t) => [t.name, t.annotations.readOnlyHint === true]));
   const allow = settings.permissions.allow;
 
   assert.deepEqual(settings.enabledMcpjsonServers, ["logseq-service"]);
+  assert.ok(allow.includes("mcp__logseq-service"), "every logseq-service tool is allowed (server-wide rule)");
+  assert.deepEqual(
+    allow.filter((a) => a.startsWith("mcp__logseq-service__")),
+    [],
+    "no per-tool logseq-service entries beside the server-wide rule",
+  );
 
-  const tools = (prefix) =>
-    allow
-      .filter((a) => a.startsWith(prefix))
-      .map((a) => a.slice(prefix.length))
-      .sort();
-  const logseq = tools("mcp__Logseq__");
-  const service = tools("mcp__logseq-service__");
+  const logseq = allow.filter((a) => a.startsWith("mcp__Logseq__")).map((a) => a.slice("mcp__Logseq__".length));
   assert.ok(logseq.length > 0);
-  assert.deepEqual(service, logseq, "the same tools are allowed under both servers");
-  for (const t of service) {
+  for (const t of logseq) {
     assert.ok(readOnly.has(t), `${t} is a tool in tools-manifest.json`);
-    assert.equal(readOnly.get(t), true, `${t} is read-only`);
+    assert.equal(readOnly.get(t), true, `mcp__Logseq__${t} is read-only`);
   }
-  for (const a of allow) {
-    assert.notEqual(a, "mcp__logseq-service", "no server-wide allow");
-    assert.doesNotMatch(a, /^mcp__logseq-service__.*[*:]/, "no wildcard allow");
-  }
+  assert.ok(!allow.includes("mcp__Logseq"), "no server-wide allow for the claude.ai connector");
+  for (const a of allow) assert.doesNotMatch(a, /^mcp__Logseq__.*[*:]/, "no wildcard allow for the claude.ai connector");
 
   // The existing deny list and hooks are kept.
   assert.ok(settings.permissions.deny.includes("Read(./.env.local)"));
