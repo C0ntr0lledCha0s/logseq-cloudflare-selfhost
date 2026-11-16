@@ -925,7 +925,7 @@ describe("query reads", () => {
 
   it("one datalog_query call inserts exactly one read row: tool, status ok, datalog:<12 hex of SHA-256>, no query text", async () => {
     writeResponse = () => Response.json(ROWS);
-    const result = await call("datalog_query", { body: { query: QUERY, inputs: '["Projets secrets"]', rules: "[]", limit: 10 } });
+    const result = await call("datalog_query", { body: { query: QUERY, inputs: '["Projets secrets"]', limit: 10 } });
     expect(result.isError, result.text).toBe(false);
     expect(JSON.parse(result.text)).toEqual(ROWS);
     const rows = await allRows();
@@ -941,7 +941,7 @@ describe("query reads", () => {
     });
     expect(JSON.parse(rows[0].addressed)).toEqual([`datalog:${await hash12(QUERY)}`]);
     expect(rows[0].addressed).toMatch(/^\["datalog:[0-9a-f]{12}"\]$/);
-    // No column holds any part of the query, its inputs or its rules.
+    // No column holds any part of the query or its inputs.
     const stored = JSON.stringify(rows[0]);
     for (const part of ["block/title", "Business Meeting", ":find", "Projets secrets"]) expect(stored, part).not.toContain(part);
   });

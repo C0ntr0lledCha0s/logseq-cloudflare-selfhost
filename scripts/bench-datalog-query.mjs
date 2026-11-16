@@ -51,7 +51,11 @@ export const SHAPES = [
 const ANCESTOR_RULES = `[[(anc ?c ?a) [?c :block/parent ?a]]
  [(anc ?c ?a) [?c :block/parent ?p] (anc ?p ?a)]]`;
 
-/** Request bodies (the fields POST /query takes) per shape. */
+/**
+ * Request bodies (the fields POST /query takes) per shape. datalog_query refuses rules, so a shape
+ * with rules runs as a named query's rules do: server data, through the same check (checked-query)
+ * and run-query.
+ */
 export const BODIES = {
   // Every datom: what a query with no selective clause costs before the cap stops it.
   "scan-cap": { query: "[:find ?e ?a ?v :where [?e ?a ?v]]" },
@@ -311,7 +315,9 @@ export function runShape(ns, shape, db, scanCap) {
   const t0 = performance.now();
   cljs.reset_BANG_(datalog.last_run, cljs.hash_map(kw("private-set-built?"), false, kw("scanned"), 0, kw("pulled"), 0));
   const given = BODIES[shape];
-  const parsed = datalog.parse_request(body(ns, given));
+  const parsed = given.rules
+    ? datalog.checked_query(ns.reader.read_string.cljs$core$IFn$_invoke$arity$1(given.query), cljs.PersistentVector.EMPTY, ns.reader.read_string.cljs$core$IFn$_invoke$arity$1(given.rules), false)
+    : datalog.parse_request(body(ns, given));
   const status = kw("logseq.db-sync.worker.handler.datalog", "status");
   let result = parsed;
   if (!cljs.contains_QMARK_(parsed, status)) {

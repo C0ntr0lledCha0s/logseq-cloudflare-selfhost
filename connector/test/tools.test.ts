@@ -1104,13 +1104,13 @@ describe("hand-written tools", () => {
     expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
   });
 
-  it("datalog_query is generated from datalogQuery: a POST of {query, inputs?, rules?, limit?, dry-run?} annotated READ, with no reason and no write tables", async () => {
+  it("datalog_query is generated from datalogQuery: a POST of {query, inputs?, limit?, dry-run?} annotated READ, with no reason and no write tables", async () => {
     const tools = await listTools();
     const query = tools.find((t) => t.name === "datalog_query");
     expect(query).toBeDefined();
     expect(query.inputSchema.required).toEqual(expect.arrayContaining(["graph", "body"]));
     expect(query.inputSchema.properties.body.required).toEqual(["query"]);
-    expect(Object.keys(query.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "inputs", "limit", "query", "rules"]);
+    expect(Object.keys(query.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "inputs", "limit", "query"]);
     expect(query.inputSchema.properties.reason).toBeUndefined();
     // A POST is taken for a write unless ANNOTATIONS says otherwise (patch 0039: POST only because the query can be long).
     expect(query.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
@@ -1118,7 +1118,7 @@ describe("hand-written tools", () => {
       expect(query.description, phrase).toContain(phrase);
     }
     // Patch 0039 stage 2: the caps Claude has to work within, and how a cut result says so.
-    for (const phrase of ["scan cap", "20,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values", "left recursion", "row cap", "2,500 rows"]) {
+    for (const phrase of ["scan cap", "20,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values", "row cap", "2,500 rows", "There are no rules", "naming run_named_query"]) {
       expect(query.description, phrase).toContain(phrase);
     }
     // A read never needs a delete rule, a snapshot plan or a context class: those tables throw only for write tools.
@@ -2497,7 +2497,11 @@ describe("queries help", () => {
   it.each([
     ["datalog_query", "datalog_query runs a read-only Datalog query"],
     ["the query's length", "(EDN, at most 4,000 characters)"],
-    ["the inputs' and rules' length", "inputs and rules are at most 4,000 characters each"],
+    ["the inputs' length", "inputs are at most 4,000 characters"],
+    ["no caller rules", "datalog_query takes no rules: a rules field, % in :in or a rule call is refused with 400"],
+    ["why no rules", "a tree of rules expands without reading data and can run for seconds before any cap stops it"],
+    ["a step up without rules", "To step up from a block use get-some ([(get-some $ ?b :block/parent) [_ ?p]])"],
+    ["ancestors through a named query", "for every ancestor use run_named_query (meetings-without-decision walks up through them with its own rules)"],
     ["run_named_query, preferred", "Prefer run_named_query when one fits"],
     ["projects-untouched", "when one fits: projects-untouched,"],
     ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
@@ -2521,7 +2525,7 @@ describe("queries help", () => {
     ["aggregates and collections", "aggregates other than count, count-distinct and distinct refuse collection values"],
     ["the text cap's number", "5,000,000 characters of text per query (the text cap"],
     ["what the text cap counts", "text the functions and aggregates return counts toward"],
-    ["the work cap's number", "every not, not-join, or, or-join and rule call charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap"],
+    ["the work cap's number", "every not, not-join, or and or-join charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap"],
     ["the call cap's number", "every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap"],
     ["the Recycle bin", "and so is anything in the Recycle bin"],
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
@@ -2534,7 +2538,6 @@ describe("queries help", () => {
     ["the allowed functions", "(comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like"],
     ["no regex, range or rand", "no regex, range or rand, and no vector"],
     ["clauses share variables", "clauses must share variables (a cross product is refused)"],
-    ["no left recursion", "a rule must read data before it calls itself"],
     ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
     ["E2EE", "Unavailable on E2EE graphs (409)"],
     ["dry-run", "dry-run: true checks the query and shows it without running it"],
