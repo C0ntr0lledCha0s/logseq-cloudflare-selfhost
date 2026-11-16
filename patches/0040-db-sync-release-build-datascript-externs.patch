@@ -1,0 +1,25 @@
+diff --git a/deps/db-sync/shadow-cljs.edn b/deps/db-sync/shadow-cljs.edn
+index 7f69937..10ae8a7 100644
+--- a/deps/db-sync/shadow-cljs.edn
++++ b/deps/db-sync/shadow-cljs.edn
+@@ -5,7 +5,12 @@
+  :builds
+  {:db-sync {:target :esm
+             :output-dir "worker/dist/worker"
++            ;; Datascript's externs keep advanced compilation from renaming its Datom fields
++            ;; (e, a, v, tx), which its query engine reads by name: without them every value a
++            ;; data pattern binds comes back nil. The app builds in the root shadow-cljs.edn set
++            ;; them too.
+             :compiler-options {:source-map true
++                               :externs ["datascript/externs.js"]
+                                :warnings {:fn-deprecated false
+                                           :redef false}}
+             :modules {:main {:exports {default logseq.db-sync.worker/worker
+@@ -18,6 +23,7 @@
+                  :output-to "worker/dist/node-adapter.js"
+                  :main logseq.db-sync.node.entry/main
+                  :compiler-options {:source-map true
++                                    :externs ["datascript/externs.js"]
+                                     :warnings {:fn-deprecated false
+                                                :redef false}}
+                  :devtools {:enabled false}

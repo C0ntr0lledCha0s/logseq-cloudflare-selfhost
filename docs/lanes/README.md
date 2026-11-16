@@ -169,7 +169,7 @@ cat > .claude/lanes.local.json <<'JSON'
 JSON
 ```
 
-Check a new container with `clojure --version`, `ls connector/vendor/openapi.json .claude/lanes.local.json` and `scripts/check.sh --upstream`. The summary should list the connector tests, typecheck, tools manifest and upstream db-sync tests as `ok`. Only `tofu fmt` may be skipped, and CI runs it.
+Check a new container with `clojure --version`, `ls connector/vendor/openapi.json .claude/lanes.local.json` and `scripts/check.sh --upstream`. The summary should list the connector tests, typecheck, tools manifest, upstream db-sync tests and release bundle query check as `ok`. Only `tofu fmt` may be skipped, and CI runs it.
 
 ## Running a lane by hand
 

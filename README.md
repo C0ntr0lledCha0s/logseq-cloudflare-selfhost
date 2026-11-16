@@ -355,6 +355,7 @@ ok openapi
 ok unauthenticated-graphs
 ok jwt-garbage-refused
 ok pat-graphs              # only when SMOKE_PAT is set; otherwise a note says so
+ok datalog-query           # with SMOKE_PAT: a read-only query returns a value, not null
 ok upstream-mcp-off
 ```
 

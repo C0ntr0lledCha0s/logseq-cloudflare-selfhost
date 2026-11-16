@@ -10,7 +10,7 @@ const script = join(resolve(dirname(fileURLToPath(import.meta.url)), ".."), "scr
 
 // A fake repository root plus stub npm/node/pnpm/tofu that log their arguments and exit with
 // the status named in STUB_FAIL_<tool> (0 when unset).
-function setup({ vendor = false, upstream = false, nodeModules = true } = {}) {
+function setup({ vendor = false, upstream = false, releaseBundle = false, nodeModules = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "check-"));
   const root = join(dir, "repo");
   const bin = join(dir, "bin");
@@ -26,6 +26,10 @@ function setup({ vendor = false, upstream = false, nodeModules = true } = {}) {
     writeFileSync(join(root, "connector", "vendor", "semantic_api_tools.mjs"), "");
   }
   if (upstream) mkdirSync(join(root, ".upstream", "deps", "db-sync"), { recursive: true });
+  if (releaseBundle) {
+    mkdirSync(join(root, ".upstream", "deps", "db-sync", "worker", "dist", "worker"), { recursive: true });
+    writeFileSync(join(root, ".upstream", "deps", "db-sync", "worker", "dist", "worker", "main.js"), "");
+  }
   const log = join(dir, "calls.log");
   for (const tool of ["npm", "node", "pnpm", "tofu"]) {
     const stub = join(bin, tool);
@@ -101,6 +105,30 @@ test("--upstream runs upstream's suite, or says it is skipped without .upstream"
   } finally {
     withUpstream.cleanup();
     without.cleanup();
+  }
+});
+
+test("--upstream queries the release bundle when it is built, or names the skip and the fix", () => {
+  const built = setup({ upstream: true, releaseBundle: true });
+  const unbuilt = setup({ upstream: true });
+  try {
+    const a = built.run(["--upstream"]);
+    assert.equal(a.status, 0, a.stdout + a.stderr);
+    assert.match(a.calls, /node scripts\/release-query-check\.mjs \.upstream/);
+    assert.match(a.stdout, /ok +release bundle query check/);
+    const failed = built.run(["--upstream"], { STUB_FAIL_node: "1" });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /FAILED +release bundle query check/);
+    const b = unbuilt.run(["--upstream"]);
+    assert.equal(b.status, 0, b.stdout + b.stderr);
+    assert.match(b.stdout, /skipped +release bundle query check .*scripts\/build\.sh \.upstream/);
+    assert.doesNotMatch(b.calls, /release-query-check/);
+    const before = failed.calls.length;
+    const c = built.run([]);
+    assert.doesNotMatch(c.calls.slice(before), /release-query-check/, "only with --upstream");
+  } finally {
+    built.cleanup();
+    unbuilt.cleanup();
   }
 });
 

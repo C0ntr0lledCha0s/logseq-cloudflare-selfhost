@@ -173,3 +173,80 @@ test("notes when SMOKE_PAT is unset", { timeout: 120000 }, async () => {
     assert.doesNotMatch(withPat.stdout, /note: SMOKE_PAT/);
   });
 });
+
+// A stub with graphs behind the PAT: queries answers POST /api/v1/graphs/<id>/query per graph id.
+function withGraphs(graphs, queries, seen = []) {
+  return (req, res) => {
+    const reply = (code, body) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(body);
+    };
+    if (req.method === "GET" && req.url === "/api/v1/graphs" && req.headers.authorization === "Bearer logseq_pat_secret") {
+      return reply(200, JSON.stringify({ graphs, "user-rsa-keys-exists?": false }));
+    }
+    const m = req.method === "POST" && req.url.match(/^\/api\/v1\/graphs\/([^/]+)\/query$/);
+    if (m) {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        seen.push({ graph: m[1], auth: req.headers.authorization, body: JSON.parse(body) });
+        const [code, out] = queries[m[1]] ?? [404, "{}"];
+        reply(code, JSON.stringify(out));
+      });
+      return;
+    }
+    return healthy(req, res);
+  };
+}
+
+const graph = (id, extra = {}) => ({ "graph-id": id, "graph-e2ee?": false, "graph-ready-for-use?": true, ...extra });
+const tagRows = { columns: ["?id"], rows: [["logseq.class/Tag"]] };
+
+test("with a PAT, a datalog query returns a value bound by a data pattern", { timeout: 120000 }, async () => {
+  const seen = [];
+  await withStub(withGraphs([graph("g1")], { g1: [200, tagRows] }, seen), async (base) => {
+    const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ok datalog-query$/m);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].auth, "Bearer logseq_pat_secret");
+    assert.match(seen[0].body.query, /:db\/ident \?id/);
+    assert.ok(!(r.stdout + r.stderr).includes("logseq_pat_secret"));
+  });
+});
+
+test("fails when the datalog query's bound value comes back null (release build without externs)", { timeout: 120000 }, async () => {
+  await withStub(withGraphs([graph("g1")], { g1: [200, { columns: ["?id"], rows: [[null]] }] }), async (base) => {
+    const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /^FAIL datalog-query: rows .*null/m);
+  });
+});
+
+test("fails when the datalog query answers an error", { timeout: 120000 }, async () => {
+  await withStub(withGraphs([graph("g1")], { g1: [500, { error: "server error" }] }), async (base) => {
+    const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /^FAIL datalog-query: 500$/m);
+  });
+});
+
+test("the datalog query skips E2EE and unready graphs and a graph the PAT can't read", { timeout: 120000 }, async () => {
+  const seen = [];
+  const graphs = [graph("enc", { "graph-e2ee?": true }), graph("new", { "graph-ready-for-use?": false }), graph("other"), graph("mine")];
+  await withStub(withGraphs(graphs, { other: [403, { error: "forbidden" }], mine: [200, tagRows] }, seen), async (base) => {
+    const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ok datalog-query$/m);
+    assert.deepEqual(seen.map((s) => s.graph), ["other", "mine"]);
+  });
+});
+
+test("notes when no graph can be queried", { timeout: 120000 }, async () => {
+  await withStub(withGraphs([graph("enc", { "graph-e2ee?": true })], {}), async (base) => {
+    const r = await run(base, { SMOKE_PAT: "logseq_pat_secret" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^note: no graph this PAT can read, so datalog-query was not checked$/m);
+    assert.doesNotMatch(r.stdout, /datalog-query$/m);
+  });
+});

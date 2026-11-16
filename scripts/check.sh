@@ -2,7 +2,8 @@
 # Usage: check.sh [--upstream]
 # The lanes' gate (see docs/lanes/README.md). Runs every check this checkout can run, names each
 # check it skipped and why, and exits 1 if any check that ran failed.
-#   --upstream  also run upstream db-sync's own suite in .upstream (needed when patches/ changed)
+#   --upstream  also run upstream db-sync's own suite in .upstream (needed when patches/ changed),
+#               then query its release bundle (scripts/release-query-check.mjs) when it is built
 # CHECK_ROOT overrides the repository root (for tests).
 set -uo pipefail
 
@@ -52,6 +53,13 @@ fi
 if [ "$upstream" = 1 ]; then
   if [ -d .upstream/deps/db-sync ]; then
     run "upstream db-sync tests" bash -c 'cd .upstream/deps/db-sync && pnpm test'
+    # Queries the release bundle deploy ships (its Datascript seeds from the test build just
+    # compiled). It tests the bundle as last built: rebuild with scripts/build.sh after a patch change.
+    if [ -f .upstream/deps/db-sync/worker/dist/worker/main.js ]; then
+      run "release bundle query check" node scripts/release-query-check.mjs .upstream
+    else
+      skip "release bundle query check" "release bundle missing: scripts/build.sh .upstream"
+    fi
   else
     skip "upstream db-sync tests" ".upstream missing: scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream"
   fi
