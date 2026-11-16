@@ -1,0 +1,15 @@
+// The do-cpu-probe Worker. The workflow deploys it with `--name do-cpu-probe-<run id>-<attempt>`
+// and `--var PROBE_KEY:<random>`, then deletes it. It has no route: workers.dev only.
+{
+  "name": "do-cpu-probe",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-07-11",
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "ProbeDO" }]
+  },
+  // SQLite-backed, so it deploys on the Free plan.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProbeDO"] }],
+  "observability": { "enabled": false }
+}

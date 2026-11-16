@@ -119,6 +119,26 @@ Without the variable, the section reads `Skipped: CONNECTOR_D1_DATABASE_ID not s
 
 To run it locally, with `.env.local` loaded (the deploy token can read analytics too): `node scripts/usage-report.mjs --settings config/settings.json`. Add `CONNECTOR_D1_DATABASE_ID=<database-id>` in front for the Audit log section.
 
+### Measuring the Durable Object CPU limit
+
+Cloudflare's docs disagree on the Free plan's CPU limit for a Durable Object (30 s per request, or the Workers' 10 ms), and that limit decides how long a datalog query can hold up a graph's sync DO. The `do-cpu-probe` workflow measures it on your own account. It deploys a throwaway Worker and SQLite-backed DO (`scripts/do-cpu-probe/`) on workers.dev as `do-cpu-probe-<run id>-<attempt>`, asks the DO for a fixed amount of busy work per target duration, and deletes the Worker again at the end, even when a step failed.
+
+**To run it:** **Actions → do-cpu-probe → Run workflow**, or `gh workflow run do-cpu-probe.yml`. The inputs are the target CPU durations in ms (default `5,50,200,500,2000,5000,15000,35000`; at most 20, each at most 120,000) and whether to keep a WebSocket client connected during the runs (default on). It uses the deploy token from the `production` environment, which needs **Workers Admin** (it includes Workers Scripts Edit, for deploying and deleting the probe) and must be able to read analytics (**Account Analytics Read**, which S3 found the deploy token could already do). The account needs its workers.dev subdomain (1.3). A missing permission or subdomain fails the run with a message naming it. The workflow file must be on `main` before it shows in the Actions tab.
+
+**What it costs:** a few dozen Worker and DO requests per run (a health check, then three requests and a WebSocket ping per duration) and about a minute of DO CPU with the defaults, well inside the Free allowances. The run takes about five minutes, most of it waiting for analytics.
+
+**Reading the table** (on the run's summary page; the same data is in the `do-cpu-probe-…` artefact as JSON):
+
+| Column | Meaning |
+|---|---|
+| Target ms, Iterations | The CPU asked for, and the loop iterations sent for it: target × the rate measured on the runner (Workers freeze the clock during synchronous work, so the probe counts work, not time) |
+| HTTP, Latency ms, Response or error | What the caller saw. A killed DO shows as a 502 from the probe Worker, with Cloudflare's error message and flags in the body |
+| DO status, CPU ms, Wall ms | From the GraphQL Analytics API (`durableObjectsInvocationsAdaptiveGroups`), for that run's invocation. The summary names which CPU field the API answered with |
+| DO memory | `kept` when a value set in the DO's memory before the run was still there after it; `reset` means the DO instance restarted |
+| WebSocket | `kept` when the connected client still answered a ping; `dropped: close <code>` when it was closed during the run |
+
+Below the table, *Calibration* gives the loop's rate on the runner and on Cloudflare, and *Limit* brackets the CPU limit: the most CPU a completed run used and the least at which a run failed. Record the figures in `docs/solutions/cost/durable-object-cpu-limit-on-free.md`.
+
 ## Prerequisites
 
 - **A Cloudflare account** with a zone (`example.com`) already active on it. The sync hostname (`sync.example.com`) must be in that zone and should not already have a DNS record: wrangler creates the record and the certificate.

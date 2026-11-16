@@ -1,0 +1,120 @@
+name: do-cpu-probe
+
+# Measures the Free plan's Durable Object CPU limit and what a CPU-limit kill does to the caller,
+# the DO's memory and a connected WebSocket client (README "Measuring the Durable Object CPU limit").
+# It deploys a throwaway Worker and DO (scripts/do-cpu-probe/) under a unique name on workers.dev,
+# runs a few dozen requests, reads the CPU figures from the GraphQL Analytics API, and always
+# deletes the Worker again. Run it by hand from the Actions tab; it never runs on its own.
+on:
+  workflow_dispatch:
+    inputs:
+      durations:
+        description: Target CPU durations in ms, comma-separated (at most 20, each at most 120000)
+        type: string
+        default: "5,50,200,500,2000,5000,15000,35000"
+      websocket:
+        description: Keep a WebSocket client connected to the DO during the runs
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: do-cpu-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      PROBE_NAME: do-cpu-probe-${{ github.run_id }}-${{ github.run_attempt }}
+      WRANGLER_VERSION: 4.151.1
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          install_args: node
+
+      - name: Validate inputs
+        env:
+          DURATIONS: ${{ inputs.durations }}
+          WEBSOCKET: ${{ inputs.websocket }}
+        run: node scripts/do-cpu-probe.mjs validate --durations "$DURATIONS" --websocket "$WEBSOCKET"
+
+      # The same loop the DO runs, timed with process CPU time on the runner.
+      - name: Calibrate in Node
+        run: node scripts/do-cpu-probe.mjs calibrate --out "$RUNNER_TEMP/calibration.json"
+
+      # Finds (and masks) the workers.dev subdomain, and checks the token can read analytics.
+      - name: Check the token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/do-cpu-probe.mjs preflight
+
+      # A random key per run, so only this job can make the public probe URL burn CPU.
+      - name: Make the probe key
+        run: |
+          key="$(openssl rand -hex 16)"
+          echo "::add-mask::$key"
+          echo "PROBE_KEY=$key" >> "$GITHUB_ENV"
+
+      # wrangler's output goes to a file first, so the probe's workers.dev host is masked before it
+      # reaches the log.
+      - name: Deploy the probe
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set +e
+          (cd scripts/do-cpu-probe && npx --yes "wrangler@$WRANGLER_VERSION" deploy --name "$PROBE_NAME" --var "PROBE_KEY:$PROBE_KEY") > "$RUNNER_TEMP/deploy.log" 2>&1
+          status=$?
+          set -e
+          node scripts/do-cpu-probe.mjs deploy-log "$RUNNER_TEMP/deploy.log" --status "$status" --name "$PROBE_NAME" --url-out "$RUNNER_TEMP/probe-url"
+
+      - name: Run the probe
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DURATIONS: ${{ inputs.durations }}
+          WEBSOCKET: ${{ inputs.websocket }}
+        run: >-
+          node scripts/do-cpu-probe.mjs run
+          --url-file "$RUNNER_TEMP/probe-url"
+          --calibration "$RUNNER_TEMP/calibration.json"
+          --durations "$DURATIONS"
+          --websocket "$WEBSOCKET"
+          --name "$PROBE_NAME"
+          --out "$RUNNER_TEMP/do-cpu-probe.json"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: do-cpu-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/do-cpu-probe.json
+            ${{ runner.temp }}/calibration.json
+          if-no-files-found: warn
+
+      # Always runs, so nothing is left on the account. wrangler delete removes the Worker and its
+      # DO namespace; the API delete after it confirms it is gone (or removes it if wrangler could
+      # not), and names the missing permission if the token is refused.
+      - name: Delete the probe
+        if: always()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          (cd scripts/do-cpu-probe && npx --yes "wrangler@$WRANGLER_VERSION" delete "$PROBE_NAME" --force) \
+            || echo "::warning::wrangler delete failed; trying the API"
+          node scripts/do-cpu-probe.mjs teardown --name "$PROBE_NAME"
