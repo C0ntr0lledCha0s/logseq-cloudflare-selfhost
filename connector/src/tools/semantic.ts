@@ -3,7 +3,7 @@ import { z } from "zod";
 import { registerSemanticApiTools } from "../../vendor/semantic_api_tools.mjs";
 import { connectorHostname } from "../config";
 import type { ResolvedGraph } from "../graphs";
-import { SyncError, type SyncRequest, syncFetch } from "../sync";
+import { SyncError, type SyncRequest, SyncStoppedError, syncFetch } from "../sync";
 import { RESULT_CHAR_LIMIT, ToolError, aliasArg, lookupGraph, resolveGraph, runTool, withCallGraphs } from "./common";
 
 export { resolveGraph };
@@ -123,6 +123,9 @@ function description(op: GraphOperation): string {
   return parts.join("\n\n");
 }
 
+/** What to try when the sync server stopped a request: the likeliest cause is a query past the CPU limit. */
+const STOPPED_HINT = "a query may have hit the CPU limit; try a narrower query";
+
 function syncErrorText(error: SyncError, alias: string, host: string): string {
   if (error.status === 401 || error.status === 403) {
     return `token for graph '${alias}' expired or lacks permission — reconnect it at https://${host}/graphs`;
@@ -131,6 +134,9 @@ function syncErrorText(error: SyncError, alias: string, host: string): string {
   // 409 is a refusal the caller can act on, e.g. a title already in use or a delete that needs an
   // acknowledge-* flag; the server's message says what to do.
   if (error.status === 400 || error.status === 409) return error.message;
+  // A 5xx with no error of the server's own came from the platform, not the handler: the Durable
+  // Object was stopped (a CPU-limit kill or a reset), so the status alone would tell Claude nothing.
+  if (error.status >= 500 && !error.serverMessage) return `the sync server stopped the request (HTTP ${error.status}); ${STOPPED_HINT}`;
   return `sync server error (HTTP ${error.status}): ${error.message}`;
 }
 
@@ -146,11 +152,14 @@ function queryParams(query: Record<string, unknown> | undefined): Record<string,
   return out;
 }
 
-/** `syncFetch` for a tool call on `alias`: a sync server error becomes a `ToolError` with clear text. */
+/** `syncFetch` for a tool call on `alias`: a sync server error, or no answer at all, becomes a `ToolError` with clear text. */
 export async function graphFetch(access: GraphAccess, alias: string, pat: string, req: SyncRequest): Promise<Response> {
   try {
     return await syncFetch(access.env, pat, req);
   } catch (error) {
+    if (error instanceof SyncStoppedError) {
+      throw new ToolError(`the sync server stopped the request without answering (${error.reason.slice(0, 200)}); ${STOPPED_HINT}`, "sync-stopped");
+    }
     if (!(error instanceof SyncError)) throw error;
     throw new ToolError(syncErrorText(error, alias, connectorHostname(access.env)), `http-${error.status}`);
   }

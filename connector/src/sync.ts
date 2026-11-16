@@ -24,6 +24,11 @@ export class SyncError extends Error {
     message: string,
     /** Seconds, from `Retry-After`, when the server sent one. */
     readonly retryAfter?: number,
+    /**
+     * False when the body held no `error` of the server's own (not JSON, empty, or JSON without
+     * one): the answer came from the platform, e.g. a Durable Object stopped at its CPU limit.
+     */
+    readonly serverMessage = true,
   ) {
     super(message);
     this.name = "SyncError";
@@ -45,20 +50,35 @@ export class InspectError extends Error {
   }
 }
 
+/** `env.SYNC.fetch` rejected: the sync server gave no answer at all (it was stopped or reset mid-request). */
+export class SyncStoppedError extends Error {
+  constructor(readonly reason: string) {
+    super(`the sync server gave no answer: ${reason}`);
+    this.name = "SyncStoppedError";
+  }
+}
+
 async function syncErrorFrom(response: Response): Promise<SyncError> {
   let message = `sync server returned HTTP ${response.status}`;
+  let serverMessage = false;
   try {
     const body = (await response.json()) as { error?: unknown } | null;
-    if (typeof body?.error === "string" && body.error !== "") message = body.error;
+    if (typeof body?.error === "string" && body.error !== "") {
+      message = body.error;
+      serverMessage = true;
+    }
   } catch {
     // Not JSON: keep the status-only message rather than echo an unknown body.
   }
   const retryHeader = response.headers.get("Retry-After");
   const retryAfter = retryHeader !== null && /^[0-9]+$/.test(retryHeader) ? Number(retryHeader) : undefined;
-  return new SyncError(response.status, message, retryAfter);
+  return new SyncError(response.status, message, retryAfter, serverMessage);
 }
 
-/** One request to the sync server as the PAT's owner. Returns 2xx responses; throws `SyncError` otherwise. */
+/**
+ * One request to the sync server as the PAT's owner. Returns 2xx responses; throws `SyncError` for
+ * any other answer, and `SyncStoppedError` when the service binding's fetch rejects.
+ */
 export async function syncFetch(env: Env, pat: string, req: SyncRequest): Promise<Response> {
   if (!req.path.startsWith("/")) throw new Error("sync path must start with /");
   if (req.json !== undefined && req.body !== undefined) throw new Error("pass json or body to syncFetch, not both");
@@ -71,7 +91,12 @@ export async function syncFetch(env: Env, pat: string, req: SyncRequest): Promis
     body = JSON.stringify(req.json);
   }
   if (req.auth !== false) headers.set("Authorization", `Bearer ${pat}`);
-  const response = await env.SYNC.fetch(new Request(url, { method: req.method, headers, body }));
+  let response: Response;
+  try {
+    response = await env.SYNC.fetch(new Request(url, { method: req.method, headers, body }));
+  } catch (error) {
+    throw new SyncStoppedError(error instanceof Error ? error.message : String(error));
+  }
   if (!response.ok) throw await syncErrorFrom(response);
   return response;
 }

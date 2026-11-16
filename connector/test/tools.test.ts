@@ -834,6 +834,56 @@ describe("routing", () => {
 });
 
 describe("errors", () => {
+  // Follow-up 5 of docs/spikes/2026-11-09-safe-caller-datalog-queries.md: when the sync server's
+  // Durable Object is stopped mid-request (a query past the CPU limit, a reset), the answer is a 5xx
+  // with no error message of the server's own (Cloudflare's text or HTML, an empty body, JSON
+  // without error), or env.SYNC.fetch rejects. Both used to reach Claude as a bare HTTP code or an
+  // unmapped throw; both now name what happened and what to try.
+  const stopped = (status: number) =>
+    `the sync server stopped the request (HTTP ${status}); a query may have hit the CPU limit; try a narrower query`;
+  const QUERY = { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } };
+
+  it.each([
+    ["datalog_query", QUERY, () => new Response("error code: 1102", { status: 503 }), 503],
+    ["datalog_query", QUERY, () => new Response("<html><body>Worker exceeded resource limits</body></html>", { status: 500, headers: { "content-type": "text/html" } }), 500],
+    ["datalog_query", QUERY, () => new Response(null, { status: 502 }), 502],
+    ["datalog_query", QUERY, () => Response.json({}, { status: 500 }), 500],
+    ["run_named_query", { graph: "work", name: "projects-untouched", body: {} }, () => new Response("error code: 1102", { status: 503 }), 503],
+    ["get_page", { graph: "work", "page-id": "p1" }, () => new Response("", { status: 500 }), 500],
+  ])("%s: a 5xx without the server's own error message is named as a stopped request (%#)", async (name, args, handler, status) => {
+    syncHandler = handler;
+    const result = await callTool(name, args);
+    expect(result).toEqual({ isError: true, text: stopped(status) });
+    expect(syncRequests).toHaveLength(1);
+    expect(logged().at(-1)).toMatch(new RegExp(`^tool ${name} graph=work status=http-${status} `));
+  });
+
+  it.each([
+    ["datalog_query", QUERY],
+    ["run_named_query", { graph: "work", name: "projects-untouched", body: {} }],
+    ["get_page", { graph: "work", "page-id": "p1" }],
+  ])("%s: a rejected env.SYNC.fetch is named as a stopped request, not an unmapped throw", async (name, args) => {
+    syncHandler = () => {
+      throw new Error("The script will never generate a response.");
+    };
+    const result = await callTool(name, args);
+    expect(result).toEqual({
+      isError: true,
+      text: "the sync server stopped the request without answering (The script will never generate a response.); a query may have hit the CPU limit; try a narrower query",
+    });
+    expect(logged().at(-1)).toMatch(new RegExp(`^tool ${name} graph=work status=sync-stopped `));
+  });
+
+  it("a 5xx with the server's own error message keeps it, and a 4xx without one keeps its code", async () => {
+    syncHandler = () => Response.json({ error: "boom" }, { status: 500 });
+    expect(await callTool("datalog_query", QUERY)).toEqual({ isError: true, text: "sync server error (HTTP 500): boom" });
+    syncHandler = () => new Response("not found", { status: 404 });
+    expect(await callTool("get_page", { graph: "work", "page-id": "p1" })).toEqual({
+      isError: true,
+      text: "sync server error (HTTP 404): sync server returned HTTP 404",
+    });
+  });
+
   it("401 maps to reconnect message, 429 maps to retry message using Retry-After and makes exactly one sync call", async () => {
     for (const status of [401, 403]) {
       syncRequests = [];
@@ -2541,6 +2591,7 @@ describe("queries help", () => {
     ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
     ["E2EE", "Unavailable on E2EE graphs (409)"],
     ["dry-run", "dry-run: true checks the query and shows it without running it"],
+    ["a stopped request", "An error saying the sync server stopped the request means it gave no answer of its own, most likely a query past the CPU limit: narrow the query rather than retrying it as it is"],
     ["the audit row", "Each call is recorded in the audit log as a read"],
     ["what the row holds", "(a hash of the query, or the named query and the names of its params; never the rows)"],
     ["not in get_activity_log", "get_activity_log lists writes, so it doesn't show them"],
