@@ -21,6 +21,8 @@ Two related gaps were left as should-fix: the "/" check ignores the graph's jour
 
 Look up the recycled holder by `:block/name` first and call `page-title-character-refusal` only when there is none. Add a test that recycles a slash-titled page and expects 201. Fixed in `4ae1ee5`.
 
+Review round 2 found the journal gap reproduced (`17/11/2026` under `dd/MM/yyyy` answered 400; base answered 201), and replaced the copy altogether (`aaadc84`): `createPage` runs the outliner's create inside `rejecting` and maps its `name-no-slash` and `name-no-hash` notifications to the named 400, so every branch (new, restore, existing, journal in the graph's own format) is the outliner's decision.
+
 ## How to catch it next time
 
 - Before adding a refusal ahead of an outliner call, read the outliner function and list every branch (new, restore, existing, journal). Say which branches the refusal applies to, and test each: one test per branch, including a recycled entity and a journal title.
