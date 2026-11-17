@@ -20,8 +20,6 @@ const SHAPES = [
   "private-set",
   "scan-cap",
   "or-join-wide",
-  "rule-recursive",
-  "rule-deep-chain",
   "not-join-fanout",
   "join-fanout",
   "pull-star-200",
@@ -39,7 +37,7 @@ test("the seeded fixture is identical for the same size and differs for another 
     assert.ok(Array.isArray(page.blocks));
   }
   // Every shape needs its fixture: private pages for the private set, tagged pages for the pull,
-  // refs for the not-join, and a deep chain of blocks for the recursive rule.
+  // refs for the not-join, and a deep chain of blocks for the self-join on its tag.
   assert.ok(a.pages.some((p) => p.tags.includes("Private")), "some pages are private");
   assert.ok(a.pages.some((p) => p.tags.includes("Bench Project")), "some pages are projects");
   assert.ok(a.pages.some((p) => p.blocks.some((b) => b.refs.length > 0)), "some blocks ref pages");
@@ -72,7 +70,7 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
       assert.ok(r[k] >= 0, `${where}: ${k}`);
     }
     assert.ok(Number.isInteger(r.datoms_scanned), `${where}: datoms_scanned`);
-    assert.ok(["rows", "scan-cap", "join-cap", "value-cap", "row-cap", "rule-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
+    assert.ok(["rows", "scan-cap", "join-cap", "value-cap", "row-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
     // The filter throws on the datom after the cap, so no run counts more than cap + 1.
     assert.ok(r.datoms_scanned <= 3001, `${where}: scanned ${r.datoms_scanned}`);
   }
@@ -86,13 +84,11 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
   // The pull returns rows on the tagged pages and is cut to limit 200 only when there are more.
   assert.equal(at("pull-star-200", 150).outcome, "rows");
   assert.ok(at("pull-star-200", 150).rows <= 200);
-  // Work the scan cap does not count: a recursive rule down a 60-block chain reads a few datoms
-  // per level but adds a guard per level, which the rule cap refuses (each refusal kind is named
-  // by its own outcome, never reported as the scan cap), and a self-join on the chain's tag
-  // matches far more rows than the datoms it reads, which the row cap (2,500) refuses before the sort.
-  assert.equal(at("rule-deep-chain", 300).outcome, "rule-cap");
-  assert.match(at("rule-deep-chain", 300).error, /^query stopped after [\d,]+ units of rule work \(the rule cap\)/);
-  assert.ok(at("rule-deep-chain", 300).datoms_scanned < 1000, "the chain reads few datoms");
+  // Work the scan cap does not count: a self-join on the chain's tag matches far more rows than
+  // the datoms it reads, which the row cap (2,500) refuses before the sort (each refusal kind is
+  // named by its own outcome, never reported as the scan cap). datalog_query takes no rules (patch
+  // 0039 stage 3), so the bench has no rule shapes.
+  assert.ok(!SHAPES.some((s) => s.startsWith("rule-")), "no rule shapes");
   assert.equal(at("join-fanout", 300).outcome, "row-cap");
   assert.match(at("join-fanout", 300).error, /^query matched 3,600 rows, more than the row cap of 2,500;/, "60 × 60 rows");
   assert.ok(at("join-fanout", 300).datoms_scanned < 3600, "rows outgrow the datoms read");

@@ -2551,7 +2551,7 @@ describe("queries help", () => {
     ["no caller rules", "datalog_query takes no rules: a rules field, % in :in or a rule call is refused with 400"],
     ["why no rules", "a tree of rules expands without reading data and can run for seconds before any cap stops it"],
     ["a step up without rules", "To step up from a block use get-some ([(get-some $ ?b :block/parent) [_ ?p]])"],
-    ["ancestors through a named query", "for every ancestor use run_named_query (meetings-without-decision walks up through them, at any depth)"],
+    ["ancestors without rules", "for every ancestor use run_named_query's meetings-without-decision, or step up one level at a time"],
     ["named queries as code", "run_named_query runs one of four fixed queries as server code, not Datalog"],
     ["plan", "Each answer carries plan (the steps and their bounds)"],
     ["work", "and work (what it counted)"],
@@ -2640,6 +2640,16 @@ describe("queries help", () => {
     const named = (await listTools()).find((t) => t.name === "run_named_query");
     for (const gone of ["rule cap", "levels deep", "scan cap", "as EDN"]) expect(named.description, gone).not.toContain(gone);
     for (const gone of ["rule cap", "levels deep", "its own rules", "projects-untouched can reach the scan cap"]) expect(QUERIES_HELP, gone).not.toContain(gone);
+  });
+
+  // Patch 0039 stage 3 removed the rule machinery: datalog_query still refuses rules, but neither its
+  // description nor the help describes a rule cap, a rule depth or rules walking ancestors.
+  it("neither datalog_query's description nor the help describes rules walking ancestors", async () => {
+    const query = (await listTools()).find((t) => t.name === "datalog_query");
+    for (const gone of ["rule cap", "rule work", "levels deep on its page", "ancestors", "vetted rules", "walks up through"]) {
+      expect(query.description, gone).not.toContain(gone);
+    }
+    for (const gone of ["walks up through them", "vetted rules", "rule work"]) expect(QUERIES_HELP, gone).not.toContain(gone);
   });
 
   // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.

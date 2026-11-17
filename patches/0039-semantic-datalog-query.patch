@@ -1,21 +1,19 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..897238d
+index 0000000..ca7c3eb
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1528 @@
+@@ -0,0 +1,1301 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
-+  A caller's query takes no rules: a body with rules, % in :in or a rule call answers 400 naming
-+  run_named_query, because a tree of rules expands without reading data and ran for seconds before
-+  any cap below could stop it. Rules exist only as server data, in the named queries, which pass
-+  through the same checks as a caller's query.
++  A query takes no rules: a body with rules, % in :in or a rule call answers 400, because a tree
++  of rules expands without reading data and ran for seconds before any cap below could stop it.
 +
-+  Read-only by construction: the query and inputs (and a named query's rules) are read as EDN
-+  (nothing is evaluated; only #uuid and #inst tags), a static validator refuses write forms,
-+  functions off the allow-list, functions in variable position (so none can be passed through
-+  inputs), sources other than $, undefined rules and cross products, and what passes runs with d/q on a d/filter view of the db,
++  Read-only by construction: the query and inputs are read as EDN (nothing is evaluated; only
++  #uuid and #inst tags), a static validator refuses write forms, functions off the allow-list,
++  functions in variable position (so none can be passed through inputs), sources other than $,
++  rule calls and cross products, and what passes runs with d/q on a d/filter view of the db,
 +  never on the conn. The filter hides private content: anything tagged with a class titled Private
 +  (any case) or a class extending one, every block on a private page or under a private block, and
 +  every ref to one of those, so neither results, pulls (reverse refs included), missing?, get-else
@@ -31,7 +29,7 @@ index 0000000..897238d
 +  is sorted before limit applies, so past the row cap the query answers 422 before the sort, and
 +  so do rows whose collections (from inputs) hold more than the value cap, which counts each
 +  character of text inside them. query and inputs are each at most 4,000 characters, refused
-+  before they are parsed, and the left-recursion check is linear in the rules' size. No allowed function
++  before they are parsed. No allowed function
 +  builds a value larger than its arguments: the collection constructors are refused, and str, +
 +  and keyword (which join strings) take at most one variable. While a query runs, every allowed
 +  function and aggregate is guarded: one given a collection from inputs answers 422 unless it only
@@ -39,9 +37,7 @@ index 0000000..897238d
 +  the text cap, and every call counts toward the call cap. Every relation operation (hash-join,
 +  subtract-rel, sum-rel, prod-rel) charges the rows it walks to the work cap. trimr runs as
 +  String.prototype.trimEnd, since cljs's trimr is a regex that costs the square of a run of
-+  trailing-whitespace candidates. A rule that calls back into itself (directly or through
-+  other rules) before a data pattern binds one of the call's variables would expand without reading
-+  datoms, so the cap could not stop it; it is refused with 400 before the query runs. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
++  trailing-whitespace candidates. Each (pull ?x pattern) in :find runs as ?x, and the pattern (at most 2 levels deep,
 +  no recursion, at most 50 values per many attribute) is pulled only for the rows kept after the
 +  limit. Rows are added to the response until its JSON would pass the byte cap, so the connector
 +  never cuts it mid-row, and the response sets rows last, after the counts and the note."
@@ -73,7 +69,7 @@ index 0000000..897238d
 +  2500)
 +(def join-cap
 +  "Rows Datascript may build while joining a query's clauses (hash joins, products, or-join and
-+  not-join branches, rule calls, collection bindings); past it the query answers 422. A joined row
++  not-join branches, collection bindings); past it the query answers 422. A joined row
 +  costs about what a scanned datom does, so it matches the scan cap: a self-join through a tag on
 +  150 blocks stops here after about 0.1 s instead of building 3,375,000 rows in 21 s."
 +  20000)
@@ -93,33 +89,16 @@ index 0000000..897238d
 +  answers 422. A predicate builds nothing, so neither the join cap nor the text cap counted it: 105
 +  includes? clauses on a 3,990-character input over 5,000 rows made 525,000 calls in about 600 ms.
 +  A guarded call through Datascript's nested predicate filters costs about 2 µs, so 20,000 calls,
-+  like the join cap's rows, add about 40 ms. Inside a recursive rule a call costs about 60 µs
-+  (each -differ? guard solve-rule adds is solved against the frame's context), so 20,000 of them
-+  would take about 1.2 s: the rule cap stops that walk first."
++  like the join cap's rows, add about 40 ms."
 +  20000)
-+(def rule-frame-weight
-+  "What one rule expansion (a frame of Datascript's solve-rule) charges to the rule cap on top of
-+  its guards: the frame solves its clauses and expands the rule's branches whether or not it adds
-+  a guard."
-+  10)
-+(def rule-cap
-+  "Rule work per query, all frames together; past it the query stops and answers 422. Each rule
-+  expansion charges rule-frame-weight plus the -differ? guards solve-rule adds to it, one per
-+  earlier call of the same rule on the path, so a recursive rule walked n frames deep charges
-+  n(n-1)/2 + 10n, and each unit costs about 55 µs. Only named queries have rules (datalogQuery
-+  refuses them), and meetings-without-decision's above walks n = d + 2 frames up from a decision
-+  d blocks down its page: 2,000 stops a decision more than 52 levels deep after about 100 ms in the
-+  release bundle, where 180 levels answered after 1.1 s."
-+  2000)
 +(def work-cap
 +  "Rows the query's relation operations may walk, all of them together: Datascript's hash-join,
-+  subtract-rel, sum-rel and prod-rel each charge the rows of both relations they are given (a rule's
-+  body runs through them against the caller's rows). not, not-join, or, or-join and rules join and subtract whole relations, and
++  subtract-rel, sum-rel and prod-rel each charge the rows of both relations they are given. not,
++  not-join, or and or-join join and subtract whole relations, and
 +  when their inner clauses match nothing no row goes through join-tuples, no datom is read and no
 +  function is called, so the other caps stay still: 155 (not [?e :block/tags 0]) clauses over 5,000
 +  rows took 400 ms, and nots nested through rules 10 x 10 x 10 took 2.8 s. At 500,000 those queries
-+  still took 95-135 ms, so the cap is 200,000; the named queries walk at most about 6,300 rows with
-+  6,000 filler blocks."
++  still took 95-135 ms, so the cap is 200,000."
 +  200000)
 +(def byte-cap 100000)
 +(def default-limit 50)
@@ -134,11 +113,10 @@ index 0000000..897238d
 +(def no-caller-rules
 +  "Why datalog_query takes no rules, ending in where to go instead. A tree of rules expands without
 +  reading data: 10^5 leaves took 5.5 s, and the work cap stopped larger trees only after about 10 s
-+  (docs/spikes/2026-11-09-safe-caller-datalog-queries.md). Named queries keep their rules: those are
-+  server data, checked by the same validator, never caller input."
++  (docs/spikes/2026-11-09-safe-caller-datalog-queries.md)."
 +  (str "datalog_query takes no rules, because a tree of rules expands without reading data and can run"
-+       " for seconds before any cap stops it; use run_named_query, whose queries carry their own vetted rules"
-+       " (meetings-without-decision walks up through ancestors), or write the query without rules"))
++       " for seconds before any cap stops it; write the query without rules, or use run_named_query when one of"
++       " its queries fits"))
 +(def max-pull-depth 2)
 +(def many-attr-limit 50)
 +
@@ -339,22 +317,18 @@ index 0000000..897238d
 +         " double one at every clause")))
 +
 +(defn- clause-errors
-+  "Why `clause` can't run, each prefixed with `label`; `rule-names` are the rules it may call, or nil
-+  for a caller's query, which may call none."
-+  [label rule-names clause]
-+  (let [nested (fn [clauses] (mapcat #(clause-errors label rule-names %) clauses))]
++  "Why `clause` can't run, each prefixed with `label`. A rule call is refused: a query takes no rules."
++  [label clause]
++  (let [nested (fn [clauses] (mapcat #(clause-errors label %) clauses))]
 +    (case (clause-kind clause)
 +      (:fn :pred) (let [[[f & args]] clause]
 +                    (concat (keep identity [(or (function-error label f) (joining-error label f args))])
 +                            (source-errors label args)))
 +      :pattern (source-errors label clause)
-+      :sourced (concat (source-errors label [(first clause)]) (clause-errors label rule-names (apply list (rest clause))))
++      :sourced (concat (source-errors label [(first clause)]) (clause-errors label (apply list (rest clause))))
 +      (not or and) (nested (rest clause))
 +      (not-join or-join) (nested (drop 2 clause))
-+      :rule (concat (cond
-+                      (nil? rule-names) [(str label ": (" (first clause) " …) calls a rule; " no-caller-rules)]
-+                      (not (contains? rule-names (first clause)))
-+                      [(str label ": rule " (first clause) " is not defined in rules")])
++      :rule (concat [(str label ": (" (first clause) " …) calls a rule; " no-caller-rules)]
 +                    (source-errors label (rest clause)))
 +      [(str label ": " (pr-str clause) " is not a clause")])))
 +
@@ -471,142 +445,17 @@ index 0000000..897238d
 +    error))
 +
 +(defn- in-errors
-+  "Problems with :in, and the number of inputs it binds after $ and %. A caller's :in may not take %."
-+  [in rules? caller?]
++  "Problems with :in, and the number of inputs it binds after $. :in may not take %: a query takes
++  no rules."
++  [in]
 +  (let [bindings (remove #{'$ '%} in)
 +        sources (filter source? in)]
 +    {:errors (concat
 +              (when (and (seq in) (not= '$ (first in))) [":in: must start with $"])
 +              (for [s (distinct sources) :when (not= '$ s)]
 +                (str ":in: source " s " is not allowed; only the default source $"))
-+              (when (and (some #{'%} in) caller?) [(str ":in: % is not accepted; " no-caller-rules)])
-+              (when (and (some #{'%} in) (not rules?) (not caller?)) [":in: % needs rules; give rules or remove %"])
-+              (when (and rules? (not (some #{'%} in))) ["rules: given, but :in has no %; add % to :in"]))
++              (when (some #{'%} in) [(str ":in: % is not accepted; " no-caller-rules)]))
 +     :bound (count (remove source? bindings))}))
-+
-+(defn- rule-names [rules] (set (keep #(when (and (vector? %) (seq? (first %))) (ffirst %)) rules)))
-+
-+(defn- rules-errors [rules]
-+  (if-not (vector? rules)
-+    ["rules: must be an EDN vector of rules, each [(name ?args) clauses…]"]
-+    (let [names (rule-names rules)]
-+      (mapcat (fn [i rule]
-+                (if-not (and (vector? rule) (seq? (first rule)) (symbol? (ffirst rule)))
-+                  [(str "rules " (inc i) ": must be [(name ?args) clauses…]")]
-+                  (let [rule-name (ffirst rule)]
-+                    (mapcat (fn [j clause] (clause-errors (str "rules: rule " rule-name " clause " (inc j)) names clause))
-+                            (range) (rest rule)))))
-+              (range) rules))))
-+
-+;; Recursion the scan cap can't stop
-+;; ==================================
-+;; Datascript expands a rule call into its branches before it reads anything. A rule that calls back
-+;; into itself (directly or through other rules) before reading a datom bound to that call keeps
-+;; adding branches while the filter is asked about few datoms, so the scan cap never stops it; a
-+;; left-recursive closure ran past 120 s at a cap of 100. Every such cycle is refused up front.
-+;; A get-some binds like a data pattern: it reads its entity's datom through the filter (counted)
-+;; and drops the row when there is none, so a walk up through it, [(get-some $ ?b :block/parent)
-+;; [_ ?x]] (above ?x ?a), stops where the data does. Other functions can bind a value without
-+;; reading one (get-else's default, ground, identity), so they bind nothing here.
-+
-+(declare body-calls)
-+
-+(defn- clause-calls
-+  "The rule calls in `clause` as [[callee guarded?] …], and the variables bound after it. `bound`
-+  holds the variables a data pattern, a get-some (or a call to a rule `settled?` says can't call
-+  back) bound earlier; a call is guarded when it holds one of them. Each or branch starts from
-+  `bound`, and or-join and not-join see only their declared variables."
-+  [clause bound settled?]
-+  (case (clause-kind clause)
-+    :pattern [[] (into bound (vars-in clause))]
-+    :fn [[] (if (= 'get-some (ffirst clause)) (into bound (vars-in (second clause))) bound)]
-+    :sourced (clause-calls (apply list (rest clause)) bound settled?)
-+    :rule (let [callee (first clause)
-+                vs (vars-in (rest clause))]
-+            [[[callee (boolean (some bound vs))]] (if (settled? callee) (into bound vs) bound)])
-+    (and not) [(body-calls (rest clause) bound settled?) bound]
-+    or [(mapcat #(body-calls [%] bound settled?) (rest clause)) bound]
-+    or-join (let [inner (set (filter (vars-in (second clause)) bound))]
-+              [(mapcat #(body-calls [%] inner settled?) (drop 2 clause)) bound])
-+    not-join [(body-calls (drop 2 clause) (set (filter (vars-in (second clause)) bound)) settled?) bound]
-+    [[] bound]))
-+
-+(defn- body-calls
-+  "The rule calls in `clauses`, read in order from `bound`, as [[callee guarded?] …]."
-+  [clauses bound settled?]
-+  (first (reduce (fn [[calls bound] clause]
-+                   (let [[more bound'] (clause-calls clause bound settled?)]
-+                     [(into calls more) bound']))
-+                 [[] bound] clauses)))
-+
-+(defn- strongly-connected
-+  "The strongly connected components of the graph `edges` (node → successors) reached from `nodes`,
-+  each a set, by Tarjan's algorithm: one walk, so the check stays linear in the rules' size."
-+  [nodes edges]
-+  (let [index (volatile! {}) low (volatile! {}) stack (volatile! []) on-stack (volatile! #{})
-+        counter (volatile! 0) components (volatile! [])
-+        visit (fn visit [v]
-+                (vswap! index assoc v @counter)
-+                (vswap! low assoc v @counter)
-+                (vswap! counter inc)
-+                (vswap! stack conj v)
-+                (vswap! on-stack conj v)
-+                (doseq [w (edges v)]
-+                  (cond
-+                    (not (contains? @index w)) (do (visit w) (vswap! low update v min (get @low w)))
-+                    (contains? @on-stack w) (vswap! low update v min (get @index w))))
-+                (when (= (get @low v) (get @index v))
-+                  (loop [component #{}]
-+                    (let [w (peek @stack)]
-+                      (vswap! stack pop)
-+                      (vswap! on-stack disj w)
-+                      (if (= w v)
-+                        (vswap! components conj (conj component w))
-+                        (recur (conj component w)))))))]
-+    (doseq [v nodes :when (not (contains? @index v))] (visit v))
-+    @components))
-+
-+(defn- left-recursion-errors
-+  "One refusal per rule cycle whose every call comes before a data pattern binds one of its
-+  variables, named from the first rule defined in it. Linear in the rules' size: one components
-+  pass over the calls, one over the unguarded calls, and one search per cycle within its component."
-+  [rules]
-+  (let [branches (keep (fn [rule]
-+                         (when (and (vector? rule) (seq? (first rule)) (symbol? (ffirst rule)))
-+                           [(ffirst rule) (rest rule)]))
-+                       rules)
-+        order (distinct (map first branches))
-+        callees (reduce (fn [m [r body]] (update m r (fnil into #{}) (map first (body-calls body #{} (constantly false)))))
-+                        {} branches)
-+        ;; A callee reaches back to its caller exactly when both are in one component.
-+        component-of (into {} (for [c (strongly-connected order callees), r c] [r c]))
-+        unguarded (reduce (fn [m [r body]]
-+                            (let [settled? #(not (contains? (component-of %) r))]
-+                              (update m r (fnil into #{})
-+                                      (keep (fn [[callee guarded?]] (when-not guarded? callee))
-+                                            (body-calls body #{} settled?)))))
-+                          {} branches)
-+        position (into {} (map-indexed (fn [i r] [r i]) order))
-+        cycle-from (fn [r within]
-+                     ;; Breadth first from r inside its component, each rule's calls in name order.
-+                     (loop [queue (conj cljs.core/PersistentQueue.EMPTY r) parent {}]
-+                       (when-let [v (peek queue)]
-+                         (let [nexts (filter within (sort-by str (unguarded v)))]
-+                           (if (some #{r} nexts)
-+                             (conj (vec (reverse (take-while some? (iterate parent v)))) r)
-+                             (let [fresh (remove #(or (= r %) (contains? parent %)) nexts)]
-+                               (recur (into (pop queue) fresh) (into parent (map (fn [w] [w v])) fresh))))))))
-+        cyclic (for [c (strongly-connected order unguarded)
-+                     :let [r (apply min-key #(get position % js/Infinity) c)]
-+                     :when (or (next c) (contains? (unguarded r) r))]
-+                 [r c])]
-+    (for [[r c] (sort-by #(get position (first %) js/Infinity) cyclic)
-+          :let [cycle (cycle-from r c)]
-+          :when cycle]
-+      (str "rules: rule " r " recurses (" (string/join " → " cycle) ") before a data"
-+           " pattern binds any of the call's variables; the scan cap can't stop that,"
-+           " so start the rule with a data pattern (or a get-some) that binds one, e.g."
-+           " [?b :block/parent ?x] (under ?x ?p)"))))
 +
 +(defn- relation-find
 +  "A :find in any of Datascript's shapes as a relation find: [?x .] and [[?x ...]] become [?x], and
@@ -618,14 +467,11 @@ index 0000000..897238d
 +    :else find))
 +
 +(defn validate-query
-+  "nil when `q` (normalised) may run with `rules` and `inputs`, else one message listing every
-+  clause's refusal. With :caller? (datalog_query's own query) there are no rules: % in :in and every
-+  rule call are refused, naming run_named_query. A named query's rules are server data and pass
-+  through the same checks."
-+  [q rules inputs & {:keys [caller?]}]
++  "nil when `q` (normalised) may run with `inputs`, else one message listing every clause's refusal.
++  There are no rules: % in :in and every rule call are refused."
++  [q inputs]
 +  (let [where (:where q)
-+        names (when-not caller? (rule-names rules))
-+        {in-problems :errors bound :bound} (in-errors (or (:in q) '[$]) (some? rules) caller?)
++        {in-problems :errors bound :bound} (in-errors (or (:in q) '[$]))
 +        errors (concat
 +                in-problems
 +                (when (and (empty? in-problems) (not= bound (count inputs)))
@@ -638,9 +484,7 @@ index 0000000..897238d
 +                        :let [names (get q k)]
 +                        :when (and names (not= (count names) columns))]
 +                    (str "query: " k " names " (count names) " columns for " columns " find elements")))
-+                (mapcat (fn [i clause] (clause-errors (str "where " (inc i)) names clause)) (range) where)
-+                (when rules (rules-errors rules))
-+                (when (vector? rules) (left-recursion-errors rules)))]
++                (mapcat (fn [i clause] (clause-errors (str "where " (inc i)) clause)) (range) where))]
 +    (if (seq errors)
 +      (string/join "; " (distinct errors))
 +      (cross-product-error where))))
@@ -691,7 +535,7 @@ index 0000000..897238d
 +
 +(defonce ^:private count-joins
 +  ;; Datascript builds every joined row with join-tuples (hash-join and prod-rel), and the rows of
-+  ;; relations that share no variable, such as a rule body's, with -collect-tuples, so counting
++  ;; relations that share no variable with -collect-tuples, so counting
 +  ;; both bounds a join before its rows exist. Outside run-query they only call through.
 +  (let [join-tuples dq/join-tuples
 +        collect-tuples dq/-collect-tuples]
@@ -789,10 +633,8 @@ index 0000000..897238d
 +
 +(defonce ^:private count-relation-work
 +  ;; Every relation operation a clause runs goes through one of these (collapse-rels through
-+  ;; hash-join), so charging what each walks bounds not, not-join, or, or-join and rule bodies
-+  ;; whatever they match. A rule call needs no charge of its own: solve-rule runs its body through
-+  ;; these against the caller's rows and sums each branch with sum-rel. Outside run-query they only
-+  ;; call through.
++  ;; hash-join), so charging what each walks bounds not, not-join, or and or-join whatever they
++  ;; match. Outside run-query they only call through.
 +  (let [hash-join dq/hash-join
 +        subtract-rel dq/subtract-rel
 +        sum-rel dq/sum-rel
@@ -810,28 +652,6 @@ index 0000000..897238d
 +    (set! dq/prod-rel (fn
 +                        ([] (prod-rel))
 +                        ([rel1 rel2] (charge-work! rel1 rel2) (prod-rel rel1 rel2))))
-+    true))
-+
-+(def ^:private rule-limit
-+  "The rule cap while run-query's d/q runs, else nil: rule expansions charge only then."
-+  (volatile! nil))
-+
-+(def ^:private rule-work (volatile! 0))
-+
-+(defonce ^:private count-rule-frames
-+  ;; solve-rule calls rule-gen-guards once per frame it expands, with the calls of each rule made so
-+  ;; far on that path; it returns one -differ? guard per earlier call of the same rule, and every
-+  ;; guard is solved against the frame's rows. So a recursive rule walked d levels deep builds about
-+  ;; d²/2 guards, each solved through a guarded -differ? call (about 60 µs each inside nested rules,
-+  ;; not the 2 µs the call cap assumes). Charging each frame its guards plus a fixed weight bounds
-+  ;; that walk before it runs long. Outside run-query it only calls through.
-+  (let [rule-gen-guards dq/rule-gen-guards]
-+    (set! dq/rule-gen-guards
-+          (fn [rule-clause used-args]
-+            (when-some [cap @rule-limit]
-+              (when (> (vswap! rule-work + rule-frame-weight (count (get used-args (first rule-clause)))) cap)
-+                (throw (ex-info "rule cap" {::rule-cap cap}))))
-+            (rule-gen-guards rule-clause used-args)))
 +    true))
 +
 +(defn- item-weight
@@ -913,12 +733,11 @@ index 0000000..897238d
 +    (coll? v) (mapv serialise v)
 +    :else v))
 +
-+(defn- query-args [in fdb rules inputs]
++(defn- query-args [in fdb inputs]
 +  (loop [[b & more] (or (seq in) '[$]) inputs inputs args []]
 +    (cond
 +      (nil? b) args
 +      (= '$ b) (recur more inputs (conj args fdb))
-+      (= '% b) (recur more inputs (conj args rules))
 +      :else (recur more (rest inputs) (conj args (first inputs))))))
 +
 +(defn- query-error-message
@@ -948,25 +767,9 @@ index 0000000..897238d
 +       " parts you need rather than the whole collection, or narrow the query"))
 +
 +(defn- work-cap-message [cap]
-+  (str "query stopped after " (format-count cap) " rows of relation work (the work cap): each not, not-join, or,"
-+       " or-join and rule call joins, subtracts or sums every row bound so far, so narrow the rows first with a"
++  (str "query stopped after " (format-count cap) " rows of relation work (the work cap): each not, not-join, or"
++       " and or-join joins, subtracts or sums every row bound so far, so narrow the rows first with a"
 +       " tag, page or attribute value, or use fewer such clauses"))
-+
-+(defn- rule-cap-levels
-+  "The deepest decision, in blocks down its page, meetings-without-decision's above walks within
-+  `cap`: a decision d blocks deep takes d + 2 frames, and frame k charges rule-frame-weight plus k
-+  guards."
-+  [cap]
-+  (loop [d 0]
-+    (let [frames (+ d 3)]
-+      (if (> (+ (quot (* frames (dec frames)) 2) (* rule-frame-weight frames)) cap) d (recur (inc d))))))
-+
-+(defn- rule-cap-message [cap]
-+  ;; Only named queries have rules, and only meetings-without-decision's above recurses.
-+  (str "query stopped after " (format-count cap) " units of rule work (the rule cap): a recursive rule checks"
-+       " every level it has already walked, so its work grows with the square of the depth it walks."
-+       " meetings-without-decision walks up from each block tagged decision_tag, and one sits more than about "
-+       (rule-cap-levels cap) " levels deep on its page; move it nearer the top of its page"))
 +
 +(defn- call-cap-message [cap]
 +  (str "query stopped after " (format-count cap) " function calls (the call cap); each function or predicate"
@@ -997,7 +800,6 @@ index 0000000..897238d
 +      (::text-cap data) (refusal 422 (text-cap-message (::text-cap data)))
 +      (::call-cap data) (refusal 422 (call-cap-message (::call-cap data)))
 +      (::work-cap data) (refusal 422 (work-cap-message (::work-cap data)))
-+      (::rule-cap data) (refusal 422 (rule-cap-message (::rule-cap data)))
 +      (::collection-arg data) (refusal 422 (collection-arg-message (::collection-arg data)))
 +      :else (refusal 400 (or (query-error-message e) (str "query: failed while running: " (ex-message e)))))))
 +
@@ -1141,15 +943,14 @@ index 0000000..897238d
 +  "Runs the normalised, validated query `q` on `db` filtered for privacy, with pulls run on the kept
 +  rows only; returns {:columns :rows :total-rows :returned :truncated?} merged with `echo` (the
 +  fields the response repeats, counted in the byte cap), or a refusal. `scan-cap` replaces the
-+  constant, and `row-cap`, `join-cap`, `text-cap`, `call-cap`, `work-cap` and `rule-cap` the other caps (tests)."
-+  [db {:keys [query inputs rules limit echo] :as opts}]
++  constant, and `row-cap`, `join-cap`, `text-cap`, `call-cap` and `work-cap` the other caps (tests)."
++  [db {:keys [query inputs limit echo] :as opts}]
 +  (let [cap (or (:scan-cap opts) scan-cap)
 +        max-rows (or (:row-cap opts) row-cap)
 +        max-joined (or (:join-cap opts) join-cap)
 +        max-text (or (:text-cap opts) text-cap)
 +        max-calls (or (:call-cap opts) call-cap)
 +        max-work (or (:work-cap opts) work-cap)
-+        max-rule-work (or (:rule-cap opts) rule-cap)
 +        original (relation-find (:find query))
 +        {find :find pulls :pulls} (rewrite-pulls original)
 +        schema (d/schema db)
@@ -1178,18 +979,14 @@ index 0000000..897238d
 +                                     (vreset! call-limit max-calls)
 +                                     (vreset! worked 0)
 +                                     (vreset! work-limit max-work)
-+                                     (vreset! rule-work 0)
-+                                     (vreset! rule-limit max-rule-work)
 +                                     ;; Datascript returns aggregates lazily: realise them while
 +                                     ;; the guards are on.
-+                                     (doall (apply d/q runnable (query-args (:in query) fdb rules inputs)))
++                                     (doall (apply d/q runnable (query-args (:in query) fdb inputs)))
 +                                     (finally
 +                                       (vreset! join-limit nil)
 +                                       (vreset! text-limit nil)
 +                                       (vreset! work-limit nil)
-+                                       (vreset! rule-limit nil)
-+                                       (swap! last-run assoc :joined @joined :calls @calls :work @worked
-+                                              :rule-work @rule-work)))]
++                                       (swap! last-run assoc :joined @joined :calls @calls :work @worked)))]
 +                       (cond
 +                         (> (count matched) max-rows)
 +                         (refusal 422 (row-cap-message (count matched) max-rows))
@@ -1237,20 +1034,18 @@ index 0000000..897238d
 +        (and (contains? body :dry-run) (not (boolean? (:dry-run body)))) (conj "dry-run: must be true or false")))))
 +
 +(defn- checked-query
-+  "`query` (as parsed) with `inputs` and `rules` checked as every query is before it runs, write
-+  forms first and then the validator: {:query (normalised) :given :inputs :rules} or a refusal.
-+  `caller?` marks datalog_query's own query, which may use no rules."
-+  [query inputs rules caller?]
++  "`query` (as parsed) with `inputs` checked before it runs, write forms first and then the
++  validator: {:query (normalised) :given :inputs} or a refusal."
++  [query inputs]
 +  (let [writes (concat (write-form-errors "query" query)
-+                       (write-form-errors "inputs" inputs)
-+                       (write-form-errors "rules" rules))
++                       (write-form-errors "inputs" inputs))
 +        normalised (normalise-query query)
 +        invalid (or (:error normalised)
-+                    (validate-query (:ok normalised) rules inputs :caller? caller?))
++                    (validate-query (:ok normalised) inputs))
 +        problems (cond-> (vec writes) invalid (conj invalid))]
 +    (if (seq problems)
 +      (refusal 400 (string/join "; " problems))
-+      {:query (:ok normalised) :given query :inputs inputs :rules rules})))
++      {:query (:ok normalised) :given query :inputs inputs})))
 +
 +(defn- parse-request
 +  "The body's query and inputs parsed, normalised and validated: {:query :inputs :given} or a
@@ -1270,7 +1065,7 @@ index 0000000..897238d
 +                              [(str "inputs: at most " max-inputs " values (got " (count inputs) ")")]))]
 +        (if (seq (concat parse-problems shape-problems))
 +          (refusal 400 (string/join "; " (concat parse-problems shape-problems)))
-+          (checked-query query (or inputs []) nil true))))))
++          (checked-query query (or inputs [])))))))
 +
 +(defn- rows-last
 +  "`result` as a JS object with rows set last, so its JSON ends with them: the connector cuts a long
@@ -1293,8 +1088,8 @@ index 0000000..897238d
 +
 +(defn- test-cap
 +  "A cap a test set on the Durable Object (`datalogScanCap`, `datalogRowCap`, `datalogJoinCap`,
-+  `datalogTextCap`, `datalogCallCap`, `datalogWorkCap`, `datalogRuleCap`), in place of the
-+  constant. No request can set it."
++  `datalogTextCap`, `datalogCallCap`, `datalogWorkCap`), in place of the constant. No request can
++  set it."
 +  [^js self field]
 +  (let [cap (some-> self (unchecked-get field))]
 +    (when (and (integer? cap) (not (neg? cap))) cap)))
@@ -1473,27 +1268,6 @@ index 0000000..897238d
 +                         :total (count rows)
 +                         :limit limit})))))
 +
-+(defn- run-legacy
-+  "An entry with a Datalog :query (only tests add one, to run rules as server data until patch 0039
-+  stage 3 removes rules): datalogQuery's checks and caps, with the query, inputs and rules echoed."
-+  [db self query-name entry inputs params body]
-+  (let [checked (checked-query (:query entry) inputs (:rules entry) false)
-+        echo {:name query-name :params params :query (pr-str (:query entry))
-+              :inputs (pr-str inputs) :rules (pr-str (or (:rules entry) []))}]
-+    (cond
-+      (refusal? checked) checked
-+      (true? (:dry-run body)) (assoc echo :dry-run true)
-+      :else (run-query db {:query (:query checked) :inputs inputs :rules (:rules entry)
-+                           :limit (or (:limit body) default-limit)
-+                           :scan-cap (test-cap self "datalogScanCap")
-+                           :row-cap (test-cap self "datalogRowCap")
-+                           :join-cap (test-cap self "datalogJoinCap")
-+                           :text-cap (test-cap self "datalogTextCap")
-+                           :call-cap (test-cap self "datalogCallCap")
-+                           :work-cap (test-cap self "datalogWorkCap")
-+                           :rule-cap (test-cap self "datalogRuleCap")
-+                           :echo echo}))))
-+
 +(defn handle-named-query
 +  "POST /named-queries/:name: refuses an E2EE graph first, then a name that isn't one (404 listing
 +  the names), a body or params that can't be used (each naming params.<name>), and otherwise
@@ -1527,7 +1301,6 @@ index 0000000..897238d
 +                   bounds (select-keys (named-bounds self) (:bounds entry))]
 +               (cond
 +                 errors (refusal 400 (string/join "; " errors))
-+                 (not (:run entry)) (run-legacy db self query-name entry inputs params body)
 +                 (true? (:dry-run body)) {:name query-name :params params
 +                                          :plan (named-queries/plan-text query-name params bounds)
 +                                          :bounds bounds :dry-run true}
@@ -1980,7 +1753,7 @@ index 0000000..a8784f4
 +         rows (run ctx inputs)]
 +     {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..52bc649 100644
+index 1365b0a..e1ab94e 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -2001,7 +1774,7 @@ index 1365b0a..52bc649 100644
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "datalogQuery" ["Run a read-only Datalog query"
 +                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
-+                        " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it. run_named_query's queries run as server code, not Datalog (meetings-without-decision walks up through a block's ancestors, at any depth)."
++                        " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query or inputs is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. Every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap): each clause runs once per joined row, so past it the query stops with 422 naming the cap; narrow the rows before the function clauses. Every not, not-join, or and or-join joins, subtracts or sums every row bound so far, so each charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap), whatever its inner clauses match, and nested ones charge once per level; past it the query stops with 422 naming the cap. The only source is $. Every where clause must share a variable with the others, through a data pattern, a function binding, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A data pattern joined to two or more bound rows scans its whole attribute, so to step up from bound blocks use get-some, which reads one datom per row ([(get-some $ ?b :block/parent) [_ ?p]])."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join and not-join bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too; each character of text inside them counts as a value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
@@ -2128,15 +1901,15 @@ index 1365b0a..52bc649 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..74b5398
+index 0000000..d49208c
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,3747 @@
+@@ -0,0 +1,3595 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
-+  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
-+  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
-+  functions bound through inputs, sources other than $, undefined rules, rules that recurse before
-+  reading data, and cross products, each naming the clause, and runs what passes on a d/filter view of the db that hides private content:
++  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query
++  and inputs as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
++  functions bound through inputs, sources other than $, rules (a rules field, % in :in and rule
++  calls), and cross products, each naming the clause, and runs what passes on a d/filter view of the db that hides private content:
 +  anything tagged with a class titled Private (any case) or a class extending one, the blocks on a
 +  private page, every block under a private block, and any ref to one of those. Rows are sorted with
 +  a type rank and cut to limit. E2EE graphs answer 409 before anything is parsed; dry-run answers the
@@ -2148,11 +1921,11 @@ index 0000000..74b5398
 +  holds a block that refs zq Public Plans and a rating value; zq Notes holds zq Hidden note (tagged
 +  Private) with a child tagged Topic, zq Public note with a child, and a block that refs zq Private
 +  Plans. Every fixture title holds zq, so a query can pick them out."
-+  (:require [cljs.reader :as reader]
-+            [cljs.test :refer [async deftest is testing]]
++  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.built-ins :as built-ins]
 +            [datascript.core :as d]
++            [datascript.query :as dq]
 +            [logseq.db-sync.test-sql :as test-sql]
 +            [logseq.db-sync.worker.handler.datalog :as datalog]
 +            [logseq.db-sync.worker.named-queries :as named-queries]
@@ -2185,8 +1958,7 @@ index 0000000..74b5398
 +
 +(defn- query!
 +  "POST /query with `form` (an EDN string, or a form printed as EDN) and the other body fields.
-+  datalog_query refuses rules (a body with them answers 400); `server-query!` runs rules as the
-+  server's own data."
++  datalog_query refuses rules: a body with them answers 400 (`no-rules-message`)."
 +  [self form & {:keys [inputs rules e2ee?] :as more}]
 +  (request! self "POST" "/semantic/query"
 +            (cond-> (merge {:query (edn form)} (dissoc more :inputs :rules :e2ee?))
@@ -2194,31 +1966,10 @@ index 0000000..74b5398
 +              (some? rules) (assoc :rules (edn rules)))
 +            e2ee?))
 +
-+(def ^:private server-query-count (atom 0))
-+
-+(def ^:private shipped-named-queries
-+  "The named queries as shipped, in order: what `server-query!` puts back."
-+  named-queries/named-queries)
-+
-+(defn- server-query!
-+  "Runs `form` with `rules` as server data, the only way rules run: as a named query added for this
-+  call to named-queries/named-queries under a name of its own (so concurrent calls don't clash),
-+  through the real POST /named-queries/:name handler, and so through the same write-form check,
-+  validator and caps a named query gets. `form` is read from EDN when it is a string. It takes no
-+  params, so no inputs after % in :in. Returns request!'s map."
-+  [self form rules & {:keys [limit dry-run]}]
-+  (let [query-name (str "test-rules-" (swap! server-query-count inc))
-+        form (if (string? form) (reader/read-string form) form)
-+        rules (if (string? rules) (reader/read-string rules) rules)]
-+    (set! named-queries/named-queries (assoc named-queries/named-queries query-name {:query form :rules rules :params []}))
-+    (-> (request! self "POST" (str "/semantic/named-queries/" query-name)
-+                  (cond-> {} limit (assoc :limit limit) (some? dry-run) (assoc :dry-run dry-run)))
-+        ;; Rebuilt from the shipped entries, not dissoc'd: past 8 entries (concurrent calls) the map
-+        ;; becomes a hash map, and the 404 lists the names in their shipped order.
-+        (p/finally #(set! named-queries/named-queries
-+                          (into shipped-named-queries
-+                                (remove (fn [[k]] (or (= k query-name) (contains? shipped-named-queries k))))
-+                                named-queries/named-queries))))))
++(defn- no-rules-message [field]
++  (str field "datalog_query takes no rules, because a tree of rules expands without reading data and can run"
++       " for seconds before any cap stops it; write the query without rules, or use run_named_query when one of"
++       " its queries fits"))
 +
 +(defn- snapshot
 +  "What a refused call must leave unchanged: the graph's last tx and its datom count."
@@ -2349,8 +2100,6 @@ index 0000000..74b5398
 +                       :inputs '[[:db/retractAttribute 1 :block/title]]}]
 +                     [":db/cas in the query" "query: :db/cas is a write form"
 +                      {:form '[:find ?e :where [?e :block/title :db/cas]]}]
-+                     [":db/cas in a rule body" "rules: :db/cas is a write form"
-+                      {:form '[:find ?e :in $ % :where (w ?e)] :rules '[[(w ?e) [?e :db/cas ?x]]]}]
 +                     ["a :db/id map in inputs" "inputs: a map with :db/id is a write form"
 +                      {:form '[:find ?t :in $ ?x :where [?e :block/title ?t]]
 +                       :inputs '[{:db/id 1 :block/title "x"}]}]
@@ -2358,8 +2107,6 @@ index 0000000..74b5398
 +                      {:form '[:find ?e :where [?e :block/title :db/retractEntity]]}]
 +                     [":db.fn/call in an or-join" "query: :db.fn/call is a write form"
 +                      {:form '[:find ?e :where [?e :block/title ?t] (or-join [?e] [?e :db.fn/call ?t] [?e :block/name ?t])]}]
-+                     [":db/add in a rule body" "rules: :db/add is a write form"
-+                      {:form '[:find ?e :in $ % :where (w ?e)] :rules '[[(w ?e) [?e :db/add ?x]]]}]
 +                     ["?f bound through inputs" "where 2: ?f is a variable in function position; functions can't be passed as inputs"
 +                      {:form '[:find ?e :in $ ?f :where [?e :block/title ?t] [(?f ?t)]]
 +                       :inputs '[clojure.core/identity]}]
@@ -2377,16 +2124,11 @@ index 0000000..74b5398
 +                      {:form '[:find ?e :where [?e :block/title ?t] (not-join [?t] [(re-find "x" ?t)])]}]
 +                     ["rand inside or" "where 2: function rand is not allowed"
 +                      {:form '[:find ?e :where [?e :block/title ?t] (or [(rand) ?t] [?e :block/name ?t])]}]
-+                     ["re-find in a rule body" "rules: rule bad clause 2: function re-find is not allowed"
-+                      {:form '[:find ?e :in $ % :where (bad ?e)]
-+                       :rules '[[(bad ?e) [?e :block/title ?t] [(re-find "x" ?t)]]]}]
 +                     ["an input-bound aggregate" "find: ?f is a variable in function position"
 +                      {:form '[:find (?f ?t) :in $ ?f :where [?e :block/title ?t]] :inputs '[count]}]]]
-+          ;; Rules are server data now (datalog_query refuses them), so the rule-body cases run as a
-+          ;; named query's rules do, through the same write-form check and validator.
-+          (p/doseq [[label message {:keys [form inputs rules]}] cases]
++          (p/doseq [[label message {:keys [form inputs]}] cases]
 +            (p/let [before (snapshot conn)
-+                    response (if rules (server-query! self form rules) (query! self form :inputs inputs))]
++                    response (query! self form :inputs inputs)]
 +              (testing label
 +                (is (refused? response message) (pr-str response))
 +                (is (= before (snapshot conn)) "max-tx and the datom count are unchanged")
@@ -2471,37 +2213,23 @@ index 0000000..74b5398
 +                clause-source (query! self '[:find ?t :where [$2 ?e :block/title ?t]])
 +                pull-source (query! self '[:find (pull $2 ?e [*]) :where [?e :block/title "zq Notes"]])
 +                aggregate-source (query! self '[:find (count $2 ?e) :where [?e :block/title "zq Notes"]])
-+                ;; Rules are server data (a named query's); these run as one does.
-+                pct-no-rules (server-query! self '[:find ?t :in $ % :where [?e :block/title ?t]] nil)
-+                rules-no-pct (server-query! self '[:find ?t :where [?e :block/title ?t]]
-+                                            '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
-+                undefined (server-query! self '[:find ?t :in $ % :where [?e :block/title ?t] (linked ?e ?x)]
-+                                         '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
-+                no-rules-call (server-query! self '[:find ?t :where [?e :block/title ?t] (linked ?e)] nil)
-+                no-dollar (query! self '[:find ?t :in ?x :where [?e :block/title ?t]] :inputs '["x"])
-+                valid (server-query! self '[:find ?title :in $ % :where (tagged ?e "Project") [?e :block/title ?title]]
-+                                     '[[(tagged ?e ?tag) [?e :block/tags ?c] [?c :block/title ?tag]]])
-+                recursive (server-query! self '[:find ?title :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?title]]
-+                                         '[[(under ?b ?p) [?b :block/parent ?p]]
-+                                           [(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]])]
++                ;; A query takes no rules (patch 0039 stage 3 removed them): % and a rule call are refused.
++                pct (query! self '[:find ?t :in $ % :where [?e :block/title ?t]])
++                rules-call (query! self '[:find ?t :in $ % :where [?e :block/title ?t] (linked ?e ?x)]
++                                   :rules '[[(linked ?e ?x) [?e :block/refs ?x]]])
++                rule-call (query! self '[:find ?t :where [?e :block/title ?t] (linked ?e)])
++                no-dollar (query! self '[:find ?t :in ?x :where [?e :block/title ?t]] :inputs '["x"])]
 +          (is (refused? two-sources ":in: source $2 is not allowed; only the default source $") (pr-str two-sources))
 +          (is (refused? clause-source "where 1: source $2 is not allowed; only the default source $") (pr-str clause-source))
 +          (testing "a source inside a pull or an aggregate in :find is refused by name"
 +            (is (refused? pull-source "find: source $2 is not allowed; only the default source $") (pr-str pull-source))
 +            (is (refused? aggregate-source "find: source $2 is not allowed; only the default source $")
 +                (pr-str aggregate-source)))
-+          (is (refused? pct-no-rules ":in: % needs rules") (pr-str pct-no-rules))
-+          (is (refused? rules-no-pct "rules: given, but :in has no %") (pr-str rules-no-pct))
-+          (is (refused? undefined "where 2: rule linked is not defined in rules") (pr-str undefined))
-+          (is (refused? no-rules-call "where 2: rule linked is not defined in rules") (pr-str no-rules-call))
-+          (is (refused? no-dollar ":in: must start with $") (pr-str no-dollar))
-+          (testing "a valid rule runs, on the filtered db: Secret and Hush Plans are tagged Project but private"
-+            (is (= [200 [["zq Public Plans"]]] [(:status valid) (get-in valid [:body :rows])]) (pr-str valid)))
-+          (testing "a recursive rule runs"
-+            (is (= 200 (:status recursive)) (pr-str recursive))
-+            (is (= #{"zq Public note" "zq Public child" "zq See"}
-+                   (set (map #(first (string/split (first %) #" \[")) (get-in recursive [:body :rows]))))
-+                "under zq Notes, without the private block and its child")))))))
++          (is (refused? pct (no-rules-message ":in: % is not accepted; ")) (pr-str pct))
++          (is (= [400 (no-rules-message "rules: not accepted; ")] [(:status rules-call) (get-in rules-call [:body :error])])
++              (pr-str rules-call))
++          (is (refused? rule-call (no-rules-message "where 2: (linked …) calls a rule; ")) (pr-str rule-call))
++          (is (refused? no-dollar ":in: must start with $") (pr-str no-dollar)))))))
 +
 +(deftest cross-product-test
 +  (async done
@@ -2510,9 +2238,6 @@ index 0000000..74b5398
 +        (p/let [disjoint (query! self '[:find ?a ?b :where [?a :block/title "zq Notes"] [?b :block/title "zq Public Plans"]])
 +                third (query! self '[:find ?a ?b :where [?a :block/title ?t] [?b :block/title ?u] [(= ?t "zq Notes")]])
 +                pred-only (query! self '[:find ?a ?b :where [?a :block/created-at ?x] [?b :block/created-at ?y] [(< ?x ?y)]])
-+                rule-join (server-query! self '[:find ?ta ?tb :in $ % :where [?a :block/title ?ta] [?b :block/title ?tb]
-+                                                [(= ?tb "zq Notes")] (child ?a ?b)]
-+                                         '[[(child ?a ?b) [?a :block/parent ?b]]])
 +                or-join (query! self '[:find ?ta ?tb :where [?a :block/title ?ta] [?b :block/title "zq Notes"]
 +                                       [?b :block/title ?tb]
 +                                       (or-join [?a ?b] [?a :block/parent ?b] [?a :block/page ?b])])
@@ -2524,9 +2249,7 @@ index 0000000..74b5398
 +          (is (refused? third "where: clauses 1 and 2 share no variable") (pr-str third))
 +          (testing "a predicate filters a cross product, it doesn't join one"
 +            (is (refused? pred-only "where: clauses 1 and 2 share no variable") (pr-str pred-only)))
-+          (testing "a rule call and an or-join join their arguments"
-+            (is (= 200 (:status rule-join)) (pr-str rule-join))
-+            (is (contains? (set (get-in rule-join [:body :rows])) ["zq Public note" "zq Notes"]))
++          (testing "an or-join joins its arguments"
 +            (is (= 200 (:status or-join)) (pr-str or-join))
 +            (is (contains? (set (get-in or-join [:body :rows])) ["zq Public child" "zq Notes"])))
 +          (testing "not-join's variables join"
@@ -3285,7 +3008,7 @@ index 0000000..74b5398
 +          (is (= before (snapshot conn))))))))
 +
 +(defn- work-cap-message [n]
-+  (str "query stopped after " n " rows of relation work (the work cap): each not, not-join, or, or-join and rule call"
++  (str "query stopped after " n " rows of relation work (the work cap): each not, not-join, or and or-join"
 +       " joins, subtracts or sums every row bound so far, so narrow the rows first with a tag, page or attribute"
 +       " value, or use fewer such clauses"))
 +
@@ -3304,34 +3027,24 @@ index 0000000..74b5398
 +  ;; 155 (not [?e :block/tags 0]) over 5,000 rows took 403 ms, 300 negated rule calls 1.1 s, and
 +  ;; nots nested through rules 10 x 10 x 10 2.8 s (10 x 10 x 10 x 10: 26 s). Every relation
 +  ;; operation charges the rows it walks to the work cap (200,000 per query) while a query runs,
-+  ;; and past it the query stops with 422. A caller can no longer send rules
-+  ;; (caller-rules-refused-test), so the rule cases run as a named query's rules do: the cap still
-+  ;; bounds the server's own rules.
++  ;; and past it the query stops with 422. A query takes no rules (caller-rules-refused-test), so
++  ;; the rule cases those times came from no longer run at all.
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self notes]}]
 +        (p/let [_ (bulk! self notes 5000 #(str "zq rw " %))
 +                before (snapshot conn)
 +                head "[:find (count ?e) . :where [?e :block/title ?t] "
-+                rule-head "[:find (count ?e) . :in $ % :where [?e :block/title ?t] "
 +                cases [["155 flat nots" (str head (clauses-str 155 "(not [?e :block/tags 0])") "]") nil]
-+                       ["300 negated rule calls" (str rule-head (clauses-str 300 "(not (r ?e))") "]")
-+                        "[[(r ?e) [?e :block/tags 0]]]"]
-+                       ["nots nested through rules, 10 x 10 x 10" (str rule-head (clauses-str 10 "(not (r ?e))") "]")
-+                        (str "[[(r ?e) " (clauses-str 10 "(not (s ?e))") " [?e :block/tags 0]]"
-+                             " [(s ?e) " (clauses-str 10 "(not [?e :block/tags 0])") " [?e :block/tags 0]]]")]
 +                       ["110 not-joins" (str head (clauses-str 110 "(not-join [?e] [?e :block/tags 0])") "]") nil]
 +                       ["65 negated or-joins whose branches match nothing"
 +                        (str head (clauses-str 65 "(not (or-join [?e] [?e :block/tags 0] [?e :block/refs 0]))") "]") nil]]
-+                refused (one-by-one! (for [[_ q rules] cases] #(if rules (server-query! self q rules) (query! self q))))
++                refused (one-by-one! (for [[_ q] cases] #(query! self q)))
 +                ordinary (one-by-one!
 +                          [#(query! self '[:find (count ?e) . :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq rw 1")]
 +                                           (not [?e :block/tags ?x] [?x :block/title "Topic"])])
 +                           #(query! self '[:find (count ?e) . :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq rw 1")]
-+                                           (or-join [?e] [?e :block/parent ?p] (not [?e :block/tags 0]))])
-+                           (fn [] (server-query! self '[:find (count ?e) . :in $ % :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq rw 1")]
-+                                                  (not (r ?e))]
-+                                           '[[(r ?e) [?e :block/tags 0]]]))])
++                                           (or-join [?e] [?e :block/parent ?p] (not [?e :block/tags 0]))])])
 +                small '[:find ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq rw 10")]
 +                        (not [?e :block/tags 0]) (or-join [?e] [?e :block/tags 0] (not [?e :block/tags 0]))]
 +                uncapped (query! self small)
@@ -3341,14 +3054,13 @@ index 0000000..74b5398
 +                _ (set-work-cap! self (dec work))
 +                over-cap (query! self small)
 +                _ (set-work-cap! self nil)]
-+          (doseq [[[label q rules] response] (map vector cases refused)]
++          (doseq [[[label q] response] (map vector cases refused)]
 +            (testing (str label ": 422 naming the work cap, within 500 ms")
 +              (is (<= (count q) 4000) (str label " " (count q)))
-+              (is (<= (count (str rules)) 4000) label)
 +              (is (= [422 (work-cap-message "200,000")] [(:status response) (get-in response [:body :error])])
 +                  (head-of response))
 +              (is (< (:ms response) 500) (head-of response))))
-+          (testing "ordinary not, or-join and negated rule queries still answer"
++          (testing "ordinary not and or-join queries still answer"
 +            (doseq [response ordinary]
 +              (is (= [200 1111] [(:status response) (get-in response [:body :rows 0 0])]) (head-of response))))
 +          (testing "a query whose relation work is exactly the cap answers, and one row over answers 422"
@@ -3366,11 +3078,6 @@ index 0000000..74b5398
 +  (str "[[(r0 ?e) " leaf "] "
 +       (string/join " " (for [k (range 1 (inc levels)) _ (range fanout)] (str "[(r" k " ?e) (r" (dec k) " ?e)]")))
 +       "]"))
-+
-+(defn- no-rules-message [field]
-+  (str field "datalog_query takes no rules, because a tree of rules expands without reading data and can run"
-+       " for seconds before any cap stops it; use run_named_query, whose queries carry their own vetted rules"
-+       " (meetings-without-decision walks up through ancestors), or write the query without rules"))
 +
 +(deftest caller-rules-refused-test
 +  ;; A tree of caller rules expands without reading data: 10^5 leaves took 5.5 s, and the work cap
@@ -3411,6 +3118,18 @@ index 0000000..74b5398
 +                              #(query! self "[:find ?t :where [?e :block/title ?t] (not (r ?e))]")]
 +                             ["a rule call inside an or-join branch" "where 2: (r …) calls a rule; "
 +                              #(query! self "[:find ?t :where [?e :block/title ?t] (or-join [?e] (r ?e) [?e :block/name ?n])]")]
++                             ["a rule call inside an or branch" "where 2: (r …) calls a rule; "
++                              #(query! self "[:find ?t :where [?e :block/title ?t] (or (r ?e) [?e :block/name \"zq Notes\"])]")]
++                             ["a rule call inside and inside or" "where 2: (r …) calls a rule; "
++                              #(query! self "[:find ?t :where [?e :block/title ?t] (or (and (r ?e)) [?e :block/name \"zq Notes\"])]")]
++                             ["a rule call inside not-join" "where 2: (r …) calls a rule; "
++                              #(query! self "[:find ?t :where [?e :block/title ?t] (not-join [?e] (r ?e))]")]
++                             ["a rule call with the source $" "where 2: (linked …) calls a rule; "
++                              #(query! self "[:find ?t :where [?e :block/title ?t] ($ linked ?e)]")]
++                             ["a rule call as the only clause" "where 1: (linked …) calls a rule; "
++                              #(query! self "[:find ?e :where (linked ?e)]")]
++                             ["% and a rule call together" ":in: % is not accepted; "
++                              #(query! self "[:find ?t :in $ % :where [?e :block/title ?t] (linked ?e)]")]
 +                             ["a :rules key in the map form" "query: :rules is not a query key; "
 +                              #(query! self "{:find [?t] :rules [] :where [[?e :block/title ?t]]}")]]
 +                body-refused (one-by-one! (map second body-cases))
@@ -3425,9 +3144,48 @@ index 0000000..74b5398
 +            (testing (str label ": 400 naming the clause and run_named_query")
 +              (is (refused? response (no-rules-message prefix)) (head-of response))
 +              (is (< (:ms response) 100) (head-of response))))
++          (testing "no refusal describes rules walking ancestors or names a rule depth"
++            (doseq [response (concat body-refused query-refused)
++                    gone ["ancestor" "vetted rules" "walks up" "levels deep" "rule cap"]]
++              (is (not (string/includes? (get-in response [:body :error]) gone)) gone)))
 +          (testing "nothing ran: no private set built, no datom scanned, nothing written"
 +            (is (= {:private-set-built? false :scanned 0} (select-keys last-run [:private-set-built? :scanned])))
-+            (is (= before (snapshot conn)))))))))
++            (is (= before (snapshot conn))))
++          (testing "queries without rules that the refusal could catch still answer 200: not, not-join, or,
++                    or-join with and, a get-some step up, inputs after $, a collection binding, a re-send"
++            (p/let [ok (one-by-one!
++                        (for [[q inputs] [["[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t \"zq Notes\")] (not [?e :block/tags 0])]"]
++                                          ["[:find ?t :where [?e :block/title ?t] [(clojure.string/includes? ?t \"zq Notes\")] (not-join [?e] [?e :block/tags 0])]"]
++                                          ["[:find ?t :where [?e :block/name \"zq notes\"] [?e :block/title ?t] (or [?e :block/tags 0] [?e :block/name \"zq notes\"])]"]
++                                          ["[:find ?t :where [?e :block/name \"zq notes\"] [?e :block/title ?t] (or-join [?e] (and [?e :block/name ?n] [(some? ?n)]) [?e :block/tags 0])]"]
++                                          ["[:find ?pt :where [?b :block/title \"zq Public note\"] [(get-some $ ?b :block/page) [_ ?p]] [?p :block/title ?pt]]"]
++                                          ["[:find ?t :in $ ?n :where [?e :block/name ?n] [?e :block/title ?t]]" "[\"zq notes\"]"]
++                                          ["[:find ?t :in $ [?n ...] :where [?e :block/name ?n] [?e :block/title ?t]]" "[[\"zq notes\"]]"]
++                                          ["[:find ?t :in $ [?n ...] :where [?e :block/name ?n] [?e :block/title ?t]]" "[[\"zq notes\"]]"]]]
++                          #(query! self q :inputs inputs)))]
++              (doseq [response ok]
++                (is (= 200 (:status response)) (head-of response))
++                (is (= [["zq Notes"]] (get-in response [:body :rows])) (head-of response))))))))))
++
++(deftest no-rule-hook-test
++  ;; Only the named queries had rules, and they run as code now (patch 0039 stage 3), so nothing
++  ;; wraps Datascript's rule-gen-guards and a query counts no rule work.
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (let [before dq/rule-gen-guards]
++          (testing "rule-gen-guards is Datascript's own, not a wrapper from this patch"
++            (is (not (string/includes? (str before) "db_sync")) (str before)))
++          (p/let [response (query! self zq-titles)
++                  run @datalog/last-run
++                  named (request! self "POST" "/semantic/named-queries/pages-missing-property"
++                                  {:params {:tag "Project" :property "rating"}})]
++            (is (= 200 (:status response)) (head-of response))
++            (is (contains? #{200 400} (:status named)) (head-of named))
++            (testing "a query leaves rule-gen-guards as it found it, and last-run counts no rule work"
++              (is (identical? before dq/rule-gen-guards))
++              (is (contains? run :work) (pr-str run))
++              (is (not (contains? run :rule-work)) (pr-str run)))))))))
 +
 +(deftest work-charges-test
 +  ;; Each relation operation charges the rows it walks, so each is pinned by a query whose work
@@ -3528,81 +3286,6 @@ index 0000000..74b5398
 +            (is (= [200 200] [(:status second-run) (:status third-run)]) (pr-str third-run))
 +            (is (= (get-in first-run [:body :rows]) (get-in third-run [:body :rows])))))))))
 +
-+(deftest rule-recursion-test
-+  ;; A recursive rule that reads data before it recurses runs under the scan cap: rows or 422.
-+  ;; Rules are server data (a named query's), so these run as one does.
-+  (async done
-+    (with-graph done
-+      (fn [{:keys [self]}]
-+        (p/let [closure-rules '[[(under ?b ?p) [?b :block/parent ?p]]
-+                                [(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]]
-+                closure '[:find ?t :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?t]]
-+                closed (server-query! self closure closure-rules)
-+                _ (set-scan-cap! self 5)
-+                capped (server-query! self closure closure-rules)
-+                _ (set-scan-cap! self nil)]
-+          (testing "the closure finds the blocks under the page"
-+            (is (= 200 (:status closed)) (pr-str closed))
-+            (is (contains? (set (map first (get-in closed [:body :rows]))) "zq Public child")))
-+          (testing "the same closure under a low cap answers 422, not 500"
-+            (is (= [422 (cap-message "5")] [(:status capped) (get-in capped [:body :error])]) (pr-str capped))))))))
-+
-+(defn- left-recursion-message [rule cycle]
-+  (str "rules: rule " rule " recurses (" cycle ") before a data pattern binds any of the call's variables;"
-+       " the scan cap can't stop that, so start the rule with a data pattern (or a get-some) that binds one,"
-+       " e.g. [?b :block/parent ?x] (under ?x ?p)"))
-+
-+(deftest rule-left-recursion-refused-test
-+  ;; A rule that reaches a call back into itself before reading any datom bound to that call
-+  ;; expands without limit: Datascript keeps adding branches, the filter is asked about few datoms,
-+  ;; and the scan cap never stops it (a left-recursive closure ran past 120 s at a cap of 100).
-+  ;; Every such rule is refused with 400 before the query runs, directly or through other rules.
-+  ;; The cap is lowered so that, without the refusal, each case answers 422 at once instead of
-+  ;; running on. Rules are server data (a named query's), so the check guards the named queries'
-+  ;; own rules, and these run as one does.
-+  (async done
-+    (with-graph done
-+      (fn [{:keys [self conn]}]
-+        (p/let [before (snapshot conn)
-+                q '[:find ?t :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?t]]
-+                base '[(under ?b ?p) [?b :block/parent ?p]]
-+                _ (set-scan-cap! self 20)
-+                cases [["left-recursive closure" "under" "under → under"
-+                        [base '[(under ?b ?p) (under ?b ?x) (under ?x ?p)]]]
-+                       ["mutually left-recursive rules" "under" "under → over → under"
-+                        [base '[(under ?b ?p) (over ?b ?x) [?x :block/parent ?p]] '[(over ?b ?p) (under ?b ?p)]]]
-+                       ["a call that repeats the head" "under" "under → under"
-+                        [base '[(under ?b ?p) (under ?b ?p)]]]
-+                       ["only a function clause before the call" "under" "under → under"
-+                        [base '[(under ?b ?p) [(ground 1) ?k] (under ?b ?x) [?x :block/parent ?p]]]]
-+                       ["a data pattern before the call that shares none of its variables" "under" "under → under"
-+                        [base '[(under ?b ?p) [?q :block/title "zq Notes"] (under ?b ?x) [?x :block/parent ?p]]]]
-+                       ["the call first inside an or" "under" "under → under"
-+                        [base '[(under ?b ?p) (or (under ?b ?x) [?b :block/parent ?x]) [?x :block/parent ?p]]]]
-+                       ["the call in a later or branch than a data pattern" "under" "under → under"
-+                        [base '[(under ?b ?p) (or [?b :block/parent ?x] (under ?b ?x)) [?x :block/parent ?p]]]]
-+                       ["the call inside an and inside an or" "under" "under → under"
-+                        [base '[(under ?b ?p) (or (and [(ground 1) ?k] (under ?b ?x)) (and [(ground 2) ?k] [?b :block/parent ?x]))
-+                                [?x :block/parent ?p]]]]
-+                       ["a pattern outside an or-join that doesn't join the call's variables" "under" "under → under"
-+                        [base '[(under ?b ?p) [?y :block/parent ?p] (or-join [?b] (under ?b ?y) [?b :block/title "zq"])]]]
-+                       ["the call inside a not-join" "under" "under → under"
-+                        [base '[(under ?b ?p) [?b :block/parent ?x] (not-join [?b] (under ?z ?x))]]]
-+                       ["the call inside a not" "under" "under → under"
-+                        [base '[(under ?b ?p) [?b :block/parent ?x] (not (under ?z ?p))]]]
-+                       ["a call with a source" "under" "under → under"
-+                        [base '[(under ?b ?p) ($ under ?b ?x) [?x :block/parent ?p]]]]]
-+                responses (p/all (for [[_ _ _ rules] cases] (server-query! self q rules)))
-+                _ (set-scan-cap! self nil)
-+                after (snapshot conn)]
-+          (doseq [[[label rule cycle] response] (map vector cases responses)]
-+            (testing label
-+              (is (refused? response (left-recursion-message rule cycle)) (pr-str response))))
-+          (testing "a cycle is named once, from the first rule defined in it"
-+            (is (not (string/includes? (get-in (second responses) [:body :error]) "rule over recurses"))
-+                (pr-str (second responses))))
-+          (is (= before after)))))))
-+
 +(defn- rule-chain
 +  "Rules r0 → r1 → … → r`n`, each calling the next before reading anything; the last reads a title,
 +  or, with `cycle?`, calls r0 back."
@@ -3641,26 +3324,6 @@ index 0000000..74b5398
 +              (is (refused? inputs-over "inputs: at most 4,000 characters (got 4,001)") (pr-str inputs-over)))
 +            (is (= before (snapshot conn)))))))))
 +
-+(deftest left-recursion-check-is-linear-test
-+  ;; The left-recursion check found each rule's reach and searched for a cycle once per rule, so a
-+  ;; chain of n rules cost n² steps: 800 rules took 1.6 s. One strongly connected components pass
-+  ;; finds the same cycles in one walk.
-+  (let [q (:ok (datalog/normalise-query (reader/read-string chain-q)))
-+        timed (fn [rules]
-+                (let [start (.now js/Date)
-+                      result (datalog/validate-query q (reader/read-string rules) [])]
-+                  [result (- (.now js/Date) start)]))
-+        [ok ok-ms] (timed (rule-chain 800 false))
-+        [cycle cycle-ms] (timed (rule-chain 800 true))]
-+    (testing "a chain of 800 rules without a cycle is accepted quickly"
-+      (is (nil? ok) ok)
-+      (is (< ok-ms 250) (str ok-ms " ms")))
-+    (testing "the same chain closed into a cycle is refused once, from r0, quickly"
-+      (is (string/includes? (str cycle) "rules: rule r0 recurses (r0 → r1 → r2 →") (subs (str cycle) 0 200))
-+      (is (string/includes? (str cycle) "→ r800 → r0)") (subs (str cycle) 0 200))
-+      (is (= 1 (count (re-seq #"recurses" (str cycle)))))
-+      (is (< cycle-ms 250) (str cycle-ms " ms")))))
-+
 +(deftest response-counts-before-rows-test
 +  ;; The connector prints a result indented and cuts it at 150,000 characters. Whatever cuts it,
 +  ;; total-rows, returned and truncated come before rows, so the counts and the note survive.
@@ -3674,66 +3337,24 @@ index 0000000..74b5398
 +            (doseq [k ["columns" "total-rows" "returned" "truncated" "query" "inputs"]]
 +              (is (< (at k) (at "rows")) (str k " before rows: " text)))))))))
 +
-+(deftest rule-recursion-after-data-runs-test
-+  ;; Recursion the refusal must leave alone: each call back into the rule follows a data pattern that
-+  ;; binds one of its variables, so every expansion reads datoms the scan cap counts.
-+  (async done
-+    (with-graph done
-+      (fn [{:keys [self]}]
-+        (p/let [q '[:find ?t :in $ % :where [?p :block/title "zq Notes"] (under ?b ?p) [?b :block/title ?t]]
-+                base '[(under ?b ?p) [?b :block/parent ?p]]
-+                cases [["right-recursive closure" [base '[(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)]]]
-+                       ["closure from the other end" [base '[(under ?b ?p) [?x :block/parent ?p] (under ?b ?x)]]]
-+                       ["mutual recursion after a data pattern"
-+                        [base '[(under ?b ?p) [?b :block/parent ?x] (over ?x ?p)] '[(over ?b ?p) (under ?b ?p)]]]
-+                       ["the call inside an or after a data pattern"
-+                        [base '[(under ?b ?p) [?b :block/parent ?x] (or (under ?x ?p) (under ?x ?p))]]]
-+                       ["a call to a rule that can't call back binds its variables"
-+                        [base '[(under ?b ?p) (child ?b ?x) (under ?x ?p)] '[(child ?c ?d) [?c :block/parent ?d]]]]
-+                       ["a non-recursive rule that calls another rule first"
-+                        [base '[(under ?b ?p) [?b :block/parent ?x] (under ?x ?p)] '[(below ?b ?p) (under ?b ?p)]]
-+                        '[:find ?t :in $ % :where [?p :block/title "zq Notes"] (below ?b ?p) [?b :block/title ?t]]]]
-+                ;; Rules are server data (a named query's), so these run as one does.
-+                responses (p/all (for [[_ rules query] cases] (server-query! self (or query q) rules)))]
-+          (doseq [[[label] response] (map vector cases responses)]
-+            (testing label
-+              (is (= 200 (:status response)) (pr-str response))
-+              (is (contains? (set (map first (get-in response [:body :rows]))) "zq Public child")
-+                  (pr-str response)))))))))
-+
-+;; A walk up through get-some reads one datom per row: get-some answers nil, and drops the row,
-+;; when the entity has no such datom, and every datom it finds goes through the filter. So a call
-+;; after it is guarded like a call after a data pattern. Functions that bind a value without reading
-+;; one (get-else's default, ground, identity) still leave the call unguarded.
-+(def ^:private above-rules
-+  '[[(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?a]]]
-+    [(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?x ?a)]])
-+
-+(deftest rule-recursion-through-get-some-test
++(deftest get-some-step-counts-test
++  ;; A step up through get-some reads one datom per row through the filter, so every datom it reads
++  ;; counts toward the scan cap. (This was rule-recursion-through-get-some-test, whose walk up was a
++  ;; rule; a query takes no rules now, so it steps up with get-some clauses instead.)
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [self conn]}]
 +        (p/let [before (snapshot conn)
-+                q '[:find ?t :in $ % :where [?b :block/title "zq Public child"] (above ?b ?a) [?a :block/title ?t]]
-+                walked (server-query! self q above-rules)
++                q '[:find ?t :where [?b :block/title "zq Public child"] [(get-some $ ?b :block/parent) [_ ?a]]
++                    [(get-some $ ?a :block/parent) [_ ?g]] [?g :block/title ?t]]
++                walked (query! self q)
 +                _ (set-scan-cap! self 2)
-+                capped (server-query! self q above-rules)
-+                _ (set-scan-cap! self 20)
-+                refused (p/all (for [[_ rules] [["get-else's default" '[(above ?b ?a) [(get-else $ ?b :block/parent 0) ?x] (above ?x ?a)]]
-+                                                ["ground" '[(above ?b ?a) [(ground 1) ?x] (above ?x ?a)]]
-+                                                ["identity of a head variable" '[(above ?b ?a) [(identity ?b) ?x] (above ?x ?a)]]
-+                                                ["a get-some that binds none of the call's variables"
-+                                                 '[(above ?b ?a) [(get-some $ ?b :block/parent) [_ ?x]] (above ?b ?a)]]]]
-+                                 (server-query! self q [(first above-rules) rules])))
++                capped (query! self q)
 +                _ (set-scan-cap! self nil)]
-+          (testing "the walk up from a block reaches its parent block and its page"
-+            (is (= 200 (:status walked)) (pr-str walked))
-+            (is (= #{"zq Public note" "zq Notes"} (set (map first (get-in walked [:body :rows])))) (pr-str walked)))
++          (testing "two steps up from a block reach its parent's parent, the page"
++            (is (= [200 [["zq Notes"]]] [(:status walked) (get-in walked [:body :rows])]) (pr-str walked)))
 +          (testing "every datom get-some reads counts towards the scan cap"
 +            (is (= [422 (cap-message "2")] [(:status capped) (get-in capped [:body :error])]) (pr-str capped)))
-+          (testing "a function that binds without reading a datom leaves the call unguarded"
-+            (doseq [r refused]
-+              (is (refused? r (left-recursion-message "above" "above → above")) (pr-str r))))
 +          (is (= before (snapshot conn))))))))
 +
 +;; The row cap: a join that fans out from few datoms
@@ -3758,7 +3379,7 @@ index 0000000..74b5398
 +(deftest row-cap-test
 +  ;; A self-join through one tag reads few datoms but returns n² rows, and every row was sorted
 +  ;; before limit applied: a tag on 500 pages gave 260,100 rows and 6.6 s of sort. Each shape
-+  ;; that can fan out like that (a plain join, a join whose rows are pulled, a rule) is refused with
++  ;; that can fan out like that (a plain join, a join whose rows are pulled) is refused with
 +  ;; 422 before the sort; an aggregate that folds the fan-out into few rows is not. The same join
 +  ;; through an or-join builds 265,302 rows on the way (each branch joins every ?t row), so the join
 +  ;; cap stops it first (join-cap-test).
@@ -3772,14 +3393,10 @@ index 0000000..74b5398
 +                        {:q [:find '?a '?c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]
 +                       ["the same join with a pull in :find (pulls run after the cap)"
 +                        {:q [:find '(pull ?a [:block/title]) '?c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]
-+                       ["the join inside a rule"
-+                        {:q '[:find ?a ?c :in $ % :where [?t :block/title "Topic"] (tagged ?a ?t) (tagged ?c ?t)]
-+                         :rules '[[(tagged ?b ?t) [?b :block/tags ?t]]]}]
 +                       ["the join with :keys"
 +                        {:q [:find '?a '?c :keys 'a 'c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]]
-+                responses (p/all (for [[_ {:keys [q rules]}] cases]
-+                                   ;; A rule is server data (a named query's), so the rule case runs as one does.
-+                                   (p/let [r (if rules (server-query! self q rules) (query! self q))]
++                responses (p/all (for [[_ {:keys [q]}] cases]
++                                   (p/let [r (query! self q)]
 +                                     (assoc r :last-run @datalog/last-run))))
 +                folded (query! self [:find '?a '(count ?c) :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]
 +                               :limit 200)
@@ -3838,8 +3455,8 @@ index 0000000..74b5398
 +  ;; The row cap counts rows after d/q has built them: a three-way self-join through a tag on 150
 +  ;; blocks read 463 datoms and built 3,375,000 rows in 21 s before its 422. Datascript builds
 +  ;; every joined row through join-tuples (hash joins, products for a function over two groups,
-+  ;; or-join and not-join branches, rule calls, collection bindings) or -collect-tuples (a rule
-+  ;; body's product), and past the join cap the query stops there with 422.
++  ;; or-join and not-join branches, collection bindings) or -collect-tuples, and past the join cap
++  ;; the query stops there with 422.
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self notes]}]
@@ -3855,12 +3472,6 @@ index 0000000..74b5398
 +                        {:q [:find '?a '?c :where topic '[?a :block/tags ?t] '[?c :block/tags ?t] '[(= ?a ?c)]]}]
 +                       ["the join with a pull in :find" {:q [:find '(pull ?a [:block/title]) '?c :where topic '[?a :block/tags ?t]
 +                                                             '[?c :block/tags ?t]]}]
-+                       ["the join inside a rule" {:q '[:find ?a ?c :in $ % :where [?t :block/title "Topic"] (tagged ?a ?t) (tagged ?c ?t)]
-+                                                  :rules '[[(tagged ?b ?t) [?b :block/tags ?t]]]}]
-+                       ["a rule body whose clauses share no variable (a product)"
-+                        {:q '[:find ?a ?c :in $ % :where (pair ?a ?c)]
-+                         :rules '[[(pair ?a ?c) [?t :block/title "Topic"] [?a :block/tags ?t] [?u :block/title "Topic"]
-+                                   [?c :block/tags ?u]]]}]
 +                       ["the join through an or-join" {:q [:find '?a '?c :where topic '[?a :block/tags ?t]
 +                                                           '(or-join [?t ?c] [?c :block/tags ?t] [?c :block/refs ?t])]}]
 +                       ["the join inside a not-join" {:q [:find '?a :where topic '[?a :block/tags ?t]
@@ -3872,9 +3483,8 @@ index 0000000..74b5398
 +                        {:q '[:find ?a ?x :in $ [?x ...] :where [?t :block/title "Topic"] [?a :block/tags ?t] [(compare ?a ?x) ?s]]
 +                         :inputs [(vec (range 30))]}]
 +                       ["an aggregate over the join" {:q [:find '?a '(count ?c) :where topic '[?a :block/tags ?t] '[?c :block/tags ?t]]}]]
-+                responses (p/all (for [[_ {:keys [q rules inputs]}] cases]
-+                                   ;; A rule is server data (a named query's), so the rule cases run as one does.
-+                                   (p/let [r (if rules (server-query! self q rules) (query! self q :inputs inputs))]
++                responses (p/all (for [[_ {:keys [q inputs]}] cases]
++                                   (p/let [r (query! self q :inputs inputs)]
 +                                     (assoc r :last-run @datalog/last-run))))
 +                one-side (query! self [:find '?c :where topic '[?a :block/tags ?t] '[?a :block/title ?at]
 +                                       '[(clojure.string/starts-with? ?at "zq fan 00 ")] '[?c :block/tags ?t]]
@@ -4219,6 +3829,11 @@ index 0000000..74b5398
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "gave a function a collection from inputs"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "20,000 function calls (the call cap)"))
 +    (is (string/includes? (get-in post [:responses "422" :description] "") "200,000 rows of relation work (the work cap)"))
++    (testing "no rule cap, rule depth or ancestor walk is described: datalog_query takes no rules"
++      (doseq [text [(:description post) (get-in post [:responses "422" :description] "")
++                    (get-in post [:responses "400" :description] "")]
++              gone ["rule cap" "rule work" "levels deep on its page" "ancestor" "vetted rules" "walks up"]]
++        (is (not (string/includes? text gone)) gone)))
 +    (testing "how a walk up stays under the caps, and no named query is said to reach one"
 +      (is (not (string/includes? (:description post) "stay within the caps")))
 +      (is (string/includes? (:description post) "[(get-some $ ?b :block/parent) [_ ?p]]"))
@@ -4737,8 +4352,10 @@ index 0000000..74b5398
 +    (is (string/includes? (:description datalog-post) "run_named_query"))))
 +
 +(deftest every-entry-validates-test
-+  ;; The shipped entries run as code; the legacy Datalog (kept here for the parity test) still
-+  ;; passes the validator, so the parity test compares against queries datalog_query would run.
++  ;; The shipped entries run as code; the legacy Datalog without rules (kept here for the parity
++  ;; test) still passes the validator, so the parity test compares against queries datalog_query
++  ;; would run. meetings-without-decision's took rules, which datalog_query refuses, so the parity
++  ;; test runs it with d/q directly.
 +  (is (= (set names) (set (keys named-queries/named-queries))))
 +  (doseq [[query-name entry] named-queries/named-queries]
 +    (is (fn? (:run entry)) query-name)
@@ -4754,7 +4371,11 @@ index 0000000..74b5398
 +                           :property :block/title))
 +                       params)]
 +      (is (:ok normalised) (str query-name ": " (:error normalised)))
-+      (is (nil? (datalog/validate-query (:ok normalised) rules inputs)) query-name))))
++      (if rules
++        (is (string/starts-with? (str (datalog/validate-query (:ok normalised) inputs))
++                                 ":in: % is not accepted; datalog_query takes no rules")
++            query-name)
++        (is (nil? (datalog/validate-query (:ok normalised) inputs)) query-name)))))
 +
 +(deftest named-dry-run-test
 +  (async done

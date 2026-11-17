@@ -28,7 +28,7 @@ export const DEFAULT_PAGES = [5_000, 20_000];
 export const DEFAULT_RUNS = 5;
 /** Blocks per page (top level), each with up to two children. */
 const BLOCKS_PER_PAGE = 4;
-/** Depth of the one deep chain of nested blocks the recursive rule walks. */
+/** Depth of the one deep chain of nested blocks, each tagged Bench Chain (join-fanout's self-join). */
 const CHAIN_DEPTH = 60;
 /** The CPU tail README records as tolerated on the Free plan (spec §5). */
 export const TOLERATED_MS = 92;
@@ -41,20 +41,14 @@ export const SHAPES = [
   "private-set",
   "scan-cap",
   "or-join-wide",
-  "rule-recursive",
-  "rule-deep-chain",
   "not-join-fanout",
   "join-fanout",
   "pull-star-200",
 ];
 
-const ANCESTOR_RULES = `[[(anc ?c ?a) [?c :block/parent ?a]]
- [(anc ?c ?a) [?c :block/parent ?p] (anc ?p ?a)]]`;
-
 /**
- * Request bodies (the fields POST /query takes) per shape. datalog_query refuses rules, so a shape
- * with rules runs as a named query's rules do: server data, through the same check (checked-query)
- * and run-query.
+ * Request bodies (the fields POST /query takes) per shape. datalog_query takes no rules (patch 0039
+ * stage 3 removed them), so no shape has any.
  */
 export const BODIES = {
   // Every datom: what a query with no selective clause costs before the cap stops it.
@@ -66,15 +60,6 @@ export const BODIES = {
                            [?b :block/path-refs ?x] [?b :logseq.property/status ?x]
                            [?b :logseq.property/priority ?x] [?b :block/collapsed? ?x]
                            [?b :logseq.property/deadline ?x])]`,
-  },
-  // A right-recursive closure with neither end bound: every block's ancestors, through a chain
-  // 60 deep. Allowed (a data pattern binds ?p before the call), bounded only by the cap.
-  "rule-recursive": { query: "[:find ?c ?a :in $ % :where (anc ?c ?a)]", rules: ANCESTOR_RULES },
-  // The same rule bound to the leaf of the 60-deep chain: a few datoms per level, but Datascript's
-  // rule solver adds a guard per level, so the work grows faster than the datoms it reads.
-  "rule-deep-chain": {
-    query: `[:find ?a :in $ % :where [?c :block/title "chain 59"] (anc ?c ?a)]`,
-    rules: ANCESTOR_RULES,
   },
   // For every page, a three-clause not-join: the anti-join's fan-out over blocks, refs and tags.
   "not-join-fanout": {
@@ -315,16 +300,13 @@ export function runShape(ns, shape, db, scanCap) {
   const t0 = performance.now();
   cljs.reset_BANG_(datalog.last_run, cljs.hash_map(kw("private-set-built?"), false, kw("scanned"), 0, kw("pulled"), 0));
   const given = BODIES[shape];
-  const parsed = given.rules
-    ? datalog.checked_query(ns.reader.read_string.cljs$core$IFn$_invoke$arity$1(given.query), cljs.PersistentVector.EMPTY, ns.reader.read_string.cljs$core$IFn$_invoke$arity$1(given.rules), false)
-    : datalog.parse_request(body(ns, given));
+  const parsed = datalog.parse_request(body(ns, given));
   const status = kw("logseq.db-sync.worker.handler.datalog", "status");
   let result = parsed;
   if (!cljs.contains_QMARK_(parsed, status)) {
     const opts = cljs.hash_map(
       kw("query"), get(parsed, kw("query")),
       kw("inputs"), get(parsed, kw("inputs")),
-      kw("rules"), get(parsed, kw("rules")),
       kw("limit"), given.limit ?? datalog.default_limit,
       kw("scan-cap"), scanCap,
       kw("echo"), cljs.hash_map(kw("query"), given.query, kw("inputs"), "[]"),
@@ -341,7 +323,6 @@ export function runShape(ns, shape, db, scanCap) {
       : error.includes("the row cap of") ? "row-cap"
       : error.includes("(the join cap)") ? "join-cap"
       : error.includes("(the value cap)") ? "value-cap"
-      : error.includes("(the rule cap)") ? "rule-cap"
       : error.includes("(the scan cap)") ? "scan-cap"
       : "refused";
     return { ms, scanned, outcome, rows: 0, error };
