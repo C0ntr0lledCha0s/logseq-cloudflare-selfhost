@@ -52,7 +52,7 @@ test("exits 2 naming the missing bundle", () => {
   }
 });
 
-test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query", { skip, timeout: 300_000 }, () => {
+test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, and stops a deep rule walk", { skip, timeout: 300_000 }, () => {
   const before = leftovers();
   const r = spawnSync(process.execPath, [script, upstream], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -62,6 +62,8 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "a function takes the bound value (clojure.string/includes?)",
     "a join through a datom value matches (tag by title)",
     "run_named_query pages-missing-property returns the tag page",
+    "run_named_query meetings-without-decision leaves out a meeting with a decision 10 levels down",
+    "run_named_query meetings-without-decision refuses a decision 180 levels down at the rule cap, quickly",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }

@@ -2627,6 +2627,16 @@ describe("queries help", () => {
     expect(QUERIES_HELP.match(/more than ([\d,]+) datoms \(the scan cap/)?.[1]).toBe(server);
   });
 
+  it.each([
+    ["rule cap", /([\d,]+) units of rule work \(the rule cap/],
+    ["depth the rule cap allows", /more than about (\d+) levels deep on its page/],
+  ])("the help's %s matches run_named_query's description", async (_cap, pattern) => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    const server = named.description.match(pattern)?.[1];
+    expect(server).toBeDefined();
+    expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
+  });
+
   // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
   it.each([
     ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],

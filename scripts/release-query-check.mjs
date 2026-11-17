@@ -11,7 +11,9 @@
 // which `pnpm test` compiles) stores only that built-in graph in the SQLite first; everything after
 // that runs in the release bundle. It creates a tag, a property and a page
 // through SyncDO.fetch(), then runs datalog_query and run_named_query through SyncDO.fetch() and
-// checks the values that come back. Exits 0 when every check passes, 1 when one fails (naming it),
+// checks the values that come back. It also runs meetings-without-decision over a decision 10
+// levels deep (answers) and one 180 levels deep (the rule cap refuses it quickly, where the walk
+// once took about 1.1 s). Exits 0 when every check passes, 1 when one fails (naming it),
 // and 2 when either build is missing.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -25,6 +27,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const PAGE_TITLE = "Release Check Page";
 export const TAG_TITLE = "Release Check Tag";
 export const PROPERTY_TITLE = "release-check-prop";
+// meetings-without-decision's rule cap (2,000 units of rule work) allows a decision this many
+// blocks down its page, and refuses one deeper, naming the depth.
+export const RULE_CAP_LEVELS = 52;
 
 export function bundlePath(upstream) {
   return join(upstream, "deps", "db-sync", "worker", "dist", "worker", "main.js");
@@ -185,8 +190,57 @@ export function checks(ctx) {
         }
       },
     ],
+    [
+      "run_named_query meetings-without-decision leaves out a meeting with a decision 10 levels down",
+      async () => {
+        await deepChain(stub, ctx.pageUuid, 10, "Release Shallow Meeting", "Release Shallow Decision");
+        const body = expectOk("named query", await meetings(stub, "Release Shallow Meeting", "Release Shallow Decision"));
+        assertRows(body.rows, []);
+      },
+    ],
+    [
+      "run_named_query meetings-without-decision refuses a decision 180 levels down at the rule cap, quickly",
+      async () => {
+        await deepChain(stub, ctx.pageUuid, 180, "Release Deep Meeting", "Release Deep Decision");
+        const start = performance.now();
+        const res = await meetings(stub, "Release Deep Meeting", "Release Deep Decision");
+        const ms = Math.round(performance.now() - start);
+        const error = res.json?.error ?? "";
+        if (res.status !== 422 || !error.includes("(the rule cap)") || !error.includes(`more than about ${RULE_CAP_LEVELS} levels deep`)) {
+          throw new Error(`HTTP ${res.status} after ${ms} ms, expected 422 naming the rule cap: ${res.text.slice(0, 300)}`);
+        }
+        if (ms > 500) throw new Error(`the rule cap answered after ${ms} ms, expected under 500 ms`);
+      },
+    ],
   ];
 }
+
+/**
+ * A chain of `n` blocks on `page`, each the only child of the one before, with tags `meeting` and
+ * `decision` (created here) on the top and the deepest block. Returns the top block's title.
+ */
+async function deepChain(stub, page, n, meeting, decision) {
+  const ok = async (step, res) => {
+    if (res.status < 200 || res.status > 299) throw new Error(`${step}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json;
+  };
+  for (const title of [meeting, decision]) await ok(`create tag ${title}`, await call(stub, "POST", "/semantic/tags", { title }));
+  let tree;
+  for (let i = n - 1; i >= 0; i--) tree = { title: `${meeting} level ${i}`, ...(tree ? { children: [tree] } : {}) };
+  const [top] = (await ok("insert the chain", await call(stub, "POST", "/semantic/block-trees", { "target-id": page, blocks: [tree] }))).blocks;
+  let deepest = top;
+  while (deepest.children?.length) deepest = deepest.children[0];
+  const tags = encodeURIComponent("block/tags");
+  await ok("tag the meeting", await call(stub, "PUT", `/semantic/blocks/${top.uuid}/properties/${tags}`, { value: [meeting] }));
+  await ok("tag the decision", await call(stub, "PUT", `/semantic/blocks/${deepest.uuid}/properties/${tags}`, { value: [decision] }));
+  return top.title;
+}
+
+const meetings = (stub, meeting, decision) =>
+  call(stub, "POST", "/semantic/named-queries/meetings-without-decision", {
+    params: { meeting_tag: meeting, decision_tag: decision, days: 3650 },
+    limit: 200,
+  });
 
 function assertRows(actual, expected) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
