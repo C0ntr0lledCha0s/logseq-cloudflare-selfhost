@@ -41,6 +41,17 @@ test("refuses a bundle whose imports changed, naming the import", async () => {
   assert.throws(() => rewriteImports('import*as a from"mldoc";import*as c from"@sentry/cloudflare";'), /cloudflare:workers/);
 });
 
+test("assertPlanAndWork accepts plan and work naming each bound, and refuses a missing one or a Datalog echo", async () => {
+  const { assertPlanAndWork, MEETING_BOUNDS } = await import(script);
+  const plan = "1. … (meetings bound 5,000) … (decisions bound 20,000) … (ancestor-steps bound 50,000) … (reads bound 100,000)";
+  const work = { meetings: 1, decisions: 2, "ancestor-steps": 3, reads: 9 };
+  assert.doesNotThrow(() => assertPlanAndWork({ plan, work }, MEETING_BOUNDS));
+  assert.throws(() => assertPlanAndWork({ plan: plan.replace("(decisions bound", "(x"), work }, MEETING_BOUNDS), /plan does not name the decisions bound/);
+  assert.throws(() => assertPlanAndWork({ plan, work: { ...work, reads: undefined } }, MEETING_BOUNDS), /work has no reads count/);
+  assert.throws(() => assertPlanAndWork({ plan, work, query: "[:find]" }, MEETING_BOUNDS), /still carries query/);
+  assert.throws(() => assertPlanAndWork({ plan, work, rules: "[]" }, MEETING_BOUNDS), /still carries rules/);
+});
+
 test("exits 2 naming the missing bundle", () => {
   const dir = mkdtempSync(join(tmpdir(), "rqc-test-"));
   try {
@@ -52,7 +63,7 @@ test("exits 2 naming the missing bundle", () => {
   }
 });
 
-test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, and stops a deep rule walk", { skip, timeout: 300_000 }, () => {
+test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, and answers a decision 180 levels down", { skip, timeout: 300_000 }, () => {
   const before = leftovers();
   const r = spawnSync(process.execPath, [script, upstream], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -63,7 +74,7 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "a join through a datom value matches (tag by title)",
     "run_named_query pages-missing-property returns the tag page",
     "run_named_query meetings-without-decision leaves out a meeting with a decision 10 levels down",
-    "run_named_query meetings-without-decision refuses a decision 180 levels down at the rule cap, quickly",
+    "run_named_query meetings-without-decision leaves out a meeting with a decision 180 levels down, quickly",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }
@@ -74,7 +85,8 @@ test("the release bundle returns the values data patterns bind, in datalog_query
 // Datom field v consistently in compiled code, but Datascript's query engine also reads a datom's
 // fields by string (tuple["v"] in lookup-pattern-db), which then read undefined. Renaming every .v
 // property access in the fixed bundle brings that back (74 accesses at 7d04944) and reproduces the
-// same five failures the unfixed bundle gave.
+// same failures the unfixed bundle gave in datalog_query (run_named_query's checks failed too until
+// the named queries ran as code).
 test("fails, naming each check, on a bundle whose Datom field v is renamed", { skip, timeout: 300_000 }, () => {
   const source = readFileSync(bundle, "utf8");
   assert.match(source, /case "v":return \w+\.v\b/, "the bundle keeps the Datom field v (externs applied)");
@@ -88,7 +100,10 @@ test("fails, naming each check, on a bundle whose Datom field v is renamed", { s
     assert.match(r.stdout, /^FAILED a uuid bound by a data pattern comes back: rows \[\[null\]\]/m);
     assert.match(r.stdout, /^FAILED a function takes the bound value .*HTTP 400/m);
     assert.match(r.stdout, /^FAILED a join through a datom value matches \(tag by title\): rows \[\]/m);
-    assert.match(r.stdout, /^FAILED run_named_query pages-missing-property returns the tag page/m);
+    // run_named_query walks the indexes as code and reads a datom's fields through its own lookup,
+    // never by string, so the renamed field leaves its checks passing.
+    assert.match(r.stdout, /^ok +run_named_query pages-missing-property returns the tag page$/m);
+    assert.match(r.stdout, /^ok +run_named_query meetings-without-decision leaves out a meeting with a decision 180 levels down, quickly$/m);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

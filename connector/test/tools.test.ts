@@ -2551,7 +2551,14 @@ describe("queries help", () => {
     ["no caller rules", "datalog_query takes no rules: a rules field, % in :in or a rule call is refused with 400"],
     ["why no rules", "a tree of rules expands without reading data and can run for seconds before any cap stops it"],
     ["a step up without rules", "To step up from a block use get-some ([(get-some $ ?b :block/parent) [_ ?p]])"],
-    ["ancestors through a named query", "for every ancestor use run_named_query (meetings-without-decision walks up through them with its own rules)"],
+    ["ancestors through a named query", "for every ancestor use run_named_query (meetings-without-decision walks up through them, at any depth)"],
+    ["named queries as code", "run_named_query runs one of four fixed queries as server code, not Datalog"],
+    ["plan", "Each answer carries plan (the steps and their bounds)"],
+    ["work", "and work (what it counted)"],
+    ["a named query's 422 names its bound", "A query that passes one of its bounds answers 422 naming the bound and what to narrow, such as a smaller days or a narrower tag"],
+    ["a bound's number", "meetings-without-decision stops after 5,000 meetings created within days (its meetings bound)"],
+    ["any depth", "A decision at any depth under a meeting counts"],
+    ["the named dry run", "run_named_query's dry run shows its plan and bounds"],
     ["run_named_query, preferred", "Prefer run_named_query when one fits"],
     ["projects-untouched", "when one fits: projects-untouched,"],
     ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
@@ -2582,7 +2589,6 @@ describe("queries help", () => {
     ["the 422", "is refused with 422, never answered in part"],
     ["how to narrow", "narrow it with a tag, page or attribute value"],
     ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
-    ["projects-untouched on a large graph", "projects-untouched can reach the scan cap on a large graph"],
     ["handles", "Pull :block/uuid and :block/title to get handles for the other tools"],
     ["pure functions only", "Only pure functions are allowed"],
     ["the allowed functions", "(comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like"],
@@ -2620,27 +2626,26 @@ describe("queries help", () => {
     expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
   });
 
-  it("the help's scan cap matches run_named_query's description", async () => {
+  // run_named_query runs as code under named bounds (patch 0039, named queries as code): the help
+  // repeats one bound's number, which must be the vendored description's.
+  it("the help's meetings bound matches run_named_query's description", async () => {
     const named = (await listTools()).find((t) => t.name === "run_named_query");
-    const server = named.description.match(/the scan cap \(([\d,]+) datoms/)?.[1];
-    expect(server).toBeDefined();
-    expect(QUERIES_HELP.match(/more than ([\d,]+) datoms \(the scan cap/)?.[1]).toBe(server);
-  });
-
-  it.each([
-    ["rule cap", /([\d,]+) units of rule work \(the rule cap/],
-    ["depth the rule cap allows", /more than about (\d+) levels deep on its page/],
-  ])("the help's %s matches run_named_query's description", async (_cap, pattern) => {
-    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    const pattern = /([\d,]+) meetings created within days \(its meetings bound\)/;
     const server = named.description.match(pattern)?.[1];
     expect(server).toBeDefined();
     expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
   });
 
+  it("neither the help nor run_named_query's description names a cap or a depth limit for the named queries", async () => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    for (const gone of ["rule cap", "levels deep", "scan cap", "as EDN"]) expect(named.description, gone).not.toContain(gone);
+    for (const gone of ["rule cap", "levels deep", "its own rules", "projects-untouched can reach the scan cap"]) expect(QUERIES_HELP, gone).not.toContain(gone);
+  });
+
   // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
   it.each([
     ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
-    ["run_named_query", ["the scan cap (20,000 datoms, 422)", "the row cap and limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
+    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
   ])("%s's generated description carries the openapi text", async (name, phrases) => {
     const tool = (await listTools()).find((t) => t.name === name);
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);

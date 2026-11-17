@@ -11,10 +11,11 @@
 // which `pnpm test` compiles) stores only that built-in graph in the SQLite first; everything after
 // that runs in the release bundle. It creates a tag, a property and a page
 // through SyncDO.fetch(), then runs datalog_query and run_named_query through SyncDO.fetch() and
-// checks the values that come back. It also runs meetings-without-decision over a decision 10
-// levels deep (answers) and one 180 levels deep (the rule cap refuses it quickly, where the walk
-// once took about 1.1 s). Exits 0 when every check passes, 1 when one fails (naming it),
-// and 2 when either build is missing.
+// checks the values that come back. run_named_query runs as server code that walks the indexes, so
+// it also runs meetings-without-decision over a decision 10 levels deep and one 180 levels deep:
+// both answer, quickly, with the meeting decided (the Datalog it replaced stopped the deep one at a
+// rule cap), and each answer carries plan and work. Exits 0 when every check passes, 1 when one
+// fails (naming it), and 2 when either build is missing.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -27,9 +28,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const PAGE_TITLE = "Release Check Page";
 export const TAG_TITLE = "Release Check Tag";
 export const PROPERTY_TITLE = "release-check-prop";
-// meetings-without-decision's rule cap (2,000 units of rule work) allows a decision this many
-// blocks down its page, and refuses one deeper, naming the depth.
-export const RULE_CAP_LEVELS = 52;
 
 export function bundlePath(upstream) {
   return join(upstream, "deps", "db-sync", "worker", "dist", "worker", "main.js");
@@ -188,6 +186,7 @@ export function checks(ctx) {
         if (!titles.includes(TAG_TITLE)) {
           throw new Error(`named query: no row titled ${TAG_TITLE}; rows: ${JSON.stringify(body.rows).slice(0, 300)}`);
         }
+        assertPlanAndWork(body, ["tagged", "reads"]);
       },
     ],
     [
@@ -196,20 +195,23 @@ export function checks(ctx) {
         await deepChain(stub, ctx.pageUuid, 10, "Release Shallow Meeting", "Release Shallow Decision");
         const body = expectOk("named query", await meetings(stub, "Release Shallow Meeting", "Release Shallow Decision"));
         assertRows(body.rows, []);
+        assertPlanAndWork(body, MEETING_BOUNDS);
       },
     ],
     [
-      "run_named_query meetings-without-decision refuses a decision 180 levels down at the rule cap, quickly",
+      "run_named_query meetings-without-decision leaves out a meeting with a decision 180 levels down, quickly",
       async () => {
-        await deepChain(stub, ctx.pageUuid, 180, "Release Deep Meeting", "Release Deep Decision");
+        await deepChain(stub, ctx.pageUuid, 181, "Release Deep Meeting", "Release Deep Decision");
         const start = performance.now();
         const res = await meetings(stub, "Release Deep Meeting", "Release Deep Decision");
         const ms = Math.round(performance.now() - start);
-        const error = res.json?.error ?? "";
-        if (res.status !== 422 || !error.includes("(the rule cap)") || !error.includes(`more than about ${RULE_CAP_LEVELS} levels deep`)) {
-          throw new Error(`HTTP ${res.status} after ${ms} ms, expected 422 naming the rule cap: ${res.text.slice(0, 300)}`);
+        const body = expectOk(`named query after ${ms} ms`, res);
+        assertRows(body.rows, []);
+        assertPlanAndWork(body, MEETING_BOUNDS);
+        if (body.work["ancestor-steps"] < 180) {
+          throw new Error(`the walk took ${body.work["ancestor-steps"]} steps up, expected at least 180: ${JSON.stringify(body.work)}`);
         }
-        if (ms > 500) throw new Error(`the rule cap answered after ${ms} ms, expected under 500 ms`);
+        if (ms > 500) throw new Error(`answered after ${ms} ms, expected under 500 ms`);
       },
     ],
   ];
@@ -241,6 +243,22 @@ const meetings = (stub, meeting, decision) =>
     params: { meeting_tag: meeting, decision_tag: decision, days: 3650 },
     limit: 200,
   });
+
+// meetings-without-decision's bounds, as plan names them and work counts them.
+export const MEETING_BOUNDS = ["meetings", "decisions", "ancestor-steps", "reads"];
+
+/** A named-query answer carries plan (naming each bound) and work (a count per bound), and no Datalog. */
+export function assertPlanAndWork(body, bounds) {
+  for (const bound of bounds) {
+    if (!String(body.plan ?? "").includes(`(${bound} bound `)) {
+      throw new Error(`plan does not name the ${bound} bound: ${JSON.stringify(body.plan)?.slice(0, 300)}`);
+    }
+    if (!Number.isInteger(body.work?.[bound])) throw new Error(`work has no ${bound} count: ${JSON.stringify(body.work)}`);
+  }
+  for (const gone of ["query", "inputs", "rules"]) {
+    if (gone in body) throw new Error(`the answer still carries ${gone}`);
+  }
+}
 
 function assertRows(actual, expected) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
