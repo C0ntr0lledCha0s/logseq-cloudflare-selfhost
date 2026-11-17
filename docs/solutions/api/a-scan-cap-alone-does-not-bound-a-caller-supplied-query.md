@@ -6,7 +6,7 @@ seen:
   - 2026-11-09 – item 40, patch 0039, stages 1 to 4 and review rounds 1 and 2 (s-2-1, s-3-1, s-4-1, r1-correctness-1; r1-correctness-1 closed in round 2)
   - 2026-11-16 – item 40, patch 0039, a named query's recursive rule on a deep outline (rule cap)
   - 2026-11-17 – item 40, patch 0039, the four named queries rewritten as code under named bounds
-promoted_to: []
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
@@ -37,6 +37,8 @@ A later review found the same class in a vetted named query. `meetings-without-d
 The 2026-11-17 rewrite settled the class for fixed queries. Review 2 showed the caps still failed the named queries on realistic graphs (10 meetings and 200 decisions answered 422 at the join cap, 700 tagged pages at the scan cap), and each earlier fix had moved the limit without removing it. A named query's shape is fixed, so patch 0039 now computes the four in Clojure by walking Datascript's indexes (`named_queries.cljs`). Each charges the datoms it reads and its candidates to a named bound and refuses with a 422 that says which bound and what to narrow. The rule cap and every rule path were removed. `datalog_query` gained a width cap on function bindings (Datascript's `bind-by-fn` copies every column of every row, so cost is rows x columns squared) and refuses a query of more than 12 function-binding clauses before it runs. In the release bundle a counted read costs about 4 us, not the 0.5 to 1 us the design assumed, so the bounds were set from that bundle's timings.
 
 ## How to catch it next time
+
+- Reviewers still found, after the rewrite, bounds that can never refuse (the reads backstop trips first) and docs that still described the old scan cap (README backlog 24). When bounds are layered, test each one with the backstop raised, and grep the docs for the old cap's name.
 
 - When a query's shape is fixed, count its work in the code that runs it and name each bound after what it counts, so the refusal can tell the caller what to narrow. A generic engine cap tells them nothing they can act on.
 - Calibrate a per-read cost in the release bundle, not the dev build, before setting a bound from it: the two differed by a factor of four here.

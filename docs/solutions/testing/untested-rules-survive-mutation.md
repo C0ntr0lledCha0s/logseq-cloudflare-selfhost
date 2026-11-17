@@ -16,7 +16,9 @@ seen:
   - 2026-11-08 – item 22 (suggest_links), stage 2 (s-2-1): the builder reported 58 of 58 mutations killed, yet `taken = c.words.length` to `taken = 1` (a shorter title inside a longer match was also suggested, giving overlapping spans) and removing the once-only `already_linked` check left 72 tests green; the stage's own re-run of mutations caught it, so verify a builder's kill count rather than quote it
   - 2026-11-08 – item 31, patch 0037, stage 1 check (s-1-1): the `final-tags` rule that keeps Code, Math and Quote under an `isResetExistingValues` tag list left 323 tests green when mutated, while four other mutations each failed tests; the lane's stage check (a scratch-copy mutation run) found it and a test where the kept class alone decided a class-restricted property closed it
   - 2026-11-09 – item 40, patch 0039, stage 1 (s-1-2): the `:db/cas` refusal, the pull-source refusal in `:find` and the `:keys` count check survived mutation although the commit message and builder's report said each refusal had a direct test; a claim of coverage needs the mutation run, not the author's word
+  - 2026-11-17 – item 40, named queries as code (should-fix deferred): three named bounds (tasks, page-blocks, decisions) can never be the one that refuses, because the reads backstop trips first, so their documented 422s are unreachable and untested
 promoted_to: ["REVIEW.md"]
+  - 2026-11-17 – item 40, named queries as code (should-fix deferred): three named bounds (tasks, page-blocks, decisions) can never be the one that refuses, because the reads backstop trips first, so their documented 422s are untested and unreachable; a bound that no test makes decide the outcome is dead text
 ---
 
 ## Symptom
@@ -37,3 +39,4 @@ None in the lane yet: the findings were open at the end. The reviewers' suggeste
 - Build each case so that, without the rule, at least two candidates remain or the scope is the only thing that rejects the value.
 - A rule that scopes by owner (this property's value blocks, this property's choices) needs a decoy owned by another property that would be matched if the scope were dropped.
 - When the description, `connector_help` or README promises a rule to Claude, there is a test that fails if it goes.
+- A cap or bound that sits behind a coarser backstop may be unreachable. For each named bound, write the input that trips only it (backstop set high in the test) and check the refusal names it. If no input can, delete the bound and its documented message.
