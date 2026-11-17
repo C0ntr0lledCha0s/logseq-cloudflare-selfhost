@@ -25,7 +25,7 @@
 // before the release bundle loads it, beside the built-in graph. On that graph it runs each named
 // query twice and checks its exact rows and that each run answers within NAMED_MS (300 ms); runs
 // each F1 shape (many function bindings over one page's blocks) and checks that it answers the
-// width-cap 422 within F1_MS (100 ms, the median of three warm runs); and runs a datalog_query
+// width-cap 422 (more than 12 function bindings, refused before it runs) within F1_MS (100 ms, the median of three warm runs); and runs a datalog_query
 // that stops at the scan cap with console.error, warn, log and info captured, failing if the
 // refusal logged anything. It prints each timing under its check. Node on a developer machine
 // guides the numbers; it does not measure the Durable Object on Cloudflare.
@@ -507,6 +507,12 @@ export const NAMED_AT_SCALE = {
 };
 
 /**
+ * The width cap's two 422s: a query of more than 12 function bindings, refused before it runs (as
+ * the F1 shapes are), and the running charge past the cap.
+ */
+export const WIDTH_422 = /^query (has \d+ function bindings, more than the \d+ the width cap allows|stopped after function bindings copied [\d,]+ values \(the width cap\))/;
+
+/**
  * Sends F1 query `q` four times: each must answer the width-cap 422, and the median of the last
  * three within F1_MS (the first also pays for compiling the code it runs, and as in the bench a
  * single run after the bulk inserts can pay for collecting their garbage, which the cap does not
@@ -515,7 +521,7 @@ export const NAMED_AT_SCALE = {
 export async function checkF1(stub, q) {
   const runs = await timed(() => call(stub, "POST", "/semantic/query", { query: q }), 4);
   for (const { res } of runs) {
-    if (res.status !== 422 || !/^query stopped after function bindings copied [\d,]+ values \(the width cap\)/.test(res.json?.error ?? "")) {
+    if (res.status !== 422 || !WIDTH_422.test(res.json?.error ?? "")) {
       throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
     }
   }

@@ -145,7 +145,8 @@ const fakeStub = ({ status, body, delay = 0, log } = {}) => ({
     return new Response(JSON.stringify(body), { status });
   },
 });
-const WIDTH_422 = { error: "query stopped after function bindings copied 40,000 values (the width cap): each function binding copies every column" };
+const WIDTH_422 = { error: "query stopped after function bindings copied 100,000 values (the width cap): each function binding copies every column" };
+const BINDINGS_422 = { error: "query has 176 function bindings, more than the 12 the width cap allows: each function binding copies every column" };
 const SCAN_422 = { error: "query stopped after scanning 20,000 datoms (the scan cap); narrow it" };
 
 test("each named query's check compares every row's cells, so the right count of wrong rows fails", async () => {
@@ -179,6 +180,8 @@ test("each named query's check compares every row's cells, so the right count of
 test("checkF1 passes a quick width-cap 422 and fails a 200, another cap's 422, or a slow 422", async () => {
   const { checkF1, F1_MS } = await import(script);
   assert.match(await checkF1(fakeStub({ status: 422, body: WIDTH_422 }), "[:find]"), /median \d+ ms/);
+  assert.match(await checkF1(fakeStub({ status: 422, body: BINDINGS_422 }), "[:find]"), /median \d+ ms/);
+  await assert.rejects(checkF1(fakeStub({ status: 422, body: { error: "query has 13 function calls (the call cap)" } }), "[:find]"), /HTTP 422/);
   await assert.rejects(checkF1(fakeStub({ status: 200, body: { rows: [[100]] } }), "[:find]"), /HTTP 200/);
   await assert.rejects(checkF1(fakeStub({ status: 422, body: SCAN_422 }), "[:find]"), /HTTP 422: .*scan cap/);
   await assert.rejects(checkF1(fakeStub({ status: 422, body: WIDTH_422, delay: F1_MS + 20 }), "[:find]"), /expected under 100 ms/);

@@ -20,8 +20,9 @@
 // reports the work each bound counted. Every Bench Project page is older than 30 days, so
 // projects-untouched reads every block on them; open-tasks-by-client reads each task's
 // :block/refs as its clients, which walks as a node property does. --width runs the F1 shapes
-// (many function bindings over one page's blocks) and the 3-binding query over 2,500 blocks
-// through run-query under the width cap, or --width-cap, and reports the width charged.
+// (many function bindings over one page's blocks; more than 12, so the width cap refuses them
+// before they run) and the 3-binding query over 2,500 blocks through run-query under the width
+// cap, or --width-cap, and reports the width charged.
 //
 // Warm times are medians over --runs runs on the conn the cold run warmed. The numbers are a guide:
 // Node on a developer machine is not a Durable Object on Cloudflare's hardware.
@@ -395,7 +396,7 @@ export function runShape(ns, shape, db, scanCap, given = BODIES[shape], widthCap
       : error.includes("(the join cap)") ? "join-cap"
       : error.includes("(the value cap)") ? "value-cap"
       : error.includes("(the scan cap)") ? "scan-cap"
-      : error.includes("(the width cap)") ? "width-cap"
+      : error.includes("(the width cap)") || error.includes("the width cap allows") ? "width-cap"
       : "refused";
     return { ms, scanned, width, outcome, rows: 0, error };
   }

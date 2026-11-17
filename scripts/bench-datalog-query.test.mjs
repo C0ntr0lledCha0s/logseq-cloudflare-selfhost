@@ -238,7 +238,7 @@ test("--bounds stops a named query at the bound it names, and --bounds refuses a
   assert.match(notWhole.stderr, /--bounds: reads needs a whole number/);
 });
 
-test("--width --json gives one record per width shape with the width charged, the F1 shapes stopped at the width cap and the 3-binding query answered", { skip, timeout: 300_000 }, () => {
+test("--width --json gives one record per width shape with the width charged, the F1 shapes refused by the width cap before running and the 3-binding query answered", { skip, timeout: 300_000 }, () => {
   const run = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "2", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(run.status, 0, run.stderr);
   const out = JSON.parse(run.stdout);
@@ -247,23 +247,27 @@ test("--width --json gives one record per width shape with the width charged, th
   assert.deepEqual(out.records.map((r) => r.shape), WIDTH);
   for (const r of out.records) {
     for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${r.shape}: ${k}`);
-    assert.ok(Number.isInteger(r.width) && r.width > 0, `${r.shape}: width ${r.width}`);
+    assert.ok(Number.isInteger(r.width) && r.width >= 0, `${r.shape}: width ${r.width}`);
   }
   const at = (shape) => out.records.find((r) => r.shape === shape);
   for (const shape of WIDTH.slice(0, 3)) {
     assert.equal(at(shape).outcome, "width-cap", `${shape}: ${at(shape).error}`);
-    assert.ok(at(shape).width > out.width_cap, `${shape}: charged past the cap`);
+    // More than 12 function bindings: refused before anything runs, so nothing is charged.
+    assert.match(at(shape).error, /^query has \d+ function bindings, more than the 12 the width cap allows/);
+    assert.equal(at(shape).width, 0, `${shape}: charged nothing`);
   }
   assert.equal(at("three-bindings").outcome, "rows");
   // ?p and ?e are bound before the title's get-else adds ?t, and each binding after adds a column:
   // the upstream suite's legitimate 3-binding query charges the same 30,000.
   assert.equal(at("three-bindings").width, 2500 * (3 + 4 + 5));
 
-  const raised = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1", "--width-cap", "100000000", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
-  assert.equal(raised.status, 0, raised.stderr);
-  const r2 = JSON.parse(raised.stdout);
-  assert.equal(r2.width_cap, 100000000);
-  assert.equal(r2.records.find((r) => r.shape === "f1-includes-20").outcome, "rows", "a higher --width-cap lets a shape through");
+  const lowered = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1", "--width-cap", "20000", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(lowered.status, 0, lowered.stderr);
+  const r2 = JSON.parse(lowered.stdout);
+  assert.equal(r2.width_cap, 20000);
+  const three = r2.records.find((r) => r.shape === "three-bindings");
+  assert.equal(three.outcome, "width-cap", "a lower --width-cap stops the 3-binding query while it runs");
+  assert.ok(three.width > 20000, `charged past the cap: ${three.width}`);
 });
 
 test("--named and --width skip naming the missing build, and refuse being given together", () => {
@@ -290,5 +294,5 @@ test("text output in --named and --width prints a row per query or shape", { ski
   const width = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1"], { encoding: "utf8" });
   assert.equal(width.status, 0, width.stderr);
   for (const s of WIDTH) assert.match(width.stdout, new RegExp(`^${s}\\s+150\\s`, "m"));
-  assert.match(width.stdout, /width cap 40,000/);
+  assert.match(width.stdout, /width cap 100,000/);
 });
