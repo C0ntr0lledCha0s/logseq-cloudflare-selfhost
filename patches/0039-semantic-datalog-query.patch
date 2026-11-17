@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..3ec4a4a
+index 0000000..6f7b7c3
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1450 @@
+@@ -0,0 +1,1466 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -1290,6 +1290,22 @@ index 0000000..3ec4a4a
 +  (let [cap (some-> self (unchecked-get field))]
 +    (when (and (integer? cap) (not (neg? cap))) cap)))
 +
++(defn named-bounds
++  "The named queries' bounds: named-queries/default-bounds, with any a test set on the Durable Object
++  in `namedQueryBounds` (a JS object of bound names to numbers) in place of the default. Only known
++  bound names with non-negative whole numbers are kept; anything else is dropped, as test-cap drops
++  a bad cap. No request can set it."
++  [^js self]
++  (let [given (some-> self (unchecked-get "namedQueryBounds"))
++        defaults named-queries/default-bounds]
++    (if-not (and (object? given) (not (array? given)))
++      defaults
++      (into defaults
++            (for [k (js-keys given)
++                  :let [bound (keyword k) v (unchecked-get given k)]
++                  :when (and (contains? defaults bound) (integer? v) (not (neg? v)))]
++              [bound v])))))
++
 +(defn handle-query
 +  "POST /query: refuses an E2EE graph first, then a body, query or inputs that can't run (rules
 +  included: a caller's query takes none), and otherwise answers the dry run or the rows."
@@ -1479,10 +1495,10 @@ index d8e3144..ea2f038 100644
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 new file mode 100644
-index 0000000..ff97074
+index 0000000..eae6264
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,244 @@
 +(ns logseq.db-sync.worker.named-queries
 +  "The named queries runNamedQuery runs (patch 0039), as data. Each entry is a map in the shape of
 +  Logseq's advanced query, {:title :query :rules :params}, so its {:query :inputs} pair can be
@@ -1508,7 +1524,133 @@ index 0000000..ff97074
 +  first of several values. One other scan is left, because no index leads from a page to its blocks: projects-untouched's not-join reads :block/page for every
 +  block when two or more stale pages remain, so on a graph above about 20,000 blocks it can answer
 +  422. A tag with tags extending it binds two or more classes, so its :block/tags pattern scans
-+  :block/tags (every tagged page and block) once.")
++  :block/tags (every tagged page and block) once.
++
++  Below the entries' replacement is being built: counted index reads (datoms*, first-value*),
++  named bounds (charge!, default-bounds) and a lazy, memoised private? (private-fn) that answers as
++  the handler's private-ids does, so the queries can walk the indexes as code under bounds that
++  name what to narrow. No route calls them yet."
++  (:require [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.worker.graph-insights :as graph-insights]))
++
++;; Counted index reads
++;; ===================
++;;
++;; A named query walks Datascript's indexes through a context `ctx`, {:db :query :bounds :work}:
++;; the db value (never the conn), the query's name, its bounds (a map of bound name to number) and
++;; :work, a volatile map of what each bound has counted so far. Every datom read goes through
++;; datoms* or first-value*, which charge :reads, and a query charges its candidate bounds itself
++;; with charge!. A charge that passes a bound throws, so work is bounded by counts, never by the
++;; clock (which does not move during synchronous CPU work in a Worker).
++
++(def default-bounds
++  "Each bound's provisional value, until the bench sets them. :reads is the backstop over every
++  read, privacy walks included; the rest count a query's candidates."
++  {:meetings 5000
++   :decisions 20000
++   :ancestor-steps 50000
++   :tagged 20000
++   :page-blocks 20000
++   :tasks 50000
++   :open-tasks 5000
++   :reads 100000})
++
++(defn- bump! [{:keys [bounds work] :as ctx} bound n]
++  (let [limit (get bounds bound)
++        counted (get (vswap! work update bound (fnil + 0) n) bound)]
++    (when (nil? limit)
++      (throw (js/Error. (str "named query: no bound " bound))))
++    (when (> counted limit)
++      (throw (ex-info (str (:query ctx) " stopped at its " (name bound) " bound")
++                      {::bound {:query (:query ctx) :bound bound :value limit}})))))
++
++(defn charge!
++  "Counts `n` toward `bound` and toward :reads (the backstop over everything). Past either, throws
++  (ex-info … {::bound {:query :bound :value}}) naming the bound passed and its value: at the bound
++  is allowed, one past it is not."
++  [ctx bound n]
++  (bump! ctx bound n)
++  (when-not (= :reads bound)
++    (bump! ctx :reads n)))
++
++(defn datoms*
++  "d/datoms over `index` and `components`, as a lazy sequence that charges one read per datom
++  realised, not for the range: taking 3 of 10 charges 3."
++  [ctx index & components]
++  (letfn [(step [s]
++            (lazy-seq
++             (when-let [s (seq s)]
++               (charge! ctx :reads 1)
++               (cons (first s) (step (rest s))))))]
++    (step (apply d/datoms (:db ctx) index components))))
++
++(defn first-value*
++  "The first value of `attr` on entity `e`, or nil; charges one read."
++  [ctx e attr]
++  (charge! ctx :reads 1)
++  (:v (first (d/datoms (:db ctx) :eavt e attr))))
++
++;; Privacy without the private set
++;; ===============================
++
++(defn private-fn
++  "A memoised `private?` for one request, giving the answer (contains? (private-ids db) e) gives
++  without building the set. An entity is a root when it has deleted-at (the Recycle bin) or a tag
++  that is a class whose lineage (the class and every class it extends) holds one titled private
++  in any case; it is private when it is a root or its :block/parent or :block/page is private. The
++  walk up is iterative, each read charged to :reads, and memoised, so each distinct ancestor costs
++  one walk per request; each class's verdict is memoised too."
++  [{:keys [db] :as ctx}]
++  (let [lineage (graph-insights/class-lineage-fn db)
++        tag-class (d/entid db :logseq.class/Tag)
++        class-memo (volatile! {})
++        private-class? (fn [c]
++                         (let [known (get @class-memo c ::unknown)]
++                           (if (not= ::unknown known)
++                             known
++                             (let [_ (charge! ctx :reads 1)
++                                   class? (some? (first (d/datoms db :eavt c :block/tags tag-class)))
++                                   classes (when class? (lineage c))
++                                   _ (charge! ctx :reads (count classes))
++                                   v (boolean (some #(= "private" (some-> (:block/title %) string/lower-case)) classes))]
++                               (vswap! class-memo assoc c v)
++                               v))))
++        root? (fn [e]
++                (or (some? (first-value* ctx e :logseq.property/deleted-at))
++                    (boolean (some (comp private-class? :v) (datoms* ctx :eavt e :block/tags)))))
++        memo (volatile! {})]
++    (fn private? [e]
++      (let [known (get @memo e)]
++        (if (some? known)
++          known
++          ;; Depth first up the parent and page edges, with an explicit stack: an entity is decided
++          ;; once both its parent and its page are. An entity met again while its own walk is open
++          ;; (a cycle, which the outliner never writes) counts as not private for that edge.
++          (loop [stack [e] open {}]
++            (if-let [x (peek stack)]
++              (cond
++                (contains? @memo x) (recur (pop stack) open)
++                (contains? open x)
++                (let [ups (get open x)
++                      v (boolean (some #(get @memo %) ups))]
++                  (vswap! memo assoc x v)
++                  (recur (pop stack) (dissoc open x)))
++                (root? x) (do (vswap! memo assoc x true) (recur (pop stack) open))
++                :else
++                (let [ups (keep identity [(first-value* ctx x :block/parent) (first-value* ctx x :block/page)])
++                      todo (remove #(or (contains? @memo %) (contains? open %)) ups)]
++                  (recur (into stack todo) (assoc open x ups))))
++              (get @memo e))))))))
++
++(defn visible-ref?
++  "True when ref value `v` may be shown: where d/filter hid a ref datom to a private entity (tags,
++  client values, property values), a named query asks this."
++  [private? v]
++  (not (private? v)))
++
++;; The Datalog entries
++;; ===================
 +
 +(def ^:private days-bounds [1 3650])
 +
@@ -1747,10 +1889,10 @@ index 1365b0a..1afdf96 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..f385eb4
+index 0000000..3d80a57
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,2744 @@
+@@ -0,0 +1,3018 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query,
 +  inputs and rules as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -4495,6 +4637,280 @@ index 0000000..f385eb4
 +          (is (= [422 (rule-cap-message (format-n (dec work)) (rule-cap-levels (dec work)))]
 +                 [(:status over-cap) (get-in over-cap [:body :error])])
 +              (head-of over-cap)))))))
++
++
++;; Named queries as code (stage 1): counted index reads, named bounds and a lazy private?
++;; ======================================================================================
++
++(defn- walk-ctx
++  "A named-query context over `db`: the default bounds with `overrides`, and no work yet."
++  ([db] (walk-ctx db {}))
++  ([db overrides]
++   {:db db :query "test-walk" :bounds (merge named-queries/default-bounds overrides) :work (volatile! {})}))
++
++(defn- work [ctx k] (get @(:work ctx) k 0))
++
++(defn- bound-data
++  "The ::bound data `f` throws, or :no-throw."
++  [f]
++  (try (f) :no-throw
++       (catch :default e (or (::named-queries/bound (ex-data e)) [:other (ex-message e)]))))
++
++(defn- prng
++  "A seeded generator of ints below n (mulberry32), so a failing graph can be rebuilt from its seed."
++  [seed]
++  (let [state (volatile! (bit-or seed 0))]
++    (fn [n]
++      (let [t (vswap! state #(bit-or (+ % 0x6D2B79F5) 0))
++            t (js/Math.imul (bit-xor t (unsigned-bit-shift-right t 15)) (bit-or t 1))
++            t (bit-xor t (+ t (js/Math.imul (bit-xor t (unsigned-bit-shift-right t 7)) (bit-or t 61))))
++            u (unsigned-bit-shift-right (bit-xor t (unsigned-bit-shift-right t 14)) 0)]
++        (mod u n)))))
++
++(defn- random-tree
++  "Block maps for one block-trees insert: `n` blocks at most `depth` deep, shaped by `rand`."
++  [rand prefix n depth]
++  (let [counter (volatile! 0)
++        node (fn node [d]
++               (let [i (vswap! counter inc)
++                     kids (if (and (< d depth) (< @counter n)) (rand 3) 0)]
++                 (cond-> {:title (str prefix " " i)}
++                   (pos? kids) (assoc :children (vec (keep (fn [_] (when (< @counter n) (node (inc d)))) (range kids)))))))]
++    (loop [acc []] (if (< @counter n) (recur (conj acc (node 1))) acc))))
++
++(defn- tree-uuids [blocks]
++  (mapcat (fn [b] (cons (uuid (:uuid b)) (tree-uuids (:children b)))) blocks))
++
++(defn- seed-random-graph
++  "A graph shaped by `seed`, written through the real handler: tags (a private one titled Private,
++  PRIVATE or private by seed, Secret extending it, Hush extending Secret, and two ordinary ones),
++  four pages with random block trees, random tags on pages and blocks, blocks moved to another
++  page, a page moved to the Recycle bin (deletePage), a deleted block (delete_block retracts it and
++  its children, so it is simply gone), and one block whose :block/page is set apart from its
++  parent chain (a stale page ref, as an uploaded graph can hold: the API keeps them in step)."
++  [seed]
++  (let [rand (prng seed)
++        private-title (["Private" "PRIVATE" "private"] (mod seed 3))
++        tags [private-title "zq Secret" "zq Hush" "zq Topic" "zq Project"]]
++    (p/let [conn (sqlite-export/create-conn)
++            self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++            tag! (fn [body] (ok! (request! self "POST" "/semantic/tags" body) 201))
++            _ (tag! {:title private-title})
++            _ (tag! {:title "zq Secret" :extends [private-title]})
++            _ (tag! {:title "zq Hush" :extends ["zq Secret"]})
++            _ (tag! {:title "zq Topic"})
++            _ (tag! {:title "zq Project"})
++            pages (p/all (for [i (range 4)]
++                           (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title (str "zq page " seed " " i)}) 201)]
++                             (uuid-of r))))
++            trees (p/all (for [[i page] (map-indexed vector pages)]
++                           (insert! self page (random-tree rand (str "zq b" seed "-" i) (+ 8 (rand 12)) 4))))
++            blocks (vec (mapcat tree-uuids trees))
++            nodes (into (vec pages) blocks)
++            ;; One write at a time: the outliner's writes on one conn don't interleave.
++            _ (reduce (fn [acc _]
++                        (p/let [_ acc] (set-tags! self (nodes (rand (count nodes))) [(tags (rand (count tags)))])))
++                      (p/resolved nil) (range (+ 3 (rand 5))))
++            first-ids (mapv (comp uuid :uuid first) trees)
++            move! (fn [block target]
++                    (ok! (request! self "POST" "/semantic/block-moves"
++                                   {:block-ids [(str block)] :target-id (str target) :position "last-child"})
++                         200))
++            ;; The last block of page 0's tree to the first top-level block of page 1, and of page 2's to page 3's.
++            _ (move! (last (tree-uuids (nth trees 0))) (first-ids 1))
++            _ (move! (last (tree-uuids (nth trees 2))) (first-ids 3))
++            _ (ok! (request! self "DELETE" (str "/semantic/pages/" (pages (rand 4))) nil) 200)
++            _ (ok! (request! self "DELETE" (str "/semantic/blocks/" (blocks (rand (count blocks)))) nil) 200)
++            ;; delete_block retracts the block and its children; the stale ref's parent is one that's left.
++            left (filterv #(d/entity @conn [:block/uuid %]) blocks)]
++      (d/transact! conn [{:block/uuid (random-uuid) :block/title (str "zq stale page ref " seed)
++                          :block/page [:block/uuid (pages (rand 4))] :block/parent [:block/uuid (left (rand (count left)))]
++                          :block/order "a0" :block/created-at 1 :block/updated-at 1}])
++      {:conn conn :self self})))
++
++(deftest private-fn-matches-private-ids-test
++  ;; private? decides one entity at a time, walking up :block/parent and :block/page; private-ids
++  ;; walks down from every root. They must agree on every entity, or a named query leaks what
++  ;; datalog_query hides (or hides what it shows).
++  (async done
++    (-> (reduce
++         (fn [acc seed]
++           (p/let [_ acc
++                   {:keys [conn]} (seed-random-graph seed)]
++             (let [db @conn
++                   expected (datalog/private-ids db)
++                   ctx (walk-ctx db {:reads 10000000})
++                   private? (named-queries/private-fn ctx)
++                   ids (distinct (map :e (d/datoms db :eavt)))
++                   wrong (vec (for [e ids :when (not= (contains? expected e) (private? e))]
++                                [e (:block/title (d/entity db e)) (contains? expected e)]))]
++               (is (= [] wrong) (str "seed " seed ": entities where private? and private-ids differ"))
++               (is (< 3 (count (filter #(and (contains? expected %) (string/includes? (str (:block/title (d/entity db %))) "zq")) ids)))
++                   (str "seed " seed ": the graph holds private zq entities to compare")))))
++         (p/resolved nil) (range 1 31))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest private-fn-cases-test
++  ;; The cases private-ids covers, one at a time: the private tag in any case, a tag extending a tag
++  ;; extending it, a page's blocks, a private block's descendants, a moved block, a stale page ref,
++  ;; the Recycle bin and a public block.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes public-note public-child hidden-child plan-block hush-plans public-plans private-plans private-tag]}]
++        (p/let [_ (ok! (request! self "POST" "/semantic/tags" {:title "zq LOUD"}) 201)
++                [moved] (insert! self notes [{:title "zq to move" :children [{:title "zq moved child"}]}])
++                _ (ok! (request! self "POST" "/semantic/block-moves"
++                                 {:block-ids [(:uuid moved)] :target-id (str hidden-child) :position "last-child"}) 200)
++                recycled (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title "zq Recycled"}) 201)] (uuid-of r))
++                [recycled-block] (insert! self recycled [{:title "zq recycled" :children [{:title "zq recycled child"}]}])
++                _ (ok! (request! self "DELETE" (str "/semantic/pages/" recycled) nil) 200)
++                shouting (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title "zq Shouting"}) 201)] (uuid-of r))
++                _ (ok! (request! self "PATCH" (str "/semantic/tags/" private-tag) {:title "PRIVATE"}) 200)
++                _ (set-tags! self shouting ["PRIVATE"])
++                [shout-block] (insert! self shouting [{:title "zq shouted"}])]
++          (d/transact! conn [{:block/uuid (random-uuid) :block/title "zq stale private block"
++                              :block/page [:block/uuid private-plans] :block/parent [:block/uuid public-note]
++                              :block/order "a1" :block/created-at 1 :block/updated-at 1}])
++          (let [db @conn
++                id (fn [u] (:db/id (d/entity db [:block/uuid (uuid (str u))])))
++                by-title (fn [t] (ffirst (d/q '[:find ?e :in $ ?t :where [?e :block/title ?t]] db t)))
++                private? (named-queries/private-fn (walk-ctx db))
++                expected (datalog/private-ids db)
++                cases [["a page tagged PRIVATE (the Private tag renamed)" (id shouting) true]
++                       ["a block on that page" (id (:uuid shout-block)) true]
++                       ["a page tagged Hush, which extends Secret, which extends Private" (id hush-plans) true]
++                       ["a block on a private page" (id plan-block) true]
++                       ["a block under a private block" (id hidden-child) true]
++                       ["a block moved under a private block, and its child" (id (:uuid moved)) true]
++                       ["the moved block's child" (by-title "zq moved child") true]
++                       ["a block whose page is private but whose parent chain is not" (by-title "zq stale private block") true]
++                       ["a page in the Recycle bin" (id recycled) true]
++                       ["a block on a recycled page" (id (:uuid recycled-block)) true]
++                       ["a block under that block" (by-title "zq recycled child") true]
++                       ["a public page" (id public-plans) false]
++                       ["a public block" (id public-child) false]
++                       ["the private tag itself" (by-title "PRIVATE") false]
++                       ["a tag titled LOUD, not private" (by-title "zq LOUD") false]]]
++            (doseq [[label e want] cases]
++              (testing label
++                (is (some? e))
++                (is (= want (contains? expected e)) "private-ids agrees with the case")
++                (is (= want (private? e)))))))))))
++
++(deftest counted-reads-test
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "zq Counted"}) 201)
++                pages (p/all (for [i (range 10)]
++                               (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title (str "zq counted " i)}) 201)]
++                                 (uuid-of r))))
++                _ (reduce (fn [acc page] (p/let [_ acc] (set-tags! self page ["zq Counted"]))) (p/resolved nil) pages)]
++          (let [db @conn
++                tag (ffirst (d/q '[:find ?e :where [?e :block/title "zq Counted"]] db))]
++            (testing "datoms* charges one read per datom realised, not for the range"
++              (let [ctx (walk-ctx db)
++                    s (named-queries/datoms* ctx :avet :block/tags tag)]
++                (is (= 0 (work ctx :reads)) "nothing is charged before a datom is realised")
++                (is (= 3 (count (doall (take 3 s)))))
++                (is (= 3 (work ctx :reads)))
++                (is (= 10 (count (doall s))))
++                (is (= 10 (work ctx :reads)) "the whole range of 10 charges 10")))
++            (testing "datoms* over EAVT charges the same way"
++              (let [ctx (walk-ctx db)
++                    e (:e (first (d/datoms db :avet :block/tags tag)))]
++                (is (= (count (d/datoms db :eavt e)) (count (doall (named-queries/datoms* ctx :eavt e)))))
++                (is (= (count (d/datoms db :eavt e)) (work ctx :reads)))))
++            (testing "first-value* charges 1 and returns the value"
++              (let [ctx (walk-ctx db)
++                    e (:e (first (d/datoms db :avet :block/tags tag)))]
++                (is (string/starts-with? (named-queries/first-value* ctx e :block/title) "zq counted "))
++                (is (nil? (named-queries/first-value* ctx e :logseq.property/deleted-at)))
++                (is (= 2 (work ctx :reads)))))
++            (testing "charge! counts up to its bound, throws one past it, and bumps reads too"
++              (let [ctx (walk-ctx db {:tagged 2})]
++                (named-queries/charge! ctx :tagged 1)
++                (named-queries/charge! ctx :tagged 1)
++                (is (= 2 (work ctx :tagged)) "at the bound is allowed")
++                (is (= 2 (work ctx :reads)))
++                (is (= {:query "test-walk" :bound :tagged :value 2}
++                       (bound-data #(named-queries/charge! ctx :tagged 1))))
++                (is (= 3 (work ctx :tagged)) "work shows the bound + 1")))
++            (testing "a charge of n past the bound in one step throws"
++              (let [ctx (walk-ctx db {:meetings 4})]
++                (named-queries/charge! ctx :meetings 3)
++                (is (= {:query "test-walk" :bound :meetings :value 4}
++                       (bound-data #(named-queries/charge! ctx :meetings 2))))))
++            (testing "reads is a backstop over every charge: past its own bound it throws naming reads"
++              (let [ctx (walk-ctx db {:reads 5})]
++                (named-queries/charge! ctx :tagged 3)
++                (is (= {:query "test-walk" :bound :reads :value 5}
++                       (bound-data #(named-queries/charge! ctx :tagged 3))))))
++            (testing "datoms* past reads throws, after realising only the reads allowed"
++              (let [ctx (walk-ctx db {:reads 4})]
++                (is (= {:query "test-walk" :bound :reads :value 4}
++                       (bound-data #(doall (named-queries/datoms* ctx :avet :block/tags tag)))))
++                (is (= 5 (work ctx :reads)))))
++            (testing "first-value* past reads throws"
++              (let [ctx (walk-ctx db {:reads 0})]
++                (is (= {:query "test-walk" :bound :reads :value 0}
++                       (bound-data #(named-queries/first-value* ctx 1 :block/title))))))
++            (testing "a bound of 0 throws on the first charge"
++              (let [ctx (walk-ctx db {:open-tasks 0})]
++                (is (= {:query "test-walk" :bound :open-tasks :value 0}
++                       (bound-data #(named-queries/charge! ctx :open-tasks 1))))))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest private-fn-is-memoised-test
++  ;; Asking about every block of a 40-level chain, deepest first, walks each ancestor once: reads
++  ;; grow with the chain, not its square. Without the memo the deepest block's walk would be
++  ;; repeated for each block above it.
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                _ (tag-pairs! self ["zq Chain Top" "zq Chain End"])
++                page (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title "zq Chain"}) 201)] (uuid-of r))
++                _ (deep-chain! self page "zq level" 40 "zq Chain Top" "zq Chain End")]
++          (let [db @conn
++                chain (->> (d/q '[:find ?e ?t :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq level ")]] db)
++                           (sort-by #(js/parseInt (subs (second %) 9)))
++                           (mapv first))
++                ctx (walk-ctx db)
++                private? (named-queries/private-fn ctx)]
++            (is (= 40 (count chain)))
++            (is (every? false? (map private? (reverse chain))))
++            (let [reads (work ctx :reads)]
++              (is (<= reads (* 8 41)) (str "reads linear in the chain: " reads))
++              (is (every? false? (map private? chain)))
++              (is (= reads (work ctx :reads)) "asking again reads nothing"))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest named-bounds-field-test
++  ;; namedQueryBounds is a test field on the Durable Object, read the way test-cap reads
++  ;; datalogScanCap: only known bound names with non-negative whole numbers; anything else is
++  ;; dropped, never a 500. No request can set it.
++  (let [defaults named-queries/default-bounds
++        bounds (fn [v] (datalog/named-bounds (if (= ::unset v) #js {} #js {:namedQueryBounds v})))]
++    (testing "the defaults, with nothing set"
++      (is (= defaults (bounds ::unset)))
++      (is (= defaults (datalog/named-bounds nil))))
++    (testing "a known name overrides its default"
++      (is (= (assoc defaults :tagged 3) (bounds #js {:tagged 3})))
++      (is (= (assoc defaults :ancestor-steps 0 :reads 7) (bounds #js {"ancestor-steps" 0 :reads 7}))))
++    (testing "unknown names, strings, negatives, fractions and non-numbers are dropped"
++      (is (= (assoc defaults :tagged 3)
++             (bounds #js {:tagged 3 :bogus 5 :meetings "7" :decisions -1 :tasks 2.5 :open-tasks nil
++                          :page-blocks true :reads #js [1]}))))
++    (testing "a field that is not an object gives the defaults"
++      (doseq [v ["tagged" 3 #js [3] true]]
++        (is (= defaults (bounds v)) (pr-str v))))
++    (testing "the default bounds, provisional until the bench sets them"
++      (is (= {:meetings 5000 :decisions 20000 :ancestor-steps 50000 :tagged 20000 :page-blocks 20000
++              :tasks 50000 :open-tasks 5000 :reads 100000}
++             defaults)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
