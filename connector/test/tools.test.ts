@@ -2584,6 +2584,8 @@ describe("queries help", () => {
     ["what the text cap counts", "text the functions and aggregates return counts toward"],
     ["the work cap's number", "every not, not-join, or and or-join charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap"],
     ["the call cap's number", "every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap"],
+    ["the width cap's number", "every function binding charges the rows x columns of the relation it returns toward 50,000 copied values per query (the width cap"],
+    ["how to stay under the width cap", "bind fewer values with functions or narrow the rows first"],
     ["the Recycle bin", "and so is anything in the Recycle bin"],
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
     ["the 422", "is refused with 422, never answered in part"],
@@ -2619,6 +2621,7 @@ describe("queries help", () => {
     ["text cap", /([\d,]+) characters of text per query \(the text cap/],
     ["call cap", /([\d,]+) function calls per query \(the call cap/],
     ["work cap", /([\d,]+) rows of relation work per query \(the work cap/],
+    ["width cap", /([\d,]+) copied values per query \(the width cap/],
   ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
     const query = (await listTools()).find((t) => t.name === "datalog_query");
     const server = query.description.match(pattern)?.[1];
