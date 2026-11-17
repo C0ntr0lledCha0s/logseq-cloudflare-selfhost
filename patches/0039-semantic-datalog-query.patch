@@ -1351,7 +1351,7 @@ index 0000000..258ccb6
 +                                          :bounds bounds :dry-run true}
 +                 :else (run-named db query-name entry resolved bounds (or (:limit body) default-limit)))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d8e3144..8150c14 100644
+index d8e3144..a5f9abe 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -15,6 +15,7 @@
@@ -1370,37 +1370,45 @@ index d8e3144..8150c14 100644
              [promesa.core :as p]))
  
  (def ^:private default-limit 50)
-@@ -1984,6 +1986,22 @@
+@@ -1984,6 +1986,30 @@
         (filter #(or (page? %) (tag? %) (property? %)))
         (sort-by :db/id)))
  
 +(defn- page-title-character-refusal
 +  "The 400 message for a plaintext page title holding a character the outliner refuses in one (\"/\"
 +  outside a date, or \"#\"), checked on the title as createPage stores it; nil when it has none.
-+  The outliner only refuses once the write has started, which answered 500."
-+  [title]
-+  (try
-+    (outliner-validate/validate-page-title-characters (outliner-page/sanitize-title title) nil)
-+    nil
-+    (catch :default error
-+      (let [data (ex-data error)]
-+        (if (= :notification (:type data))
-+          (str "title: a page title can't include \""
-+               (if (= :page.validation/name-no-hash (get-in data [:payload :i18n-key])) "#" "/")
-+               "\" (" title ")")
-+          (throw error))))))
++  The outliner only refuses once the write has started, which answered 500. It refuses \"#\" on
++  every create, but \"/\" only for a new page: a recycled page (tagged Page, as the outliner looks
++  it up) is restored under its own title, so only \"#\" is checked then."
++  [db title]
++  (let [title' (outliner-page/sanitize-title title)
++        restore? (some->> (first (ldb/page-exists? db title' #{:logseq.class/Page}))
++                          (d/entity db)
++                          ldb/recycled?)]
++    (try
++      (if restore?
++        (outliner-validate/validate-page-title-no-hashtag title' nil)
++        (outliner-validate/validate-page-title-characters title' nil))
++      nil
++      (catch :default error
++        (let [data (ex-data error)]
++          (if (= :notification (:type data))
++            (str "title: a page title can't include \""
++                 (if (= :page.validation/name-no-hash (get-in data [:payload :i18n-key])) "#" "/")
++                 "\" (" title ")")
++            (throw error)))))))
 +
  (defn- title-taken-response
    "409 naming each holder of `title`. createTag passes `promotable?`: a holder it accepts gets a
    pointer to promote_page_to_tag in the message and promote: true in its existing[] entry."
-@@ -2498,10 +2516,13 @@
+@@ -2498,10 +2524,13 @@
      :semantic/pages-create
      (p/let [body (body-clj request)
              holders (when (and (not e2ee?) (non-blank-string? (:title body)))
 -                      (title-holders db (:title body)))]
 +                      (title-holders db (:title body)))
 +            character-refusal (when (and (not e2ee?) (non-blank-string? (:title body)))
-+                                (page-title-character-refusal (:title body)))]
++                                (page-title-character-refusal db (:title body)))]
        (cond
          (not (non-blank-string? (:title body))) (http/bad-request "missing title")
          (seq holders) (title-taken-response (:title body) holders)
@@ -1408,7 +1416,7 @@ index d8e3144..8150c14 100644
          :else
          (let [[title page-id] (authored-write! conn creator outliner-page/create! (:title body)
                                                       {:encrypted-title? e2ee? :encrypted-name (:name body)})]
-@@ -5513,6 +5534,10 @@
+@@ -5513,6 +5542,10 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -1850,7 +1858,7 @@ index 0000000..e6dd3bc
 +         rows (run ctx inputs)]
 +     {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..d43e338 100644
+index 1365b0a..de944bb 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1870,7 +1878,7 @@ index 1365b0a..d43e338 100644
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
     "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
 -   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
-+   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
++   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A page in the Recycle bin is restored instead, even when its title holds \"/\". Not checked on E2EE graphs, whose names are ciphertext."]
     "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
     "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
@@ -5827,7 +5835,7 @@ index 0000000..7b2099e
 +          (is (identical? own after-refused) "restored after a refused query")
 +          (is (pos? direct) "a query outside run-query runs uncharged"))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
-index d0b664a..57bf489 100644
+index d0b664a..7a95374 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 @@ -13,6 +13,7 @@
@@ -5907,14 +5915,74 @@ index d0b664a..57bf489 100644
  (deftest create-page-restores-a-recycled-page-test
    (async done
      (with-graph done
-@@ -305,4 +368,6 @@
+@@ -138,6 +201,57 @@
+           (is (= (:uuid created) (:uuid body)) "Logseq restores it, as in the editor")
+           (is (not (entity-util/hidden? (entity conn (:uuid created))))))))))
+ 
++(deftest create-page-restores-a-recycled-page-whose-title-holds-a-slash-test
++  ;; The outliner restores a recycled page without checking its title's characters, so the
++  ;; up-front "/" refusal must not block the restore. A page titled "zq/probe" can exist from the
++  ;; app or an import; it is renamed here with a direct transact.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (let [rename! (fn [id title]
++                        (d/transact! conn [{:block/uuid (uuid id)
++                                            :block/title title
++                                            :block/name (string/lower-case title)}]))]
++          (p/let [[_ probe] (call "POST" "/pages" {:title "zq probe"})
++                  [_ spaced] (call "POST" "/pages" {:title "zq spaced"})
++                  [_ hashed] (call "POST" "/pages" {:title "zq hashed"})
++                  [_ tag] (call "POST" "/pages" {:title "zq tagged"})
++                  [_ hidden] (call "POST" "/pages" {:title "zq hidden"})
++                  _ (rename! (:uuid probe) "zq/probe")
++                  _ (rename! (:uuid spaced) "zq/spaced")
++                  _ (rename! (:uuid hashed) "zq#hashed")
++                  _ (rename! (:uuid tag) "zq/tagged")
++                  _ (rename! (:uuid hidden) "zq/hidden")
++                  ;; Hidden but not recycled: only a restore is exempt from the "/" check.
++                  _ (d/transact! conn [[:db/add [:block/uuid (uuid (:uuid hidden))] :logseq.property/hide? true]])
++                  deletes (p/all (map #(call "DELETE" (str "/pages/" (:uuid %))) [probe spaced hashed tag]))
++                  _ (is (= [200 200 200 200] (map first deletes)))
++                  ;; A recycled entity under the title that is not tagged Page (here a tag): the
++                  ;; outliner looks for a Page, so it creates a new page and checks the title.
++                  _ (d/transact! conn [[:db/retract [:block/uuid (uuid (:uuid tag))] :block/tags :logseq.class/Page]
++                                       [:db/add [:block/uuid (uuid (:uuid tag))] :block/tags :logseq.class/Tag]])
++                  _ (is (entity-util/hidden? (entity conn (:uuid tag))) "the tag is in the Recycle bin")
++                  [status body] (call "POST" "/pages" {:title "zq/probe"})
++                  [spaced-status spaced-body] (call "POST" "/pages" {:title "  ZQ/Spaced "})
++                  [hash-status hash-body] (call "POST" "/pages" {:title "zq#hashed"})
++                  [tag-status tag-body] (call "POST" "/pages" {:title "zq/tagged"})
++                  [hidden-status hidden-body] (call "POST" "/pages" {:title "zq/hidden"})
++                  [new-status new-body] (call "POST" "/pages" {:title "zq/never"})]
++            (testing "a recycled page with \"/\" in its title is restored"
++              (is (= [201 (:uuid probe) "zq/probe"] [status (:uuid body) (:title body)]) (pr-str body))
++              (is (not (entity-util/hidden? (entity conn (:uuid probe))))))
++            (testing "matched as the outliner matches it: case-insensitively, after trimming"
++              (is (= [201 (:uuid spaced)] [spaced-status (:uuid spaced-body)]) (pr-str spaced-body)))
++            (testing "\"#\" is still refused: the outliner refuses it before it restores"
++              (is (= [400 "title: a page title can't include \"#\" (zq#hashed)"] [hash-status (:error hash-body)]))
++              (is (entity-util/hidden? (entity conn (:uuid hashed)))))
++            (testing "a recycled tag is not restored by createPage, so its title is still checked"
++              (is (= [400 "title: a page title can't include \"/\" (zq/tagged)"] [tag-status (:error tag-body)])))
++            (testing "a hidden page that is not in the Recycle bin is not restored, so the title is still checked"
++              (is (= [400 "title: a page title can't include \"/\" (zq/hidden)"] [hidden-status (:error hidden-body)])))
++            (testing "a title no recycled page holds is still refused"
++              (is (= [400 "title: a page title can't include \"/\" (zq/never)"] [new-status (:error new-body)])))))))))
++
+ (deftest delete-page-with-references-needs-acknowledgement-test
+   (async done
+     (with-graph done
+@@ -305,4 +419,8 @@
        (is (= "#/components/schemas/TitleConflict"
               (get-in paths [path :post :responses "409" :content "application/json" :schema :$ref]))))
      (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
 -                          "no need to search before creating"))))
 +                          "no need to search before creating"))
 +    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
-+                          "Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\""))))
++                          "Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\""))
++    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
++                          "A page in the Recycle bin is restored instead, even when its title holds \"/\"."))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

@@ -1385,7 +1385,7 @@ describe("hand-written tools", () => {
     );
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      'create_page refuses with a 400 a title holding "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title, and names the character.',
+      'create_page refuses with a 400 a title holding "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title, and names the character; a page in the Recycle bin is restored under its own title, "/" included.',
     );
   });
 
