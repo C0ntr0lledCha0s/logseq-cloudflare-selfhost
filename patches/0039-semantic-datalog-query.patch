@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..b21b48f
+index 0000000..258ccb6
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1343 @@
+@@ -0,0 +1,1346 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -108,9 +108,12 @@ index 0000000..b21b48f
 +  and work caps stay low: 175 [(identity ?t) ?rN] clauses over 100 rows answered after 1.9 s. Each
 +  binding charges the rows x columns of the relation it returns; 3 bindings over 2,500 rows charge
 +  30,000. Copying costs about 1.4 us a value in the dev build whatever the hooks do (a plain d/q of
-+  the 42 clauses 100,000 lets through took 124-153 ms), so the cap is 50,000: the F1 shapes stop
-+  after about 70 ms there. Stage 5's bench sets it from the release bundle."
-+  50000)
++  the 42 clauses 100,000 lets through took 124-153 ms), and about 1.5 us in the release bundle, on
++  top of the request's own 20 to 40 ms (the private set grows with the graph). At 50,000 the F1
++  shapes answered 422 after 88 to 102 ms warm in the release bundle on a graph of 20,000 blocks
++  (scripts/release-query-check.mjs), at the edge of the 100 ms they must stop within, so the cap is
++  40,000: about 80 ms there, and a legitimate 3-binding query over 2,500 rows (30,000) still runs."
++  40000)
 +(def byte-cap 100000)
 +(def default-limit 50)
 +(def max-limit 200)
@@ -1372,10 +1375,10 @@ index d8e3144..ea2f038 100644
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 new file mode 100644
-index 0000000..a8784f4
+index 0000000..e6dd3bc
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,424 @@
 +(ns logseq.db-sync.worker.named-queries
 +  "The named queries runNamedQuery runs (patch 0039), as server code that walks Datascript's
 +  indexes, not as Datalog. Each entry is {:title :description :columns :bounds :run :params}; the
@@ -1423,16 +1426,22 @@ index 0000000..a8784f4
 +;; clock (which does not move during synchronous CPU work in a Worker).
 +
 +(def default-bounds
-+  "Each bound's provisional value, until the bench sets them. :reads is the backstop over every
-+  read, privacy walks included; the rest count a query's candidates."
-+  {:meetings 5000
-+   :decisions 20000
-+   :ancestor-steps 50000
-+   :tagged 20000
-+   :page-blocks 20000
-+   :tasks 50000
-+   :open-tasks 5000
-+   :reads 100000})
++  "Each bound's value, set from the release bundle (scripts/release-query-check.mjs and the bench's
++  --named mode). :reads is the backstop over every read, privacy walks included: a counted read
++  costs about 4 us there (3.6 to 4.8 us warm, by query), so 100,000 reads took 360 to 480 ms and
++  meetings-without-decision on 20,000 pages unbounded took 800 ms, while at 30,000 reads each query
++  stops after 90 to 120 ms. The rest count a query's candidates, each set where its query's usual
++  reads per candidate (about 12 per tagged page and per meeting, 10 to 17 per open task, 2 per
++  block, decision or task read, 1 to 5 per ancestor step) reach about that work, so the bound that
++  names what to narrow stops the query before the backstop does."
++  {:meetings 2000
++   :decisions 10000
++   :ancestor-steps 10000
++   :tagged 2500
++   :page-blocks 10000
++   :tasks 10000
++   :open-tasks 2000
++   :reads 30000})
 +
 +(defn- bump! [{:keys [bounds work] :as ctx} bound n]
 +  (let [limit (get bounds bound)
@@ -1795,7 +1804,7 @@ index 0000000..a8784f4
 +         rows (run ctx inputs)]
 +     {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..caa74f6 100644
+index 1365b0a..03a80b3 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1817,17 +1826,17 @@ index 1365b0a..caa74f6 100644
 +   "datalogQuery" ["Run a read-only Datalog query"
 +                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
 +                        " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
-+                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query or inputs is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. Every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap): each clause runs once per joined row, so past it the query stops with 422 naming the cap; narrow the rows before the function clauses. Every not, not-join, or and or-join joins, subtracts or sums every row bound so far, so each charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap), whatever its inner clauses match, and nested ones charge once per level; past it the query stops with 422 naming the cap. Every function binding ([(f ?x) ?y]) copies every column of every row bound so far, so each charges the rows x columns of the relation it returns toward 50,000 copied values per query (the width cap): many bindings over many rows stop with 422 naming the cap, so bind fewer values with functions or narrow the rows first; predicates and data patterns charge nothing. The only source is $. Every where clause must share a variable with the others, through a data pattern, a function binding, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A data pattern joined to two or more bound rows scans its whole attribute, so to step up from bound blocks use get-some, which reads one datom per row ([(get-some $ ?b :block/parent) [_ ?p]])."
++                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query or inputs is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. Every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap): each clause runs once per joined row, so past it the query stops with 422 naming the cap; narrow the rows before the function clauses. Every not, not-join, or and or-join joins, subtracts or sums every row bound so far, so each charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap), whatever its inner clauses match, and nested ones charge once per level; past it the query stops with 422 naming the cap. Every function binding ([(f ?x) ?y]) copies every column of every row bound so far, so each charges the rows x columns of the relation it returns toward 40,000 copied values per query (the width cap): many bindings over many rows stop with 422 naming the cap, so bind fewer values with functions or narrow the rows first; predicates and data patterns charge nothing. The only source is $. Every where clause must share a variable with the others, through a data pattern, a function binding, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A data pattern joined to two or more bound rows scans its whole attribute, so to step up from bound blocks use get-some, which reads one datom per row ([(get-some $ ?b :block/parent) [_ ?p]])."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join and not-join bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too; each character of text inside them counts as a value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
 +                        " Each refusal is a 400 naming the clause (where 2, find, find: pull ?b, :in) or the field (rules) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query and inputs come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
 +   "runNamedQuery" ["Run a named read-only query"
 +                    (str "Runs one of four read-only queries as server code, not Datalog, by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
-+                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. It reads each stale page's blocks, and stops with 422 after 20,000 tagged pages and blocks (its tagged bound) or after reading 20,000 blocks on pages not updated within days (its page-blocks bound): give a narrower tag or a larger days."
-+                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them tagged decision_tag, a decision at any depth; columns created-at (ms) and meeting. It walks up once from each decision-tagged block on a meeting's page, sharing the ancestors walks have already reached, and stops with 422 after 5,000 meetings created within days (its meetings bound), 20,000 blocks tagged decision_tag (its decisions bound) or 50,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
-+                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 50,000 blocks tagged Task (its tasks bound) or when it finds more than 5,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
-+                         " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 20,000 tagged pages and blocks (its tagged bound): give a narrower tag."
-+                         " Every read, the privacy checks' included, counts toward 100,000 reads (its reads bound, the backstop over every read). A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
++                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. It reads each stale page's blocks, and stops with 422 after 2,500 tagged pages and blocks (its tagged bound) or after reading 10,000 blocks on pages not updated within days (its page-blocks bound): give a narrower tag or a larger days."
++                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them tagged decision_tag, a decision at any depth; columns created-at (ms) and meeting. It walks up once from each decision-tagged block on a meeting's page, sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
++                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound) or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
++                         " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
++                         " Every read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read). A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
 +                         " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
 +                         " The response has name, the resolved params (titles and idents; a tag's includes lists the tags extending it), columns, total-rows, returned, truncated, plan (the steps the query took, each with its bound and number) and work (what each bound counted, and reads), then rows."
 +                         " Private content is left out as datalog_query leaves it out: anything tagged Private, on a private page or under a private block is left out (a tag extending Private, and Private in any case, count too), and so is anything in the Recycle bin; a reference to one of those (a tag, a client, a property value) doesn't count. Rows are cut to limit (1 to 200, default 50) and then to about 100,000 characters of JSON (the byte cap), whole rows only; truncated says which applied. A param that doesn't resolve or is out of range answers 400 naming it (params.<name>), never empty rows, including a default the graph doesn't have (no Business Meeting tag, say): pass the graph's own tag or property instead. An unknown name answers 404 listing the names. With dry-run=true the resolved params, the plan and the bounds come back, with nothing read. Unavailable for E2EE graphs (409): titles are ciphertext.")]
@@ -1898,7 +1907,7 @@ index 1365b0a..caa74f6 100644
 +                            "404" {:description "No named query has that name; the error lists the names"}
 +                            "409" {:description "The graph is E2EE"}
 +                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound)"}}
-+           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap), made more than 20,000 function calls (the call cap), did more than 200,000 rows of relation work (the work cap), had function bindings copy more than 50,000 values (the width cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
++           "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap), made more than 20,000 function calls (the call cap), did more than 200,000 rows of relation work (the work cap), had function bindings copy more than 40,000 values (the width cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
@@ -1943,10 +1952,10 @@ index 1365b0a..caa74f6 100644
                                                     :title {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..3e86485
+index 0000000..7b2099e
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,3787 @@
+@@ -0,0 +1,3788 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query
 +  and inputs as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -4434,7 +4443,7 @@ index 0000000..3e86485
 +          (is (true? (get-in response [:body :dry-run])))
 +          (is (= "meetings-without-decision" (get-in response [:body :name])))
 +          (is (string/includes? (get-in response [:body :plan]) "Business Meeting"))
-+          (is (= {:meetings 5000 :decisions 20000 :ancestor-steps 50000 :reads 100000} (get-in response [:body :bounds])))
++          (is (= {:meetings 2000 :decisions 10000 :ancestor-steps 10000 :reads 30000} (get-in response [:body :bounds])))
 +          (is (not-any? #(contains? (:body response) %) [:query :inputs :rules :rows :work]))
 +          (is (= {:private-set-built? false :scanned 0 :joined 0 :width 0 :pulled 0 :named-work {}} @datalog/last-run)))))))
 +
@@ -4786,9 +4795,9 @@ index 0000000..3e86485
 +    (testing "a field that is not an object gives the defaults"
 +      (doseq [v ["tagged" 3 #js [3] true]]
 +        (is (= defaults (bounds v)) (pr-str v))))
-+    (testing "the default bounds, provisional until the bench sets them"
-+      (is (= {:meetings 5000 :decisions 20000 :ancestor-steps 50000 :tagged 20000 :page-blocks 20000
-+              :tasks 50000 :open-tasks 5000 :reads 100000}
++    (testing "the default bounds, as the release bundle set them (stage 5)"
++      (is (= {:meetings 2000 :decisions 10000 :ancestor-steps 10000 :tagged 2500 :page-blocks 10000
++              :tasks 10000 :open-tasks 2000 :reads 30000}
 +             defaults)))))
 +
 +
@@ -5275,12 +5284,13 @@ index 0000000..3e86485
 +(defn- bound-text [template n] (string/replace template "%s" (format-n n)))
 +
 +(deftest named-bound-messages-test
-+  ;; The spec's four messages, word for word, at the default bounds.
++  ;; The spec's four messages, word for word, at the default bounds (the numbers the release bundle
++  ;; set in stage 5).
 +  (doseq [[query-name bound text]
-+          [["meetings-without-decision" :meetings "meetings-without-decision stopped after 5,000 meetings created within days (its meetings bound); give a smaller days or a narrower meeting_tag"]
-+           ["projects-untouched" :page-blocks "projects-untouched stopped after reading 20,000 blocks on pages not updated within days (its page-blocks bound); give a narrower tag or a larger days"]
-+           ["open-tasks-by-client" :open-tasks "open-tasks-by-client found more than 5,000 open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"]
-+           ["pages-missing-property" :tagged "pages-missing-property stopped after 20,000 tagged pages and blocks (its tagged bound); give a narrower tag"]]]
++          [["meetings-without-decision" :meetings "meetings-without-decision stopped after 2,000 meetings created within days (its meetings bound); give a smaller days or a narrower meeting_tag"]
++           ["projects-untouched" :page-blocks "projects-untouched stopped after reading 10,000 blocks on pages not updated within days (its page-blocks bound); give a narrower tag or a larger days"]
++           ["open-tasks-by-client" :open-tasks "open-tasks-by-client found more than 2,000 open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"]
++           ["pages-missing-property" :tagged "pages-missing-property stopped after 2,500 tagged pages and blocks (its tagged bound); give a narrower tag"]]]
 +    (is (= text (named-queries/bound-message {:query query-name :bound bound :value (get named-queries/default-bounds bound)})))))
 +
 +(deftest named-bounds-test
@@ -5392,7 +5402,7 @@ index 0000000..3e86485
 +          (testing "dry run: name, params, plan and bounds, nothing read, a bound of 0 ignored"
 +            (is (= 200 (:status dry)) (head-of dry))
 +            (is (= [:name :params :plan :bounds :dry-run] (mapv keyword (js-keys (js/JSON.parse (:text dry))))))
-+            (is (= {:meetings 0 :decisions 20000 :ancestor-steps 50000 :reads 0} (get-in dry [:body :bounds])))
++            (is (= {:meetings 0 :decisions 10000 :ancestor-steps 10000 :reads 0} (get-in dry [:body :bounds])))
 +            (is (= {} dry-work))
 +            (is (= 422 (:status refused)) "the same bound refuses the run"))
 +          (testing "E2EE before the name, then the 404 and the params 400 unchanged"
@@ -5578,7 +5588,7 @@ index 0000000..3e86485
 +  ;; stays low: 175 [(identity ?t) ?rN] clauses over the 100 blocks of one page answered 200 after
 +  ;; about 1.9 s (the 99 over 200 rows stopped at the join cap after 1.4 s, the 20 includes? answered
 +  ;; 200 after 0.2 s). Each binding charges the rows x columns of the relation it returns toward the
-+  ;; width cap (50,000 per query), and past it the query stops with 422.
++  ;; width cap (40,000 per query), and past it the query stops with 422.
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn self]}]

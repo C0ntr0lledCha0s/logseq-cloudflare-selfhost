@@ -142,3 +142,153 @@ test("a bad --pages is refused with the flag named", () => {
   assert.equal(run.status, 2);
   assert.match(run.stderr, /--pages/);
 });
+
+// Named-query and width modes (named queries as code, stage 5)
+// =============================================================
+
+const NAMED = ["projects-untouched", "meetings-without-decision", "open-tasks-by-client", "pages-missing-property"];
+const NAMED_BOUNDS = {
+  "projects-untouched": ["tagged", "page-blocks", "reads"],
+  "meetings-without-decision": ["meetings", "decisions", "ancestor-steps", "reads"],
+  "open-tasks-by-client": ["tasks", "open-tasks", "reads"],
+  "pages-missing-property": ["tagged", "reads"],
+};
+const WIDTH = ["f1-identity-175", "f1-identity-99", "f1-includes-20", "three-bindings"];
+
+test("the fixture carries meetings, decisions under them, tasks with statuses and, when asked, the width pages, the same on every run", async () => {
+  const { makeFixture, WIDTH_SHAPES } = await import(script);
+  const a = makeFixture(300);
+  const blocks = a.pages.flatMap((p) => p.blocks);
+  const meetings = blocks.filter((b) => b.tags.includes("Bench Meeting"));
+  assert.ok(meetings.length >= 10, `meetings: ${meetings.length}`);
+  assert.ok(meetings.some((m) => m.children.some((c) => c.tags.includes("Bench Decision"))), "a meeting with a decision below it");
+  assert.ok(meetings.some((m) => !m.children.some((c) => c.tags.includes("Bench Decision"))), "a meeting with none");
+  const statuses = new Set(blocks.filter((b) => b.task).map((b) => b.task));
+  assert.deepEqual([...statuses].sort(), ["canceled", "doing", "done", "todo"]);
+  assert.deepEqual(a.width, [], "no width pages unless asked");
+  assert.ok(a.tags.some((t) => t.title === "Bench Meeting") && a.tags.some((t) => t.title === "Bench Decision"));
+  // The named-query extras come from their own stream, so the shapes' fixture is what it was.
+  const before = makeFixture(300);
+  for (const p of before.pages) for (const b of p.blocks) delete b.task;
+  assert.deepEqual(a.chain, before.chain);
+  assert.deepEqual(a.pages.map((p) => [p.uuid, p.title, p.tags]), before.pages.map((p) => [p.uuid, p.title, p.tags]));
+
+  const w = makeFixture(300, 1, { width: true });
+  assert.deepEqual(w.width.map((p) => p.blocks.length), WIDTH_SHAPES.map((s) => s.blocks));
+  assert.deepEqual(makeFixture(300, 1, { width: true }), w);
+  assert.deepEqual(w.pages, a.pages, "the width pages leave the rest of the fixture alone");
+});
+
+test("the width shapes are the F1 shapes and the 3-binding query, each a count over one page's blocks", async () => {
+  const { WIDTH_SHAPES, widthQuery } = await import(script);
+  assert.deepEqual(WIDTH_SHAPES.map((s) => s.shape), WIDTH);
+  assert.deepEqual(WIDTH_SHAPES.map((s) => s.blocks), [100, 200, 500, 2500]);
+  const count = (q, re) => (q.match(re) ?? []).length;
+  const [i175, i99, inc20, three] = WIDTH_SHAPES.map((s) => widthQuery(s, `Page ${s.blocks}`));
+  assert.equal(count(i175, /\[\(identity \?t\) \?r\d+\]/g), 175);
+  assert.equal(count(i99, /\[\(identity \?t\) \?r\d+\]/g), 99);
+  assert.equal(count(inc20, /\[\(clojure\.string\/includes\? \?t "block"\) \?b\d+\]/g), 20);
+  assert.equal(count(three, /\[\((identity|clojure\.string\/lower-case|get-else) /g), 3, "the title's get-else and two more");
+  for (const q of [i175, i99, inc20, three]) {
+    assert.ok(q.length <= 4000, `${q.length} characters, within the query length limit`);
+    // The page by :block/name (indexed) and each title with get-else, so nothing scans every title.
+    assert.match(q, /^\[:find \(count \?e\) \. :where \[\?p :block\/name "page \d+"\] \[\?e :block\/page \?p\] \[\(get-else \$ \?e :block\/title ""\) \?t\] /);
+  }
+});
+
+test("--named --json gives one record per named query and size, with work for each of its bounds and ms cold and warm", { skip, timeout: 300_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--named", "--pages", "150,300", "--runs", "2", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.mode, "named");
+  assert.equal(out.runs, 2);
+  assert.deepEqual(Object.keys(out.bounds).sort(), ["ancestor-steps", "decisions", "meetings", "open-tasks", "page-blocks", "reads", "tagged", "tasks"]);
+  assert.equal(out.records.length, NAMED.length * 2);
+  for (const pages of [150, 300]) assert.deepEqual(out.records.filter((r) => r.pages === pages).map((r) => r.query), NAMED);
+  for (const r of out.records) {
+    const where = `${r.query} at ${r.pages}`;
+    for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${where}: ${k}`);
+    assert.equal(r.outcome, "rows", `${where}: ${r.error}`);
+    assert.ok(Number.isInteger(r.rows) && r.rows > 0, `${where}: rows ${r.rows}`);
+    assert.deepEqual(Object.keys(r.work).sort(), [...NAMED_BOUNDS[r.query]].sort(), `${where}: work names its bounds`);
+    for (const [bound, n] of Object.entries(r.work)) assert.ok(Number.isInteger(n) && n > 0, `${where}: ${bound} ${n}`);
+  }
+  const at = (q, pages) => out.records.find((r) => r.query === q && r.pages === pages);
+  // Every Bench Project page is older than 30 days, so the walk reads all of their blocks.
+  assert.ok(at("projects-untouched", 300).work["page-blocks"] > at("projects-untouched", 150).work["page-blocks"]);
+  assert.ok(at("meetings-without-decision", 300).work["ancestor-steps"] > 0);
+});
+
+test("--bounds stops a named query at the bound it names, and --bounds refuses an unknown bound", { skip, timeout: 300_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--named", "--pages", "150", "--runs", "1", "--bounds", "reads=50,tagged=40000", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.bounds.reads, 50);
+  assert.equal(out.bounds.tagged, 40000);
+  for (const r of out.records) {
+    assert.equal(r.outcome, "bound", `${r.query}: ${r.outcome}`);
+    assert.equal(r.bound, "reads", r.query);
+    assert.equal(r.work.reads, 51, `${r.query}: stopped one past the bound`);
+  }
+  const bad = spawnSync(process.execPath, [script, "--named", "--bounds", "nope=1"], { encoding: "utf8" });
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /--bounds: unknown bound nope \(bounds: meetings, decisions, ancestor-steps, tagged, page-blocks, tasks, open-tasks, reads\)/);
+  const notWhole = spawnSync(process.execPath, [script, "--named", "--bounds", "reads=x"], { encoding: "utf8" });
+  assert.equal(notWhole.status, 2);
+  assert.match(notWhole.stderr, /--bounds: reads needs a whole number/);
+});
+
+test("--width --json gives one record per width shape with the width charged, the F1 shapes stopped at the width cap and the 3-binding query answered", { skip, timeout: 300_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "2", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.mode, "width");
+  assert.ok(Number.isInteger(out.width_cap) && out.width_cap > 0);
+  assert.deepEqual(out.records.map((r) => r.shape), WIDTH);
+  for (const r of out.records) {
+    for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${r.shape}: ${k}`);
+    assert.ok(Number.isInteger(r.width) && r.width > 0, `${r.shape}: width ${r.width}`);
+  }
+  const at = (shape) => out.records.find((r) => r.shape === shape);
+  for (const shape of WIDTH.slice(0, 3)) {
+    assert.equal(at(shape).outcome, "width-cap", `${shape}: ${at(shape).error}`);
+    assert.ok(at(shape).width > out.width_cap, `${shape}: charged past the cap`);
+  }
+  assert.equal(at("three-bindings").outcome, "rows");
+  // ?p and ?e are bound before the title's get-else adds ?t, and each binding after adds a column:
+  // the upstream suite's legitimate 3-binding query charges the same 30,000.
+  assert.equal(at("three-bindings").width, 2500 * (3 + 4 + 5));
+
+  const raised = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1", "--width-cap", "100000000", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(raised.status, 0, raised.stderr);
+  const r2 = JSON.parse(raised.stdout);
+  assert.equal(r2.width_cap, 100000000);
+  assert.equal(r2.records.find((r) => r.shape === "f1-includes-20").outcome, "rows", "a higher --width-cap lets a shape through");
+});
+
+test("--named and --width skip naming the missing build, and refuse being given together", () => {
+  const empty = mkdtempSync(join(tmpdir(), "bench-datalog-empty-"));
+  try {
+    for (const mode of ["--named", "--width"]) {
+      const run = spawnSync(process.execPath, [script, mode, "--upstream", empty, "--json"], { encoding: "utf8" });
+      assert.equal(run.status, 0, run.stderr);
+      assert.match(JSON.parse(run.stdout).skipped, /deps\/db-sync\/worker\/dist\/worker-test\.js.*scripts\/upstream-test\.sh/);
+    }
+    const both = spawnSync(process.execPath, [script, "--named", "--width"], { encoding: "utf8" });
+    assert.equal(both.status, 2);
+    assert.match(both.stderr, /give one of --named or --width/);
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test("text output in --named and --width prints a row per query or shape", { skip, timeout: 300_000 }, () => {
+  const named = spawnSync(process.execPath, [script, "--named", "--pages", "150", "--runs", "1"], { encoding: "utf8" });
+  assert.equal(named.status, 0, named.stderr);
+  for (const q of NAMED) assert.match(named.stdout, new RegExp(`^${q}\\s+150\\s`, "m"));
+  assert.match(named.stdout, /named queries bench: bounds .*reads 30,000/, "the bounds are read from the build");
+  const width = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1"], { encoding: "utf8" });
+  assert.equal(width.status, 0, width.stderr);
+  for (const s of WIDTH) assert.match(width.stdout, new RegExp(`^${s}\\s+150\\s`, "m"));
+  assert.match(width.stdout, /width cap 40,000/);
+});

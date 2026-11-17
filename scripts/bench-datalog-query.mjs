@@ -12,6 +12,16 @@
 //
 //   node scripts/bench-datalog-query.mjs [--pages 5000,20000] [--runs 5] [--scan-cap N]
 //                                        [--shapes a,b] [--upstream .upstream] [--json]
+//   node scripts/bench-datalog-query.mjs --named [--bounds reads=N,tagged=N…] [--pages …] [--runs …]
+//   node scripts/bench-datalog-query.mjs --width [--width-cap N] [--pages …] [--runs …]
+//
+// --named runs the four named queries as code (named-queries/run-named on the restored db, as the
+// handler does after resolving params) under default-bounds, or the values --bounds gives, and
+// reports the work each bound counted. Every Bench Project page is older than 30 days, so
+// projects-untouched reads every block on them; open-tasks-by-client reads each task's
+// :block/refs as its clients, which walks as a node property does. --width runs the F1 shapes
+// (many function bindings over one page's blocks) and the 3-binding query over 2,500 blocks
+// through run-query under the width cap, or --width-cap, and reports the width charged.
 //
 // Warm times are medians over --runs runs on the conn the cold run warmed. The numbers are a guide:
 // Node on a developer machine is not a Durable Object on Cloudflare's hardware.
@@ -103,6 +113,37 @@ const uuid = (rand) => `${hex(rand, 8)}-${hex(rand, 4)}-4${hex(rand, 3)}-a${hex(
 
 /** The tags the fixture creates, by title. Private is the class the privacy filter looks for. */
 export const TAGS = ["Private", "Bench Project", "Bench Topic", "Bench Chain"];
+/** The tags the named-query extras add, from their own stream (so the shapes' fixture is unchanged). */
+export const NAMED_TAGS = ["Bench Meeting", "Bench Decision"];
+const TASK_STATUSES = ["todo", "doing", "done", "canceled"];
+
+/** The pages a width shape counts over: one page of `blocks` blocks each. */
+export const WIDTH_SHAPES = [
+  { shape: "f1-identity-175", blocks: 100, clauses: () => identityClauses(175) },
+  { shape: "f1-identity-99", blocks: 200, clauses: () => identityClauses(99) },
+  {
+    shape: "f1-includes-20",
+    blocks: 500,
+    clauses: () => Array.from({ length: 20 }, (_, i) => `[(clojure.string/includes? ?t "block") ?b${i}]`),
+  },
+  // Three function bindings in all, the title's get-else (in widthQuery) and these two.
+  { shape: "three-bindings", blocks: 2500, clauses: () => ["[(identity ?t) ?a]", "[(clojure.string/lower-case ?t) ?b]"] },
+];
+
+function identityClauses(n) {
+  return Array.from({ length: n }, (_, i) => `[(identity ?t) ?r${i}]`);
+}
+
+/**
+ * A width shape's query: a count of the blocks on page `title` (titled "… block N"), with its
+ * clauses. It reads only that page's datoms whatever the graph's size: the page by :block/name
+ * (indexed) and each block's title with get-else (one datom a row). A data pattern such as
+ * [?p :block/title "…"] or [?e :block/title ?t] joined to many rows scans every title, which on a
+ * graph of 20,000 blocks stops at the scan cap before any function binding runs.
+ */
+export function widthQuery(spec, title) {
+  return `[:find (count ?e) . :where [?p :block/name ${JSON.stringify(title.toLowerCase())}] [?e :block/page ?p] [(get-else $ ?e :block/title "") ?t] ${spec.clauses().join(" ")}]`;
+}
 
 /**
  * A seeded graph of `pages` pages as plain data: {tags, pages, chain}. About one page in ten is
@@ -110,7 +151,7 @@ export const TAGS = ["Private", "Bench Project", "Bench Topic", "Bench Chain"];
  * children, and about one block in four refs another page; one in twenty is tagged Bench Topic.
  * `chain` is CHAIN_DEPTH nested blocks on the first page, each tagged Bench Chain.
  */
-export function makeFixture(pages, seed = 1) {
+export function makeFixture(pages, seed = 1, { width = false } = {}) {
   const rand = prng(seed);
   const tags = TAGS.map((title) => ({ title, uuid: uuid(rand) }));
   const out = [];
@@ -140,7 +181,28 @@ export function makeFixture(pages, seed = 1) {
     }
   }
   const chain = Array.from({ length: CHAIN_DEPTH }, (_, d) => ({ uuid: uuid(rand), title: `chain ${d}` }));
-  return { tags, pages: out, chain };
+  // The named-query extras, from a second stream: about one top block in eight is a Bench Meeting
+  // with each child a Bench Decision half the time, and about one block in ten a Task with a status.
+  const extra = prng(seed ^ 0x5eed);
+  for (const title of NAMED_TAGS) tags.push({ title, uuid: uuid(extra) });
+  for (const page of out) {
+    for (const block of page.blocks) {
+      if (extra() < 0.125) {
+        block.tags = [...block.tags, "Bench Meeting"];
+        for (const child of block.children) if (extra() < 0.5) child.tags = ["Bench Decision"];
+      } else if (extra() < 0.1) {
+        block.task = pick(extra, TASK_STATUSES);
+      }
+    }
+  }
+  const widthPages = !width
+    ? []
+    : WIDTH_SHAPES.map(({ blocks }) => ({
+        uuid: uuid(extra),
+        title: `Bench Width ${blocks}`,
+        blocks: Array.from({ length: blocks }, (_, i) => ({ uuid: uuid(extra), title: `Bench Width ${blocks} block ${i}` })),
+      }));
+  return { tags, pages: out, chain, width: widthPages };
 }
 
 // Loading the build
@@ -188,7 +250,7 @@ const median = (xs) => {
 const round = (ms) => Math.round(ms * 100) / 100;
 
 /** EDN for the fixture's transaction, in chunks of about `size` entities. */
-function fixtureTx(fixture, now) {
+export function fixtureTx(fixture, now) {
   const str = (s) => JSON.stringify(s);
   const ident = (t) => `:user.class/${t.title.replace(/\s+/g, "")}-bench`;
   const byTitle = Object.fromEntries(fixture.tags.map((t) => [t.title, t]));
@@ -214,7 +276,8 @@ function fixtureTx(fixture, now) {
   let order = 0;
   const block = (b, page, parent) => {
     const refs = b.refs.length ? ` :block/refs #{${b.refs.map((r) => `[:block/uuid #uuid ${str(r)}]`).join(" ")}}` : "";
-    const tags = b.tags?.length ? ` :block/tags ${tagRefs(b.tags, false)}` : "";
+    const idents = [...(b.task ? [":logseq.class/Task"] : []), ...(b.tags ?? []).map((t) => ident(byTitle[t]))];
+    const tags = (idents.length ? ` :block/tags #{${idents.join(" ")}}` : "") + (b.task ? ` :logseq.property/status :logseq.property/status.${b.task}` : "");
     return `{:block/uuid #uuid ${str(b.uuid)} :block/title ${str(b.title)} :block/page [:block/uuid #uuid ${str(page)}] :block/parent [:block/uuid #uuid ${str(parent)}] :block/order ${str(`a${(order++).toString(36)}`)} :block/created-at ${now} :block/updated-at ${now}${refs}${tags}}`;
   };
   for (let i = 0; i < fixture.pages.length; i += 500) {
@@ -234,6 +297,10 @@ function fixtureTx(fixture, now) {
   for (const c of fixture.chain) {
     chunks.push(block({ ...c, refs: [], tags: ["Bench Chain"] }, first, parent));
     parent = c.uuid;
+  }
+  for (const p of fixture.width ?? []) {
+    chunks.push(`{:block/uuid #uuid ${str(p.uuid)} :block/title ${str(p.title)} :block/name ${str(p.title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at ${now} :block/updated-at ${now}}`);
+    chunks.push(p.blocks.map((b) => block({ ...b, refs: [] }, p.uuid, p.uuid)).join(" "));
   }
   return chunks.map((c) => `[${c}]`);
 }
@@ -262,11 +329,11 @@ function memorySql() {
 }
 
 /** Builds the fixture graph and stores it, so each shape can restore a cold conn. */
-export function storeGraph(ns, pages, seed) {
+export function storeGraph(ns, pages, seed, opts = {}) {
   const { cljs, reader, d, logseq } = ns;
   const conn = logseq.db.sqlite.export$.create_conn();
   const now = 1_762_646_400_000; // 2025-11-09, fixed so the fixture is the same on every run
-  for (const chunk of fixtureTx(makeFixture(pages, seed), now)) d.transact_BANG_.cljs$core$IFn$_invoke$arity$2(conn, reader.read_string.cljs$core$IFn$_invoke$arity$1(chunk));
+  for (const chunk of fixtureTx(makeFixture(pages, seed, opts), now)) d.transact_BANG_.cljs$core$IFn$_invoke$arity$2(conn, reader.read_string.cljs$core$IFn$_invoke$arity$1(chunk));
   const sql = memorySql();
   const storage = logseq.db_sync.storage.new_sqlite_storage(sql);
   d.store.cljs$core$IFn$_invoke$arity$2(cljs.deref(conn), storage);
@@ -286,8 +353,11 @@ function body(ns, b) {
   return cljs.hash_map(...kv);
 }
 
-/** One run of a shape on `db`: {ms, scanned, outcome, rows}. */
-export function runShape(ns, shape, db, scanCap) {
+/**
+ * One run of a shape on `db`: {ms, scanned, width, outcome, rows}. `given` is the request body (the
+ * shape's own in BODIES by default) and `widthCap` the width cap (the build's when not given).
+ */
+export function runShape(ns, shape, db, scanCap, given = BODIES[shape], widthCap) {
   const { cljs, logseq } = ns;
   const datalog = logseq.db_sync.worker.handler.datalog;
   const kw = cljs.keyword;
@@ -298,8 +368,7 @@ export function runShape(ns, shape, db, scanCap) {
     return { ms: performance.now() - t0, scanned: 0, outcome: "rows", rows: cljs.count(ids) };
   }
   const t0 = performance.now();
-  cljs.reset_BANG_(datalog.last_run, cljs.hash_map(kw("private-set-built?"), false, kw("scanned"), 0, kw("pulled"), 0));
-  const given = BODIES[shape];
+  cljs.reset_BANG_(datalog.last_run, cljs.hash_map(kw("private-set-built?"), false, kw("scanned"), 0, kw("width"), 0, kw("pulled"), 0));
   const parsed = datalog.parse_request(body(ns, given));
   const status = kw("logseq.db-sync.worker.handler.datalog", "status");
   let result = parsed;
@@ -309,12 +378,14 @@ export function runShape(ns, shape, db, scanCap) {
       kw("inputs"), get(parsed, kw("inputs")),
       kw("limit"), given.limit ?? datalog.default_limit,
       kw("scan-cap"), scanCap,
+      ...(widthCap != null ? [kw("width-cap"), widthCap] : []),
       kw("echo"), cljs.hash_map(kw("query"), given.query, kw("inputs"), "[]"),
     );
     result = datalog.run_query(db, opts);
   }
   const ms = performance.now() - t0;
   const scanned = get(cljs.deref(datalog.last_run), kw("scanned"));
+  const width = get(cljs.deref(datalog.last_run), kw("width"));
   const refused = get(result, status);
   if (refused != null) {
     const error = get(result, kw("logseq.db-sync.worker.handler.datalog", "error"));
@@ -324,10 +395,145 @@ export function runShape(ns, shape, db, scanCap) {
       : error.includes("(the join cap)") ? "join-cap"
       : error.includes("(the value cap)") ? "value-cap"
       : error.includes("(the scan cap)") ? "scan-cap"
+      : error.includes("(the width cap)") ? "width-cap"
       : "refused";
-    return { ms, scanned, outcome, rows: 0, error };
+    return { ms, scanned, width, outcome, rows: 0, error };
   }
-  return { ms, scanned, outcome: "rows", rows: get(result, kw("returned")), total: get(result, kw("total-rows")) };
+  return { ms, scanned, width, outcome: "rows", rows: get(result, kw("returned")), total: get(result, kw("total-rows")) };
+}
+
+// Named queries and the width cap
+// ===============================
+
+/** The named queries, in output order, and the bounds each counts (named-queries/named-queries). */
+export const NAMED = {
+  "projects-untouched": ["tagged", "page-blocks", "reads"],
+  "meetings-without-decision": ["meetings", "decisions", "ancestor-steps", "reads"],
+  "open-tasks-by-client": ["tasks", "open-tasks", "reads"],
+  "pages-missing-property": ["tagged", "reads"],
+};
+/** Every named bound, as default-bounds names them. */
+export const NAMED_BOUNDS = ["meetings", "decisions", "ancestor-steps", "tagged", "page-blocks", "tasks", "open-tasks", "reads"];
+const DAY_MS = 86_400_000;
+
+/**
+ * The resolved inputs (by param name) and params echo the handler would give each named query on
+ * the bench fixture, as EDN: Bench Project pages older than 30 days; Bench Meetings created in the
+ * last 3,650 days (the fixture's fixed date is within it) with Bench Decisions; Tasks with their
+ * :block/refs as clients; Bench Project pages with no Description.
+ */
+function namedInputs(ns, db, query) {
+  const { cljs, d } = ns;
+  const tag = (title) => d.entid(db, cljs.keyword("user.class", `${title.replace(/\s+/g, "")}-bench`));
+  const now = Date.now();
+  const echo = (title) => `{:title ${JSON.stringify(title)} :includes []}`;
+  switch (query) {
+    case "projects-untouched":
+      return `{:inputs {:tag [${tag("Bench Project")}] :days ${now - 30 * DAY_MS}} :params {"tag" ${echo("Bench Project")} "days" 30}}`;
+    case "meetings-without-decision":
+      return `{:inputs {:meeting_tag [${tag("Bench Meeting")}] :decision_tag #{${tag("Bench Decision")}} :days ${now - 3650 * DAY_MS}} :params {"meeting_tag" ${echo("Bench Meeting")} "decision_tag" ${echo("Bench Decision")} "days" 3650}}`;
+    case "open-tasks-by-client":
+      return `{:inputs {:client_property :block/refs} :params {"client_property" {:title "Refs"}}}`;
+    case "pages-missing-property":
+      return `{:inputs {:tag [${tag("Bench Project")}] :property :logseq.property/description} :params {"tag" ${echo("Bench Project")} "property" {:title "Description"}}}`;
+  }
+  throw new Error(`no named query ${query}`);
+}
+
+/** One run of named query `query` on `db` under `bounds` (EDN): {ms, outcome, rows, work, bound?}. */
+export function runNamed(ns, query, db, bounds) {
+  const { cljs, reader } = ns;
+  const named = ns.logseq.db_sync.worker.named_queries;
+  const read = (edn) => reader.read_string.cljs$core$IFn$_invoke$arity$1(edn);
+  const resolved = read(namedInputs(ns, db, query));
+  const work = cljs.volatile_BANG_(cljs.PersistentArrayMap.EMPTY);
+  const t0 = performance.now();
+  try {
+    const result = named.run_named.cljs$core$IFn$_invoke$arity$5(query, db, resolved, read(bounds), work);
+    const ms = performance.now() - t0;
+    return { ms, outcome: "rows", rows: cljs.count(cljs.get.cljs$core$IFn$_invoke$arity$2(result, cljs.keyword("rows"))), work: cljs.clj__GT_js(cljs.deref(work)) };
+  } catch (e) {
+    const ms = performance.now() - t0;
+    const data = cljs.ex_data(e);
+    const bound = data && cljs.get.cljs$core$IFn$_invoke$arity$2(data, cljs.keyword("logseq.db-sync.worker.named-queries", "bound"));
+    if (!bound) throw e;
+    const which = cljs.clj__GT_js(bound);
+    return { ms, outcome: "bound", rows: 0, work: cljs.clj__GT_js(cljs.deref(work)), bound: which.bound, error: named.bound_message(bound) };
+  }
+}
+
+function boundsEdn(bounds) {
+  return `{${Object.entries(bounds).map(([k, v]) => `:${k} ${v}`).join(" ")}}`;
+}
+
+/** --named: each named query at each size, cold then warm, with the work each of its bounds counted. */
+export async function benchNamed({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, bounds = {}, upstream = join(root, ".upstream"), seed = 1 } = {}) {
+  const build = findBuild(upstream);
+  if (build.missing) return { skipped: build.missing };
+  const ns = loadBuild(build);
+  const given = { ...ns.cljs.clj__GT_js(ns.logseq.db_sync.worker.named_queries.default_bounds), ...bounds };
+  const records = [];
+  for (const size of pages) {
+    const graph = storeGraph(ns, size, seed);
+    for (const [query, own] of Object.entries(NAMED)) {
+      const edn = boundsEdn(Object.fromEntries(own.map((b) => [b, given[b]])));
+      const db = restore(ns, graph);
+      const cold = runNamed(ns, query, db, edn);
+      const warm = [];
+      let last = cold;
+      for (let i = 0; i < runs; i++) {
+        last = runNamed(ns, query, db, edn);
+        warm.push(last.ms);
+      }
+      records.push({
+        query,
+        pages: size,
+        datoms: graph.datoms,
+        cold_ms: round(cold.ms),
+        warm_ms: round(median(warm)),
+        outcome: last.outcome,
+        rows: last.rows,
+        work: Object.fromEntries(own.map((b) => [b, last.work[b] ?? 0])),
+        ...(last.bound ? { bound: last.bound, error: last.error } : {}),
+      });
+    }
+  }
+  return { mode: "named", bounds: given, runs, node: process.version, records };
+}
+
+/** --width: the F1 shapes and the 3-binding query at each size, cold then warm, with the width charged. */
+export async function benchWidth({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, widthCap, upstream = join(root, ".upstream"), seed = 1 } = {}) {
+  const build = findBuild(upstream);
+  if (build.missing) return { skipped: build.missing };
+  const ns = loadBuild(build);
+  const datalog = ns.logseq.db_sync.worker.handler.datalog;
+  const cap = widthCap ?? datalog.width_cap;
+  const records = [];
+  for (const size of pages) {
+    const graph = storeGraph(ns, size, seed, { width: true });
+    for (const spec of WIDTH_SHAPES) {
+      const given = { query: widthQuery(spec, `Bench Width ${spec.blocks}`) };
+      const db = restore(ns, graph);
+      const cold = runShape(ns, spec.shape, db, datalog.scan_cap, given, cap);
+      const warm = [];
+      let last = cold;
+      for (let i = 0; i < runs; i++) {
+        last = runShape(ns, spec.shape, db, datalog.scan_cap, given, cap);
+        warm.push(last.ms);
+      }
+      records.push({
+        shape: spec.shape,
+        pages: size,
+        blocks: spec.blocks,
+        cold_ms: round(cold.ms),
+        warm_ms: round(median(warm)),
+        width: last.width,
+        outcome: last.outcome,
+        ...(last.error ? { error: last.error } : {}),
+      });
+    }
+  }
+  return { mode: "width", width_cap: cap, runs, node: process.version, records };
 }
 
 export async function bench({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, scanCap, shapes = SHAPES, upstream = join(root, ".upstream"), seed = 1 } = {}) {
@@ -370,6 +576,7 @@ export async function bench({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, scanCa
 
 function parseArgs(argv) {
   const opts = { pages: DEFAULT_PAGES, runs: DEFAULT_RUNS, json: false };
+  const modes = [];
   const whole = (flag, v) => {
     const n = Number(v);
     if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} needs a whole number of at least 1, got ${v}`);
@@ -382,12 +589,26 @@ function parseArgs(argv) {
     else if (a === "--runs") opts.runs = whole(a, argv[++i]);
     else if (a === "--scan-cap") opts.scanCap = whole(a, argv[++i]);
     else if (a === "--upstream") opts.upstream = resolve(argv[++i] ?? "");
+    else if (a === "--named" || a === "--width") modes.push(a.slice(2));
+    else if (a === "--width-cap") opts.widthCap = whole(a, argv[++i]);
+    else if (a === "--bounds") {
+      opts.bounds = {};
+      for (const pair of String(argv[++i]).split(",")) {
+        const [bound, v] = pair.split("=");
+        if (!NAMED_BOUNDS.includes(bound)) throw new Error(`--bounds: unknown bound ${bound} (bounds: ${NAMED_BOUNDS.join(", ")})`);
+        const n = Number(v);
+        if (!Number.isInteger(n) || n < 0) throw new Error(`--bounds: ${bound} needs a whole number, got ${v}`);
+        opts.bounds[bound] = n;
+      }
+    }
     else if (a === "--shapes") {
       opts.shapes = String(argv[++i]).split(",");
       for (const s of opts.shapes) if (!SHAPES.includes(s)) throw new Error(`--shapes: unknown shape ${s} (shapes: ${SHAPES.join(", ")})`);
     }
-    else throw new Error(`unknown argument ${a}; usage: bench-datalog-query.mjs [--pages N[,N…]] [--runs N] [--scan-cap N] [--shapes NAME[,NAME…]] [--upstream DIR] [--json]`);
+    else throw new Error(`unknown argument ${a}; usage: bench-datalog-query.mjs [--named [--bounds NAME=N[,…]] | --width [--width-cap N]] [--pages N[,N…]] [--runs N] [--scan-cap N] [--shapes NAME[,NAME…]] [--upstream DIR] [--json]`);
   }
+  if (modes.length > 1) throw new Error("give one of --named or --width");
+  opts.mode = modes[0] ?? "shapes";
   return opts;
 }
 
@@ -401,10 +622,43 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.error(e.message);
     process.exit(2);
   }
-  const r = await bench(opts);
+  const r = opts.mode === "named" ? await benchNamed(opts) : opts.mode === "width" ? await benchWidth(opts) : await bench(opts);
   if (opts.json) console.log(JSON.stringify(r, null, 2));
   else if (r.skipped) console.log(`skipped: ${r.skipped}`);
-  else {
+  else if (r.mode === "named") {
+    console.log(`named queries bench: bounds ${Object.entries(r.bounds).map(([k, v]) => `${k} ${fmt(v)}`).join(", ")}; warm median of ${r.runs} runs, Node ${r.node}`);
+    console.log("query                       pages    datoms  cold_ms  warm_ms  outcome   rows  work");
+    for (const x of r.records) {
+      console.log(
+        [
+          x.query.padEnd(26),
+          String(x.pages).padStart(6),
+          String(x.datoms).padStart(9),
+          x.cold_ms.toFixed(1).padStart(8),
+          x.warm_ms.toFixed(1).padStart(8),
+          (x.bound ? `${x.bound}!` : x.outcome).padEnd(8),
+          String(x.rows).padStart(6),
+          Object.entries(x.work).map(([k, v]) => `${k} ${v}`).join(", "),
+        ].join(" "),
+      );
+    }
+  } else if (r.mode === "width") {
+    console.log(`width bench: width cap ${fmt(r.width_cap)}, warm median of ${r.runs} runs, Node ${r.node}`);
+    console.log("shape              pages  blocks  cold_ms  warm_ms     width  outcome");
+    for (const x of r.records) {
+      console.log(
+        [
+          x.shape.padEnd(18),
+          String(x.pages).padStart(6),
+          String(x.blocks).padStart(7),
+          x.cold_ms.toFixed(1).padStart(8),
+          x.warm_ms.toFixed(1).padStart(8),
+          String(x.width).padStart(9),
+          x.outcome,
+        ].join(" "),
+      );
+    }
+  } else {
     console.log(`datalog_query bench: scan cap ${fmt(r.scan_cap)}, warm median of ${r.runs} runs, Node ${r.node} (tolerated tail ${r.tolerated_ms} ms)`);
     console.log("shape              pages    datoms  cold_ms  warm_ms  scanned  outcome   rows  nodes_cold");
     for (const x of r.records) {
