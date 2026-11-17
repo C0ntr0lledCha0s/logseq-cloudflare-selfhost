@@ -341,7 +341,9 @@ export function runShape(ns, shape, db, scanCap) {
       : error.includes("the row cap of") ? "row-cap"
       : error.includes("(the join cap)") ? "join-cap"
       : error.includes("(the value cap)") ? "value-cap"
-      : "scan-cap";
+      : error.includes("(the rule cap)") ? "rule-cap"
+      : error.includes("(the scan cap)") ? "scan-cap"
+      : "refused";
     return { ms, scanned, outcome, rows: 0, error };
   }
   return { ms, scanned, outcome: "rows", rows: get(result, kw("returned")), total: get(result, kw("total-rows")) };

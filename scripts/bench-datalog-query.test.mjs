@@ -72,7 +72,7 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
       assert.ok(r[k] >= 0, `${where}: ${k}`);
     }
     assert.ok(Number.isInteger(r.datoms_scanned), `${where}: datoms_scanned`);
-    assert.ok(["rows", "scan-cap", "join-cap", "value-cap", "row-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
+    assert.ok(["rows", "scan-cap", "join-cap", "value-cap", "row-cap", "rule-cap", "refused"].includes(r.outcome), `${where}: outcome ${r.outcome}`);
     // The filter throws on the datom after the cap, so no run counts more than cap + 1.
     assert.ok(r.datoms_scanned <= 3001, `${where}: scanned ${r.datoms_scanned}`);
   }
@@ -87,10 +87,11 @@ test("--json gives one record per shape and size with cold_ms, warm_ms, datoms_s
   assert.equal(at("pull-star-200", 150).outcome, "rows");
   assert.ok(at("pull-star-200", 150).rows <= 200);
   // Work the scan cap does not count: a recursive rule down a 60-block chain reads a few datoms
-  // per level, and a self-join on the chain's tag matches far more rows than the datoms it reads,
-  // which the row cap (2,500) refuses before the sort.
-  assert.equal(at("rule-deep-chain", 300).outcome, "rows");
-  assert.equal(at("rule-deep-chain", 300).total_rows, 60);
+  // per level but adds a guard per level, which the rule cap refuses (each refusal kind is named
+  // by its own outcome, never reported as the scan cap), and a self-join on the chain's tag
+  // matches far more rows than the datoms it reads, which the row cap (2,500) refuses before the sort.
+  assert.equal(at("rule-deep-chain", 300).outcome, "rule-cap");
+  assert.match(at("rule-deep-chain", 300).error, /^query stopped after [\d,]+ units of rule work \(the rule cap\)/);
   assert.ok(at("rule-deep-chain", 300).datoms_scanned < 1000, "the chain reads few datoms");
   assert.equal(at("join-fanout", 300).outcome, "row-cap");
   assert.match(at("join-fanout", 300).error, /^query matched 3,600 rows, more than the row cap of 2,500;/, "60 × 60 rows");
