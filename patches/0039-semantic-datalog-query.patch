@@ -1351,7 +1351,7 @@ index 0000000..258ccb6
 +                                          :bounds bounds :dry-run true}
 +                 :else (run-named db query-name entry resolved bounds (or (:limit body) default-limit)))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d8e3144..ea2f038 100644
+index d8e3144..8150c14 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -15,6 +15,7 @@
@@ -1362,7 +1362,53 @@ index d8e3144..ea2f038 100644
              [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
              [logseq.db-sync.worker.http :as http]
              [logseq.db-sync.worker.ws :as ws]
-@@ -5513,6 +5514,10 @@
+@@ -31,6 +32,7 @@
+             [logseq.outliner.page :as outliner-page]
+             [logseq.outliner.property :as outliner-property]
+             [logseq.outliner.tree :as otree]
++            [logseq.outliner.validate :as outliner-validate]
+             [promesa.core :as p]))
+ 
+ (def ^:private default-limit 50)
+@@ -1984,6 +1986,22 @@
+        (filter #(or (page? %) (tag? %) (property? %)))
+        (sort-by :db/id)))
+ 
++(defn- page-title-character-refusal
++  "The 400 message for a plaintext page title holding a character the outliner refuses in one (\"/\"
++  outside a date, or \"#\"), checked on the title as createPage stores it; nil when it has none.
++  The outliner only refuses once the write has started, which answered 500."
++  [title]
++  (try
++    (outliner-validate/validate-page-title-characters (outliner-page/sanitize-title title) nil)
++    nil
++    (catch :default error
++      (let [data (ex-data error)]
++        (if (= :notification (:type data))
++          (str "title: a page title can't include \""
++               (if (= :page.validation/name-no-hash (get-in data [:payload :i18n-key])) "#" "/")
++               "\" (" title ")")
++          (throw error))))))
++
+ (defn- title-taken-response
+   "409 naming each holder of `title`. createTag passes `promotable?`: a holder it accepts gets a
+   pointer to promote_page_to_tag in the message and promote: true in its existing[] entry."
+@@ -2498,10 +2516,13 @@
+     :semantic/pages-create
+     (p/let [body (body-clj request)
+             holders (when (and (not e2ee?) (non-blank-string? (:title body)))
+-                      (title-holders db (:title body)))]
++                      (title-holders db (:title body)))
++            character-refusal (when (and (not e2ee?) (non-blank-string? (:title body)))
++                                (page-title-character-refusal (:title body)))]
+       (cond
+         (not (non-blank-string? (:title body))) (http/bad-request "missing title")
+         (seq holders) (title-taken-response (:title body) holders)
++        character-refusal (http/bad-request character-refusal)
+         :else
+         (let [[title page-id] (authored-write! conn creator outliner-page/create! (:title body)
+                                                      {:encrypted-title? e2ee? :encrypted-name (:name body)})]
+@@ -5513,6 +5534,10 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -1804,7 +1850,7 @@ index 0000000..e6dd3bc
 +         rows (run ctx inputs)]
 +     {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..03a80b3 100644
+index 1365b0a..d43e338 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1819,6 +1865,15 @@ index 1365b0a..03a80b3 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/e2ee/public-keys" :internal-path "/e2ee/public-keys"
      :handler :semantic/e2ee-public-keys :operation-id "getE2eePublicKeys" :scope "logseq/read" :rate-class :read :edge? true}
     {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/encrypt" :internal-path "/e2ee/encrypt"
+@@ -147,7 +152,7 @@
+ (def ^:private operation-docs
+   {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+-   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
++   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
 @@ -195,6 +200,23 @@
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
@@ -1950,6 +2005,33 @@ index 1365b0a..03a80b3 100644
                 :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs b/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
+index 1dda244..765eed6 100644
+--- a/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
+@@ -67,6 +67,22 @@
+              (p/catch #(is false (str %)))
+              (p/finally done))))
+ 
++(deftest encrypted-page-title-with-a-slash-is-created-test
++  ;; createPage refuses "/" and "#" in a plaintext title before the write; an E2EE title is a
++  ;; ciphertext package whose base64 often holds "/", so it is not checked.
++  (async done
++         (-> (p/let [key (<key)
++                     title (p/loop [n 0]
++                             (p/let [package (<encrypt key "zq plain")]
++                               (if (or (re-find #"/" package) (> n 200)) package (p/recur (inc n)))))
++                     name (<encrypt key "zq plain")
++                     conn (sqlite-export/create-conn)
++                     response (sync/handle-http (self conn) (request "/semantic/pages" "POST" {:title title :name name}))]
++               (is (re-find #"/" title) "the package holds a slash")
++               (is (= 201 (.-status response))))
++             (p/catch #(is false (str %)))
++             (p/finally done))))
++
+ (deftest encrypted-page-writes-require-name-and-reject-invalid-packages-test
+   (async done
+          (-> (p/let [key (<key)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
 index 0000000..7b2099e
@@ -5744,6 +5826,95 @@ index 0000000..7b2099e
 +          (is (identical? own after-answered) "restored after an answered query")
 +          (is (identical? own after-refused) "restored after a refused query")
 +          (is (pos? direct) "a query outside run-query runs uncharged"))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
+index d0b664a..57bf489 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
+@@ -13,6 +13,7 @@
+             [logseq.db.frontend.entity-util :as entity-util]
+             [logseq.db.sqlite.export :as sqlite-export]
+             [logseq.outliner.property :as outliner-property]
++            [logseq.outliner.validate :as outliner-validate]
+             [promesa.core :as p]))
+ 
+ (def ^:private sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
+@@ -122,6 +123,68 @@
+             (is (string/includes? (:error journal-body) (str "journal \"" (:block/title journal) "\""))))
+           (is (= 201 fresh-status) "a free title is still created"))))))
+ 
++(defn- capturing-console-error
++  "Runs `f` (returning a promise) with console.error recorded; resolves to [result errors]."
++  [f]
++  (let [original (.-error js/console)
++        errors (atom [])]
++    (aset js/console "error" (fn [& args] (swap! errors conj (pr-str args))))
++    (-> (p/let [result (f)] [result @errors])
++        (p/finally #(aset js/console "error" original)))))
++
++(defn- snapshot [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(deftest create-page-refuses-a-character-the-outliner-refuses-test
++  ;; The outliner refuses "/" (and "#") in a page title only once the write has started, which
++  ;; answered 500 "server error" with a console.error. createPage now refuses up front with 400.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (p/let [refused [["a/b" "/"]
++                         ["zq Plans/2026/Q4" "/"]
++                         ["[[zq x/y]]" "/"]
++                         ["  zq spaced/out  " "/"]
++                         ["zq a#b" "#"]]
++                before (snapshot conn)
++                [results errors] (capturing-console-error
++                                  #(p/all (map (fn [[title _]] (call "POST" "/pages" {:title title})) refused)))]
++          (doseq [[[title character] [status body]] (map vector refused results)]
++            (testing title
++              (is (= 400 status))
++              (is (= (str "title: a page title can't include \"" character "\" (" title ")") (:error body)))))
++          (is (= before (snapshot conn)) "nothing was written")
++          (is (empty? errors) "no console.error")
++          (testing "titles the outliner accepts are still created"
++            (p/let [[lead-status lead] (call "POST" "/pages" {:title "/zq lead"})
++                    [trail-status trail] (call "POST" "/pages" {:title "zq trail/"})
++                    [plain-status _] (call "POST" "/pages" {:title "zq plain"})
++                    [again-status again] (call "POST" "/pages" {:title "zq plain"})
++                    [date-status date] (call "POST" "/pages" {:title "11/17/2026"})]
++              (is (= [201 "zq lead"] [lead-status (:title lead)]) "boundary slashes are trimmed, as in the editor")
++              (is (= [201 "zq trail"] [trail-status (:title trail)]))
++              (is (= 201 plain-status))
++              (is (= 409 again-status) "a re-sent title is still a conflict, not a character refusal")
++              (is (string/includes? (:error again) "page \"zq plain\""))
++              (is (not= 400 date-status) (str "a date title keeps its slashes: " (pr-str date))))))))))
++
++(deftest create-page-character-check-keeps-other-errors-test
++  ;; Only the outliner's own notification becomes the 400; any other error from the check is not
++  ;; reported as a character the title holds.
++  (async done
++    ;; The check's call throws; the outliner's own later call doesn't, so a swallowed error would
++    ;; let the page be written.
++    (let [original outliner-validate/validate-page-title-characters
++          calls (atom 0)]
++      (set! outliner-validate/validate-page-title-characters
++            (fn [title meta-m]
++              (if (= 1 (swap! calls inc)) (throw (js/Error. "zq broken check")) (original title meta-m))))
++      (with-graph (fn [] (set! outliner-validate/validate-page-title-characters original) (done))
++        (fn [{:keys [call]}]
++          (p/let [[[status _] _] (capturing-console-error #(call "POST" "/pages" {:title "zq plain"}))]
++            (is (= 500 status))
++            (is (= 1 @calls) "the write never ran")))))))
++
+ (deftest create-page-restores-a-recycled-page-test
+   (async done
+     (with-graph done
+@@ -305,4 +368,6 @@
+       (is (= "#/components/schemas/TitleConflict"
+              (get-in paths [path :post :responses "409" :content "application/json" :schema :$ref]))))
+     (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
+-                          "no need to search before creating"))))
++                          "no need to search before creating"))
++    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
++                          "Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\""))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

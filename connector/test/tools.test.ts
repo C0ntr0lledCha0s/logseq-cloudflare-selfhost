@@ -1377,6 +1377,18 @@ describe("hand-written tools", () => {
     );
   });
 
+  it("create_page and connector_help say a title can't hold \"/\" (outside a date) or \"#\"", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_page");
+    expect(create.description).toContain(
+      'Refuses with 400 and writes nothing when the title holds "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title; the error names the character and the title.',
+    );
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      'create_page refuses with a 400 a title holding "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title, and names the character.',
+    );
+  });
+
   it("connector_help says the edit-stamp properties are set by the server and refused by the property tools", async () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
