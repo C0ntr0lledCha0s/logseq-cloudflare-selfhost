@@ -5,6 +5,7 @@ tags: [datalog_query, run_named_query, caps, join-fanout, recursion, allow-list,
 seen:
   - 2026-11-09 – item 40, patch 0039, stages 1 to 4 and review rounds 1 and 2 (s-2-1, s-3-1, s-4-1, r1-correctness-1; r1-correctness-1 closed in round 2)
   - 2026-11-16 – item 40, patch 0039, a named query's recursive rule on a deep outline (rule cap)
+  - 2026-11-17 – item 40, patch 0039, the four named queries rewritten as code under named bounds
 promoted_to: []
 ---
 
@@ -33,7 +34,12 @@ r1-correctness-1, `(str ?x)` on a whole-collection input repeated per joined row
 
 A later review found the same class in a vetted named query. `meetings-without-decision` walks up from each decision with a recursive `above` rule, and Datascript's `solve-rule` adds a `-differ?` guard for every earlier call of the rule on the path, so a decision 180 levels deep made about 16,000 guarded calls. Inside a recursive rule each call cost about 60 µs, not the 2 µs the call cap was calibrated from, so the call cap (20,000) stopped 250 levels only after 1.2 to 1.4 s and 180 levels answered 200 after 1.1 s. A caller can build such a chain with the insert tools. While a query runs, `rule-gen-guards` is wrapped (the `join-tuples` pattern) and each rule frame charges its guards plus 10 toward a rule cap of 2,000 per query, its own budget because a unit costs about 200 times a row of relation work. A decision more than 52 levels deep now answers 422 in about 80 ms, naming the cap and the depth; 50 levels answer in about 70 ms.
 
+The 2026-11-17 rewrite settled the class for fixed queries. Review 2 showed the caps still failed the named queries on realistic graphs (10 meetings and 200 decisions answered 422 at the join cap, 700 tagged pages at the scan cap), and each earlier fix had moved the limit without removing it. A named query's shape is fixed, so patch 0039 now computes the four in Clojure by walking Datascript's indexes (`named_queries.cljs`). Each charges the datoms it reads and its candidates to a named bound and refuses with a 422 that says which bound and what to narrow. The rule cap and every rule path were removed. `datalog_query` gained a width cap on function bindings (Datascript's `bind-by-fn` copies every column of every row, so cost is rows x columns squared) and refuses a query of more than 12 function-binding clauses before it runs. In the release bundle a counted read costs about 4 us, not the 0.5 to 1 us the design assumed, so the bounds were set from that bundle's timings.
+
 ## How to catch it next time
+
+- When a query's shape is fixed, count its work in the code that runs it and name each bound after what it counts, so the refusal can tell the caller what to narrow. A generic engine cap tells them nothing they can act on.
+- Calibrate a per-read cost in the release bundle, not the dev build, before setting a bound from it: the two differed by a factor of four here.
 
 - For any endpoint that runs caller-written queries, list every cost driver (read, join, recursion, value size, sort, serialise) and ask which cap bounds each. Try one adversarial query per driver that is cheap on the others, and record the time and rows next to the cap.
 - Treat every allow-listed function as a size question: can its result be larger than its arguments, and can it be chained in a loop? Probe with 20 chained clauses. Then ask what it costs on its own, once per joined row, with the largest argument an input can carry: a function that returns something small (`=`, `pos?`, `index-of`) can still print or walk a large argument.
