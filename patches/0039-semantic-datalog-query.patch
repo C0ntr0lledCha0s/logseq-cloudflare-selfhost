@@ -1,9 +1,9 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 new file mode 100644
-index 0000000..e6f44c9
+index 0000000..a682bda
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-@@ -0,0 +1,1383 @@
+@@ -0,0 +1,1391 @@
 +(ns logseq.db-sync.worker.handler.datalog
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery).
 +
@@ -1079,6 +1079,14 @@ index 0000000..e6f44c9
 +          (let [{:keys [total kept]} result]
 +            (shape-response {:echo echo :columns columns :rows (mapv serialise kept) :total total :limit limit})))))))
 +
++(defn- fn-bindings-refusal
++  "The 422 for a normalised query `query` of more than `max-fn-bindings` function bindings, else
++  nil. A static rule: the dry run applies it as the run does."
++  [query]
++  (let [bindings (fn-binding-count (:where query))]
++    (when (> bindings max-fn-bindings)
++      (refusal 422 (fn-bindings-message bindings max-fn-bindings)))))
++
 +(defn run-query
 +  "Runs the normalised, validated query `q` on `db` filtered for privacy, with pulls run on the kept
 +  rows only; returns {:columns :rows :total-rows :returned :truncated?} merged with `echo` (the
@@ -1087,10 +1095,8 @@ index 0000000..e6f44c9
 +  `scan-cap` replaces the constant, and `row-cap`, `join-cap`, `text-cap`, `call-cap`, `work-cap` and
 +  `width-cap` the other caps (tests)."
 +  [db {:keys [query] :as opts}]
-+  (let [bindings (fn-binding-count (:where query))]
-+    (if (> bindings max-fn-bindings)
-+      (refusal 422 (fn-bindings-message bindings max-fn-bindings))
-+      (run-checked db opts))))
++  (or (fn-bindings-refusal query)
++      (run-checked db opts)))
 +
 +;; The handler
 +;; ===========
@@ -1193,7 +1199,8 @@ index 0000000..e6f44c9
 +
 +(defn handle-query
 +  "POST /query: refuses an E2EE graph first, then a body, query or inputs that can't run (rules
-+  included: a caller's query takes none), and otherwise answers the dry run or the rows."
++  included: a caller's query takes none) and a query of too many function bindings, and otherwise
++  answers the dry run or the rows."
 +  [{:keys [request db e2ee? self]}]
 +  (reset! last-run {:private-set-built? false :scanned 0 :joined 0 :width 0 :pulled 0})
 +  (if e2ee?
@@ -1202,10 +1209,11 @@ index 0000000..e6f44c9
 +                     (p/catch (fn [_] ::malformed)))]
 +      (if (= ::malformed body)
 +        (http/bad-request "body: give a JSON object with query")
-+        (let [parsed (parse-request body)]
++        (let [parsed (parse-request body)
++              refused (if (refusal? parsed) parsed (fn-bindings-refusal (:query parsed)))]
 +          (respond
 +           (cond
-+             (refusal? parsed) parsed
++             refused refused
 +             (true? (:dry-run body)) {:dry-run true
 +                                      :query (pr-str (:given parsed))
 +                                      :inputs (pr-str (:inputs parsed))}
@@ -1388,7 +1396,7 @@ index 0000000..e6f44c9
 +                                          :bounds bounds :dry-run true}
 +                 :else (run-named db query-name entry resolved bounds (or (:limit body) default-limit)))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d8e3144..a5f9abe 100644
+index d8e3144..f2aa3a7 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -15,6 +15,7 @@
@@ -1399,61 +1407,49 @@ index d8e3144..a5f9abe 100644
              [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
              [logseq.db-sync.worker.http :as http]
              [logseq.db-sync.worker.ws :as ws]
-@@ -31,6 +32,7 @@
-             [logseq.outliner.page :as outliner-page]
-             [logseq.outliner.property :as outliner-property]
-             [logseq.outliner.tree :as otree]
-+            [logseq.outliner.validate :as outliner-validate]
-             [promesa.core :as p]))
- 
- (def ^:private default-limit 50)
-@@ -1984,6 +1986,30 @@
+@@ -1984,6 +1985,23 @@
         (filter #(or (page? %) (tag? %) (property? %)))
         (sort-by :db/id)))
  
-+(defn- page-title-character-refusal
-+  "The 400 message for a plaintext page title holding a character the outliner refuses in one (\"/\"
-+  outside a date, or \"#\"), checked on the title as createPage stores it; nil when it has none.
-+  The outliner only refuses once the write has started, which answered 500. It refuses \"#\" on
-+  every create, but \"/\" only for a new page: a recycled page (tagged Page, as the outliner looks
-+  it up) is restored under its own title, so only \"#\" is checked then."
-+  [db title]
-+  (let [title' (outliner-page/sanitize-title title)
-+        restore? (some->> (first (ldb/page-exists? db title' #{:logseq.class/Page}))
-+                          (d/entity db)
-+                          ldb/recycled?)]
-+    (try
-+      (if restore?
-+        (outliner-validate/validate-page-title-no-hashtag title' nil)
-+        (outliner-validate/validate-page-title-characters title' nil))
-+      nil
-+      (catch :default error
-+        (let [data (ex-data error)]
-+          (if (= :notification (:type data))
-+            (str "title: a page title can't include \""
-+                 (if (= :page.validation/name-no-hash (get-in data [:payload :i18n-key])) "#" "/")
-+                 "\" (" title ")")
-+            (throw error)))))))
++(defn- title-character-rejection
++  "Calls `write`, re-throwing the outliner's refusal of a page title's characters (\"/\" outside
++  a journal title, or \"#\") as a `reject!` that names `title` and the character, so `rejecting`
++  answers 400. The outliner decides, as it creates or restores the page: it checks \"#\" on every
++  create, \"/\" only for a new page that isn't a journal in the graph's own title format."
++  [title write]
++  (try
++    (write)
++    (catch :default error
++      (let [k (get-in (ex-data error) [:payload :i18n-key])]
++        (if (and (= :notification (:type (ex-data error)))
++                 (contains? #{:page.validation/name-no-slash :page.validation/name-no-hash} k))
++          (reject! (str "title: a page title can't include \""
++                        (if (= :page.validation/name-no-hash k) "#" "/")
++                        "\" (" title ")"))
++          (throw error))))))
 +
  (defn- title-taken-response
    "409 naming each holder of `title`. createTag passes `promotable?`: a holder it accepts gets a
    pointer to promote_page_to_tag in the message and promote: true in its existing[] entry."
-@@ -2498,10 +2524,13 @@
-     :semantic/pages-create
-     (p/let [body (body-clj request)
-             holders (when (and (not e2ee?) (non-blank-string? (:title body)))
--                      (title-holders db (:title body)))]
-+                      (title-holders db (:title body)))
-+            character-refusal (when (and (not e2ee?) (non-blank-string? (:title body)))
-+                                (page-title-character-refusal db (:title body)))]
-       (cond
+@@ -2503,10 +2521,13 @@
          (not (non-blank-string? (:title body))) (http/bad-request "missing title")
          (seq holders) (title-taken-response (:title body) holders)
-+        character-refusal (http/bad-request character-refusal)
          :else
-         (let [[title page-id] (authored-write! conn creator outliner-page/create! (:title body)
-                                                      {:encrypted-title? e2ee? :encrypted-name (:name body)})]
-@@ -5513,6 +5542,10 @@
+-        (let [[title page-id] (authored-write! conn creator outliner-page/create! (:title body)
+-                                                     {:encrypted-title? e2ee? :encrypted-name (:name body)})]
+-          (broadcast-change! self)
+-          (http/json-response nil {:uuid (str page-id) :kind "page" :title title} 201))))
++        (rejecting
++         #(let [[title page-id] (title-character-rejection
++                                 (:title body)
++                                 (fn [] (authored-write! conn creator outliner-page/create! (:title body)
++                                                         {:encrypted-title? e2ee? :encrypted-name (:name body)})))]
++            (broadcast-change! self)
++            (http/json-response nil {:uuid (str page-id) :kind "page" :title title} 201)))))
+ 
+     :semantic/pages-blocks
+     (with-page-selector db e2ee? "page-id" (:page-id path-params) find-visible-entity
+@@ -5513,6 +5534,10 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -1466,10 +1462,10 @@ index d8e3144..a5f9abe 100644
  (defn- answering-stamp-conflicts
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 new file mode 100644
-index 0000000..e6dd3bc
+index 0000000..7cac252
 --- /dev/null
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,427 @@
 +(ns logseq.db-sync.worker.named-queries
 +  "The named queries runNamedQuery runs (patch 0039), as server code that walks Datascript's
 +  indexes, not as Datalog. Each entry is {:title :description :columns :bounds :run :params}; the
@@ -1487,14 +1483,16 @@ index 0000000..e6dd3bc
 +    stopping at the first fresh block that isn't private;
 +  - meetings-without-decision reads the entities tagged meeting_tag created within days
 +    (:meetings), then the entities tagged decision_tag (:decisions), and walks up :block/parent
-+    from each decision on a meeting's page into one shared set (:ancestor-steps), so a decision at
-+    any depth costs one step per ancestor no other walk has reached;
++    from each decision that isn't private into one shared set (:ancestor-steps), through its page
++    and any page above it, so a decision at any depth costs one step per ancestor no other walk has
++    reached;
 +  - open-tasks-by-client reads the entities tagged Task (:tasks), and for each open one (:open-tasks)
 +    its client_property values, else its page's;
 +  - pages-missing-property reads the entities tagged tag (:tagged) and each page's property values.
 +
 +  Every datom read goes through datoms* or first-value* and counts toward :reads (the backstop over
-+  everything, privacy walks included). A charge past any bound throws {::bound {:query :bound
++  every read, privacy walks included); a candidate bound counts candidates only, so it can stop a
++  query before :reads does. A charge past any bound throws {::bound {:query :bound
 +  :value}}, which the handler answers with bound-message's 422; no rows found so far are returned.
 +  Nothing reads the clock: the Worker's does not move during synchronous work.
 +
@@ -1513,7 +1511,7 @@ index 0000000..e6dd3bc
 +;; the db value (never the conn), the query's name, its bounds (a map of bound name to number) and
 +;; :work, a volatile map of what each bound has counted so far. Every datom read goes through
 +;; datoms* or first-value*, which charge :reads, and a query charges its candidate bounds itself
-+;; with charge!. A charge that passes a bound throws, so work is bounded by counts, never by the
++;; with charge!, which counts toward that bound only. A charge that passes a bound throws, so work is bounded by counts, never by the
 +;; clock (which does not move during synchronous CPU work in a Worker).
 +
 +(def default-bounds
@@ -1521,10 +1519,12 @@ index 0000000..e6dd3bc
 +  --named mode). :reads is the backstop over every read, privacy walks included: a counted read
 +  costs about 4 us there (3.6 to 4.8 us warm, by query), so 100,000 reads took 360 to 480 ms and
 +  meetings-without-decision on 20,000 pages unbounded took 800 ms, while at 30,000 reads each query
-+  stops after 90 to 120 ms. The rest count a query's candidates, each set where its query's usual
-+  reads per candidate (about 12 per tagged page and per meeting, 10 to 17 per open task, 2 per
-+  block, decision or task read, 1 to 5 per ancestor step) reach about that work, so the bound that
-+  names what to narrow stops the query before the backstop does."
++  stops after 90 to 120 ms. The rest count a query's candidates only, never toward :reads, so each
++  can stop its query before the backstop does: a task and its status, a block and its updated-at,
++  or a tagged decision cost 1 or 2 reads, so 10,000 of them are at most 20,000 reads. A shape that
++  reads more per candidate (about 12 per tagged page and per meeting, 10 to 17 per open task, 5 or
++  more per decision walked up its parents) can meet the backstop first, and its advice fits the
++  query."
 +  {:meetings 2000
 +   :decisions 10000
 +   :ancestor-steps 10000
@@ -1544,13 +1544,12 @@ index 0000000..e6dd3bc
 +                      {::bound {:query (:query ctx) :bound bound :value limit}})))))
 +
 +(defn charge!
-+  "Counts `n` toward `bound` and toward :reads (the backstop over everything). Past either, throws
-+  (ex-info … {::bound {:query :bound :value}}) naming the bound passed and its value: at the bound
++  "Counts `n` toward `bound` only: :reads counts the datoms read (datoms*, first-value*), not the
++  candidates a query charges, so a candidate bound can stop a query before :reads does. Past the
++  bound, throws (ex-info … {::bound {:query :bound :value}}) naming it and its value: at the bound
 +  is allowed, one past it is not."
 +  [ctx bound n]
-+  (bump! ctx bound n)
-+  (when-not (= :reads bound)
-+    (bump! ctx :reads n)))
++  (bump! ctx bound n))
 +
 +(defn datoms*
 +  "d/datoms over `index` and `components`, as a lazy sequence that charges one read per datom
@@ -1687,11 +1686,13 @@ index 0000000..e6dd3bc
 +
 +(defn meetings-without-decision
 +  "Pages and blocks tagged meeting_tag (or a tag extending it) created at or after the cutoff that
-+  aren't private, each charged to :meetings, with no block tagged decision_tag below them. The
-+  decisions on those meetings' pages that aren't private, each tagged datom charged to :decisions,
-+  are walked up :block/parent into one shared set, each step charged to :ancestor-steps; a walk
-+  stops at the first ancestor already in the set, and the decision itself goes in only as another
-+  decision's ancestor. A meeting not in the set is a row [created-at meeting], at any depth."
++  aren't private, each charged to :meetings, with no block or page tagged decision_tag below them.
++  Every decision that isn't private, each tagged datom charged to :decisions, is walked up
++  :block/parent into one shared set, each step charged to :ancestor-steps: through its blocks, its
++  page and any page that page sits under (a namespace child's :block/parent is its parent page), as
++  the Datalog's above rule walked. A walk stops at the first ancestor already in the set, and the
++  decision itself goes in only as another decision's ancestor. A meeting not in the set is a row
++  [created-at meeting], at any depth."
 +  [ctx {:keys [meeting_tag decision_tag days]}]
 +  (let [private? (private-fn ctx)
 +        candidates (into []
@@ -1703,11 +1704,9 @@ index 0000000..e6dd3bc
 +                         (tagged ctx private? meeting_tag nil))]
 +    (if (empty? candidates)
 +      []
-+      (let [pages (into #{} (map (fn [[_ m]] (or (first-value* ctx m :block/page) m))) candidates)
-+            decided (volatile! #{})]
++      (let [decided (volatile! #{})]
 +        (doseq [d (tagged ctx private? decision_tag :decisions)]
-+          (when (and (contains? pages (first-value* ctx d :block/page))
-+                     (not (private? d)))
++          (when-not (private? d)
 +            (loop [x (first-value* ctx d :block/parent)]
 +              (when (and (some? x) (not (contains? @decided x)))
 +                (charge! ctx :ancestor-steps 1)
@@ -1786,7 +1785,7 @@ index 0000000..e6dd3bc
 +   {:advice "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
 +    :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)" "list one client's tasks with datalog_query"]
 +             :open-tasks ["found more than" "open tasks (its open-tasks bound)"]
-+             :reads ["stopped after" reads-counted]}}
++             :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}}
 +   "pages-missing-property"
 +   {:advice "give a narrower tag"
 +    :bounds {:tagged ["stopped after" "tagged pages and blocks (its tagged bound)"]
@@ -1824,8 +1823,8 @@ index 0000000..e6dd3bc
 +      (str "1. Read the pages and blocks tagged " (tag-text (get params "meeting_tag")) " created within " (days "days")
 +           ", each counted " (b :meetings) ", leaving out private ones and the Recycle bin."
 +           " 2. Read the blocks tagged " (tag-text (get params "decision_tag")) ", each counted " (b :decisions)
-+           ", keeping the ones on those meetings' pages that aren't private."
-+           " 3. Walk up from each through its parents, each step counted " (b :ancestor-steps)
++           ", keeping the ones that aren't private."
++           " 3. Walk up from each through its parents, its page and any page above it, each step counted " (b :ancestor-steps)
 +           ", stopping at a block already reached. 4. A meeting no walk reached is a row, oldest first." reads)
 +      "open-tasks-by-client"
 +      (str "1. Read the blocks tagged Task, each counted " (b :tasks) "."
@@ -1895,7 +1894,7 @@ index 0000000..e6dd3bc
 +         rows (run ctx inputs)]
 +     {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 1365b0a..bec4393 100644
+index 1365b0a..99f38aa 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,11 @@
@@ -1915,7 +1914,7 @@ index 1365b0a..bec4393 100644
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
     "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
 -   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. A page in the Recycle bin is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
-+   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A page in the Recycle bin is restored instead, even when its title holds \"/\". Not checked on E2EE graphs, whose names are ciphertext."]
++   "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A \"/\" is allowed where Logseq allows it: in a journal title that the graph's journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
     "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
     "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
@@ -1929,14 +1928,14 @@ index 1365b0a..bec4393 100644
 +                        " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query or inputs is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. Every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap): each clause runs once per joined row, so past it the query stops with 422 naming the cap; narrow the rows before the function clauses. Every not, not-join, or and or-join joins, subtracts or sums every row bound so far, so each charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap), whatever its inner clauses match, and nested ones charge once per level; past it the query stops with 422 naming the cap. Every function binding ([(f ?x) ?y]) copies every column of every row bound so far, so a query may hold at most 12 function bindings (at any depth; predicates don't count; more answer 422 before running), and each charges the rows x columns of the relation it returns toward 100,000 copied values per query (the width cap): from a page and its blocks, 8 bindings fit about 1,900 rows and 12 about 1,000, and past it the query stops with 422 naming the cap, so return extra attributes with (pull ?b [...]) in :find, which runs only on the kept rows, bind fewer values with functions or narrow the rows first; predicates and data patterns charge nothing. The only source is $. Every where clause must share a variable with the others, through a data pattern, a function binding, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A data pattern joined to two or more bound rows scans its whole attribute, so to step up from bound blocks use get-some, which reads one datom per row ([(get-some $ ?b :block/parent) [_ ?p]])."
 +                        " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
 +                        " Work is capped, not timed: a query that scans more than 20,000 datoms (the scan cap; every datom it reads counts, private ones too) is stopped and refused with 422 naming the cap, never answered in part, so narrow it with a tag, page or attribute value. A query that matches more than 2,500 rows (the row cap) is refused with 422 naming the cap too, because every row is sorted before limit applies: a join can match far more rows than it reads datoms (a self-join through a tag on n blocks matches n × n), so bind one side, or count with an aggregate such as (count ?b), which folds the rows before the cap. A join is also bounded while Datascript builds it: a query that builds more than 20,000 rows while joining (the join cap; every pair a join through a shared value matches counts, in or-join and not-join bodies too) is stopped with 422 naming the cap, and an aggregate doesn't help there, since it counts rows after the join. Rows whose collections (an inputs collection bound to a variable every row returns) hold more than 20,000 values in all (the value cap) are refused with 422 before the sort too; each character of text inside them counts as a value. Rows are sorted (entity ids, then values, by type), and cut to limit (1 to 200, default 50), then to about 100,000 characters of JSON (the byte cap), whole rows only; total-rows counts every row, and truncated says which cap cut them (by: limit or byte-cap) with a note. Scalar (?x .), collection ([?x ...]) and aggregate finds come back as rows and are cut the same way. Each (pull ?x pattern) in :find is pulled only for the rows kept, so a pull costs at most limit pulls: the pattern is a literal vector at most 2 levels deep ([:block/title {:block/parent [:block/title]}]), with no recursion (... or a recursion number) and no :xform, and a many attribute (and a reverse ref) returns at most 50 values; (limit :block/refs n) takes n from 1 to 50. Pull :block/uuid and :block/title to get handles for the other tools. Keywords come back as text without the colon (block/title), uuids as text and refs as numbers (entity ids)."
-+                        " Each refusal is a 400 naming the clause (where 2, find, find: pull ?b, :in) or the field (rules) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query and inputs come back as EDN without running. Unavailable for E2EE graphs (409): titles are ciphertext.")]
++                        " Each refusal is a 400 naming the clause (where 2, find, find: pull ?b, :in) or the field (rules) and the reason (a pull refusal names the attribute or the depth); a malformed query names the line and column, and an inputs count that doesn't match :in names both counts. With dry-run=true the query and inputs come back as EDN without running; a dry run refuses what the run would refuse before running, more than 12 function bindings included. Unavailable for E2EE graphs (409): titles are ciphertext.")]
 +   "runNamedQuery" ["Run a named read-only query"
 +                    (str "Runs one of four read-only queries as server code, not Datalog, by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
 +                         " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. It reads each stale page's blocks, and stops with 422 after 2,500 tagged pages and blocks (its tagged bound) or after reading 10,000 blocks on pages not updated within days (its page-blocks bound): give a narrower tag or a larger days."
-+                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block below them tagged decision_tag, a decision at any depth; columns created-at (ms) and meeting. It walks up once from each decision-tagged block on a meeting's page, sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
-+                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound) or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
++                         " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block or page below them tagged decision_tag, a decision at any depth, on a page nested under the meeting page included; columns created-at (ms) and meeting. It walks up once from each decision_tag block or page that isn't private, through its blocks, its page and any page that page sits under (a namespace child sits under its parent page), sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
++                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
 +                         " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
-+                         " Every read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read). A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
++                         " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
 +                         " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
 +                         " The response has name, the resolved params (titles and idents; a tag's includes lists the tags extending it), columns, total-rows, returned, truncated, plan (the steps the query took, each with its bound and number) and work (what each bound counted, and reads), then rows."
 +                         " Private content is left out as datalog_query leaves it out: anything tagged Private, on a private page or under a private block is left out (a tag extending Private, and Private in any case, count too), and so is anything in the Recycle bin; a reference to one of those (a tag, a client, a property value) doesn't count. Rows are cut to limit (1 to 200, default 50) and then to about 100,000 characters of JSON (the byte cap), whole rows only; truncated says which applied. A param that doesn't resolve or is out of range answers 400 naming it (params.<name>), never empty rows, including a default the graph doesn't have (no Business Meeting tag, say): pass the graph's own tag or property instead. An unknown name answers 404 listing the names. With dry-run=true the resolved params, the plan and the bounds come back, with nothing read. Unavailable for E2EE graphs (409): titles are ciphertext.")]
@@ -2079,10 +2078,10 @@ index 1dda244..765eed6 100644
           (-> (p/let [key (<key)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 new file mode 100644
-index 0000000..239244e
+index 0000000..047acfc
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-@@ -0,0 +1,3946 @@
+@@ -0,0 +1,4072 @@
 +(ns logseq.db-sync.semantic-datalog-query-test
 +  "Read-only Datalog over the semantic API (patch 0039, datalogQuery). POST /query reads the query
 +  and inputs as EDN (nothing is evaluated), refuses write forms, functions off the allow-list,
@@ -4845,12 +4844,12 @@ index 0000000..239244e
 +                (is (string/starts-with? (named-queries/first-value* ctx e :block/title) "zq counted "))
 +                (is (nil? (named-queries/first-value* ctx e :logseq.property/deleted-at)))
 +                (is (= 2 (work ctx :reads)))))
-+            (testing "charge! counts up to its bound, throws one past it, and bumps reads too"
++            (testing "charge! counts up to its bound, throws one past it, and leaves reads to the reads"
 +              (let [ctx (walk-ctx db {:tagged 2})]
 +                (named-queries/charge! ctx :tagged 1)
 +                (named-queries/charge! ctx :tagged 1)
 +                (is (= 2 (work ctx :tagged)) "at the bound is allowed")
-+                (is (= 2 (work ctx :reads)))
++                (is (= 0 (work ctx :reads)) "a candidate charge is not a read")
 +                (is (= {:query "test-walk" :bound :tagged :value 2}
 +                       (bound-data #(named-queries/charge! ctx :tagged 1))))
 +                (is (= 3 (work ctx :tagged)) "work shows the bound + 1")))
@@ -4859,11 +4858,13 @@ index 0000000..239244e
 +                (named-queries/charge! ctx :meetings 3)
 +                (is (= {:query "test-walk" :bound :meetings :value 4}
 +                       (bound-data #(named-queries/charge! ctx :meetings 2))))))
-+            (testing "reads is a backstop over every charge: past its own bound it throws naming reads"
++            (testing "a candidate charge never trips reads; reads past its own bound throws naming reads"
 +              (let [ctx (walk-ctx db {:reads 5})]
-+                (named-queries/charge! ctx :tagged 3)
++                (named-queries/charge! ctx :tagged 6)
++                (is (= :no-throw (bound-data #(named-queries/charge! ctx :tagged 3))))
++                (named-queries/charge! ctx :reads 5)
 +                (is (= {:query "test-walk" :bound :reads :value 5}
-+                       (bound-data #(named-queries/charge! ctx :tagged 3))))))
++                       (bound-data #(named-queries/charge! ctx :reads 1))))))
 +            (testing "datoms* past reads throws, after realising only the reads allowed"
 +              (let [ctx (walk-ctx db {:reads 4})]
 +                (is (= {:query "test-walk" :bound :reads :value 4}
@@ -5425,6 +5426,61 @@ index 0000000..239244e
 +                    ["pages-missing-property" {:tag "Business Meeting" :property "forClient"}]
 +                    ["meetings-without-decision" {}] ["meetings-without-decision" {:decision_tag "Key Decision"}]]))))))
 +
++;; Review round 2 (r2-correctness-1): the legacy `above` rule walked :block/parent from a decision
++;; through its page to any page above it, so a decision on a page nested under a meeting page (a
++;; namespace child, whose :block/parent the outliner's split-namespace sets to the parent page), or
++;; a page tagged Decision whose parent is the meeting page, decided the meeting. The walk must too.
++(deftest named-decision-under-nested-page-test
++  (async done
++    (with-named done
++      (fn [{:keys [conn self undecided]}]
++        (let [parent! (fn [child parent]
++                        (d/transact! conn [[:db/add [:block/uuid (uuid (str child))] :block/parent
++                                            [:block/uuid (uuid (str parent))]]]))]
++          (p/let [;; A decision block on a child page of a meeting page.
++                  child (page-id! self "zq Minutes Child")
++                  _ (parent! child undecided)
++                  [child-decision] (insert! self child [{:title "zq child decision"}])
++                  _ (set-tags! self (:uuid child-decision) ["Decision"])
++                  ;; A Key Decision two pages down: a grandchild page of a meeting page.
++                  grand-meeting (page-id! self "zq Grand Meeting")
++                  _ (set-tags! self grand-meeting ["Business Meeting"])
++                  middle (page-id! self "zq Grand Middle")
++                  _ (parent! middle grand-meeting)
++                  grandchild (page-id! self "zq Grand Child")
++                  _ (parent! grandchild middle)
++                  [deep] (insert! self grandchild [{:title "zq grand notes" :children [{:title "zq grand decision"}]}])
++                  _ (set-tags! self (get-in deep [:children 0 :uuid]) ["Key Decision"])
++                  ;; A page tagged Decision whose parent is a meeting page.
++                  page-meeting (page-id! self "zq Page Decided Meeting")
++                  _ (set-tags! self page-meeting ["Business Meeting"])
++                  decision-page (page-id! self "zq Decision Page")
++                  _ (parent! decision-page page-meeting)
++                  _ (set-tags! self decision-page ["Decision"])
++                  ;; Control: a child page under a meeting, with no decision on it.
++                  bare-meeting (page-id! self "zq Bare Meeting")
++                  _ (set-tags! self bare-meeting ["Business Meeting"])
++                  bare-child (page-id! self "zq Bare Child")
++                  _ (parent! bare-child bare-meeting)
++                  _ (insert! self bare-child [{:title "zq bare notes"}])
++                  meetings (named! self "meetings-without-decision" {:limit 200})
++                  key-meetings (named! self "meetings-without-decision" {:params {:decision_tag "Key Decision"} :limit 200})
++                  titles (set (row-titles meetings 1))]
++            (is (= [200 200] (map :status [meetings key-meetings])) (pr-str (map head-of [meetings key-meetings])))
++            (testing "a decision on a child page, a grandchild page, or a child page tagged Decision decides the meeting"
++              (is (not (contains? titles "zq Meeting Undecided")) (pr-str titles))
++              (is (not (contains? titles "zq Grand Meeting")) (pr-str titles))
++              (is (not (contains? titles "zq Page Decided Meeting")) (pr-str titles)))
++            (testing "a child page with no decision decides nothing"
++              (is (contains? titles "zq Bare Meeting") (pr-str titles)))
++            (testing "under Key Decision only the Key Decision's meeting is decided"
++              (is (= #{"zq Meeting Undecided" "zq Page Decided Meeting" "zq Bare Meeting"}
++                     (set (filter #{"zq Meeting Undecided" "zq Grand Meeting" "zq Page Decided Meeting" "zq Bare Meeting"}
++                                  (row-titles key-meetings 1))))))
++            (parity! conn self "nested pages"
++                     [["meetings-without-decision" {}] ["meetings-without-decision" {:days 365}]
++                      ["meetings-without-decision" {:decision_tag "Key Decision"}]])))))))
++
 +;; Bounds, clock, read-only and the response
 +;; -----------------------------------------
 +
@@ -5443,7 +5499,7 @@ index 0000000..239244e
 +   ["open-tasks-by-client" nil
 +    {:tasks "open-tasks-by-client stopped after %s blocks tagged Task (its tasks bound); list one client's tasks with datalog_query"
 +     :open-tasks "open-tasks-by-client found more than %s open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
-+     :reads "open-tasks-by-client stopped after %s reads (its reads bound, the backstop over every read); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"}]
++     :reads "open-tasks-by-client stopped after %s reads (its reads bound, the backstop over every read); list one client's tasks with datalog_query"}]
 +   ["pages-missing-property" {:params {:tag "Project" :property "forClient"}}
 +    {:tagged "pages-missing-property stopped after %s tagged pages and blocks (its tagged bound); give a narrower tag"
 +     :reads "pages-missing-property stopped after %s reads (its reads bound, the backstop over every read); give a narrower tag"}]])
@@ -5494,6 +5550,53 @@ index 0000000..239244e
 +                acc messages))
 +             (p/resolved nil) named-bound-cases)
 +            (p/finally #(set-bounds! self nil)))))))
++
++;; Review round 1 (r1-light-1): the candidate bounds (tasks, page-blocks, decisions) must be able to
++;; stop a query before the reads backstop does, so their 422 names what to narrow. Each runs on the
++;; shape that reaches it most directly (finished tasks, one stale page of many blocks, decisions
++;; side by side), with every bound at a tenth of its default: reads per candidate don't depend on
++;; the scale, and the fixed reads (tags, classes) weigh more at a tenth, so this is the harder case.
++(deftest named-candidate-bounds-trip-before-reads-test
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                tenth (fn [bound] (quot (get named-queries/default-bounds bound) 10))
++                over (fn [bound] (inc (tenth bound)))
++                _ (tag-pairs! self ["zq tb Proj" "zq tb Meet" "zq tb Dec"])
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "forClient" :type "node"}) 201)
++                ;; Finished tasks, one past the tasks bound.
++                task-page (page-id! self "zq tb tasks")
++                _ (insert! self task-page (vec (for [i (range (over :tasks))]
++                                                 {:title (str "zq tb task " i)
++                                                  :properties {"block/tags" ["Task"] "logseq.property/status" "Done"}})))
++                ;; A stale project page with one block past the page-blocks bound, every one stale.
++                project (page-id! self "zq tb project")
++                _ (set-tags! self project ["zq tb Proj"])
++                blocks (bulk! self project (over :page-blocks) #(str "zq tb block " %))
++                ;; A meeting, and decisions side by side on another page, one past the decisions bound.
++                meeting (page-id! self "zq tb meeting")
++                _ (set-tags! self meeting ["zq tb Meet"])
++                decisions (page-id! self "zq tb decisions")
++                _ (insert! self decisions (vec (for [i (range (over :decisions))] (tagged-block (str "zq tb decision " i) ["zq tb Dec"]))))
++                _ (age! conn :block/updated-at 60 (cons project (map :uuid blocks)))
++                bounds (into {} (map (juxt identity tenth)) (keys named-queries/default-bounds))
++                cases [[:tasks "open-tasks-by-client" nil]
++                       [:page-blocks "projects-untouched" {:params {:tag "zq tb Proj"}}]
++                       [:decisions "meetings-without-decision" {:params {:meeting_tag "zq tb Meet" :decision_tag "zq tb Dec"}}]]
++                responses (one-by-one! (for [[_ query-name body] cases]
++                                         #(p/let [_ (set-bounds! self bounds)
++                                                  r (named! self query-name body)
++                                                  work (:named-work @datalog/last-run)]
++                                            (assoc r :work work))))]
++          (set-bounds! self nil)
++          (doseq [[[bound query-name] r] (map vector cases responses)]
++            (testing (str query-name " stops at its " (name bound) " bound, before reads")
++              (is (= 422 (:status r)) (head-of r))
++              (is (string/includes? (str (get-in r [:body :error])) (str "(its " (name bound) " bound)"))
++                  (pr-str (get-in r [:body :error]) (:work r)))
++              (is (< (get-in r [:work :reads] 0) (tenth :reads)) (pr-str (:work r))))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
 +
 +(deftest named-no-clock-test
 +  ;; No walk reads the clock: a run calls Date.now exactly as often as its dry run, which only
@@ -5688,8 +5791,8 @@ index 0000000..239244e
 +(deftest named-guards-test
 +  ;; Rules no other test pins (found by the stage's mutation step): a tag param that is itself
 +  ;; private hides its datoms, as the private filter did; a private Task class hides every task; no
-+  ;; meeting in the window reads no decision; and a decision on a page without a meeting is never
-+  ;; walked.
++  ;; meeting in the window reads no decision; and a decision on a page without a meeting is walked
++  ;; up to its page (as the Datalog's above rule walked every decision), deciding nothing.
 +  (async done
 +    (with-named done
 +      (fn [{:keys [conn self]}]
@@ -5718,10 +5821,10 @@ index 0000000..239244e
 +          (testing "no meeting in the window answers at once, reading no decision"
 +            (is (= [200 []] [(:status empty-window) (get-in empty-window [:body :rows])]) (head-of empty-window))
 +            (is (= [0 0 0] (mapv #(get empty-work % 0) [:meetings :decisions :ancestor-steps])) (pr-str empty-work)))
-+          (testing "a decision on a page with no meeting is read but never walked"
++          (testing "a decision on a page with no meeting is walked up its 5 blocks and its page, and decides nothing"
 +            (is (= (get-in before [:body :rows]) (get-in after [:body :rows])))
 +            (is (= (inc (:decisions before-work)) (:decisions after-work)) (pr-str [before-work after-work]))
-+            (is (= (:ancestor-steps before-work) (:ancestor-steps after-work)) (pr-str [before-work after-work])))
++            (is (= (+ 6 (:ancestor-steps before-work)) (:ancestor-steps after-work)) (pr-str [before-work after-work])))
 +          (testing "a private Task class hides every task (the Datalog, over the filter, couldn't even resolve
 +                    :logseq.class/Task, and answered 400)"
 +            (is (= [200 []] [(:status tasks) (get-in tasks [:body :rows])]) (head-of tasks))))))))
@@ -5903,6 +6006,28 @@ index 0000000..239244e
 +              (is (= [422 (fn-bindings-message 13) nil] result)))))))))
 +
 +
++;; Review round 2 (r2-tests-1): the function-binding limit is a static rule, so a dry run, which
++;; checks the query without running it, must answer the same 422 the real call would.
++(deftest dry-run-applies-fn-binding-limit-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [_ (reset! datalog/last-run nil)
++                twelve (query! self (on-page "zq Notes" (identity-clauses 12)) :dry-run true)
++                thirteen (query! self (on-page "zq Notes" (identity-clauses 13)) :dry-run true)
++                after-dry-run @datalog/last-run
++                nested (query! self (on-page "zq Notes" (concat (identity-clauses 12) ["(not [(identity ?t) ?n] [(= ?n \"x\")])"]))
++                               :dry-run true)
++                real (query! self (on-page "zq Notes" (identity-clauses 13)))]
++          (testing "12 function bindings pass the dry run"
++            (is (= [200 true] [(:status twelve) (get-in twelve [:body :dry-run])]) (pr-str twelve)))
++          (testing "13 answer the 422 the real call answers, and nothing runs"
++            (is (= [422 (fn-bindings-message 13)] [(:status thirteen) (get-in thirteen [:body :error])]) (pr-str thirteen))
++            (is (= [422 (fn-bindings-message 13)] [(:status real) (get-in real [:body :error])]) (pr-str real))
++            (is (= {:private-set-built? false :scanned 0 :joined 0 :width 0 :pulled 0} after-dry-run)))
++          (testing "a binding nested inside not counts in the dry run too"
++            (is (= [422 (fn-bindings-message 13)] [(:status nested) (get-in nested [:body :error])]) (pr-str nested))))))))
++
 +(deftest width-cap-legitimate-test
 +  ;; A few function bindings over the row cap's rows stay far under the width cap, a query of data
 +  ;; patterns only charges nothing, the charge starts afresh on every request, and narrowing the rows
@@ -6030,7 +6155,7 @@ index 0000000..239244e
 +          (is (identical? own after-refused) "restored after a refused query")
 +          (is (pos? direct) "a query outside run-query runs uncharged"))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
-index d0b664a..7a95374 100644
+index d0b664a..0db3a8f 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 @@ -13,6 +13,7 @@
@@ -6041,7 +6166,7 @@ index d0b664a..7a95374 100644
              [promesa.core :as p]))
  
  (def ^:private sqlite (if (find-ns 'nbb.core) (aget sqlite3 "default") sqlite3))
-@@ -122,6 +123,68 @@
+@@ -122,6 +123,78 @@
              (is (string/includes? (:error journal-body) (str "journal \"" (:block/title journal) "\""))))
            (is (= 201 fresh-status) "a free title is still created"))))))
  
@@ -6091,33 +6216,70 @@ index d0b664a..7a95374 100644
 +              (is (not= 400 date-status) (str "a date title keeps its slashes: " (pr-str date))))))))))
 +
 +(deftest create-page-character-check-keeps-other-errors-test
-+  ;; Only the outliner's own notification becomes the 400; any other error from the check is not
-+  ;; reported as a character the title holds.
++  ;; Only the outliner's "/" and "#" notifications become the title's character 400. Another
++  ;; notification keeps its own message (as `rejecting` answers it elsewhere), and any other error
++  ;; stays a 500; nothing is written either way.
 +  (async done
-+    ;; The check's call throws; the outliner's own later call doesn't, so a swallowed error would
-+    ;; let the page be written.
 +    (let [original outliner-validate/validate-page-title-characters
-+          calls (atom 0)]
++          mode (atom nil)]
 +      (set! outliner-validate/validate-page-title-characters
 +            (fn [title meta-m]
-+              (if (= 1 (swap! calls inc)) (throw (js/Error. "zq broken check")) (original title meta-m))))
++              (case @mode
++                :error (throw (js/Error. "zq broken check"))
++                :other (throw (ex-info "zq other" {:type :notification
++                                                   :payload {:message "zq another refusal"
++                                                             :i18n-key :page.validation/name-blank}}))
++                (original title meta-m))))
 +      (with-graph (fn [] (set! outliner-validate/validate-page-title-characters original) (done))
-+        (fn [{:keys [call]}]
-+          (p/let [[[status _] _] (capturing-console-error #(call "POST" "/pages" {:title "zq plain"}))]
-+            (is (= 500 status))
-+            (is (= 1 @calls) "the write never ran")))))))
++        (fn [{:keys [conn call]}]
++          (p/let [before (snapshot conn)
++                  _ (reset! mode :error)
++                  [[error-status _] _] (capturing-console-error #(call "POST" "/pages" {:title "zq plain"}))
++                  _ (reset! mode :other)
++                  [other-status other] (call "POST" "/pages" {:title "zq plain"})
++                  _ (reset! mode nil)]
++            (is (= 500 error-status))
++            (is (= [400 "zq another refusal"] [other-status (:error other)]))
++            (is (= before (snapshot conn)) "nothing was written")))))))
 +
  (deftest create-page-restores-a-recycled-page-test
    (async done
      (with-graph done
-@@ -138,6 +201,57 @@
+@@ -138,6 +211,85 @@
            (is (= (:uuid created) (:uuid body)) "Logseq restores it, as in the editor")
            (is (not (entity-util/hidden? (entity conn (:uuid created))))))))))
  
++;; Review round 2 (r2-correctness-2, r2-integrity-1): the outliner reads a title as a journal date
++;; with the graph's own journal title format, case-insensitively, and never checks a journal
++;; title's characters, so a "/" in a date the graph's format parses is created as that journal.
++(deftest create-page-journal-title-in-the-graphs-slash-format-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn call]}]
++        (let [format! (fn [fmt] (d/transact! conn [[:db/add :logseq.class/Journal :logseq.property.journal/title-format fmt]]))
++              cases [["dd/MM/yyyy" "17/11/2026"]
++                     ["E, MM/dd/yyyy" "tue, 11/17/2026"]
++                     ["E, MM/dd/yyyy" "TUE, 11/17/2026"]
++                     ["EEEE, yyyy/MM/dd" "tuesday, 2026/11/17"]]]
++          (p/let [results (reduce (fn [acc [fmt title]]
++                                    (p/let [results acc
++                                            _ (format! fmt)
++                                            result (call "POST" "/pages" {:title title})]
++                                      (conj results result)))
++                                  (p/resolved []) cases)]
++            (doseq [[[fmt title] [status body]] (map vector cases results)]
++              (testing (str title " under " fmt)
++                (is (= 201 status) (pr-str body))
++                (is (= 20261117 (:block/journal-day (entity conn (:uuid body)))) (pr-str body))
++                (is (contains? (set (map :db/ident (:block/tags (entity conn (:uuid body))))) :logseq.class/Journal))))
++            (testing "a \"/\" title the format doesn't parse is still refused"
++              (p/let [[status body] (call "POST" "/pages" {:title "zq 17/11/2026 notes"})]
++                (is (= [400 "title: a page title can't include \"/\" (zq 17/11/2026 notes)"] [status (:error body)]))))))))))
++
 +(deftest create-page-restores-a-recycled-page-whose-title-holds-a-slash-test
-+  ;; The outliner restores a recycled page without checking its title's characters, so the
-+  ;; up-front "/" refusal must not block the restore. A page titled "zq/probe" can exist from the
-+  ;; app or an import; it is renamed here with a direct transact.
++  ;; The outliner restores a recycled page without checking its title's "/", and createPage
++  ;; answers the outliner's own refusal, so the restore goes through. A page titled "zq/probe" can
++  ;; exist from the app or an import; it is renamed here with a direct transact.
 +  (async done
 +    (with-graph done
 +      (fn [{:keys [conn call]}]
@@ -6135,7 +6297,8 @@ index d0b664a..7a95374 100644
 +                  _ (rename! (:uuid hashed) "zq#hashed")
 +                  _ (rename! (:uuid tag) "zq/tagged")
 +                  _ (rename! (:uuid hidden) "zq/hidden")
-+                  ;; Hidden but not recycled: only a restore is exempt from the "/" check.
++                  ;; Hidden but not recycled: the outliner hands back an existing top-level page
++                  ;; without checking its title, whatever the characters.
 +                  _ (d/transact! conn [[:db/add [:block/uuid (uuid (:uuid hidden))] :logseq.property/hide? true]])
 +                  deletes (p/all (map #(call "DELETE" (str "/pages/" (:uuid %))) [probe spaced hashed tag]))
 +                  _ (is (= [200 200 200 200] (map first deletes)))
@@ -6160,24 +6323,24 @@ index d0b664a..7a95374 100644
 +              (is (entity-util/hidden? (entity conn (:uuid hashed)))))
 +            (testing "a recycled tag is not restored by createPage, so its title is still checked"
 +              (is (= [400 "title: a page title can't include \"/\" (zq/tagged)"] [tag-status (:error tag-body)])))
-+            (testing "a hidden page that is not in the Recycle bin is not restored, so the title is still checked"
-+              (is (= [400 "title: a page title can't include \"/\" (zq/hidden)"] [hidden-status (:error hidden-body)])))
++            (testing "a hidden page that is not in the Recycle bin is the outliner's existing page, so \"/\" is not checked"
++              (is (= [201 (:uuid hidden)] [hidden-status (:uuid hidden-body)]) (pr-str hidden-body)))
 +            (testing "a title no recycled page holds is still refused"
 +              (is (= [400 "title: a page title can't include \"/\" (zq/never)"] [new-status (:error new-body)])))))))))
 +
  (deftest delete-page-with-references-needs-acknowledgement-test
    (async done
      (with-graph done
-@@ -305,4 +419,8 @@
+@@ -305,4 +457,8 @@
        (is (= "#/components/schemas/TitleConflict"
               (get-in paths [path :post :responses "409" :content "application/json" :schema :$ref]))))
      (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
 -                          "no need to search before creating"))))
 +                          "no need to search before creating"))
 +    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
-+                          "Refuses with 400 and writes nothing when the title holds \"/\" (except in a date) or \"#\""))
++                          "Refuses with 400 and writes nothing when the title holds \"/\" or \"#\""))
 +    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
-+                          "A page in the Recycle bin is restored instead, even when its title holds \"/\"."))))
++                          "in a journal title that the graph's journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead."))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f8de330..7c49e9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

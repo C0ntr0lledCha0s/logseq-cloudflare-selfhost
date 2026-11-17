@@ -1377,15 +1377,15 @@ describe("hand-written tools", () => {
     );
   });
 
-  it("create_page and connector_help say a title can't hold \"/\" (outside a date) or \"#\"", async () => {
+  it("create_page and connector_help say a title can't hold \"/\" (outside a journal title) or \"#\"", async () => {
     const tools = await listTools();
     const create = tools.find((t) => t.name === "create_page");
     expect(create.description).toContain(
-      'Refuses with 400 and writes nothing when the title holds "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title; the error names the character and the title.',
+      'Refuses with 400 and writes nothing when the title holds "/" or "#", which Logseq doesn\'t allow in a page title; the error names the character and the title. A "/" is allowed where Logseq allows it: in a journal title that the graph\'s journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead.',
     );
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      'create_page refuses with a 400 a title holding "/" (except in a date) or "#", which Logseq doesn\'t allow in a page title, and names the character; a page in the Recycle bin is restored under its own title, "/" included.',
+      'create_page refuses with a 400 a title holding "/" or "#", which Logseq doesn\'t allow in a page title, and names the character and the title; a "/" is fine in a journal title the graph\'s journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and a page in the Recycle bin is restored under its own title, "/" included.',
     );
   });
 
@@ -2613,6 +2613,8 @@ describe("queries help", () => {
     ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
     ["E2EE", "Unavailable on E2EE graphs (409)"],
     ["dry-run", "dry-run: true checks the query and shows it without running it"],
+    ["the dry run refuses as the run does", "refusing what the run would refuse before it runs (more than 12 function bindings included)"],
+    ["a decision on a nested page", "on a page nested under the meeting page too (a namespace child, or a page tagged Decision whose parent is the meeting)"],
     ["a stopped request", "An error saying the sync server stopped the request means it gave no answer of its own, most likely a query past the CPU limit: narrow the query rather than retrying it as it is"],
     ["the audit row", "Each call is recorded in the audit log as a read"],
     ["what the row holds", "(a hash of the query, or the named query and the names of its params; never the rows)"],
