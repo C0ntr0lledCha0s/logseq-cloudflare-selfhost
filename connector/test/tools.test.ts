@@ -660,6 +660,35 @@ describe("delete one property value (patch 0042)", () => {
       ["DELETE", `/api/v1/graphs/${WORK_ID}/blocks/b1/properties/Tags`, null],
     ]);
   });
+
+  it("a misplaced or misspelt value is refused before anything reaches the sync server, never sent as a whole-property delete", async () => {
+    acceptEverything();
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["delete_block_property", { graph: "work", "block-id": "b1", "property-id": "Tags", value: "Project", reason: REASON }],
+      ["delete_block_property", { graph: "work", "block-id": "b1", "property-id": "Tags", body: { values: "Project" }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", body: { entries: [{ "block-id": "b1", "property-id": "Tags", values: "Project" }] }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", body: { entries: [{ "block-id": "b1", "property-id": "Tags" }], value: "Project" }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", value: "Project", body: { entries: [{ "block-id": "b1", "property-id": "Tags" }] }, reason: REASON }],
+    ];
+    for (const [name, args] of calls) {
+      const result = await callTool(name, args);
+      expect(result.isError, `${name} ${JSON.stringify(args)}: ${result.text}`).toBe(true);
+      expect(result.text, name).toMatch(/value/);
+    }
+    expect(writeRequests()).toEqual([]);
+  });
+
+  it("the tool text says a repeated value delete answers 400 and how a value is matched", async () => {
+    const tools = await listTools();
+    const tool = (name: string) => tools.find((t: any) => t.name === name);
+    expect(tool("delete_block_property").description).toContain("repeating its delete answers 400");
+    expect(tool("delete_block_property").description).not.toContain("Idempotently");
+    expect(tool("batch_delete_block_property").description).toContain("repeating that entry answers 400");
+    expect(tool("delete_block_property").inputSchema.properties.body.properties.value.description).toContain("matched exactly, then ignoring case");
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("Once a value is gone, the same value delete answers 400");
+    expect(help).toContain("Node references (block/refs)");
+  });
 });
 
 describe("target-label", () => {
