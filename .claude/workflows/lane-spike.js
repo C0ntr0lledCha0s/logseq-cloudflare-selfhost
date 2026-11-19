@@ -158,5 +158,8 @@ return {
   writeup,
   open_gaps: critique ? critique.gaps : [],
   compound,
+  // A spike answers a question: its write-up is the result, so there is no build phase, PR or branch
+  // to track on the task. A write-up the challenge still finds unsound stays Doing for the owner's call.
+  logseq_properties: { status: critique && !critique.sound ? 'Doing' : 'Done', phase: null, branch: null, pr_url: null },
   logseq_update_hint: `Add "**Spike ${TODAY}** – ${writeup.recommendation}: ${writeup.summary}" under item ${brief.issue_number ?? '(no issue)'}, with a link to ${writeup.path} and the follow-ups as tasks if the owner agrees.`,
 }
