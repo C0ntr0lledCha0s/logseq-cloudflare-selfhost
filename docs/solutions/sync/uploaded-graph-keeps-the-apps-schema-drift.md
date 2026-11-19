@@ -4,7 +4,8 @@ area: sync
 tags: [schema, cardinality, upload, snapshot, closed-value-property, edit-stamps, convert-values, datoms, check-and-fix-schema]
 seen:
   - 2026-11-08 – edit stamp 409 hotfix, patch 0034 amended
-promoted_to: ["REVIEW.md"]
+  - 2026-11-19 – item 27, the same 409 re-reported as an "orphaned claude choice"; already fixed on main, patch 0041 added
+promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
 ## Symptom
@@ -32,3 +33,4 @@ Patch 0034 (amended, no new number, because the repair and the stamp ship togeth
 - Data effect: before this fix, `convert_values` on an uploaded graph could delete the property's own choice and answer 500 (the choice was not recognised as the property's own). The owner may want to check past `convert_values` calls on uploaded graphs in the audit log.
 - The repair runs on the first request after deploy. The datom reads cover stamps whether or not the repair has run.
 - Open follow-up from review: `repair-schema!` keeps its own copy of the snapshot-upload meta key (`:snapshot-uploading?`), so a rename in the sync handler would drop that check silently; the catch still keeps such an open from failing. When a guard keys on state set elsewhere, test it by driving the real handler that sets the state (as the upload test now does), and reference the one constant instead of copying it.
+- Second sighting (item 27): the 409 was filed as an orphaned or nameless choice and the issue guessed the wrong cause. The empty `choice of  ()` text comes only from a truthy owner with no title and no ident, which is what the cardinality-one entity read gives. A real ownerless choice prints `held by a block`. Read the exact message against the code branch that prints it before accepting a reported cause, then reproduce on a graph built through the upload path with a stale-schema conn. The stored data was never damaged, because the old precheck refused before it wrote.
