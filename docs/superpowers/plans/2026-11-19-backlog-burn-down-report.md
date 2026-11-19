@@ -10,7 +10,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 38: removing one tag returns 500 | ready (two passes) | `fix/tags-reset-keeps-builtins` | [#60](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/60) | `4abb221` |
 | 43: Page as a tags value answers 500 | ready | `fix/page-tag-value-refused` | [#61](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61) | `df57c67` |
 | 33: JSON number read as a db id | ready | `fix/json-number-not-db-id` | [#62](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62) | `6a629b8` |
-| 45: batch class check uses stale classes | running | `fix/batch-class-check-final-state` | – | – |
+| 45: batch class check uses stale classes | ready | `fix/batch-class-check-final-state` | [#63](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/63) | `5d23b6e` |
+| 36: Tags title takes the first class | running | `fix/tags-title-scoped` | – | – |
 
 ---
 
@@ -140,3 +141,22 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - Verified on 6a629b8 (scripts/check.sh --upstream green; tofu fmt skipped). Not yet checked live.
   - Open: integers above 2^53 stored as rounded text (r1-correctness-1); `[[N]]` in titles still resolves db id N (proposed backlog).
 ```
+
+---
+
+## Item 45: a batch that changes classes or extends stores out-of-class values
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#63](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/63), HEAD `5d23b6e`, standard tier, stacked on PR 62.
+- **Cause:** patch 0031's batch class check overlaid only the final tags. It read the property's classes and the tags' extends from before the batch. That had three effects:
+  - silent out-of-class stores
+  - false refusals
+  - a batch-set route that skipped update_property's own checks
+- **Fix (patch 0045):** set, batch set and insert refuse writes to `logseq.property/classes` and `logseq.property.class/extends`. The refusal names the entry and points to update_property or update_tag, and nothing is written. Refusing was chosen over overlaying the final classes and extends.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `5d23b6e` and it passed (822 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** 43 failures before the fix, all in the 5 new tests. All 5 mutants were killed.
+- **Open should-fix (minor):** r1-correctness-1 / r1-light-1. The help and README say only update_property and update_tag write these two properties, but the delete tools still reset extends and clear classes.
+- **Backlog proposals:**
+  - refuse the delete paths too
+  - a single set of a many-valued property may add to its values instead of replacing them (needs a probe)
+- **Skill note:** change classes with update_property and extends with update_tag, in their own call, before writing values that depend on them.
+- **Logseq write-back:** applied (audit entries 295 and 296).
