@@ -83,6 +83,15 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
     delete cfg.vars.OPENAI_APPS_CHALLENGE;
   }
 
+  // Upstream turns invocation logs off, so Workers Logs show only what the code logs and no
+  // line per request. Keep them on: they show each request's outcome (a sync that fails, a
+  // rejected write) without wrangler tail running at the time.
+  cfg.observability = {
+    ...(cfg.observability ?? {}),
+    enabled: true,
+    logs: { ...(cfg.observability?.logs ?? {}), invocation_logs: true },
+  };
+
   // 'Today' (capture, tasks and assets with no page) is the date in this zone. Workers run in
   // UTC, so without it a New Zealand morning lands on yesterday's journal (patch 0025).
   if (settings.timeZone !== undefined) {
