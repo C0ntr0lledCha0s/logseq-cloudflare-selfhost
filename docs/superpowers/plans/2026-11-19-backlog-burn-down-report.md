@@ -11,7 +11,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 43: Page as a tags value answers 500 | ready | `fix/page-tag-value-refused` | [#61](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61) | `df57c67` |
 | 33: JSON number read as a db id | ready | `fix/json-number-not-db-id` | [#62](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62) | `6a629b8` |
 | 45: batch class check uses stale classes | ready | `fix/batch-class-check-final-state` | [#63](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/63) | `5d23b6e` |
-| 36: Tags title takes the first class | running | `fix/tags-title-scoped` | – | – |
+| 36: Tags title takes the first class | ready | `fix/tags-title-scoped` | [#64](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/64) | `425a9da` |
+| 34: value block shared by UUID | running | `fix/value-block-by-uuid-copied` | – | – |
 
 ---
 
@@ -160,3 +161,19 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - a single set of a many-valued property may add to its values instead of replacing them (needs a probe)
 - **Skill note:** change classes with update_property and extends with update_tag, in their own call, before writing values that depend on them.
 - **Logseq write-back:** applied (audit entries 295 and 296).
+
+---
+
+## Item 36: a Tags value given by title took the first class with that title
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#64](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/64), HEAD `425a9da`, standard tier, two review rounds, stacked on PR 63.
+- **Cause:** the Tags string branch in `resolve-ref-entity` took `first` of the matching classes, so the oldest class won. Patch 0021 had moved the other ref properties onto `title-candidates`, but not Tags.
+- **Fix (patch 0046):** a title that several visible classes share is refused with a 400 listing their UUIDs, on all four write paths. Hidden and recycled classes no longer match, and matching stays exact.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `425a9da` and it passed (828 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** 73 of 122 assertions failed before the fix. Mutating the filter guards gave 16 failures each.
+- **Open should-fix (minor):** connector_help doesn't mention the Tags shared-title refusal.
+- **Backlog proposals:**
+  - major, pre-existing: `resolve-tag-selector` still takes the oldest class for a property's classes, a tag's extends and the named-query tag param.
+  - minor: a user tag sharing a built-in title is refused with bare UUIDs, so you can't tell which is the built-in.
+- **Skill note:** pass a tag's UUID when its title may be shared, such as namespace tags or a tag with a built-in title.
+- **Logseq write-back:** applied (audit entries 297 and 298).
