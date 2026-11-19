@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const script = join(resolve(dirname(fileURLToPath(import.meta.url)), ".."), "scripts", "check.sh");
 
 // A fake repository root plus stub npm/node/pnpm/tofu that log their arguments and exit with
-// the status named in STUB_FAIL_<tool> (0 when unset).
+// the status named in STUB_FAIL_<tool> (0 when unset), after printing STUB_OUT_<tool> when set.
 function setup({ vendor = false, upstream = false, releaseBundle = false, nodeModules = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "check-"));
   const root = join(dir, "repo");
@@ -35,7 +35,7 @@ function setup({ vendor = false, upstream = false, releaseBundle = false, nodeMo
     const stub = join(bin, tool);
     writeFileSync(
       stub,
-      `#!/usr/bin/env bash\necho "${tool} $*" >> "${log}"\nexit "\${STUB_FAIL_${tool}:-0}"\n`,
+      `#!/usr/bin/env bash\necho "${tool} $*" >> "${log}"\n[ -n "\${STUB_OUT_${tool}:-}" ] && printf '%s\\n' "\${STUB_OUT_${tool}}"\nexit "\${STUB_FAIL_${tool}:-0}"\n`,
     );
     chmodSync(stub, 0o755);
   }
@@ -147,6 +147,41 @@ test("rejects unknown arguments", () => {
   const { run, cleanup } = setup();
   try {
     assert.equal(run(["--nope"]).status, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("names each skipped scripts test in a WARNING line, without failing the gate", () => {
+  const { run, cleanup } = setup();
+  try {
+    const tap = [
+      "TAP version 13",
+      "ok 1 - parses the durations",
+      "ok 2 - --named --json gives one record per named query # SKIP worker-test.js missing: run scripts/upstream-test.sh",
+      "    ok 1 - a nested case # SKIP",
+      "ok 3 - the release bundle returns the values # SKIP release bundle missing",
+      "# skipped 3",
+    ].join("\n");
+    const r = run([], { STUB_OUT_npm: tap });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /^ok       scripts unit tests$/m);
+    assert.match(r.stdout, /^WARNING  scripts unit tests skipped 3 test\(s\); a skipped test proves nothing:$/m);
+    assert.match(r.stdout, /^  - --named --json gives one record per named query \(worker-test\.js missing: run scripts\/upstream-test\.sh\)$/m);
+    assert.match(r.stdout, /^  - a nested case$/m);
+    assert.match(r.stdout, /^  - the release bundle returns the values \(release bundle missing\)$/m);
+    assert.ok(r.stdout.indexOf("WARNING") > r.stdout.indexOf("== summary"), "the warning is in the summary");
+  } finally {
+    cleanup();
+  }
+});
+
+test("prints no WARNING when no scripts test was skipped", () => {
+  const { run, cleanup } = setup();
+  try {
+    const r = run([], { STUB_OUT_npm: "TAP version 13\nok 1 - parses the durations\n# skipped 0" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout, /WARNING/);
   } finally {
     cleanup();
   }
