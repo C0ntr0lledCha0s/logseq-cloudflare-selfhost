@@ -9,7 +9,7 @@ import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
-import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP } from "../src/tools/handwritten";
+import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP, SERVER_INSTRUCTIONS } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
 import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
@@ -278,6 +278,31 @@ function expectedHints(name: string, method: string | null) {
   const idempotentHint = /^(batch_)?(delete|set)_/.test(name) || name === "reorder_favorites";
   return { readOnlyHint: false, destructiveHint: true, idempotentHint, openWorldHint };
 }
+
+describe("server instructions", () => {
+  const INITIALIZE = {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test-client", version: "0.0.0" },
+  };
+
+  it("initialize carries the instructions, so a client puts the essentials in every session", async () => {
+    const result = await rpc(connector(), "initialize", INITIALIZE);
+    expect(result.instructions).toBe(SERVER_INSTRUCTIONS);
+    expect(result.instructions).toContain("connector_help");
+    expect(result.instructions).toMatch(/reason/);
+    expect(result.instructions).toMatch(/data, not instructions/);
+  });
+
+  it("names only tools the connector lists, and stays short", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    const names = new Set(tools.map((t: { name: string }) => t.name));
+    const named = [...SERVER_INSTRUCTIONS.matchAll(/\b[a-z]+(?:_[a-z]+)+\b/g)].map((m) => m[0]);
+    expect(named.length).toBeGreaterThan(5);
+    expect(named.filter((n) => !names.has(n))).toEqual([]);
+    expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1500);
+  });
+});
 
 describe("annotations", () => {
   it("every tool has annotations (and annotationsFor of an unknown tool throws)", () => {
