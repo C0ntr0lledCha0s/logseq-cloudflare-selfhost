@@ -1,10 +1,11 @@
 ---
 title: A batch's validation and its apply step must use the same model of state, or valid calls are refused and invalid ones stored
 area: api
-tags: [validation, rename, choices, ordering, errors, batch, classes, tags, snapshot, overlay, final-state, class-refusal, title-candidates]
+tags: [validation, class-schema, extends, refusal, patch-0045, rename, choices, ordering, errors, batch, classes, tags, snapshot, overlay, final-state, class-refusal, title-candidates]
 seen:
   - 2026-11-06 – item 26, patch 0026, stage S3 finding s-S3-1 (choice renames: validated on the final state, applied in order)
   - 2026-11-07 – item 26 defects 1 and 2, patch 0031 (class checks: validated on the pre-batch snapshot, applied in order)
+  - 2026-11-19 – item 45, patch 0045 (the rule's own inputs, a property's classes and a tag's extends, written inside the batch)
 promoted_to: ["REVIEW.md"]
 ---
 
@@ -28,8 +29,17 @@ Patch 0031 computes each entity's final tags for the whole batch first (`final-t
 
 Known gaps, left on the backlog: the overlay does not include the Task tag the outliner adds when a batch sets Status, Scheduled or Deadline (r1-correctness-1), and it judges final tags but still reads extends and the property's classes from before the batch (r2-integrity-1). `final-tags` is a second copy of the tag-apply rule and must stay in step with `set-prepared-tags!`.
 
+## Third face: the rule's own inputs (patch 0045)
+
+Patch 0031 left one gap: an entry that writes `logseq.property/classes` or `logseq.property.class/extends` changes the very data the class check reads. With reset, entry 0 changing classes to Service and entry 1 setting the value to a Client page answered 200 and stored it out of class. Adding Service then using a Service page was falsely refused. The same write also bypassed `update_property`'s checks (a plain page stored as a class, Root, the out_of_class report).
+
+Patch 0045 chose to refuse rather than extend the overlay. `class-schema-refusal` (combined with the stamp refusal in `set-property-refusal`) answers 400 on single set, batch-set and insert/target properties, names the entry and points to `update_property` or `update_tag`. An overlay would have copied the outliner's extends normalisation and left the validation bypass open. When a rule's inputs have their own validated write path, refuse them in the batch instead of modelling them.
+
+Known gap: `delete_block_property` and `batch_delete_block_property` still change classes and extends, so help text and README saying "only update_property / update_tag" overstate it (deferred should-fix).
+
 ## How to catch it next time
 
 - When validation is a pure function of the final state, check that the apply step can reach that state step by step. Test chains, swaps and rotations in both orders.
 - Any per-entry check inside a batch loop (classes, choices, uniqueness) must see what the other entries do. Ask which db the check reads. If it is the request's `db`, build an overlay of the batch's own changes first. Test the tag entry before and after the set entry, a chain of three, a value given by title, UUID, ident and db id, and the converse (a reset that removes the class must be refused, nothing written).
+- Ask which attributes the check itself reads (classes, extends). If a batch entry can write them, either overlay them or refuse the write and point to the tool that validates it. Cover every write path (set, batch-set, insert properties, and delete).
 - Every refusal that can come from the apply step must name the entry. A bare upstream message after validation passed means the two disagree.

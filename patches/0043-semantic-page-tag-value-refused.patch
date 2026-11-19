@@ -1,0 +1,332 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 9af4dab..5566d8b 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1135,10 +1135,14 @@
+   :db/ident a tag needs, so a page is pointed there. A tag already holds Tag, so re-sending it is
+   allowed, and set-prepared-property! doesn't set it again.
+   The outliner refuses every other private tag too (disallow-node-cant-tag-with-private-tags:
+-  Journal, Whiteboard, Pdf-annotation, Property, Asset; Page has its own guard), which surfaced as a
+-  server error on a set and as its bare text on an insert. Logseq sets these itself, so they are
+-  refused here, except one the target already holds (a journal re-sending Journal, an asset
+-  re-sending Asset), which set-prepared-tags! skips as a no-op. The outliner's other exception,
++  Journal, Whiteboard, Pdf-annotation, Property, Asset), which surfaced as a server error on a set
++  and as its bare text on an insert. Logseq sets these itself, so they are refused here, except one
++  the target already holds (a journal re-sending Journal, an asset re-sending Asset), which
++  set-prepared-tags! skips as a no-op. Page is refused by the same held rule (item 43): the
++  outliner leaves it to its own guards, which on a server write answered 500 (a nested block can't
++  become a page, a top-level one needs the client pipeline's toggle-page-and-block, and a journal,
++  tag or property can't hold Page). A page re-sending Page, and a page a batch insert creates (its
++  ::held-tags holds Page), are allowed; a block is pointed to the app's convert-to-page. The outliner's other exception,
+   Asset on an asset, is covered by that: an asset entity must hold Asset to be valid. A page a batch
+   insert creates has no :db/id yet; its scope's ::held-tags names the tags create! gives it (Journal
+   for a journal day), so a new journal may be sent Journal too. Code-block, Math-block and
+@@ -1160,7 +1164,15 @@
+                     ident (:db/ident tag)]
+                 (when-not (contains? held id)
+                   (cond
+-                    (contains? (disj ldb/private-tags :logseq.class/Page) ident)
++                    ;; The outliner leaves Page to its own guards, which answered 500 on a server write:
++                    ;; a nested block can't become a page, and a top-level one needs the client
++                    ;; pipeline's toggle-page-and-block, which a server write doesn't run (item 43).
++                    (= :logseq.class/Page ident)
++                    (if (or (:block/name target) (contains? scope ::held-tags))
++                      "Page is a built-in tag Logseq sets itself and can't be added to a journal, tag or property"
++                      "Page marks a page and can't be set as a value on a block; to make a block a page, use convert-to-page in the Logseq app")
++
++                    (contains? ldb/private-tags ident)
+                     (str (:block/title tag) " is a built-in tag Logseq sets itself and can't be set as a value")
+                     ;; One way to write a block's type (patch 0037), so tag and type can't drift. A held
+                     ;; one is a no-op, as a held private tag is.
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_page_tag_value_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_page_tag_value_test.cljs
+new file mode 100644
+index 0000000..4ac0b7c
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_page_tag_value_test.cljs
+@@ -0,0 +1,243 @@
++(ns logseq.db-sync.semantic-page-tag-value-test
++  "Page as a tags value on something that doesn't already hold Page (item 43). Page is a private
++  tag, but the handler's up-front refusal (tag-value-refusal) left it out, as the outliner's
++  disallow-node-cant-tag-with-private-tags does, leaving it to the outliner's own guards. On a
++  server write those answered 500: a nested block hit validate-block-can-tag-with-page-tag ('Can't
++  convert this block to page'), and a top-level block, a journal, a tag or a property failed schema
++  validation, because the client pipeline that turns a block into a page doesn't run on the
++  server. A tree, children or batch insert answered that 500, or the outliner's bare 400 with no
++  entry or path. Every tags write path now refuses Page up front with a 400 naming the entry and
++  Page, and nothing is written. A page re-sending Page stays a no-op, a list with Page and a user
++  tag adds the user tag to a page, and a new page entry may name Page, which create! gives it.
++  The graph is made through the handler: the tag Food and Drink, the property rating, and a batch
++  insert that creates the page Notes (Top > Nested, Top2), the page Diner and the journal
++  2026-11-06."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid id]))
++
++(defn- tag-titles [conn id]
++  (set (map :block/title (:block/tags (entity conn id)))))
++
++(defn- child-uuid [conn parent-id title]
++  (some #(when (= title (:block/title %)) (:block/uuid %))
++        (:block/_parent (entity conn parent-id))))
++
++(defn- seed-graph
++  "A conn holding the entities the namespace docstring names, all made through the handler, and
++  the handler context to call it through."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          food (request! self "POST" "/semantic/tags" {:title "Food"})
++          _ (is (= 201 (:status food)) (pr-str food))
++          drink (request! self "POST" "/semantic/tags" {:title "Drink"})
++          _ (is (= 201 (:status drink)) (pr-str drink))
++          rating (request! self "POST" "/semantic/properties" {:title "rating" :type "default"})
++          _ (is (= 201 (:status rating)) (pr-str rating))
++          seeded (request! self "POST" "/semantic/block-trees/batch"
++                           {:entries [{:page "Notes" :blocks [{:title "Top" :children [{:title "Nested"}]}
++                                                              {:title "Top2"}]}
++                                      {:page "Diner" :blocks [{:title "x"}]}
++                                      {:page "2026-11-06" :blocks [{:title "j"}]}]})
++          _ (is (= 201 (:status seeded)) (pr-str seeded))
++          notes (:block/uuid (ldb/get-page @conn "Notes"))
++          top (child-uuid conn notes "Top")]
++    {:conn conn :self self :notes notes :top top
++     :nested (child-uuid conn top "Nested")
++     :top2 (child-uuid conn notes "Top2")
++     :diner (:block/uuid (ldb/get-page @conn "Diner"))
++     :journal (:block/uuid (ldb/get-journal-page-by-day @conn 20261106))
++     :food (uuid (get-in food [:body :uuid]))
++     :rating (:block/uuid (d/entity @conn (keyword (get-in rating [:body :ident]))))}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(def ^:private tags-property (js/encodeURIComponent "block/tags"))
++
++(defn- set-tags! [self id value]
++  (request! self "PUT" (str "/semantic/blocks/" id "/properties/" tags-property) {:value value}))
++
++(defn- batch-set! [self reset? entries]
++  (request! self "POST" "/semantic/block-properties/batch-set"
++            {:isResetExistingValues reset? :entries entries}))
++
++(defn- value-forms
++  "Each way a caller names Page: its title, its ident, its UUID, and a list that also holds a tag
++  the target may take."
++  [conn]
++  [["title" "Page"]
++   ["ident" "logseq.class/Page"]
++   ["UUID" (str (:block/uuid (d/entity @conn :logseq.class/Page)))]
++   ["list with another tag" ["Drink" "Page"]]])
++
++(defn- refused-up-front?
++  "The response is a 400 whose error starts with `prefix` (the entry or path, then the property)
++  and names Page."
++  [response prefix]
++  (let [error (get-in response [:body :error])]
++    (and (= 400 (:status response))
++         (string? error)
++         (string/starts-with? error prefix)
++         (string/includes? (subs error (count prefix)) "Page"))))
++
++(defn- points-to-convert?
++  "A refusal for a block points to the app's convert-to-page, the way to make a block a page."
++  [response]
++  (boolean (re-find #"convert" (str (get-in response [:body :error])))))
++
++;; Before the fix, through the real handler:
++;;   a nested block: 500 {:error "server error", :debug-message "#error {:message \"Can't convert
++;;     this block to page since its parent is not a page.\" ..."}
++;;   a top-level block, a journal, a tag: 500 {:error "server error", :debug-message "#error
++;;     {:message \"DB write failed with invalid data\" ..."} (:block/name missing, or 'should not
++;;     have other built-in page tags when tagged with #Page')
++(deftest set-page-tag-on-non-page-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self nested top2 journal food rating]}]
++        (p/doseq [[kind id block? form value]
++                  (for [[kind id block?] [["a nested block" nested true]
++                                          ["a top-level block" top2 true]
++                                          ["a journal" journal false]
++                                          ["a tag" food false]
++                                          ["a property" rating false]]
++                        [form value] (value-forms conn)]
++                    [kind id block? form value])]
++          (p/let [held (tag-titles conn id)
++                  before (snapshot conn)
++                  response (set-tags! self id value)]
++            (testing (str kind ", " form)
++              (is (refused-up-front? response "Tags: ") (pr-str response))
++              (is (= block? (points-to-convert? response)) (pr-str response))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= held (tag-titles conn id))))))))))
++
++;; Before the fix: 500 "server error" with no entry index ('Can't convert this block to page' for
++;; the nested block, :block/name missing for the top-level one), with entry 0 already prepared.
++(deftest batch-set-page-tag-names-entry-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self top nested top2 journal]}]
++        (p/doseq [[reset? kind id] (for [reset? [false true]
++                                         [kind id] [["a nested block" nested]
++                                                    ["a top-level block" top2]
++                                                    ["a journal" journal]]]
++                                     [reset? kind id])]
++          (p/let [held (tag-titles conn id)
++                  before (snapshot conn)
++                  response (batch-set! self reset?
++                                       [{:block-id (str top) :property-id "block/tags" :value ["Food"]}
++                                        {:block-id (str id) :property-id "block/tags" :value ["Page"]}])]
++            (testing (str "isResetExistingValues " reset? ", " kind)
++              (is (refused-up-front? response "entry 1: Tags: ") (pr-str response))
++              (is (= (not= kind "a journal") (points-to-convert? response)) (pr-str response))
++              (is (= before (snapshot conn)) "entry 0 isn't written either")
++              (is (= #{} (tag-titles conn top)))
++              (is (= held (tag-titles conn id))))))))))
++
++;; Before the fix: a top-level node answered 500 (:block/name missing), and a nested node, a child
++;; inserted under a block, or a batch entry on a nested block answered the outliner's bare text
++;; with no entry or path:
++;;   400 {:error "Can't convert this block to page since its parent is not a page."}
++(deftest insert-page-tag-names-path-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes top nested journal]}]
++        (p/doseq [[path prefix call]
++                  [["insert tree, top-level node" "blocks[1]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees"
++                               {:target-id (str notes)
++                                :blocks [{:title "Fine"} {:title "Bistro" :properties {"Tags" "Page"}}]})]
++                   ["insert tree, nested node" "blocks[0].children[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees"
++                               {:target-id (str notes)
++                                :blocks [{:title "Parent" :children [{:title "Bistro" :properties {"Tags" ["Food" "Page"]}}]}]})]
++                   ["insert children" "blocks[0]: Tags: "
++                    #(request! self "POST" (str "/semantic/blocks/" top "/children")
++                               {:position "append" :blocks [{:title "Bistro" :properties {"Tags" "Page"}}]})]
++                   ["batch insert, new top-level block" "entries[0].blocks[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees/batch"
++                               {:entries [{:target-id (str notes) :blocks [{:title "Bistro" :properties {"Tags" ["Page"]}}]}]})]
++                   ["batch insert, new nested block" "entries[0].blocks[0].children[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees/batch"
++                               {:entries [{:target-id (str notes)
++                                           :blocks [{:title "Parent" :children [{:title "Bistro" :properties {"Tags" "Page"}}]}]}]})]
++                   ["batch insert, entry on a nested block" "entries[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees/batch"
++                               {:entries [{:target-id (str nested) :properties {"Tags" "Page"}}]})]
++                   ["batch insert, entry on a journal" "entries[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees/batch"
++                               {:entries [{:target-id (str journal) :properties {"Tags" "Page"}}]})]
++                   ["batch insert, page entry that creates a journal" "entries[0]: Tags: "
++                    #(request! self "POST" "/semantic/block-trees/batch"
++                               {:entries [{:page "2026-11-07" :properties {"Tags" ["Page"]}}]})]]]
++          (p/let [before (snapshot conn)
++                  response (call)]
++            (testing path
++              (is (refused-up-front? response prefix) (pr-str response))
++              ;; A block is pointed to convert-to-page; a journal, existing or created, is not.
++              (is (= (not (string/includes? path "journal")) (points-to-convert? response))
++                  (pr-str response))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= #{} (tag-titles conn nested)))
++              (is (nil? (ldb/get-journal-page-by-day @conn 20261107))))))))))
++
++;; Controls, which passed before the fix too: a page already holds Page, so re-sending it is a
++;; no-op, a list with Page adds the other tag, a reset that keeps Page answers 200, and a page entry
++;; that creates a page may name Page, which create! gives it.
++(deftest page-re-sending-page-still-allowed-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self diner]}]
++        (p/let [forms (value-forms conn)
++                _ (p/doseq [[form value] (butlast forms)]
++                    (p/let [before (snapshot conn)
++                            response (set-tags! self diner value)]
++                      (testing (str "re-sending Page by its " form)
++                        (is (= 200 (:status response)) (pr-str response))
++                        (is (= before (snapshot conn)) "nothing is written")
++                        (is (= #{"Page"} (tag-titles conn diner))))))
++                with-food (set-tags! self diner ["Page" "Food"])
++                _ (testing "Page with Food adds Food"
++                    (is (= 200 (:status with-food)) (pr-str with-food))
++                    (is (= #{"Page" "Food"} (tag-titles conn diner))))
++                reset (batch-set! self true [{:block-id (str diner) :property-id "block/tags" :value ["Page"]}])
++                _ (testing "a reset to [Page] keeps Page"
++                    (is (= 200 (:status reset)) (pr-str reset))
++                    (is (contains? (tag-titles conn diner) "Page")))
++                new-page (request! self "POST" "/semantic/block-trees/batch"
++                                   {:entries [{:page "Bistro" :properties {"Tags" ["Page" "Food"]}}]})]
++          (testing "a new page entry with Page and Food"
++            (is (= 201 (:status new-page)) (pr-str new-page))
++            (is (= #{"Page" "Food"} (set (map :block/title (:block/tags (ldb/get-page @conn "Bistro"))))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs
+index aa65306..c2429af 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_private_tags_test.cljs
+@@ -7,7 +7,7 @@
+   answered the outliner's bare 400 with no entry or path. Every private tag, on every tags write
+   path, is refused up front with a 400 that names the entry and the tag, and nothing is written. A
+   private tag the target already holds (a journal re-sending Journal) and Asset on an asset stay
+-  allowed. The graph has a tag Food, pages Restaurant and Notes (with one block), a journal, a
++  allowed. Page has its own test (semantic-page-tag-value-test, patch 0043). The graph has a tag Food, pages Restaurant and Notes (with one block), a journal, a
+   whiteboard, an asset block and a property."
+   (:require [cljs.test :refer [async deftest is testing]]
+             [clojure.string :as string]
+@@ -97,7 +97,7 @@
+ 
+ (def ^:private private-tags
+   "Every private tag the outliner refuses as a value, other than Tag (refused since patch 0027) and
+-  Page (allowed, with its own outliner guard)."
++  Page (refused unless the target holds it, covered by semantic-page-tag-value-test, patch 0043)."
+   [:logseq.class/Journal :logseq.class/Whiteboard :logseq.class/Pdf-annotation
+    :logseq.class/Property :logseq.class/Asset])
+ 
+@@ -215,7 +215,7 @@
+               (is (= 200 (:status response)) (pr-str response))
+               (is (contains? (tag-titles conn id) private)))))))))
+ 
+-;; Guard: Page is a private tag too, but the outliner leaves it to its own guards, and a new page
++;; Guard: Page is a private tag too, refused unless the target holds it (patch 0043), and a new page
+ ;; holds it already, so a page created with its own tags (Page and a user tag) isn't refused.
+ (deftest new-page-with-page-tag-still-allowed-test
+   (async done
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index d9e4b77..b96bb34 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -23,6 +23,7 @@
+             [logseq.db-sync.semantic-property-classes-root-test]
+             [logseq.db-sync.semantic-promote-page-to-tag-test]
+             [logseq.db-sync.semantic-private-tags-test]
++            [logseq.db-sync.semantic-page-tag-value-test]
+             [logseq.db-sync.semantic-readable-writes-test]
+             [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]

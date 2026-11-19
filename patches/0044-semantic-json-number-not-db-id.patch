@@ -1,0 +1,505 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 5566d8b..9aac442 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -826,14 +826,15 @@
+ 
+ (defn- resolve-ref-entity
+   "The db id of the entity `value` names for a ref property, nil when none, or {::error reason}
+-  when a title names more than one."
++  when a title names more than one. A JSON number is a title (a page or tag titled 2026), never a
++  db id: db ids aren't stable or visible over the API, so an existing entity is named by UUID."
+   [db property-ident value]
+-  (let [value (if (string? value)
+-                (get-in property-choice-aliases
+-                        [property-ident (string/lower-case value)] value)
+-                value)
++  (let [value (cond
++                (number? value) (str value)
++                (string? value) (get-in property-choice-aliases
++                                        [property-ident (string/lower-case value)] value)
++                :else value)
+         entity (cond
+-                 (number? value) (d/entity db value)
+                  (qualified-keyword? value) (d/entity db value)
+                  (and (string? value) (common-util/uuid-string? value))
+                  (d/entity db [:block/uuid (uuid value)])
+@@ -909,14 +910,16 @@
+ (defn- free-text-value?
+   "A plain string for a text (default-type) property without fixed choices. The outliner stores it
+   in a new value block, as the editor does, so it is never looked up by title: text that happens to
+-  match a page title is still text. A UUID string keeps referencing an existing value. E2EE graphs
+-  need client-encrypted values, so plaintext is never accepted there."
++  match a page title is still text. A UUID string keeps referencing an existing value. A JSON
++  number is text too (2026 is stored as \"2026\"), never a db id. E2EE graphs need client-encrypted
++  values, so plaintext is never accepted there."
+   [property value e2ee?]
+   (and (not e2ee?)
+        (= :default (get property :logseq.property/type :default))
+        (empty? (:block/_closed-value-property property))
+-       (non-blank-string? value)
+-       (not (common-util/uuid-string? value))))
++       (or (and (number? value) (js/isFinite value))
++           (and (non-blank-string? value)
++                (not (common-util/uuid-string? value))))))
+ 
+ (defn- own-url-value
+   "For a URL given to a :url property, the URL itself, so the outliner makes a value block for this
+@@ -952,8 +955,8 @@
+ (defn- class-refusal
+   "{::error reason} when `property` is limited to classes and the entity with db id `id` is an
+   object of none of them (nor of a tag extending one), else nil. A title only ever resolves among
+-  the classes' objects (title-candidates); this holds a value given by UUID, ident or db id to the
+-  same rule, as the app's picker does."
++  the classes' objects (title-candidates); this holds a value given by UUID or ident to the same
++  rule, as the app's picker does."
+   [db property value id]
+   (let [classes (:logseq.property/classes property)]
+     (when (and (seq classes) (number? id)
+@@ -965,7 +968,7 @@
+   (let [property (d/entity db property-ident)]
+     (cond
+       (seq (:block/_closed-value-property property)) (resolve-choice db property value scope)
+-      (free-text-value? property value e2ee?) value
++      (free-text-value? property value e2ee?) (if (number? value) (str value) value)
+       (number-text property value) (number-text property value)
+       (and (not e2ee?)
+            (= :url (:logseq.property/type property))
+@@ -1214,6 +1217,11 @@
+                (empty? (:block/_closed-value-property property))
+                (not (common-util/uuid-string? (unresolved))))
+           (refusal property (str (pr-str (str (unresolved))) " should be a finite number"))
++          ;; A JSON number is matched as a title, never read as a db id (item 33).
++          (and (number? (unresolved)) (empty? (:block/_closed-value-property property)))
++          (refusal property (str "no " (if (= :block/tags property-ident) "tag" "page or block")
++                                 " titled " (pr-str (str (unresolved)))
++                                 "; a number is matched as a title, never as a db id, so give the value by UUID"))
+           :else
+           {:error (cond
+                     (= property-ident :block/tags)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index f551a38..02e797c 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -120,8 +120,9 @@
+   "How the property-writing operations resolve a value and what they refuse. One copy, shared by
+   every operation that sets properties, so the descriptions can't drift apart."
+   (str "A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed."
+-       " A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags (its classes) takes only an object with one of those tags or a tag extending one, however it is given: a title only other entities have, and a UUID, ident or db id of anything else, are refused. A title several pages share is refused with their UUIDs."
++       " A node property given a title takes the page with that title (else the one block), never another property's choice; one limited to tags (its classes) takes only an object with one of those tags or a tag extending one, however it is given: a title only other entities have, and a UUID or ident of anything else, are refused. A title several pages share is refused with their UUIDs."
+        " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
++       " A bare JSON number is never a db id: a text property without choices stores it as text (2026 is stored as \"2026\"), and a node, date or URL property or Tags matches it as a title (the page or tag titled 150); one that matches nothing is refused, naming the entry, so give the value by UUID."
+        " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
+ 
+ (def ^:private display-type-note
+@@ -191,9 +192,9 @@
+    "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
+    "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+-   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID, ident or db id; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title), and Root Tag (logseq.class/Root, which would allow any node; leave classes out instead), is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
++   "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID or ident; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title), and Root Tag (logseq.class/Root, which would allow any node; leave classes out instead), is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+    "getProperty" ["Get a property definition" "Returns one property definition by UUID, ident or title: its type, cardinality, choices in the order the editor lists them (each with its icon and description when set) and, for a node property, the classes it is limited to (empty when it takes any node)."]
+-   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles; set and add refuse Root Tag (logseq.class/Root), and remove takes it off a property that holds it. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID, ident or db id that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
++   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles; set and add refuse Root Tag (logseq.class/Root), and remove takes it off a property that holds it. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID or ident that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
+    "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+    "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+@@ -1232,7 +1233,7 @@
+                                                :properties {:page-id {:type "string"}
+                                                             :page-title {:type "string"}}}]}
+                :PropertyValue
+-               {:description "For ref properties, pass an existing entity by UUID, ident, or title. A title never resolves to another property's choice or value block: pages come before blocks, an exact title before one differing in case, and a title several pages share is refused with their UUIDs. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH. A property with choices takes only its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
++               {:description "For ref properties, pass an existing entity by UUID, ident, or title. A title never resolves to another property's choice or value block: pages come before blocks, an exact title before one differing in case, and a title several pages share is refused with their UUIDs. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH. A property with choices takes only its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value. A JSON number is never a db id: a text property stores it as text, a node, date or URL property or Tags matches it as a title, and one that matches nothing is refused; name an existing entity by UUID."
+                 :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
+                         {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
+               write-guard-schemas)
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+index b4b696f..ce28cdb 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+@@ -1,7 +1,8 @@
+ (ns logseq.db-sync.semantic-batch-class-check-test
+   "A property limited to classes, written in a batch: the class check judges the batch's final
+   state, so a tag one entry gives a page counts for a value another entry sets to that page, in
+-  any entry order and however the value is given (title, UUID, ident or db id). A batch whose final
++  any entry order and however the value is given (title, UUID or ident; a bare number is a title,
++  never a db id, so a page's db id is refused, naming the entry). A batch whose final
+   state puts an object outside the classes is refused up front, naming the entry, and writes
+   nothing. Covers batchSetBlockProperty and batchInsertBlockTrees.
+   The graph has tags Client, Service and VIP (VIP extends Client), a Client page Acme, a Service
+@@ -111,8 +112,9 @@
+ 
+ (deftest batch-set-sees-tag-from-earlier-entry-test
+   ;; Entry 0 makes an untagged page a Client; entry 1 sets for-client to it. Each way of naming
+-  ;; the value reaches the class check: a title (title-candidates), a UUID, an ident and a db id
+-  ;; (class-refusal).
++  ;; the value reaches the class check: a title (title-candidates), a UUID and an ident
++  ;; (class-refusal). A db id is not a way of naming it (item 33): the batch is refused, naming the
++  ;; entry and asking for a UUID, and neither entry is written.
+   (async done
+     (run done
+       (fn [{:keys [conn self blocks acme-ltd beta gamma globex for-client fc]}]
+@@ -128,12 +130,18 @@
+                                              {:block-id (str b3) :property-id fc :value "user.page/globex"}])]
+             (doseq [[label response block page] [["title" by-title b0 acme-ltd]
+                                                  ["UUID" by-uuid b1 beta]
+-                                                 ["db id" by-db-id b2 gamma]
+                                                  ["ident" by-ident b3 globex]]]
+               (testing (str "value by " label)
+                 (is (= 200 (:status response)) (str (:body response)))
+                 (is (= page (stored conn block for-client)) "the value reads back")
+-                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))))))))
++                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))
++            (testing "value by db id is refused"
++              (is (= 400 (:status by-db-id)) (str (:body by-db-id)))
++              (is (= (str "entry 1: for-client: no page or block titled \"" gamma-id
++                          "\"; a number is matched as a title, never as a db id, so give the value by UUID")
++                     (get-in by-db-id [:body :error])))
++              (is (nil? (stored conn b2 for-client)) "no value is written")
++              (is (= #{"Page"} (tag-titles conn gamma)) "the tag entry isn't written either"))))))))
+ 
+ (deftest batch-set-sees-tag-from-later-entry-test
+   ;; The final state is valid whichever entry comes first.
+@@ -152,12 +160,18 @@
+                                              (tag-entry globex "Client")])]
+             (doseq [[label response block page] [["title" by-title b0 acme-ltd]
+                                                  ["UUID" by-uuid b1 beta]
+-                                                 ["db id" by-db-id b2 gamma]
+                                                  ["ident" by-ident b3 globex]]]
+               (testing (str "value by " label)
+                 (is (= 200 (:status response)) (str (:body response)))
+                 (is (= page (stored conn block for-client)) "the value reads back")
+-                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))))))))
++                (is (contains? (tag-titles conn page) "Client") "the tag reads back")))
++            (testing "value by db id is refused"
++              (is (= 400 (:status by-db-id)) (str (:body by-db-id)))
++              (is (= (str "entry 0: for-client: no page or block titled \"" gamma-id
++                          "\"; a number is matched as a title, never as a db id, so give the value by UUID")
++                     (get-in by-db-id [:body :error])))
++              (is (nil? (stored conn b2 for-client)) "no value is written")
++              (is (= #{"Page"} (tag-titles conn gamma)) "the tag entry isn't written either"))))))))
+ 
+ (deftest batch-set-tag-forms-test
+   ;; The other ways a batch can make the page an object of the class: a subclass (VIP extends
+@@ -235,7 +249,8 @@
+          (for [[label form tag-first? expected]
+                [["UUID, tag entry first" :uuid true "entry 1: no #Client object %s"]
+                 ["UUID, value entry first" :uuid false "entry 0: no #Client object %s"]
+-                ["db id, tag entry first" :db-id true "entry 1: no #Client object %d"]
++                ["db id, tag entry first" :db-id true
++                 "entry 1: for-client: no page or block titled \"%d\"; a number is matched as a title, never as a db id, so give the value by UUID"]
+                 ["title, tag entry first" :title true "entry 1: no #Client object titled \"Acme\""]
+                 ["title, value entry first" :title false "entry 0: no #Client object titled \"Acme\""]]]
+            (p/let [{:keys [conn self blocks acme fc for-client]} (graph!)
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs
+new file mode 100644
+index 0000000..bff8b6f
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs
+@@ -0,0 +1,263 @@
++(ns logseq.db-sync.semantic-json-number-value-test
++  "A bare JSON number given to a property is never a db id over the API (item 33). The handler's
++  resolve-ref-entity read any number as a db id, so on every write path (set, batch set, insert
++  tree, batch insert trees) a node property given 150 stored the entity with db id 150 (a built-in
++  History block) instead of the page titled \"150\"; a text property given another block's value
++  block id stored that block, now shared by two holders, and a text property given 2026 was
++  refused with the generic 'must resolve' error. A date, URL or tags value given a db id was
++  stored as that journal, URL value or class. A text property now stores the number as text, a
++  node property resolves it as a title, and a number that names nothing is refused up front,
++  naming the entry and asking for a UUID, with nothing written. Number and choice properties
++  already took numbers as values (patches 0020 and 0022) and are checked here so they stay so.
++  The graph is made through the handler: the properties topic (node), note (text), due (date),
++  link (url), count (number) and level (text with choices 150 and 7), the tags Client and 2027,
++  and a batch insert that creates the pages 150 and Notes (block A) and the journal 2026-11-06.
++  Block A holds note \"hello\" and link https://example.com, whose value blocks are the decoys."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- notes-child [conn title]
++  (some #(when (= title (:block/title %)) %) (:block/_parent (ldb/get-page @conn "Notes"))))
++
++(defn- held
++  "The entities block `title` on Notes holds for `ident`, as a vector of {:id :title}."
++  [conn title ident]
++  (let [v (get (notes-child conn title) ident)]
++    (mapv (fn [e] {:id (:db/id e)
++                   :title (or (:block/title e) (some-> (:logseq.property/value e) str) (str (:db/ident e)))})
++          (cond (nil? v) [] (set? v) (sort-by :db/id v) :else [v]))))
++
++(defn- seed-graph []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          prop! (fn [body] (p/let [r (request! self "POST" "/semantic/properties" body)]
++                             (is (= 201 (:status r)) (pr-str body r))
++                             (get-in r [:body :ident])))
++          topic (prop! {:title "topic" :type "node"})
++          note (prop! {:title "note" :type "default"})
++          due (prop! {:title "due" :type "date"})
++          link (prop! {:title "link" :type "url"})
++          count-id (prop! {:title "count" :type "number"})
++          level (prop! {:title "level" :type "default" :choices [{:title "150"} {:title "7"}]})
++          client (request! self "POST" "/semantic/tags" {:title "Client"})
++          _ (is (= 201 (:status client)) (pr-str client))
++          y2027 (request! self "POST" "/semantic/tags" {:title "2027"})
++          _ (is (= 201 (:status y2027)) (pr-str y2027))
++          seeded (request! self "POST" "/semantic/block-trees/batch"
++                           {:entries [{:page "150" :blocks [{:title "p"}]}
++                                      {:page "Notes" :blocks [{:title "A" :properties {note "hello" link "https://example.com"}}]}
++                                      {:page "2026-11-06" :blocks [{:title "j"}]}]})
++          _ (is (= 201 (:status seeded)) (pr-str seeded))
++          a (notes-child conn "A")
++          k #(keyword %)]
++    (is (= "hello" (:block/title (get a (k note)))))
++    (is (= "https://example.com" (:block/title (get a (k link)))))
++    {:conn conn :self self
++     :notes (str (:block/uuid (ldb/get-page @conn "Notes")))
++     :ids {:topic topic :note note :due due :link link :count count-id :level level :tags "block/tags"}
++     :page-150 (:db/id (ldb/get-page @conn "150"))
++     :notes-page (:db/id (ldb/get-page @conn "Notes"))
++     :journal (:db/id (ldb/get-journal-page-by-day @conn 20261106))
++     :note-vblock (:db/id (get a (k note)))
++     :link-vblock (:db/id (get a (k link)))
++     :client (:db/id (d/entity @conn [:block/uuid (uuid (get-in client [:body :uuid]))]))
++     :y2027 (:db/id (d/entity @conn [:block/uuid (uuid (get-in y2027 [:body :uuid]))]))}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(def ^:private paths [:set :batch-set :tree :batch-tree])
++
++(def ^:private path-prefix
++  "How each path names the one entry it was given in a refusal."
++  {:set "" :batch-set "entry 0: " :tree "blocks[0]: " :batch-tree "entries[0].blocks[0]: "})
++
++(defn- write-four!
++  "Writes `value` to property `prop` (an ident, or block/tags) through each write path, each on its
++  own block of Notes titled `<path>-<label>`; set and batch set write to a block inserted first.
++  Returns {path {:status :error :title :unchanged?}}, :unchanged? comparing snapshots around the
++  write itself."
++  [{:keys [conn self notes]} prop value label]
++  (p/let [titles (into {} (map (fn [path] [path (str (name path) "-" label)])) paths)
++          made (request! self "POST" "/semantic/block-trees"
++                         {:target-id notes :blocks [{:title (titles :set)} {:title (titles :batch-set)}]})
++          _ (is (= 201 (:status made)) (pr-str made))
++          uuid-of #(str (:block/uuid (notes-child conn %)))
++          calls {:set #(request! self "PUT" (str "/semantic/blocks/" (uuid-of (titles :set))
++                                                 "/properties/" (js/encodeURIComponent prop))
++                                 {:value value})
++                 :batch-set #(request! self "POST" "/semantic/block-properties/batch-set"
++                                       {:entries [{:block-id (uuid-of (titles :batch-set)) :property-id prop :value value}]})
++                 :tree #(request! self "POST" "/semantic/block-trees"
++                                  {:target-id notes :blocks [{:title (titles :tree) :properties {prop value}}]})
++                 :batch-tree #(request! self "POST" "/semantic/block-trees/batch"
++                                        {:entries [{:target-id notes
++                                                    :blocks [{:title (titles :batch-tree) :properties {prop value}}]}]})}]
++    (p/loop [i 0 acc {}]
++      (if (= i (count paths))
++        acc
++        (p/let [path (nth paths i)
++                before (snapshot conn)
++                r ((calls path))]
++          (p/recur (inc i) (assoc acc path {:status (:status r)
++                                            :error (get-in r [:body :error])
++                                            :title (titles path)
++                                            :unchanged? (= before (snapshot conn))})))))))
++
++(defn- ident [graph k] (keyword (get-in graph [:ids k])))
++
++;; Before the fix: 200/201 on every path, holding {:id 150 :title "History block"}.
++(deftest node-property-number-resolves-as-a-title-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn page-150] :as graph}]
++        (p/let [results (write-four! graph (get-in graph [:ids :topic]) 150 "topic-150")]
++          (doseq [path paths :let [{:keys [status title]} (results path)]]
++            (testing (str (name path) ": topic = 150 stores the page titled 150, not entity 150")
++              (is (#{200 201} status) (pr-str (results path)))
++              (is (= [{:id page-150 :title "150"}] (held conn title (ident graph :topic)))))))))))
++
++;; Before the fix: another block's value block id stored that block (shared with block A), and 2026
++;; or 2.5 was refused with 'property value must resolve to an existing entity by UUID, ident, or title'.
++(deftest text-property-number-is-stored-as-text-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn note-vblock page-150] :as graph}]
++        (p/do
++         (p/doseq [[label value] [["vblock" note-vblock] ["2026" 2026] ["page-id" page-150] ["2.5" 2.5]]]
++          (p/let [results (write-four! graph (get-in graph [:ids :note]) value (str "note-" label))]
++            (doseq [path paths :let [{:keys [status title]} (results path)
++                                     stored (held conn title (ident graph :note))]]
++              (testing (str (name path) ": note = " value " stores the text " value)
++                (is (#{200 201} status) (pr-str (results path)))
++                (is (= [(str value)] (mapv :title stored)))
++                (is (not-any? #{note-vblock page-150} (map :id stored)) "never the entity with that db id")))))
++        (is (= "hello" (:block/title (get (notes-child conn "A") (ident graph :note))))
++            "block A's own value is untouched"))))))
++
++(defn- refused-with-uuid-hint
++  "Each path answered 400 naming its entry, the property (`prop-name`) and the number `value`, and
++  asking for a UUID, with nothing written. The generic 'must resolve to an existing entity by UUID,
++  ident, or title' error names neither the property nor the value, so it doesn't pass."
++  [results prop-name value]
++  (doseq [path paths :let [{:keys [status error unchanged?]} (results path)
++                           error (str error)]]
++    (testing (str (name path) ": " prop-name " = " value " is refused up front, naming the entry and asking for a UUID")
++      (is (= 400 status) (pr-str (results path)))
++      (is (string/starts-with? error (path-prefix path)) (pr-str error))
++      (is (string/includes? (string/lower-case error) prop-name) (pr-str error))
++      (is (string/includes? error (str value)) (pr-str error))
++      (is (string/includes? error "UUID") (pr-str error))
++      (is unchanged? "nothing is written"))))
++
++;; Before the fix: a number that is some other entity's db id (the page Notes) was stored as that
++;; entity; one that is no entity's id got the generic 'must resolve' error, with no UUID hint.
++(deftest node-property-number-matching-no-title-is-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn notes-page] :as graph}]
++        (p/doseq [[label value] [["notes-page-id" notes-page] ["999999" 999999]]]
++          (p/let [results (write-four! graph (get-in graph [:ids :topic]) value (str "topic-" label))]
++            (refused-with-uuid-hint results "topic" value)
++            (doseq [path paths]
++              (is (empty? (held conn (:title (results path)) (ident graph :topic))) (name path)))))))))
++
++(deftest batch-set-refusal-names-the-entry-with-the-number-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes-page] :as graph}]
++        (p/let [a (str (:block/uuid (notes-child conn "A")))
++                before (snapshot conn)
++                r (request! self "POST" "/semantic/block-properties/batch-set"
++                            {:entries [{:block-id a :property-id (get-in graph [:ids :level]) :value "7"}
++                                       {:block-id a :property-id (get-in graph [:ids :topic]) :value notes-page}]})]
++          (is (= 400 (:status r)) (pr-str r))
++          (is (string/starts-with? (str (get-in r [:body :error])) "entry 1: ") (pr-str r))
++          (is (string/includes? (str (get-in r [:body :error])) "UUID") (pr-str r))
++          (is (= before (snapshot conn)) "entry 0 isn't written either"))))))
++
++;; Before the fix: due = the journal's db id stored that journal; link = another block's URL value
++;; block id stored that block (shared with A); tags = Client's db id tagged the block Client.
++(deftest date-url-and-tags-number-is-not-a-db-id-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn journal link-vblock client] :as graph}]
++        (p/doseq [[k value forbidden] [[:due journal journal]
++                                       [:link link-vblock link-vblock]
++                                       [:tags client client]]]
++          (p/let [results (write-four! graph (get-in graph [:ids k]) value (str (name k) "-" value))]
++            (refused-with-uuid-hint results (name k) value)
++            (doseq [path paths
++                    :let [stored (if (= :tags k)
++                                   (map :db/id (:block/tags (notes-child conn (:title (results path)))))
++                                   (map :id (held conn (:title (results path)) (ident graph k))))]]
++              (is (not-any? #{forbidden} stored) (str (name path) ": " (name k) " never holds entity " forbidden)))))))))
++
++;; A tags value given as a number names a tag by its title, as text does.
++(deftest tags-number-resolves-as-a-class-title-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn y2027] :as graph}]
++        (p/let [results (write-four! graph "block/tags" 2027 "tags-2027")]
++          (doseq [path paths :let [{:keys [status title]} (results path)]]
++            (testing (str (name path) ": tags = 2027 tags the block with the tag titled 2027")
++              (is (#{200 201} status) (pr-str (results path)))
++              (is (contains? (set (map :db/id (:block/tags (notes-child conn title)))) y2027)))))))))
++
++;; Number and choice properties already took a JSON number as a value (patches 0020 and 0022);
++;; these pass before the fix and must still pass after it.
++(deftest number-and-choice-properties-keep-taking-numbers-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn] :as graph}]
++        (p/let [counts (write-four! graph (get-in graph [:ids :count]) 150 "count-150")
++                levels (write-four! graph (get-in graph [:ids :level]) 150 "level-150")]
++          (doseq [path paths]
++            (testing (str (name path) ": count = 150 stores the number 150")
++              (is (#{200 201} (:status (counts path))) (pr-str (counts path)))
++              (is (= ["150"] (mapv :title (held conn (:title (counts path)) (ident graph :count))))))
++            (testing (str (name path) ": level = 150 stores the choice titled 150")
++              (is (#{200 201} (:status (levels path))) (pr-str (levels path)))
++              (is (= ["150"] (mapv :title (held conn (:title (levels path)) (ident graph :level))))))))))))
++
++;; A number that is none of a choice property's choices keeps the choice error, which lists the
++;; valid choices, rather than the title-or-UUID refusal a node property gets.
++(deftest choice-property-number-outside-choices-keeps-the-choice-error-test
++  (async done
++    (with-graph done
++      (fn [graph]
++        (p/let [results (write-four! graph (get-in graph [:ids :level]) 999 "level-999")]
++          (doseq [path paths :let [{:keys [status error unchanged?]} (results path)]]
++            (testing (str (name path) ": level = 999 is refused with the valid choices listed")
++              (is (= 400 status) (pr-str (results path)))
++              (is (string/starts-with? (str error) (path-prefix path)) (pr-str error))
++              (is (string/includes? (str error) "choices (150, 7), got 999") (pr-str error))
++              (is unchanged? "nothing is written"))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
+index c759955..b75daa7 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
+@@ -104,7 +104,6 @@
+                                   ["ident" "logseq.class/Tag"]
+                                   ["UUID" (str (:block/uuid tag))]
+                                   ["upper-case UUID" (string/upper-case (str (:block/uuid tag)))]
+-                                  ["db id (bare integer)" (:db/id tag)]
+                                   ["list with another tag" ["Food" "Tag"]]
+                                   ["list with Page" ["Page" "Tag"]]]]
+             (p/let [before (snapshot conn)
+@@ -114,7 +113,17 @@
+                        [(:status response) (get-in response [:body :error])])
+                     (pr-str response))
+                 (is (= before (snapshot conn)) "nothing is written")
+-                (is (= #{"Page"} (tag-titles conn restaurant)))))))))))
++                (is (= #{"Page"} (tag-titles conn restaurant))))))
++          ;; A bare number is a tag title, never Tag's db id (item 33): no tag has that title.
++          (p/let [before (snapshot conn)
++                  response (set-tags! self restaurant (:db/id tag))]
++            (testing "db id (bare integer)"
++              (is (= [400 (str "Tags: no tag titled \"" (:db/id tag)
++                               "\"; a number is matched as a title, never as a db id, so give the value by UUID")]
++                     [(:status response) (get-in response [:body :error])])
++                  (pr-str response))
++              (is (= before (snapshot conn)) "nothing is written")
++              (is (= #{"Page"} (tag-titles conn restaurant))))))))))
+ 
+ ;; Before the fix: 500 "Can't set tag with built-in #Tag", the same as the empty page.
+ (deftest set-tags-to-tag-on-page-with-blocks-test
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index b96bb34..91a5dfc 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -34,6 +34,7 @@
+             [logseq.db-sync.semantic-favorites-test]
+             [logseq.db-sync.semantic-datalog-query-test]
+             [logseq.db-sync.semantic-delete-property-value-test]
++            [logseq.db-sync.semantic-json-number-value-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
