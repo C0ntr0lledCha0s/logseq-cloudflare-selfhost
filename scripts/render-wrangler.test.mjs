@@ -210,3 +210,14 @@ test("missing or empty hostname is rejected", () => {
     assert.throws(() => render({ hostname: bad }), /missing hostname/);
   }
 });
+
+test("invocation logs are on, whatever upstream sets", () => {
+  const out = render();
+  assert.equal(out.observability.enabled, true);
+  assert.equal(out.observability.logs.invocation_logs, true);
+  const noBlock = render({
+    upstreamToml: fixture.replace(/\[observability\]\nenabled = true\n\n\[observability\.logs\]\ninvocation_logs = false\n/, ""),
+  });
+  assert.equal(noBlock.observability.enabled, true);
+  assert.equal(noBlock.observability.logs.invocation_logs, true);
+});

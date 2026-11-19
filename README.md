@@ -351,7 +351,7 @@ You can deploy either from your machine or from GitHub Actions; both have been v
 
 1. checks that `DB_SYNC_ALLOWED_USERS` is `none` or a list of user IDs, and stops before anything is deployed if it isn't (section 9);
 2. reads the OpenTofu outputs (the D1 database ID);
-3. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`);
+3. renders upstream's `wrangler.toml` for your account, hostname and plan (`scripts/render-wrangler.mjs`). It also turns Workers Logs' invocation logs on, which upstream leaves off, so the dashboard shows each sync request's outcome as well as the lines the code logs;
 4. applies D1 migrations (`wrangler d1 migrations apply logseq-sync-index --remote`) **before** deploying;
 5. checks the list against the users the server already knows. It stops when none of the listed IDs is a known user, and warns when a listed ID hasn't signed in yet or a user who owns graphs isn't listed;
 6. runs `wrangler deploy --secrets-file`, which ships the code and the three secrets (`ASSET_LINK_SECRET`, `DB_SYNC_ADMIN_TOKEN`, `DB_SYNC_ALLOWED_USERS`) together, and attaches the custom domain;
