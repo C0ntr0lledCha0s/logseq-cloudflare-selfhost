@@ -14,7 +14,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 36: Tags title takes the first class | ready | `fix/tags-title-scoped` | [#64](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/64) | `425a9da` |
 | 34: value block shared by UUID | ready | `fix/value-block-by-uuid-copied` | [#65](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/65) | `0a75ac4` |
 | 53: indexer stops on a rejected sync | ready | `fix/indexer-survives-rejected-sync` | [#66](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/66) | `7dd3e49` |
-| 46: batch insert marked non-destructive | running | `fix/batch-insert-destructive-hint` | – | – |
+| 46: batch insert marked non-destructive | not a bug (already fixed) | `fix/batch-insert-destructive-hint` | – | `34357b6` |
+| 44: batch ignores the Task tag Status adds | running | `fix/batch-status-adds-task-tag` | – | – |
 
 ---
 
@@ -210,3 +211,12 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Backlog proposals:** that case, and other non-sync errors such as a malformed feed (README known limit 29, added by this lane).
 - **Skill note:** none needed (cron-internal).
 - **Logseq write-back:** applied (audit entries 301 and 302).
+
+---
+
+## Item 46: batch_insert_block_trees marked non-destructive
+
+- **Status:** not a bug. It was already fixed on main by commit 2376d5a, the annotation work that followed the review that logged it. Quick tier.
+- **Evidence:** `connector/src/tools/spec.mjs` classes the tool as DESTRUCTIVE. `tools-manifest.json`, connector_help and README 11.8 agree, and `connector/test/tools.test.ts` pins it (241 tests pass). `insert_block_tree` and `insert_block_children` rightly stay additive, because they reuse an existing block unchanged.
+- **Commits:** one learnings note (`34357b6`, "an issue logged in review may already be fixed at HEAD"). It has no PR of its own and rides along in item 44's PR.
+- **Your call:** close item 46. I left its Status alone and added a "Checked" note (audit entry 304).
