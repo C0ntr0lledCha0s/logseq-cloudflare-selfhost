@@ -67,10 +67,10 @@ index 02e797c..f60a2be 100644
                write-guard-schemas)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs
 new file mode 100644
-index 0000000..418357b
+index 0000000..e252522
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,228 @@
 +(ns logseq.db-sync.semantic-tags-title-scoped-test
 +  "A Tags value given by a title several classes share is refused, naming their UUIDs (item 36).
 +  resolve-ref-entity gave :block/tags its own title branch, which took the first class with the
@@ -270,6 +270,33 @@ index 0000000..418357b
 +            (doseq [path paths :let [{:keys [status title unchanged?]} (only-recycled path)]]
 +              (testing (str (name path) ": a title only recycled classes have is refused")
 +                (is (= 400 status) (pr-str (only-recycled path)))
++                (is unchanged?)
++                (is (empty? (tag-ids conn title)))))))))))
++
++;; A hidden class (hide? on the class itself) is no candidate for a title either: the live class
++;; sharing its title resolves, by string and by number, and a title only hidden classes have is
++;; refused. (Hiding through a parent is out of reach here: the app gives a class no :block/parent;
++;; namespace tags use :logseq.property.class/extends.)
++(deftest tags-title-skips-a-hidden-class-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews y2027s] :as graph}]
++        (let [[older-2027 newer-2027] y2027s
++              [older-review newer-review] reviews]
++          (d/transact! conn [{:db/id (:db/id older-2027) :logseq.property/hide? true}
++                             {:db/id (:db/id older-review) :logseq.property/hide? true}
++                             {:db/id (:db/id newer-review) :logseq.property/hide? true}])
++          (p/let [by-string (write-four! graph "2027" "hidden-string")
++                  by-number (write-four! graph 2027 "hidden-number")
++                  only-hidden (write-four! graph "Review" "only-hidden")]
++            (doseq [[label results] [["string" by-string] ["number" by-number]]
++                    path paths :let [{:keys [status title]} (results path)]]
++              (testing (str (name path) ": " label " 2027 stores the class that isn't hidden")
++                (is (#{200 201} status) (pr-str (results path)))
++                (is (= #{(:db/id newer-2027)} (tag-ids conn title)))))
++            (doseq [path paths :let [{:keys [status title unchanged?]} (only-hidden path)]]
++              (testing (str (name path) ": a title only hidden classes have is refused")
++                (is (= 400 status) (pr-str (only-hidden path)))
 +                (is unchanged?)
 +                (is (empty? (tag-ids conn title)))))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
