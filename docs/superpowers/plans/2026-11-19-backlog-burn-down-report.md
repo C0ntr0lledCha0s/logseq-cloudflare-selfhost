@@ -1,6 +1,6 @@
 # Overnight backlog burn-down: report
 
-This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The branches are stacked, each cut from the one before it, and every PR is a draft against main. Nothing was merged or deployed, and nothing was written to the owner's graph. Each item ends with a Logseq write-back in draft, ready for the owner to apply.
+This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The branches are stacked, each cut from the one before it, and every PR is a draft against main. Nothing was merged or deployed. At the owner's request (2026-11-19, evening), the issue tasks in Logseq are updated as each lane finishes: Status, phase, branch and pr-url, plus a dated Built note. The write-backs below were applied for items 67, 38, 43 and 33 (audit entries 293 and 294); later items say whether theirs was applied.
 
 ## Summary
 
@@ -32,7 +32,7 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - Write down when a fix gets a new patch and when it amends one.
 - **Skill note:** keep "Mark Claude's edits" on once this is deployed, and add `orphan-choices` to the weekly review.
 
-**Logseq write-back (draft, not applied).** These go on the item's task block:
+**Logseq write-back (applied).** These go on the item's task block:
 
 1. `batch_set_block_property`: Status In Review, phase `review`, branch `fix/edit-stamp-orphaned-choice`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/59`.
 2. A child note under the task:
@@ -68,7 +68,7 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - A repeated value delete answers 400.
   - Drop the item 38 quirk row.
 
-**Logseq write-back (draft, not applied):**
+**Logseq write-back (applied):**
 
 1. `batch_set_block_property` on the task: Status In Review, phase `review`, branch `fix/tags-reset-keeps-builtins`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/60`.
 2. A child note:
@@ -94,7 +94,7 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Retro:** test a refusal rule on every target type; record why the tier was lowered.
 - **Skill note:** never put Page or Tag in Tags on something that doesn't already hold it. To turn a block into a page, use convert-to-page in the app; to turn a page into a tag, use `promote_page_to_tag`.
 
-**Logseq write-back (draft, not applied):**
+**Logseq write-back (applied):**
 
 1. `batch_set_block_property` on the task: Status In Review, phase `review`, branch `fix/page-tag-value-refused`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61`.
 2. A child note:
@@ -130,7 +130,7 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - Name an existing entity by UUID, never by db id.
   - Until the backlog items are fixed, send integers above 2^53 as strings, and use `[[uuid]]` for numeric page titles in block titles.
 
-**Logseq write-back (draft, not applied):**
+**Logseq write-back (applied):**
 
 1. `batch_set_block_property` on the task: Status In Review, phase `review`, branch `fix/json-number-not-db-id`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62`.
 2. A child note:
