@@ -21,6 +21,7 @@ import { registerSuggestLinksTool } from "./tools/suggest-links";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 import { connectorHostname } from "./config";
 import { FAVICON_PATH, FAVICON_SIZE } from "./favicon";
+import { firstLineFor } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
 const spec = openapi as unknown as OpenApiSpec;
@@ -109,6 +110,17 @@ export function callerOf(request: Request): Caller {
  * One request's MCP handler. Only the call form is exposed: the SDK handler's `fetch` and `notify`
  * would run outside `requestScope.run`.
  */
+/**
+ * Puts each tool's first line (spec.mjs FIRST_LINES) in front of its description, for every tool the
+ * server registers, generated or hand-written: claude.ai lists tools with only that line until it loads
+ * one. A tool with no first line throws, so it can't be registered without one.
+ */
+function withFirstLines(server: McpServer): void {
+  const register = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+  (server as { registerTool: unknown }).registerTool = (name: string, config: { description?: string }, ...rest: unknown[]) =>
+    register(name, { ...config, description: `${firstLineFor(name)}\n\n${config.description ?? ""}`.trimEnd() }, ...rest);
+}
+
 export type McpRequestHandler = (request: Request, env: unknown, ctx: ExecutionContext) => Promise<Response>;
 
 /**
@@ -142,6 +154,7 @@ export function mcpHandler(
         },
         { instructions: SERVER_INSTRUCTIONS },
       );
+      withFirstLines(server);
       registerHandwrittenTools(server, env, store, semantic !== null);
       registerActivityLogTool(server, { log, access, timeZone: TIME_ZONE });
       registerGraphTools(server, graphTools, onSuccess, audit);
