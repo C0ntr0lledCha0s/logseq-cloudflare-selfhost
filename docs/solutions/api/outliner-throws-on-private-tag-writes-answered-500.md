@@ -1,12 +1,13 @@
 ---
 title: The outliner throws when any private tag (Tag, Journal, Whiteboard, Property, Asset, Page) is set or removed through :block/tags, and an unrefused throw answers 500
 area: api
-tags: [tags, private-tags, journal, new-journal, choice-scope, tag-class, 500, outliner-throw, replace-write, idempotent, does-not-reproduce]
+tags: [page-tag, held-tags, tags, private-tags, journal, new-journal, choice-scope, tag-class, 500, outliner-throw, replace-write, idempotent, does-not-reproduce]
 seen:
   - 2026-11-06 – item 16, patch 0027, stage 1 finding s-1-1 (review round 1)
   - 2026-11-07 – item 26 follow-up, patch 0029, defect 6 (Journal and the other private tags still answered 500, or the outliner's bare 400 on tree inserts), review round 1 (r1-correctness-1)
   - 2026-11-19 – item 38 (reset report not reproducible on HEAD; the whole-property delete of Tags still answers 500 on Page and Journal holders)
   - 2026-11-19 – item 38, patch 0042 (the remove route fixed: a Tags delete keeps built-in tags and answers 200; a value delete refuses a private tag or display class by name)
+  - 2026-11-19 – item 43, patch 0043 (Page as a tags value, the one private tag left unrefused, answered 500 or a bare 400 on every write path)
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
@@ -47,3 +48,11 @@ The reset route was fixed and deployed (see [a-500-that-does-not-reproduce-on-he
 Patch 0042: a whole-property Tags delete never reaches `remove-block-property!`. It removes only the tags that fail the `kept?` rule `set-prepared-tags!` uses (private tag or display class) and answers 200 with the built-in tags kept. A value delete (new optional `value`) refuses a private tag or display class as the value with a 400 naming the entry. A plain block still loses every tag (pinned by a guard test). The test pairs each private-tag holder with the delete, since each holder type has its own private tag and the throw is certain for all of them.
 
 Check the other direction when you fix one half: the set and remove routes shared the rule but not the code, and only the set half had the `kept?` predicate.
+
+## Fourth sighting (item 43, patch 0043): key the rule on what the target holds, not what it is
+
+Page had been left out of the refusal because the outliner skips it in `disallow-node-cant-tag-with-private-tags` ("validated by later fns"). Those later guards differ by target. A nested block gets the "parent is not a page" notification (500 on set and batch-set, a bare 400 on inserts). A top-level block passes that guard, but server writes skip the client pipeline's `toggle-page-and-block`, so the entity fails schema validation (`:block/name` missing, 500). A journal or tag page fails the schema ("should not have other built-in page tags when tagged with #Page", 500).
+
+The brief proposed "refuse Page when the target is not a page". That would have left the journal and tag cases answering 500, because those are pages. The rule that works is "refuse Page unless the target already holds it" (its `:block/tags` plus the scope's `::held-tags`). That keeps a page re-sending Page a no-op and keeps a batch page entry that creates a page (it gets Page through `new-page-held-tags`).
+
+Catch it: when a brief states the refusal rule in terms of target type, reproduce each target type (nested, top-level, journal, tag, property) through the real handler before writing the rule, and prefer the held-tags form that the earlier private-tag branches already use. Nothing was written in any failing case, so the defect was status and message only; the test still asserts max-tx and datom count are unchanged.
