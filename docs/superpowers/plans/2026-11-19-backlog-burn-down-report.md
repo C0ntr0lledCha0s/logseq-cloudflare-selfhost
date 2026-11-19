@@ -13,7 +13,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 45: batch class check uses stale classes | ready | `fix/batch-class-check-final-state` | [#63](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/63) | `5d23b6e` |
 | 36: Tags title takes the first class | ready | `fix/tags-title-scoped` | [#64](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/64) | `425a9da` |
 | 34: value block shared by UUID | ready | `fix/value-block-by-uuid-copied` | [#65](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/65) | `0a75ac4` |
-| 53: indexer stops on a rejected sync | running | `fix/indexer-survives-rejected-sync` | – | – |
+| 53: indexer stops on a rejected sync | ready | `fix/indexer-survives-rejected-sync` | [#66](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/66) | `7dd3e49` |
+| 46: batch insert marked non-destructive | running | `fix/batch-insert-destructive-hint` | – | – |
 
 ---
 
@@ -195,3 +196,17 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Backlog proposals:** major, pre-existing: a number given by value still reuses an imported graph's value block parented to its holder, so it is lost when the holder is deleted. Existing shared refs are still lost on delete (README backlog 28, added by this lane).
 - **Skill note:** pass the text or URL itself, never another block's value-block UUID. Re-sending a block's own value UUID is fine.
 - **Logseq write-back:** applied (audit entries 299 and 300).
+
+---
+
+## Item 53: one rejected sync request aborted a whole semantic indexer run
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#66](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/66), HEAD `7dd3e49`, standard tier, one review round, stacked on PR 65. Connector only, no patch.
+- **Cause:** PR 52 wraps a rejected `env.SYNC.fetch` as `SyncStoppedError`. The indexer's per-page catch handled only `SyncError` and `BindingError` and rethrew anything else, so the run stopped. The failed graph stayed leased as `building` with no error, and later graphs were skipped.
+- **Fix:** the `BindingError` branch also takes `SyncStoppedError`. It records the graph's error, moves on to the next graph and retries after the lease expires. No extra D1 reads (a test checks the statement count).
+- **Gate:** the lane ran `scripts/check.sh` on `7dd3e49` and it passed (1017 connector tests). `--upstream` was not needed. tofu fmt was skipped.
+- **Regression tests:** five tests through the real `runIndexer`, all failing before the fix. The mutant was killed.
+- **Open should-fix (minor):** a reset after the headers, while the feed body is read, still aborts the run.
+- **Backlog proposals:** that case, and other non-sync errors such as a malformed feed (README known limit 29, added by this lane).
+- **Skill note:** none needed (cron-internal).
+- **Logseq write-back:** applied (audit entries 301 and 302).
