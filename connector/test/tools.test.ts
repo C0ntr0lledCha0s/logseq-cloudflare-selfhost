@@ -651,6 +651,68 @@ describe("reason", () => {
   });
 });
 
+describe("delete one property value (patch 0042)", () => {
+  it("delete_block_property takes an optional body.value and batch_delete_block_property entries take value; both reach the sync server as sent", async () => {
+    const tools = await listTools();
+    const tool = (name: string) => tools.find((t: any) => t.name === name);
+    const single = tool("delete_block_property").inputSchema;
+    expect(single.required ?? []).not.toContain("body");
+    expect(single.properties.body.properties.value.type).toEqual(["string", "number"]);
+    expect(single.properties.body.properties.value.description).toContain("omit it to remove the whole property");
+    const entry = tool("batch_delete_block_property").inputSchema.properties.body.properties.entries.items;
+    expect(entry.properties.value.type).toEqual(["string", "number"]);
+    expect(entry.required).not.toContain("value");
+    for (const name of ["delete_block_property", "batch_delete_block_property"]) {
+      expect(tool(name).description, name).toContain("keeps the built-in tags Logseq sets");
+    }
+
+    acceptEverything();
+    const one = await callTool("delete_block_property", {
+      graph: "work", "block-id": "b1", "property-id": "Tags", body: { value: "Project" }, reason: REASON,
+    });
+    expect(one.isError, one.text).toBe(false);
+    const batchBody = { entries: [{ "block-id": "b1", "property-id": "Scores", value: 3 }, { "block-id": "b2", "property-id": "Tags" }] };
+    const batch = await callTool("batch_delete_block_property", { graph: "work", body: batchBody, reason: REASON });
+    expect(batch.isError, batch.text).toBe(false);
+    const whole = await callTool("delete_block_property", { graph: "work", "block-id": "b1", "property-id": "Tags", reason: REASON });
+    expect(whole.isError, whole.text).toBe(false);
+    expect(writeRequests().map((r) => [r.method, new URL(r.url).pathname, r.body ? JSON.parse(r.body) : null])).toEqual([
+      ["DELETE", `/api/v1/graphs/${WORK_ID}/blocks/b1/properties/Tags`, { value: "Project" }],
+      ["POST", `/api/v1/graphs/${WORK_ID}/block-properties/batch-delete`, batchBody],
+      ["DELETE", `/api/v1/graphs/${WORK_ID}/blocks/b1/properties/Tags`, null],
+    ]);
+  });
+
+  it("a misplaced or misspelt value is refused before anything reaches the sync server, never sent as a whole-property delete", async () => {
+    acceptEverything();
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["delete_block_property", { graph: "work", "block-id": "b1", "property-id": "Tags", value: "Project", reason: REASON }],
+      ["delete_block_property", { graph: "work", "block-id": "b1", "property-id": "Tags", body: { values: "Project" }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", body: { entries: [{ "block-id": "b1", "property-id": "Tags", values: "Project" }] }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", body: { entries: [{ "block-id": "b1", "property-id": "Tags" }], value: "Project" }, reason: REASON }],
+      ["batch_delete_block_property", { graph: "work", value: "Project", body: { entries: [{ "block-id": "b1", "property-id": "Tags" }] }, reason: REASON }],
+    ];
+    for (const [name, args] of calls) {
+      const result = await callTool(name, args);
+      expect(result.isError, `${name} ${JSON.stringify(args)}: ${result.text}`).toBe(true);
+      expect(result.text, name).toMatch(/value/);
+    }
+    expect(writeRequests()).toEqual([]);
+  });
+
+  it("the tool text says a repeated value delete answers 400 and how a value is matched", async () => {
+    const tools = await listTools();
+    const tool = (name: string) => tools.find((t: any) => t.name === name);
+    expect(tool("delete_block_property").description).toContain("repeating its delete answers 400");
+    expect(tool("delete_block_property").description).not.toContain("Idempotently");
+    expect(tool("batch_delete_block_property").description).toContain("repeating that entry answers 400");
+    expect(tool("delete_block_property").inputSchema.properties.body.properties.value.description).toContain("matched exactly, then ignoring case");
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("Once a value is gone, the same value delete answers 400");
+    expect(help).toContain("Node references (block/refs)");
+  });
+});
+
 describe("target-label", () => {
   const SINGLE = [
     "insert_block_children",
@@ -1051,6 +1113,19 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("out_of_class");
     expect(update.description).toContain("holders left empty aren't counted");
     expect(update.description).toContain("A built-in property's classes, such as Assignee's, can't be changed");
+  });
+
+  it("the block-property write tools say a property's classes and a tag's extends are refused, and where to change them", async () => {
+    const tools = await listTools();
+    for (const name of ["set_block_property", "batch_set_block_property", "insert_block_tree", "insert_block_children", "batch_insert_block_trees"]) {
+      const description = tools.find((t) => t.name === name).description;
+      expect(description, name).toContain("logseq.property/classes");
+      expect(description, name).toContain("use update_property (classes)");
+      expect(description, name).toContain("use update_tag (extends)");
+    }
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("logseq.property/classes can't be set here; use update_property (classes)");
+    expect(help).toContain("use update_tag (extends)");
   });
 
   it("create_property and update_property take choices, and say how", async () => {
