@@ -8,7 +8,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 |---|---|---|---|---|
 | 67 (formerly 27): edit-stamp precheck | ready | `fix/edit-stamp-orphaned-choice` | [#59](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/59) | `0b7b2a4` |
 | 38: removing one tag returns 500 | ready (two passes) | `fix/tags-reset-keeps-builtins` | [#60](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/60) | `4abb221` |
-| 43: Page as a tags value answers 500 | running | `fix/page-tag-value-refused` | – | – |
+| 43: Page as a tags value answers 500 | ready | `fix/page-tag-value-refused` | [#61](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61) | `df57c67` |
+| 33: JSON number read as a db id | running | `fix/json-number-not-db-id` | – | – |
 
 ---
 
@@ -75,4 +76,29 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Built 2026-11-19** – PR 60 (patch 0042). The Tags reset 500 was fixed by patch 0027 (deployed 2026-11-07). Deleting Tags on a page or journal now keeps Page/Journal and answers 200; delete_block_property and its batch form take an optional `value` that removes one value of a many-valued property; bad entries answer 400 naming the entry.
   - Verified on 4abb221 (scripts/check.sh --upstream green; tofu fmt skipped). Not yet checked live (service token is write-no-delete).
   - Open: r2-integrity-1 (value delete can remove a built-in class property from a built-in tag).
+```
+
+---
+
+## Item 43: Page as a tags value answers 500
+
+- **Status:** ready. It is draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#61](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61), HEAD `df57c67`, quick tier, stacked on PR 60.
+- **Cause:** `tag-value-refusal` refused every private tag except Page. Server writes then failed later in two ways:
+  - On a nested block, the outliner refused the conversion.
+  - On a top-level block, journal or tag page, the write failed with `:block/name` missing, because the client pipeline that converts a block to a page doesn't run on the server.
+- **Fix (patch 0043):** Page is refused unless the target already holds it. The 400 names the entry or path, and nothing is written. Re-sending Page to a page still works. The rule depends on which tags the target already holds, not on what kind of block it is, which also covers journals and tag pages.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `df57c67` and it passed (809 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** 42 assertions failed before the fix, for example `{:status 500 ... "Can't convert this block to page since its parent is not a page."}`. All 3 mutants were killed.
+- **Open findings:** none. No backlog proposals.
+- **Retro:** test a refusal rule on every target type; record why the tier was lowered.
+- **Skill note:** never put Page or Tag in Tags on something that doesn't already hold it. To turn a block into a page, use convert-to-page in the app; to turn a page into a tag, use `promote_page_to_tag`.
+
+**Logseq write-back (draft, not applied):**
+
+1. `batch_set_block_property` on the task: Status In Review, phase `review`, branch `fix/page-tag-value-refused`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61`.
+2. A child note:
+
+```
+- **Built 2026-11-19** – PR 61 (patch 0043). Page as a tags value is refused with a 400 naming the entry unless the target already holds it (set, batch-set, reset and every insert path); nothing is written. Re-sending Page to a page still works.
+  - Verified on df57c67 (scripts/check.sh --upstream green; tofu fmt skipped). Not yet checked live.
 ```
