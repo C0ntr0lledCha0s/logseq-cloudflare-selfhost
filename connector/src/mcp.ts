@@ -19,6 +19,8 @@ import { SemanticStore } from "./semantic/store";
 import { registerSemanticTools } from "./tools/semantic-search";
 import { registerSuggestLinksTool } from "./tools/suggest-links";
 import type { OpenApiSpec } from "./tools/spec.mjs";
+import { connectorHostname } from "./config";
+import { FAVICON_PATH, FAVICON_SIZE } from "./favicon";
 import { firstLineFor } from "./tools/spec.mjs";
 
 /** The sync server's OpenAPI document at UPSTREAM_REF, vendored by scripts/vendor-upstream-api.sh and bundled. */
@@ -142,7 +144,16 @@ export function mcpHandler(
   };
   const handler = createMcpHandler(
     () => {
-      const server = new McpServer({ name: "logseq-connector", version: "0.0.0" }, { instructions: SERVER_INSTRUCTIONS });
+      const server = new McpServer(
+        {
+          name: "logseq-connector",
+          title: "Logseq",
+          version: "0.0.0",
+          // The icon a client such as claude.ai can show for the connector (src/favicon.ts).
+          icons: [{ src: `https://${connectorHostname(env)}${FAVICON_PATH}`, mimeType: "image/png", sizes: [FAVICON_SIZE] }],
+        },
+        { instructions: SERVER_INSTRUCTIONS },
+      );
       withFirstLines(server);
       registerHandwrittenTools(server, env, store, semantic !== null);
       registerActivityLogTool(server, { log, access, timeZone: TIME_ZONE });
