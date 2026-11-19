@@ -1093,6 +1093,19 @@ describe("hand-written tools", () => {
     expect(update.description).toContain("A built-in property's classes, such as Assignee's, can't be changed");
   });
 
+  it("the block-property write tools say a property's classes and a tag's extends are refused, and where to change them", async () => {
+    const tools = await listTools();
+    for (const name of ["set_block_property", "batch_set_block_property", "insert_block_tree", "insert_block_children", "batch_insert_block_trees"]) {
+      const description = tools.find((t) => t.name === name).description;
+      expect(description, name).toContain("logseq.property/classes");
+      expect(description, name).toContain("use update_property (classes)");
+      expect(description, name).toContain("use update_tag (extends)");
+    }
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("logseq.property/classes can't be set here; use update_property (classes)");
+    expect(help).toContain("use update_tag (extends)");
+  });
+
   it("create_property and update_property take choices, and say how", async () => {
     const tools = await listTools();
     const create = tools.find((t) => t.name === "create_property");
