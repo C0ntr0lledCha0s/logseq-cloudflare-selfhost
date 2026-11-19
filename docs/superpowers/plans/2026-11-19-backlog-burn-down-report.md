@@ -9,7 +9,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 67 (formerly 27): edit-stamp precheck | ready | `fix/edit-stamp-orphaned-choice` | [#59](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/59) | `0b7b2a4` |
 | 38: removing one tag returns 500 | ready (two passes) | `fix/tags-reset-keeps-builtins` | [#60](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/60) | `4abb221` |
 | 43: Page as a tags value answers 500 | ready | `fix/page-tag-value-refused` | [#61](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/61) | `df57c67` |
-| 33: JSON number read as a db id | running | `fix/json-number-not-db-id` | – | – |
+| 33: JSON number read as a db id | ready | `fix/json-number-not-db-id` | [#62](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62) | `6a629b8` |
+| 45: batch class check uses stale classes | running | `fix/batch-class-check-final-state` | – | – |
 
 ---
 
@@ -101,4 +102,41 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 ```
 - **Built 2026-11-19** – PR 61 (patch 0043). Page as a tags value is refused with a 400 naming the entry unless the target already holds it (set, batch-set, reset and every insert path); nothing is written. Re-sending Page to a page still works.
   - Verified on df57c67 (scripts/check.sh --upstream green; tofu fmt skipped). Not yet checked live.
+```
+
+---
+
+## Item 33: a bare JSON number was read as a db id
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#62](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62), HEAD `6a629b8`, standard tier, stacked on PR 61.
+- **Cause:** `resolve-ref-entity` (patch 0021) had a branch that turned any number into `d/entity`. Only choice and number properties caught numbers before it, so node, date, URL, text and Tags values on all four write paths took the db-id branch. For example, `topic = 150` stored the History block.
+- **Fix (patch 0044):**
+  - A text property stores a number as text.
+  - Other properties resolve a number as a title.
+  - A number that matches nothing is refused with a 400 that asks for a UUID.
+  - README Backlog item 9 is closed.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `6a629b8` and it passed (817 db-sync tests, 369 scripts tests). tofu fmt was skipped.
+- **Regression tests:** 7 tests failed before the fix (162 of 315 assertions). One example is `topic = 150 ... [{:id 150, :title "History block"}]`.
+- **Should-fix findings left open (minor, your call):**
+  - r1-correctness-1 / r1-integrity-1: a text property given an integer above 2^53 or 1e21 silently stores a different number as text. These were refused before.
+  - r1-tests-1: the `isFinite` guard has no test.
+- **Backlog proposal:** r1-correctness-2 (major, pre-existing upstream code). `[[N]]` in a block title still resolves to the entity with db id N.
+- **Retro proposals:**
+  - Quote README backlog headings instead of their numbers. The brief said item 10; it is item 9.
+  - Claim mutation checks only for rules that were actually mutated.
+  - When closing a lookup rule, grep the earlier patches' tests and sibling lookup sites.
+- **Skill note:**
+  - Numbers are now matched as titles or stored as text, so they no longer need quoting.
+  - Name an existing entity by UUID, never by db id.
+  - Until the backlog items are fixed, send integers above 2^53 as strings, and use `[[uuid]]` for numeric page titles in block titles.
+
+**Logseq write-back (draft, not applied):**
+
+1. `batch_set_block_property` on the task: Status In Review, phase `review`, branch `fix/json-number-not-db-id`, pr-url `https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62`.
+2. A child note:
+
+```
+- **Built 2026-11-19** – PR 62 (patch 0044). A bare JSON number is never a db id: a text property stores it as text; node, date, URL and Tags values resolve it as a title; an unmatched number is refused with a 400 asking for a UUID. Covers set, batch set, insert tree and batch insert trees.
+  - Verified on 6a629b8 (scripts/check.sh --upstream green; tofu fmt skipped). Not yet checked live.
+  - Open: integers above 2^53 stored as rounded text (r1-correctness-1); `[[N]]` in titles still resolves db id N (proposed backlog).
 ```
