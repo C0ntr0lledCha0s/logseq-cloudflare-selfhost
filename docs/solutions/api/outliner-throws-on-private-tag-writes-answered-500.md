@@ -5,6 +5,7 @@ tags: [tags, private-tags, journal, new-journal, choice-scope, tag-class, 500, o
 seen:
   - 2026-11-06 – item 16, patch 0027, stage 1 finding s-1-1 (review round 1)
   - 2026-11-07 – item 26 follow-up, patch 0029, defect 6 (Journal and the other private tags still answered 500, or the outliner's bare 400 on tree inserts), review round 1 (r1-correctness-1)
+  - 2026-11-19 – item 38 (reset report not reproducible on HEAD; the whole-property delete of Tags still answers 500 on Page and Journal holders)
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
@@ -37,3 +38,7 @@ Patch 0027 refused only Tag, so Journal, Whiteboard, PDF Annotation, Property an
 Page as a tags value is still not refused up front (backlog r1-correctness-2).
 
 Rules kept so retries work: a private tag the target already holds is a no-op, Asset on an asset stays allowed, and the remaining tags in a list still apply. The regression test pairs every refused case with that control.
+
+## Third sighting (item 38)
+
+The reset route is fixed and deployed (see [a-500-that-does-not-reproduce-on-head-may-predate-its-fix-deploy](a-500-that-does-not-reproduce-on-head-may-predate-its-fix-deploy.md)). The remove route is not: `remove-prepared-property!` calls `remove-block-property!`, which runs `throw-error-if-removing-private-tag`, so deleting Tags (single or batch) on a page or journal answers 500 and the batch error carries no entry index. Refusal or a user-tags-only removal is still owed there.
