@@ -3,12 +3,12 @@ import { z } from "zod";
 import { registerSemanticApiTools } from "../../vendor/semantic_api_tools.mjs";
 import { connectorHostname } from "../config";
 import type { ResolvedGraph } from "../graphs";
-import { SyncError, type SyncRequest, syncFetch } from "../sync";
-import { ToolError, aliasArg, resolveGraph, runTool } from "./common";
+import { SyncError, type SyncRequest, SyncStoppedError, syncFetch } from "../sync";
+import { RESULT_CHAR_LIMIT, ToolError, aliasArg, lookupGraph, resolveGraph, runTool, withCallGraphs } from "./common";
 
 export { resolveGraph };
 import { type AuditContext, audited } from "../audit/log";
-import { type OnSuccess, capWriteResult, reasonGiven, reasonSchema } from "./readable";
+import { type OnSuccess, capWriteResult, compact, reasonGiven, reasonSchema } from "./readable";
 import { DELETE_RULES, DRY_RUN_TOOLS, declaredDryRun, deleteReason, noDeleteMessage } from "./deletes.mjs";
 import { ALIAS_PATTERN, type GraphOperation, type OpenApiSpec, annotationsFor, graphOperations, transformSpec } from "./spec.mjs";
 
@@ -123,6 +123,9 @@ function description(op: GraphOperation): string {
   return parts.join("\n\n");
 }
 
+/** What to try when the sync server stopped a request: the likeliest cause is a query past the CPU limit. */
+const STOPPED_HINT = "a query may have hit the CPU limit; try a narrower query";
+
 function syncErrorText(error: SyncError, alias: string, host: string): string {
   if (error.status === 401 || error.status === 403) {
     return `token for graph '${alias}' expired or lacks permission — reconnect it at https://${host}/graphs`;
@@ -131,6 +134,9 @@ function syncErrorText(error: SyncError, alias: string, host: string): string {
   // 409 is a refusal the caller can act on, e.g. a title already in use or a delete that needs an
   // acknowledge-* flag; the server's message says what to do.
   if (error.status === 400 || error.status === 409) return error.message;
+  // A 5xx with no error of the server's own came from the platform, not the handler: the Durable
+  // Object was stopped (a CPU-limit kill or a reset), so the status alone would tell Claude nothing.
+  if (error.status >= 500 && !error.serverMessage) return `the sync server stopped the request (HTTP ${error.status}); ${STOPPED_HINT}`;
   return `sync server error (HTTP ${error.status}): ${error.message}`;
 }
 
@@ -146,11 +152,14 @@ function queryParams(query: Record<string, unknown> | undefined): Record<string,
   return out;
 }
 
-/** `syncFetch` for a tool call on `alias`: a sync server error becomes a `ToolError` with clear text. */
+/** `syncFetch` for a tool call on `alias`: a sync server error, or no answer at all, becomes a `ToolError` with clear text. */
 export async function graphFetch(access: GraphAccess, alias: string, pat: string, req: SyncRequest): Promise<Response> {
   try {
     return await syncFetch(access.env, pat, req);
   } catch (error) {
+    if (error instanceof SyncStoppedError) {
+      throw new ToolError(`the sync server stopped the request without answering (${error.reason.slice(0, 200)}); ${STOPPED_HINT}`, "sync-stopped");
+    }
     if (!(error instanceof SyncError)) throw error;
     throw new ToolError(syncErrorText(error, alias, connectorHostname(access.env)), `http-${error.status}`);
   }
@@ -162,13 +171,25 @@ interface DeleteRoute {
   pattern: RegExp;
 }
 
+/** An operation's path after `/graphs/{graph-id}`, as a pattern. */
+function routePattern(op: GraphOperation): RegExp {
+  return new RegExp(`^${op.path.replace(/^\/api\/v1\/graphs\/\{graph-id\}/, "").replace(/\{[^}]+\}/g, "[^/]+")}$`);
+}
+
 function deleteRoutes(operations: GraphOperation[]): DeleteRoute[] {
+  return operations.filter((op) => op.method === "DELETE").map((op) => ({ name: op.name, pattern: routePattern(op) }));
+}
+
+/** A read sent with a method other than GET (datalog_query, patch 0039), by method and path pattern. */
+interface ReadRoute {
+  method: string;
+  pattern: RegExp;
+}
+
+function nonGetReadRoutes(operations: GraphOperation[]): ReadRoute[] {
   return operations
-    .filter((op) => op.method === "DELETE")
-    .map((op) => ({
-      name: op.name,
-      pattern: new RegExp(`^${op.path.replace(/^\/api\/v1\/graphs\/\{graph-id\}/, "").replace(/\{[^}]+\}/g, "[^/]+")}$`),
-    }));
+    .filter((op) => op.method !== "GET" && annotationsFor(op.name).readOnlyHint)
+    .map((op) => ({ method: op.method, pattern: routePattern(op) }));
 }
 
 /**
@@ -189,7 +210,7 @@ function refuseDelete(graph: ResolvedGraph, alias: string, req: UpstreamRequest,
   );
 }
 
-async function request(access: GraphAccess, req: UpstreamRequest, routes: DeleteRoute[]): Promise<unknown> {
+async function request(access: GraphAccess, req: UpstreamRequest, routes: DeleteRoute[], reads: ReadRoute[]): Promise<unknown> {
   const match = GRAPH_PATH.exec(req.path);
   // Upstream builds the path from the transformed spec, and the input schema enforces the alias pattern.
   if (!match || !ALIAS.test(match[1])) throw new Error("generated tool produced an unexpected path");
@@ -202,7 +223,9 @@ async function request(access: GraphAccess, req: UpstreamRequest, routes: Delete
       throw new ToolError("path arguments may not be '.' or '..'", "refused");
     }
   }
-  const graph = await resolveGraph(access, alias, req.method !== "GET");
+  // A write needs a graph (and token) in write mode; a read annotated READ may use any method.
+  const write = req.method !== "GET" && !reads.some((r) => r.method === req.method && r.pattern.test(rest));
+  const graph = await resolveGraph(access, alias, write);
   refuseDelete(graph, alias, req, rest, routes);
   const response = await graphFetch(access, alias, graph.pat, {
     method: req.method,
@@ -253,14 +276,74 @@ export function buildGraphTools(spec: OpenApiSpec, access: GraphAccess): GraphTo
     },
   };
   const routes = deleteRoutes([...operations.values()]);
-  registerSemanticApiTools(recorder, transformSpec(spec), (req: UpstreamRequest) => request(access, req, routes));
+  const reads = nonGetReadRoutes([...operations.values()]);
+  registerSemanticApiTools(recorder, transformSpec(spec), (req: UpstreamRequest) => request(access, req, routes, reads));
   if (tools.size !== operations.size) throw new Error("upstream did not register every graph operation");
   return [...tools.values()];
 }
 
 /**
+ * The reads that each leave one `kind = 'read'` audit row (spec 2026-11-09-datalog-query-named-queries
+ * §3.10): a query can read anything that is not private, so the owner gets a record of each one.
+ * Each name must be READ in ANNOTATIONS (a test checks it).
+ */
+export const LOGGED_READS: ReadonlySet<string> = new Set(["datalog_query", "run_named_query"]);
+
+/**
+ * What a logged read's row says it addressed: `named:<name>` and `param:<name>` for each param it
+ * gave, sorted, or `datalog:<first 12 hex of the SHA-256 of the query text>`. Never the query text
+ * or a param value, keeping migration 0004's rule against storing raw arguments.
+ */
+async function readAddressed(tool: string, args: Record<string, unknown>): Promise<string[]> {
+  const body = args.body !== null && typeof args.body === "object" ? (args.body as Record<string, unknown>) : {};
+  if (tool === "run_named_query") {
+    const params = body.params !== null && typeof body.params === "object" ? Object.keys(body.params).sort() : [];
+    return [`named:${String(args.name)}`, ...params.map((p) => `param:${p}`)];
+  }
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(body.query))));
+  return [`datalog:${Array.from(digest.subarray(0, 6), (b) => b.toString(16).padStart(2, "0")).join("")}`];
+}
+
+/**
+ * A query's result, its JSON written without indentation when indented it would pass
+ * `RESULT_CHAR_LIMIT`. The server's byte cap keeps the compact JSON under 100,000 characters, but
+ * rows of many small values (a reverse-ref pull) grow 1.6 times or more when indented, and the read
+ * path's cap would then cut the JSON mid-row. Under the limit it stays indented.
+ */
+export function compactQueryResult(result: CallToolResult): CallToolResult {
+  const size = result.content.reduce((n, c) => n + (c.type === "text" ? c.text.length : 0), 0);
+  if (size <= RESULT_CHAR_LIMIT) return result;
+  return { ...result, content: result.content.map((c) => (c.type === "text" ? { ...c, text: compact(c.text) } : c)) };
+}
+
+/**
+ * Runs one LOGGED_READS call and records its read row, status `ok` or `error`, with 0 D1 rows read
+ * (the query reads the Durable Object). The graph is looked up once per call (`withCallGraphs`), so
+ * the row's graph id costs no extra D1 read. A row that can't be stored is logged to Workers Logs
+ * and the result, or the error, is returned unchanged.
+ */
+function loggedRead(audit: AuditContext, tool: string, alias: string, args: Record<string, unknown>, run: () => Promise<CallToolResult>): Promise<CallToolResult> {
+  return withCallGraphs(async () => {
+    let status: "ok" | "error" = "error";
+    try {
+      const result = await run();
+      status = "ok";
+      return result;
+    } finally {
+      try {
+        const graphId = (await lookupGraph(audit.access, alias))?.graphId ?? null;
+        await audit.log.recordRead(tool, status, graphId, alias, await readAddressed(tool, args), 0);
+      } catch (error) {
+        console.error(`audit-read-failed tool=${tool} graph=${alias} ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  });
+}
+
+/**
  * Registers built graph tools on one request's server, with the connector's logging, error mapping
- * and result cap. Every write runs through `audited()`, which logs it (refusals and failures too),
+ * and result cap. A read in LOGGED_READS leaves one read row (`loggedRead`); other reads leave none.
+ * Every write runs through `audited()`, which logs it (refusals and failures too),
  * takes its `reason` out of the arguments before the handler sees them, so it never reaches the sync
  * server, and leads the result with a plain summary: what the write touched, by page, breadcrumb and
  * snippet, then the reason, then the audit entry. `onSuccess` runs after each call the sync server
@@ -276,9 +359,11 @@ export function registerGraphTools(server: McpServer, tools: GraphTool[], onSucc
         alias,
         async () => {
           if (!write) {
-            const result = await tool.handler(args);
             // The input schema requires a well-formed alias, so a call that got this far has one.
             if (alias === undefined) throw new Error("graph tool ran without a valid alias");
+            const result = LOGGED_READS.has(tool.name)
+              ? compactQueryResult(await loggedRead(audit, tool.name, alias, args, () => tool.handler(args)))
+              : await tool.handler(args);
             onSuccess(tool.name, alias);
             return result;
           }

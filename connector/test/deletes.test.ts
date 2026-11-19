@@ -363,6 +363,8 @@ describe("dry runs", () => {
   function declared(): Record<string, "query" | "body"> {
     const out: Record<string, "query" | "body"> = {};
     for (const { name, operation } of graphOperations(openapi as unknown as OpenApiSpec)) {
+      // The table holds write tools; a read's dry run (datalog_query, patch 0039) changes nothing to refuse.
+      if (ANNOTATIONS[name as keyof typeof ANNOTATIONS]?.readOnlyHint) continue;
       const inQuery = (operation.parameters ?? []).some((p) => p.name === "dry-run" && p.in === "query");
       const body = operation.requestBody as
         | { content?: { "application/json"?: { schema?: { properties?: Record<string, unknown> } } } }

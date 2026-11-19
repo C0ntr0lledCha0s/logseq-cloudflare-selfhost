@@ -77,6 +77,13 @@ jobs:
         working-directory: .upstream/deps/db-sync
         run: pnpm test
 
+      # The tests above run the dev build. Deploy ships the release bundle (Closure advanced
+      # compilation), which once renamed Datascript's Datom field v and returned null for every
+      # value a query bound (patch 0040). This queries the release bundle itself; it seeds the
+      # built-in graph with the test build the step above compiled.
+      - name: Query the release bundle
+        run: node scripts/release-query-check.mjs .upstream
+
       - name: Render and dry-run deploy for both plans
         run: |
           placeholder="$RUNNER_TEMP/tofu-output.json"

@@ -22,7 +22,7 @@ This repo self-hosts Logseq's DB sync server on Cloudflare, plus `logseq-connect
 
 ## Commands
 
-- `scripts/check.sh` is the gate every lane uses. It runs the scripts' unit tests, the connector tests, typecheck and tools-manifest check (when `connector/vendor/` exists), and `tofu fmt`. It names each check it skipped and why. Add `--upstream` when `patches/` changed.
+- `scripts/check.sh` is the gate every lane uses. It runs the scripts' unit tests, the connector tests, typecheck and tools-manifest check (when `connector/vendor/` exists), and `tofu fmt`. It names each check it skipped and why. Add `--upstream` when `patches/` changed: it then runs upstream's db-sync suite and `scripts/release-query-check.mjs`, which queries the release bundle as last built by `scripts/build.sh` (the dev build can't show what Closure's advanced compilation renames).
 - `npm test` runs the scripts' unit tests only (fast, needs nothing built).
 - Connector checks need the vendored upstream API: `scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream`. The build needs mise's toolchain (Java, the Clojure CLI, pnpm) and takes a while. CI builds it on every push and PR, and also runs upstream's own db-sync suite, which includes the tests the patches add.
 - `npm --prefix connector run update:manifest` rewrites `tools-manifest.json` after a tool is added, removed or renamed.

@@ -273,7 +273,7 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
 
         if (args.id !== undefined) {
           const { row, rowsRead } = await log.lookup(graphId, args.id);
-          await log.recordRead(graphId, alias, [`id:${args.id}`], rowsRead);
+          await log.recordRead("get_activity_log", "ok", graphId, alias, [`id:${args.id}`], rowsRead);
           if (row === null || row.kind !== "write") throw new ToolError(`id ${args.id}: no such entry for graph ${alias}`, "refused");
           const text = `Audit log entry ${row.id} of graph '${alias}' (times in ${timeZone}):\n- ${entryLine(row, timeZone)}`;
           return {
@@ -298,7 +298,7 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           includeSnapshot: args.include_snapshot === true,
           snapshotChars: RESULT_CHAR_LIMIT - RESULT_RESERVE,
         });
-        await log.recordRead(graphId, alias, [`${new Date(since).toISOString()}/${new Date(until).toISOString()}`], page.rowsRead);
+        await log.recordRead("get_activity_log", "ok", graphId, alias, [`${new Date(since).toISOString()}/${new Date(until).toISOString()}`], page.rowsRead);
 
         // Entries are kept, newest first, while the result fits; the rest follow from the last one kept.
         // Each is built only when it is reached, so one that is cut is never parsed.

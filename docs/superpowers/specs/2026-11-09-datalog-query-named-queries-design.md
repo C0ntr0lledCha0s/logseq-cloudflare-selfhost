@@ -1,0 +1,350 @@
+# Read-only Datalog query and named queries: design
+
+Date: 2026-11-09
+Issue: item 40 on the tracker ("Read-only Datalog query tool and named query library"), status Backlog. Areas: patch, connector, semantic, docs, scripts.
+Upstream: `logseq/logseq` at `UPSTREAM_REF`, `deps/db-sync`, with patches 0001 to 0038. This work adds patch 0039.
+Branch: `claude/relaxed-maxwell-s4r8o4-queries`, from `6d9da57` (patch 0038, favourites, PR 47), 0 commits behind `origin/main`.
+Builds on: `2026-11-07-connector-write-audit-log-design.md` ("the audit design", item 28), `2026-11-09-page-favourites-connector-tools-design.md` (the shape of a semantic-API patch with generated tools), `docs/solutions/cost/per-request-scan-of-a-cached-index-needs-a-cpu-bench-at-the-cap.md` and `docs/solutions/connector/per-item-summary-blows-result-cap.md`.
+
+Decisions marked **(brief)** come from the owner's brief or the tracker item. Decisions marked **(call)** were made while writing this design. The design panel chose the "minimal" proposal: two read routes in patch 0039, run against a filtered Datascript db, with generated connector tools and no hand-written tool code. No ideas were grafted from other proposals. The decisions most worth a second look are in section 11.
+
+**What was run for this spec.** This spec states no bug cause, so there was nothing to reproduce. Source was read in `.upstream` and the vendored Datascript on 2026-11-09, and the owner's tags and properties were listed read-only through the connector (`list_tags`, `list_properties`) to check the named queries' defaults. Facts checked that way:
+
+- Datascript is Logseq's fork at `3f141af`. Its `built_ins/query-fns` (`built_ins.cljc:81`) includes `rand`, `rand-int`, `range`, `re-find`, `re-matches`, `re-seq`, `re-pattern`, `clojure.string/join`, `replace` and `split`.
+- In ClojureScript `resolve-sym` returns `nil` (`query.cljc:504-507`). A function or predicate symbol therefore resolves only from `query-fns` or from a variable bound in the query's inputs; anything else raises `Unknown function '…` or `Unknown predicate '…` (`query.cljc:515, 531`). So `transact!` cannot be called by name today. The allow-list in 3.3 is still needed, to shut out the CPU-heavy built-ins and input-bound functions, and to name the refusal clearly.
+- `d/filter` (`core.cljc:246`) proxies every operation to the original db and applies the predicate on each access, uncached.
+- `handler/semantic.cljs` is 5,552 lines. `dispatch-handle` is at :5503. The insights reads refuse E2EE with 409 (`semantic.cljs:2526, 2778` and the comment at :4803).
+- `graph-insights/class-lineage-fn` (`graph_insights.cljs:164`) maps a class to itself plus every class it **extends** (upwards), memoised per request. `excluded-page?` (:180) uses it to test "tagged with, or with a tag extending, a class titled X". The private rule in 3.4 uses the same test.
+- `AuditLog.recordRead` (`connector/src/audit/log.ts:436`) hard-codes both `tool = 'get_activity_log'` and `status = 'ok'`. Migration 0004 allows `kind IN ('write','read')`, and `tool` is free text.
+- `RESULT_CHAR_LIMIT` is 150,000 characters (`connector/src/tools/common.ts`). `registerGraphTools` (`connector/src/tools/semantic.ts:269`) sends a read straight to the handler with no audit row.
+
+Behaviour that no test has shown yet is marked **unverified**, and section 8 names the test that settles it.
+
+## 1. Goal
+
+Claude should be able to run Datalog against a graph from a claude.ai chat, with no desktop app, tunnel or CLI. The queries the owner wants (projects untouched for N days, meetings with no recorded decision, open tasks by client, pages missing a required property) take many tool calls today. Patch 0039 adds a guarded `datalog_query` and a small library of vetted named queries, `run_named_query`, to the semantic API. The connector exposes both as generated read tools.
+
+Acceptance (tracker item 40 and the brief):
+
+1. A Datalog query runs from a claude.ai chat with no desktop app or tunnel.
+2. An over-cap query never answers 500 or fails on a CPU limit. A result over the row or byte cap is truncated with a note naming the cap. A query that hits the scan cap is refused with 422 and a note naming the cap, since Datascript cannot yield partial rows once it stops (section 3.5).
+3. Pages tagged private never appear in results, and neither do blocks tagged private, blocks on a private page or blocks under a private block (the brief extends the tracker's "pages").
+4. Each named query runs in one call. `connector_help` and the logseq-kb skill note list them.
+5. The tool is read-only by construction. A write form, a function that is not on the allow-list and a function bound through inputs are refused, and a test proves the db is unchanged after each.
+6. Pull patterns are bounded. `(pull ?b [*])` across the graph returns at most `limit` rows, with a note naming the cap.
+7. E2EE behaviour is defined and tested.
+8. Each call is accounted for: a decision on whether reads are logged, and the D1 rows read and written per call.
+9. The query representation is reusable by the follow-up that turns query fences into Query blocks (README backlog 21).
+10. `tools-manifest.json`, `connector_help`, the tool descriptions and README §11.8 are updated, and the PR body carries a Logseq skill note.
+
+Tracker criterion 5 ("the weekly review uses the change feed and the extended health checks") is **out of scope** by the brief. Section 10 moves it to a follow-up item, and section 11 asks the owner to confirm.
+
+## 2. Context
+
+**What Claude can do today.** The semantic API answers fixed questions: `list_tag_objects`, `list_tasks`, `get_page_backlinks`, `kb_index`, `get_graph_health` and `semantic_search`. A question that joins tags, properties, time and structure ("tasks not done whose page's client is X") takes several calls and client-side joins, and Claude often gets the join wrong. The Logseq CLI answers such questions with Datalog, but only on the desktop. Upstream logseq PR 13622 (`datascriptQuery`) is the precedent for exposing Datalog over an API; this design keeps the idea and adds the guards a public, Free-plan Worker needs.
+
+**The db.** The semantic handlers read the graph's Datascript db (`@conn`) in the graph's Durable Object. Datascript's query engine runs synchronously and has no timeout or work limit. `d/filter` gives a view in which every datom is checked against a predicate before any index, query or pull sees it.
+
+**Why a wall-clock timeout cannot work.** The Worker clock (`Date.now`, `performance.now`) does not advance during synchronous CPU work, so a deadline checked inside the query would never fire (`docs/solutions/cost/per-request-scan-of-a-cached-index-needs-a-cpu-bench-at-the-cap.md`). The limit has to count work instead.
+
+**Private content.** The semantic indexer keeps out any block tagged `private` (any case) and everything under it, and anything on a private page (`connector/src/semantic/document.ts:38`, `PRIVATE_TAG`). `kb_index` excludes pages tagged with, or with a tag extending, a class whose title is in its excluded set. The owner's graph has a user tag titled Private.
+
+**E2EE.** On an E2EE graph titles are stored as `[iv ciphertext]` packages (README, near line 391). Structure, tags, property values and refs are plain. Every read that depends on titles or text already refuses E2EE with 409.
+
+**The owner's schema (checked read-only for the defaults).** Project and Decision exist as tags. There is no tag titled Meeting; the meeting tag is titled Business Meeting. Tasks use the built-in Task tag and `:logseq.property/status`. The client of a piece of work is a node property titled `forClient`, limited to the Client tag; there is no property titled `client`. No graph name, ident suffix or uuid from the owner's graph appears in this spec or in any file the work adds.
+
+**Connector plumbing.** Generated tools need an `ANNOTATIONS` entry in `spec.mjs`. A POST without one would be treated as a write and need `reason`. Reads skip `audited()` and leave no audit row today; only `get_activity_log` records its own reads.
+
+## 3. Design
+
+### 3.1 Layout
+
+| Layer | File | Change |
+|---|---|---|
+| Routes | patch 0039: `worker/routes/semantic.cljs` | two POST routes, `logseq/read`, rate class read, openapi summaries and schemas |
+| Handler | patch 0039: new `worker/handler/datalog.cljs` | parse, validate, private filter, scan cap, pull rewrite, sort, truncate, serialise |
+| Named queries | patch 0039: new `worker/named_queries.cljs` | four queries as data |
+| Wiring | patch 0039: `worker/handler/semantic.cljs` | `dispatch-handle` entries only, so the 5,552-line file barely grows |
+| Tests | patch 0039: new test namespace and runner entry | real outliner on a `create_graph` db |
+| Vendor | `connector/vendor/openapi.json`, `semantic_api_tools.mjs` | regenerated |
+| Annotations | `connector/src/tools/spec.mjs` | `datalog_query: READ`, `run_named_query: READ` |
+| Audit | `connector/src/audit/log.ts`, `connector/src/tools/semantic.ts` | `recordRead(tool, status, …)`; `LOGGED_READS` in `registerGraphTools` |
+| Contract | `connector_help` (`handwritten.ts`), `tools-manifest.json`, README §11.8 | Queries paragraph, regenerated manifest, entry, cost line, troubleshooting rows |
+| Bench | `scripts/bench-datalog-query.mjs` and `.test.mjs` | times the scan cap cold and warm |
+
+### 3.2 Routes (brief)
+
+Both are POST because the query text can be long, and both are reads:
+
+- `POST /api/v1/graphs/:graph-id/query`, operationId `datalogQuery`, tool `datalog_query`.
+- `POST /api/v1/graphs/:graph-id/named-queries/:name`, operationId `runNamedQuery`, tool `run_named_query`.
+
+The `:name` path parameter is a plain slug (`[a-z-]+`), so the qualified-ident re-encoding trap does not apply, but the route test still calls it through the router.
+
+### 3.3 Read-only by construction (call)
+
+Three layers.
+
+1. **Only a db value reaches the query.** The handler runs `d/q` and `d/pull` on `(d/filter @conn pred)` and never passes `conn`. Nothing a query can name reaches a transact.
+2. **Parse without evaluating, then validate.** The query, inputs and rules are read with `cljs.reader/read-string` (the EDN reader, which does not evaluate code; tagged literals are limited to `#uuid` and `#inst`). Before anything runs, a static validator walks the parsed form:
+   - Map form keys are limited to `:find :in :where :keys :strs :syms :with`; the vector form is converted to the map form first. `:rules` comes only from the `rules` field.
+   - `:in` starts with `$` (or is omitted); any other `$`-prefixed source is refused. `%` is allowed only when `rules` is given.
+   - In every function or predicate clause, including those inside `or`, `or-join`, `not`, `not-join` and rule bodies, the function is a symbol on an explicit allow-list. A `?var` in function position is refused, which shuts out functions bound through inputs.
+   - The allow-list is `query-fns` minus `rand`, `rand-int`, `range`, `re-pattern`, `re-find`, `re-matches`, `re-seq` (CPU with no datom cost, and ReDoS), minus the `clojure.string` functions that build large strings (`join`, `replace`, `replace-first`, `split`, `split-lines`, `escape`, `reverse`), minus `meta`, `pr-str`, `print-str`, `println-str` and `prn-str`, and (review round 1) minus the collection constructors `vector`, `list`, `set`, `hash-map`, `array-map` and `tuple`, which chained double a value at every clause. It keeps `includes?`, `starts-with?`, `ends-with?`, `lower-case`, `upper-case`, `blank?`, the comparisons, arithmetic, `get-else`, `get-some`, `missing?`, `ground`, `untuple`, `count` and the type predicates. `str`, `+` and `keyword`, which can join strings, take at most one `?variable`.
+   - Transaction-shaped values anywhere in the query, inputs or rules (`:db/add`, `:db/retract`, `:db.fn/*`, `:db/retractEntity`, a map with `:db/id`) are refused.
+   - A `pull` whose pattern is not a literal vector is refused.
+3. **A test proves it.** After each refused query, `max-tx` and the datom count are the same as before.
+
+Each refusal names where and why, for example `where 2: function transact! is not allowed (allowed: =, <, …)`, `where 3: ?f is a variable in function position; functions can't be passed as inputs` or `query: :db/add is a write form; datalog_query is read-only` (`docs/solutions/api/one-error-for-every-failure.md`).
+
+**Allow-list drift.** A test asserts that every allowed symbol is a key of `query-fns`, so a Datascript bump that renames one fails the `bump-upstream` workflow. Because the list is deny-by-default, a new built-in stays refused until it is added on purpose.
+
+### 3.4 Private exclusion with one filter (call)
+
+Per request, the handler builds a set of private entity ids:
+
+- **private classes:** classes whose title is `private` in any case;
+- **private entities:** every page or block whose tags, through `class-lineage-fn`, include a private class (the `excluded-page?` test, applied to blocks too);
+- every block whose `:block/page` is a private page;
+- every descendant (through `:block/_parent`) of a private block;
+- every property value entity owned by one of the above (it has `:block/parent` or `:block/page` pointing into the set, so the two rules above catch it; a test pins this).
+
+It also builds the set of ref attributes from the schema. The `d/filter` predicate drops a datom when its `e` is private, or when its attribute is a ref and its `v` is private. A private page's title, its blocks and the fact that something links to it never appear in results, in pulls (including reverse refs such as `:block/_refs`), in `missing?` or `get-else`, or in aggregates such as `count`. This matches the semantic indexer's rule ("tagged private, or under a private block or page") and extends `kb_index`'s page rule to blocks.
+
+What it does not hide: a public block's raw `:block/title` that contains a `[[uuid]]` ref to a private page still shows the uuid string, but not the title. This is the same as `get_block` today. The private classes themselves stay visible, so `[:find ?t :where [?t :block/title "Private"]]` returns the tag, but not what it tags.
+
+Building the set costs O(private pages + their blocks + private subtrees) per request. If the bench shows it matters on a large graph, the set can be cached per tx id in the Durable Object; this design does not cache it.
+
+### 3.5 A scan cap in place of a timeout (call)
+
+The filter predicate also counts every datom it is asked about. Past `scan-cap` it throws `(ex-info … {::scan-cap n})`. The handler answers that with 422:
+
+```
+query stopped after scanning 50,000 datoms (the scan cap); narrow it with a tag, page or attribute value, or use a named query
+```
+
+It is never a 500. The cap is a constant set from the bench (section 7, risk 1); 50,000 is the starting point. The counter is per request, not per process.
+
+**Cross products.** A cross product grows without scanning more datoms, so a static check refuses it. Where-clause variables are grouped with union-find, treating rule-call arguments and `or-join`/`not-join` variable lists as joins. More than one group answers 400: `where: clauses 1 and 3 share no variable (a cross product); join them through a shared variable`.
+
+The 422 is a refusal, not a partial result. Acceptance 2's "truncated result with a clear note" holds for the row and byte caps (3.6); for the scan cap the note is in the 422.
+
+### 3.6 Bounded pulls and results (call)
+
+Before running, each `(pull ?x pattern)` in `:find` is rewritten to the bare `?x`. Then the handler:
+
+1. runs the query on the filtered db;
+2. sorts the tuples deterministically: entity ids, then values, with a type rank (nil, boolean, number, string, keyword, uuid, other) so mixed types never make `compare` throw;
+3. cuts them to `limit` (default 50, maximum 200, the same as the other semantic reads);
+4. pulls only the kept rows, on the filtered db.
+
+So `(pull ?b [*])` across the graph costs at most 200 pulls. The pull pattern is validated first: nesting depth at most 2; no recursion (`...` or a recursion number); a many-cardinality attribute takes `(limit :attr n)` with n at most 50, and gets limit 50 when none is given. A larger limit is refused naming the attribute.
+
+Rows are then added to the response until its JSON would pass `byte-cap`, 100,000 characters. That is below the connector's `RESULT_CHAR_LIMIT` of 150,000, so the connector never cuts the JSON mid-row (`docs/solutions/connector/per-item-summary-blows-result-cap.md`).
+
+Scalar finds (`?x .`), collection finds (`[?x ...]`) and aggregate finds pass through the same cut. Output turns keywords into strings without the colon (`"block/title"`), uuids into strings and `{:db/id n}` into numbers. The tool text says to pull `:block/uuid` and `:block/title` to get handles for the other tools.
+
+### 3.7 E2EE (call)
+
+Both routes answer 409 `datalog_query is unavailable on an E2EE graph (titles are ciphertext)` before parsing, as the insights reads do. Structure-only queries could work there, but every useful one filters or returns titles, and a query over ciphertext that silently matches nothing would be a silent wrong answer. Section 11 asks the owner whether structure-only queries on E2EE graphs are wanted.
+
+### 3.8 Dry run (call)
+
+`dry-run: true` parses, validates and resolves parameters, and answers `{dry-run: true, query, inputs, rules}` as EDN strings without building the private set or running the query. For a named query it shows the exact Datalog it would run.
+
+### 3.9 Named queries (brief, with defaults checked)
+
+The queries are data in `worker/named_queries.cljs`. Each is a map in the shape of Logseq's advanced query, `{:title :query :rules :params}`. Each param has a name, a type (`:tag`, `:property`, `:days`, `:int`), a default and bounds. The handler resolves params with the semantic API's existing resolvers:
+
+- a tag resolves by title, case-insensitive, then expands to itself plus every class extending it;
+- a property resolves by ident or title;
+- days must be 1 to 3650 and become a cutoff in milliseconds.
+
+The resolved values become positional `:in` values (a cutoff, a collection of class ids, a property ident). Datascript joins a pattern to earlier rows by scanning its attribute unless a single value is bound, so the entries read per row with `get-else` and `missing?` where they can; the not-join over a project's blocks and the `child` rule still scan `:block/page` and `:block/parent`, so on a graph with more blocks than the scan cap they can answer 422 (the projects query when two or more stale pages remain to check, the meetings query once the subtrees are walked). The same validator, filter, scan cap and limits then apply, so a named query cannot get round any guard. A test runs the validator over every entry. Errors name the param: `params.tag: no tag titled Projet`, `params.days: must be 1-3650`. A default that does not resolve answers 400 naming the param, never empty rows.
+
+| Name | Params (default) | Finds |
+|---|---|---|
+| `projects-untouched` | `tag` (Project), `days` (30) | Pages tagged `tag` whose own `:block/updated-at` is before the cutoff and with no block on the page updated since (`not-join`). |
+| `meetings-without-decision` | `meeting_tag` (Business Meeting), `decision_tag` (Decision), `days` (90) | Pages or blocks tagged `meeting_tag`, created within `days`, with no block below them (through a recursive `child` rule, so every block on a meeting page, and only a meeting block's own subtree) tagged `decision_tag`. A Decision elsewhere on a journal page does not settle another meeting on it. |
+| `open-tasks-by-client` | `client_property` (forClient) | Blocks tagged Task whose status is not Done or Canceled, with the client from the task's own property or, failing that, its page's (an empty client when neither has one). Rows are sorted by client title. `client_property` must be a property whose values have titles (node, default, url, date); a number, checkbox or datetime property is refused with 400. |
+| `pages-missing-property` | `tag` (required), `property` (required) | Pages tagged `tag` where `[(missing? $ ?p ?prop)]`. |
+
+The defaults Business Meeting and forClient differ from the tracker's examples (Meeting, client) because the owner's graph has no tag or property with those titles. `meetings-without-decision` gains a `days` window (call) so it does not walk every meeting ever held; section 11 asks about it. The tool text says the defaults can be overridden.
+
+**Reusable representation (brief).** Every response carries `query` and `inputs` as EDN strings. That `{:query … :inputs …}` pair is what the backlog-21 lane writes into a Query block's value. Named query entries use the advanced-query map shape for the same reason.
+
+### 3.10 Audit (call: reads are logged)
+
+Reads of the whole graph are worth a record: a query can read anything that is not private, and the owner already reviews `get_activity_log`. So both tools write one audit row per call.
+
+- `AuditLog.recordRead(graphId, alias, addressed, rowsRead)` becomes `recordRead(tool, status, graphId, alias, addressed, rowsRead)`. `get_activity_log`'s two calls pass `'get_activity_log', 'ok'`, so its rows are unchanged.
+- `registerGraphTools` gets a `LOGGED_READS` set (`datalog_query`, `run_named_query`). After a call in the set it records one `kind='read'` row, status `ok` or `error`.
+- `addressed` holds `named:<name>` plus the param names, or `datalog:<first 12 hex of the SHA-256 of the query text>`. Never the query text or param values, keeping migration 0004's rule against raw arguments.
+- `rows_read` is 0, since the query reads the Durable Object, not D1.
+- A failed audit insert is logged to Workers Logs and the result is still returned, as `get_activity_log` does.
+
+No migration is needed: the `kind` CHECK already allows `'read'`, and `tool` and `status` are free text.
+
+### 3.11 Contract (brief)
+
+- `spec.mjs` ANNOTATIONS: both tools READ. Without this, POST would mark them as writes and require `reason`.
+- The tool descriptions come from the patch's operation summaries. They state the caps, the private rule, E2EE, that pulls should ask for `:block/uuid` and `:block/title`, and that named queries are preferred.
+- `connector_help` gets a Queries paragraph (section 4).
+- `npm --prefix connector run update:manifest` regenerates `tools-manifest.json`.
+- README §11.8 gets a query entry and a cost line; troubleshooting gets rows for the 422 and the 409.
+- The PR body carries the Logseq skill note (section 4).
+
+## 4. Tool contract
+
+**`datalog_query`** (READ; `POST /api/v1/graphs/{graph-id}/query`). Inputs:
+
+| Field | Type | Rule |
+|---|---|---|
+| `graph` | alias | required |
+| `query` | EDN string | the vector or map form, at most 4,000 characters |
+| `inputs` | EDN vector string | optional; values bound to `:in` after `$`, at most 20 entries; `#uuid` and keywords allowed |
+| `rules` | EDN vector string | optional; bound to `%` |
+| `limit` | integer | 1 to 200, default 50 |
+| `dry-run` | boolean | optional |
+
+Output: `{columns, rows, total-rows, returned, truncated?: {by: "limit" | "byte-cap", note}, query, inputs}`. The note reads, for example, `returned 50 of 1,234 rows (limit 50, maximum 200); narrow the query or add a :where clause`. A dry run answers `{dry-run: true, query, inputs, rules}`.
+
+Refusals:
+
+- 400 naming the clause and reason: a function not on the allow-list, a variable in function position, a write form, a cross product, a bad pull pattern (depth, recursion, many-attribute limit), a non-default source, a parse error with its position, or an `inputs`/`:in` count mismatch;
+- 422 when the scan cap is hit, naming the cap;
+- 409 on an E2EE graph.
+
+**`run_named_query`** (READ; `POST /api/v1/graphs/{graph-id}/named-queries/{name}`). Inputs: `graph`; `name`, one of `projects-untouched`, `meetings-without-decision`, `open-tasks-by-client`, `pages-missing-property`; `params`, an object per query (section 3.9); `limit`; `dry-run`. Output: the same shape as `datalog_query`, plus `name` and the resolved `params` (titles and idents, not ids). Refusals: 400 `params.<name>: <reason>`; 404 for an unknown name, listing the names; plus the `datalog_query` refusals.
+
+**Changed (internal).** `AuditLog.recordRead` takes `tool` and `status` first.
+
+**`connector_help` Queries paragraph (draft).** "`datalog_query` runs a read-only Datalog query (EDN, at most 4,000 characters) against the graph. Prefer `run_named_query` when one fits: `projects-untouched`, `meetings-without-decision`, `open-tasks-by-client` and `pages-missing-property`, each with defaults you can override. Results are cut to `limit` rows (default 50, maximum 200) and about 100,000 characters, and `truncated` says which cap applied. A query that scans more than 50,000 datoms is refused (422): narrow it with a tag, page or attribute value. Pull `:block/uuid` and `:block/title` to get handles for the other tools. Only pure functions are allowed (comparisons, arithmetic, `get-else`, `missing?`, `includes?`, `starts-with?`, `lower-case` and the like; no regex, `range` or `rand`), and clauses must share variables. Anything tagged Private, on a private page or under a private block is left out. Unavailable on E2EE graphs. `dry-run: true` shows the query without running it."
+
+**Logseq skill note (for the PR body).** Claude can now query the graph with Datalog. For weekly reviews, use `run_named_query` (`projects-untouched`, `meetings-without-decision`, `open-tasks-by-client`, `pages-missing-property`) before writing fresh Datalog. Meetings are tagged Business Meeting and clients are set with `forClient`; pass other tags or properties as params. Private content never appears in results. Each query is logged in `get_activity_log`.
+
+## 5. Cost on the Free plan
+
+| Per call | Worker requests | D1 rows read | D1 rows written | AI neurons, Vectorize, KV |
+|---|---|---|---|---|
+| `datalog_query` or `run_named_query` | 2 (connector, sync Worker via the binding) | about 1 (graph token lookup) | 2 (the read row and its `(graph_id, at)` index entry) | 0 |
+| Dry run | 2 | about 1 | 2 | 0 |
+| Refused (400, 409, 422) | 2 | about 1 | 2 | 0 |
+
+At 1,000 queries a day that is 2,000 requests (2% of 100k), 2,000 rows written (2% of 100k) and about 1,000 rows read (0.02% of 5M). The hourly audit purge removes the rows after `auditRetentionDays`. No cron work and no stored state beyond the audit rows.
+
+**CPU.** The work runs in the sync Worker's graph Durable Object, not the front Worker. It is bounded by `scan-cap` filtered datoms, the private-set build, a sort of at most `row-cap` rows (a join can match far more rows than it scans datoms, so past the row cap the query answers 422 before the sort; *as built in stage 3's review: 2,500 rows*), at most 200 pulls (depth 2, at most 50 values per many-attribute) and a 100,000-character serialisation. The connector's front Worker only forwards JSON. Whether the Durable Object's request on the Free plan has the same 10 ms CPU limit as the front Worker is **unverified** here; README records the slowest 1% of requests at up to 92 ms without rejection. The bench (section 8) times the scan cap cold and warm at 5,000 and 20,000 pages, and the cap is set so the warm worst case stays near the observed tolerated tail. On Paid the cap can rise.
+
+## 6. Safety
+
+- **Read-only by construction.** No `conn` reaches the query, the EDN reader evaluates nothing, and the validator refuses write forms, unlisted functions and input-bound functions. A test checks `max-tx` and the datom count after each refusal.
+- **Private content stays out** of results, pulls, reverse refs and aggregates, because the filter runs below the query engine.
+- **No silent success or silent wrong answer.** Over-cap results say which cap applied; the scan cap answers 422; E2EE answers 409 instead of matching nothing; a named query default that does not resolve answers 400.
+- **Errors name the entry and reason**: the clause number, the param name or the cap.
+- **No query text in D1.** The audit row holds a hash or the named query's name.
+- **Example data only.** Tests and docs use `sync.example.com`, `mcp.example.com` and example aliases. No graph name, ident suffix or uuid from the owner's graphs appears in any file.
+
+## 7. Risks
+
+1. **CPU on Free.** The scan cap counts datoms, not join work. Join and predicate work that scans few datoms (a wide `or-join`, a recursive rule over a small set, `not-join` fan-out) still costs CPU the cap does not count. The cross-product refusal and the removal of `range`, regex and `rand` narrow this but do not close it. The bench must time the worst shapes at the cap; if a shape exceeds the budget, add a rule-depth or `or` branch limit rather than raise the cap. Review round 1 found joins that build millions of rows from a few hundred datoms (a three-way self-join through a tag), so a join cap now counts the rows Datascript builds while joining (`join-tuples` and `-collect-tuples`) and stops the query at 20,000.
+2. **Private leaks through derived values.** Covered for aggregates by filtering below the query. A raw title holding a `[[uuid]]` to a private page shows the uuid (not the title). Property value entities owned by private blocks must be in the set; tests cover a property value on a private page and a child of a private block on a public page.
+3. **Storage-backed Datascript.** Logseq's fork may load storage lazily during a big scan, adding I/O and memory the scan cap does not count. **Unverified**; the bench on a large graph shows it.
+4. **Allow-list drift** on a Datascript bump. Deny-by-default plus the existence test (3.3).
+5. **Sort cost and mixed types.** Deterministic truncation sorts the whole result before the cut, bounded by the scan cap. Mixed-type `compare` would throw a 500 without the type rank; a test runs a find over mixed value types.
+6. **Named query defaults** are checked against the owner's current schema. A renamed tag gives a 400 naming the param, never empty rows.
+7. **Audit writes.** Logging every query adds 2 D1 writes per call. A loop of queries could take a visible share of the 100k writes a day. The tool text steers to named queries and `limit`, and the usage report already counts `kind='read'` rows. Section 11 asks whether reads should be logged at all.
+8. **`d/filter` is uncached.** Every index access runs the predicate, which does a set lookup and a schema check. The bench includes this overhead.
+
+## 8. Testing
+
+Each test is written first and seen to fail before its code exists, and the PR quotes the failure.
+
+**Patch 0039**, through the real `sync-handler/handle-http` on a graph built by `create_graph`, with the real outliner and no stubs:
+
+1. **Read-only.** `[:find ?b :where [(transact! ?b)]]`, a `[:db/add …]` in inputs, a `?f` bound through inputs, and `range`, `re-find` and `rand` are each refused with 400 naming the clause. After each, `max-tx` and the datom count are unchanged. Every allow-listed symbol is a key of `query-fns`.
+2. **Private.** Fixtures: a page tagged Private; a page tagged a tag that extends Private; a block tagged private on a public page, with a child; a property value on a private page; a public block that refs the private page. Queries by title, a `count` aggregate, `missing?`, a pull with `:block/_refs` and `(pull ?b [*])` never return them, and the count equals the public total.
+3. **Caps.** A graph above the scan cap answers 422 naming the cap, never 500. `(pull ?b [*])` across the graph returns 50 rows with `truncated.by = "limit"` and the total. Long titles give `truncated.by = "byte-cap"` with JSON under 100,000 characters. A cross product and `...` recursion in a pull answer 400. A many-attribute limit above 50 is refused. A find over mixed value types sorts without throwing.
+4. **E2EE.** Both routes on a graph with `graph-e2ee=true` answer 409.
+5. **Dry run.** Returns the EDN and runs nothing; the scan counter stays at 0.
+6. **Named queries.** Each runs on fixtures with known answers; for example `projects-untouched` with `days=30` returns the stale project and not the one with a fresh child block edit. Bad params name `params.<name>`. An unknown name answers 404 listing the names. Every entry passes the validator.
+7. **Parse errors.** Malformed EDN names the position; an `inputs`/`:in` count mismatch names both counts.
+
+**Connector (vitest pool-workers):**
+
+- Both tools are READ, take no `reason` and are not routed through `audited()`.
+- Each call inserts exactly one `kind='read'` row with `tool`, `status` and `addressed` set (a hash or a name, never the query text); the D1 meta shows 2 rows written and 0 read.
+- An error from the server records `status='error'`.
+- An audit insert failure still returns the result.
+- `get_activity_log`'s own read rows are unchanged by the `recordRead` signature change.
+- The manifest check and the `connector_help` snapshot pass.
+
+**Scripts:** `bench-datalog-query.mjs` (after `bench-suggest-links.mjs`) runs the built handler under Node against a generated N-page graph and times the scan cap, the private-set build and the worst query shapes from risk 1, cold and warm, at 5,000 and 20,000 pages. Its `.test.mjs` checks the output shape only.
+
+Finally, `scripts/check.sh --upstream` on HEAD, naming the SHA and what it skipped.
+
+## 9. Rollout and verification
+
+**Build order.** (1) Patch 0039 validator and filter tests (1, 2), then caps (3), then E2EE, dry run, named queries and parse errors. (2) The bench; set `scan-cap` from it and record the numbers in the PR. (3) Rebuild `.upstream`, re-vendor. (4) Connector annotations, `recordRead` change, `LOGGED_READS` and tests. (5) `connector_help`, manifest, README §11.8. (6) `scripts/check.sh --upstream` on HEAD.
+
+**After merge** (`deploy` applies the patch and the Worker; no migration):
+
+1. On the test graph (example alias `test`): `datalog_query` with `[:find (pull ?p [:block/uuid :block/title]) :where [?p :block/tags ?t] [?t :block/title "Project"]]` returns the project pages.
+2. `(pull ?b [*])` with no other clause answers rows with `truncated.by = "limit"`, or 422 naming the scan cap on a large graph, never 500.
+3. A page tagged Private does not appear in a title query that would match it.
+4. Each named query runs in one call with its defaults; `dry-run: true` shows its Datalog.
+5. `get_activity_log` lists each call as a read with a hash or a name.
+6. The next day's usage report: Worker requests and D1 writes are up by about 2 per query; neurons are flat.
+
+**Rollback.** Revert the Worker and the patch. The tools write nothing to the graph; the audit rows are ordinary read rows.
+
+## 10. Out of scope
+
+- The change feed (`changes_since`), schema export and deeper `get_graph_health` checks from tracker item 40. Tracker criterion 5 (the weekly review uses them) moves to a follow-up item.
+- Converting query fences into Query blocks (README backlog 21); this design only keeps the `{:query :inputs}` representation ready for it.
+- Structure-only queries on E2EE graphs.
+- Owner-defined named queries stored in the graph or D1; the library is code.
+- Caching the private set or query results.
+- Any D1 migration, kb-index change or semantic index change.
+- Tracker item 3 (CLI bridge A). It is replaced if this ships, but closing it is the owner's call.
+
+## 11. Open questions for the owner
+
+1. **Scope.** The change feed, schema export and deeper health checks from item 40 are left for a follow-up, and with them criterion 5. Is that right, and should the follow-up be a new tracker item?
+2. **Logging reads.** Each query writes one audit row (2 D1 rows). Do you want queries in `get_activity_log`, or should reads stay unlogged as other reads are?
+3. **Named query defaults.** Your graph has Business Meeting rather than Meeting, and `forClient` rather than `client`. Are those the right defaults? Should `meetings-without-decision` look back 90 days by default?
+4. **Private.** The rule hides anything tagged Private (any case, and tags that extend it), anything on a private page and anything under a private block. Should other tags also be hidden from queries?
+5. **E2EE.** Both tools refuse E2EE graphs. Would structure-only queries there (tags, refs, dates, no titles) be useful?
+6. **Scan cap.** It starts at 50,000 datoms and the bench sets the final number. On a large graph some broad questions will answer 422 and need narrowing. Is that acceptable, or would you rather have named queries cover those?
+7. **Item 3 (CLI bridge A).** Close it once this ships?
+
+## 12. As built
+
+The build follows sections 3 to 9: patch 0039 adds `datalog_query` and `run_named_query`, both generated READ tools; reads are logged as `kind = 'read'` rows with no migration; and there is no change feed, schema export or health check. The section 11 questions were not answered during the build, so each default stands (Business Meeting, forClient, 90 days, logged reads, E2EE refused). The differences are below.
+
+- **Caps are 20,000 datoms, 20,000 joined rows, 2,500 matched rows, 20,000 collection values, 5,000,000 characters of built text, 20,000 function calls, 200,000 rows of relation work and 2,000 units of rule work, not one scan cap of 50,000.** The bench (`scripts/bench-datalog-query.mjs`) set the scan cap at 20,000, so that a counted shape at the cap plus the private set stays near the 92 ms tail README records. Three more caps were added after review, and each answers 422 naming the cap, never a partial result:
+  - *Row cap (2,500).* The sort costs about 10 µs a row, so rows are counted after `d/q` and refused before `sort-rows` and the pulls. Section 3.6's sort of "at most the scanned rows" was wrong: a join matches far more rows than it scans. Aggregates are not affected, because `d/q` folds their rows before the count. The row cap bounds the sort, not the join.
+  - *Join cap (20,000).* The row cap counts after Datascript has built the rows, so a three-way self-join through a tag on 150 blocks built 3,375,000 rows in 21 s from 463 datoms. Patch 0039 wraps Datascript's `join-tuples` and `-collect-tuples`, counts rows only while a query runs, and stops that join in about 20 ms. A Datascript bump that renames either function fails the tests.
+  - *Value cap (20,000).* Collections reach rows only through `inputs`, and the sort prints each once per row. Rows whose collections hold more than 20,000 values (each character of text counts) are refused before the sort.
+- **No allowed function builds a value larger than its arguments.** Section 3.3's allow-list also drops `vector`, `list`, `set`, `hash-map`, `array-map` and `tuple`, and `str`, `+` and `keyword` take at most one `?variable`.
+- **Functions are guarded while a query runs.** The value cap sees only the collections rows return, so `[(str ?x) ?s]` with `?x` a 1,900-item input printed the whole collection once per joined row: about 2 s on 2,400 blocks. Patch 0039 wraps the allowed entries of Datascript's `query-fns` and `aggregates`, active only while `run-query`'s `d/q` runs (the `join-tuples` pattern), and realises the result inside that window because Datascript returns aggregates lazily. Two rules apply, each answering 422:
+  - *Collection arguments.* A function given a collection answers 422 naming it unless it only looks into one (`count`, `contains?`, `get`, `empty?`, `not-empty`, `identity`, `ground`, `untuple`, `get-else`, `get-some`, `missing?`, `nil?`, `some?`, `true?`, `false?`, `identical?`, `type`, `and`, `or`, `not`), and aggregates other than `count`, `count-distinct` and `distinct` refuse collection values. The list is deny by default, so a function a Datascript bump adds is refused a collection until it is listed. The same query now stops in about 50 ms.
+  - *Text cap (5,000,000 characters).* Every character of text a function or aggregate returns counts, per query. Functions that pass a value through (`identity`, `ground`, `untuple`, `get`, `get-else`, `get-some`, `not-empty`, `max`, `min`) count nothing. A 3,990-character input lower-cased on 1,400 blocks stops after about 1,250 rows.
+  - *Call cap (20,000 calls).* A predicate builds nothing, so neither the join cap nor the text cap counted it: 105 `includes?` clauses on a 3,990-character input over 5,000 rows made 535,000 calls in 650 ms. Every guarded call counts, and past 20,000 the query stops; that query now answers 422 in about 90 ms, most of it the 105 clauses' relations rather than the calls.
+  - *Linear string functions.* cljs's `clojure.string/trimr` is `goog.string.trimRight`, a regex (`/[\s\xa0]+$/`) that retries a run of whitespace from every start: 3,990 spaces and then `x` took 3.3 s over 300 rows. Inside a query it runs as `String.prototype.trimEnd`, which trims the same characters in one pass (13 ms). A test times every allowed `clojure.string` function on that input, and fails for one added without a case.
+  - *Work cap (200,000 rows).* `not`, `not-join`, `or`, `or-join` and rule bodies join, subtract and sum whole relations, and when their inner clauses match nothing no row goes through `join-tuples`, no datom is read and no function is called, so the other caps stayed still: 155 `(not [?e :block/tags 0])` over 5,000 blocks took 443 ms, 300 negated rule calls 1.05 s, `not`s nested through rules 10 × 10 × 10 2.8 s and 10 × 10 × 10 × 10 26 s. Patch 0039 wraps Datascript's `hash-join`, `subtract-rel`, `sum-rel` and `prod-rel` (the `join-tuples` pattern), each charging the rows of the relations it walks (`sum-rel` not charging a vector it reuses), so the class is bounded at the relation layer rather than clause by clause. Each of those queries now stops in 55–75 ms; the named queries walk at most about 6,300 rows with 6,000 filler blocks. A rule-depth limit was not added: every rule body's work goes through these operations.
+  Read-only text predicates (`includes?`, `starts-with?`, `index-of` and the like) build no text and are not counted toward the text cap; on long text they cost about 60 ms at 2,400 rows, README backlog item 25.
+- **`datalog_query` takes no rules.** Section 4's `rules` field is gone. A body with `rules`, `%` in `:in`, a rule call in `:where` and a `:rules` key in the map form each answer 400 at once, naming the field or clause and pointing to `run_named_query`, before anything is parsed or run. A tree of caller rules expands without reading data: 10^5 leaves took 5.5 s, and the work cap stopped larger trees only after about 10 s, blocking the graph's sync (`docs/spikes/2026-11-09-safe-caller-datalog-queries.md`, Follow-up 2). The named queries keep their rules as server data: `checked-query` takes a `caller?` flag, false for a named query, so its rules pass the same write-form check, validator and caps (`every-entry-validates-test`). Tests that exercised rules now run them as a named query does, through the real `/named-queries/:name` handler. The next step is one fuel counter (README backlog item 23); with it, caller rules could return.
+- **The release bundle keeps Datascript's Datom fields.** The `:db-sync` build had no `:externs ["datascript/externs.js"]`, so advanced compilation renamed the Datom field `v` and every value a data pattern bound came back null in production (spike Finding 0). Patch 0040 adds the externs, and `scripts/release-query-check.mjs` queries the release bundle in CI and in `scripts/check.sh --upstream`.
+- **`query` and `inputs` are each at most 4,000 characters** (and so were `rules`, before they were refused), refused with 400 naming the field before parsing. Section 4 gave the limit for `query` only. The left-recursion check is one strongly connected components pass, so 800 chained rules validate in milliseconds.
+- **Rules that recurse before reading data are refused (400).** Datascript expands such a rule without limit and no cap can stop it. A rule cycle is refused when every call in it comes before a data pattern, or a `get-some`, that binds one of the call's variables. Right-recursive closures run under the scan cap. Section 3.3 did not list this.
+- **The column-name check counts what the query runs.** `validate-query` counts the elements of the relation find, so an aggregate or a pull is one column, and applies the same check to `:keys`, `:strs` and `:syms`.
+- **The private filter also hides the Recycle bin.** Anything with `deleted-at`, and its blocks, is left out, so queries agree with `list_tasks`. Section 3.4 did not say this.
+- **`open-tasks-by-client` gives a task with two clients a row under each.** `get-else` returns only the first value of a many-valued property, so the client comes from data patterns in an `or-join`.
+- **`meetings-without-decision` walks up, not down.** Section 3.9's recursive `child` rule scanned every block at each level, so a few thousand blocks answered 422. The query now starts from each Decision-tagged block and walks up to its ancestors with `get-some`, so its datom count does not grow with the number of blocks. The validator counts a `get-some` like a data pattern when it guards a recursive call, and still refuses `get-else`, `ground` and `identity`.
+- **`meetings-without-decision` refuses a decision more than 52 levels deep (the rule cap).** Datascript's `solve-rule` adds a `-differ?` guard for every earlier call of a rule on the path, so the walk up from a decision d blocks down its page solves about d²/2 guards, each about 60 µs (not the 2 µs the call cap was set from). With 5,000 other blocks in the release bundle, 100 levels answered after 243 ms and 180 after 0.9 to 1.1 s; only the call cap stopped 250 levels, after 1.1 to 1.4 s. While `run-query`'s `d/q` runs, patch 0039 wraps Datascript's `rule-gen-guards` (the `join-tuples` pattern), and each frame charges its guards plus 10 toward 2,000 units of rule work per query. A walk n frames deep charges n(n-1)/2 + 10n, and a decision d blocks deep takes d + 2 frames, so 52 levels answer (about 70 to 100 ms) and 53 or more answer 422 in about 80 ms, naming the cap and the depth. The rule cap is its own budget, not the work cap: a unit of rule work costs about 200 times a row of relation work. Only named queries have rules, and only this one recurses. A fixed-depth `get-some` chain was the fallback and was not needed. `scripts/release-query-check.mjs` checks a 10-level and a 180-level decision in the release bundle.
+- **`projects-untouched` can still answer 422 above about 20,000 blocks.** No index leads from a page to its blocks, so the `not-join` reads every block's `:block/page` once when two or more stale pages remain. The tool text and README say so, and README backlog item 24 records it. Section 3.9's claim that the named queries stay within the caps no longer appears in the tool text.
+- **CPU is only partly bounded.** The private set at 20,000 pages costs CPU the caps do not count, and a recursive rule's guards are counted only by the rule cap. README backlog item 23 records the measurements. Whether the Durable Object's request has the front Worker's 10 ms limit on Free is still unverified (section 5).
+- **Audit is as designed.** `recordRead(tool, status, graphId, alias, addressed, rowsRead)`, `LOGGED_READS`, `addressed` as `datalog:<12 hex>` or `named:<name>` plus `param:<name>`, `rows_read` 0 and a logged `audit-read-failed` on an insert failure. The `get_activity_log` listing is unchanged, so it does not show these rows, which section 4's skill note had wrong.
+- **The connector writes a large result without indentation.** The server's byte cap counts compact JSON, so the connector prints a `datalog_query` or `run_named_query` result compactly when the indented form would pass its 150,000-character limit; otherwise `total-rows`, `returned` and `truncated` were lost.
+- **`connector_help`.** `QUERIES_HELP` is the section 4 draft with the real caps (20,000 datoms, 20,000 joined rows, 2,500 rows, 5,000,000 characters of text, 20,000 function calls, 200,000 rows of relation work, and the rule cap's 2,000 units and 52 levels for `meetings-without-decision`), the collection rule, the Recycle bin, the byte cap, the audit note and the rule that a default the graph lacks answers 400. Tests check its cap numbers against the vendored tool descriptions. `tools-manifest.json` gained exactly the two tools.
+- **README.** Section 11.8 has a Queries entry, 11.10 five rows, the list of what the patches add an entry, and the backlog items 23, 24 and 25 for what the caps leave open.

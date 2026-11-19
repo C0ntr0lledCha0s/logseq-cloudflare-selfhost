@@ -58,6 +58,34 @@ if [ -n "${SMOKE_PAT:-}" ]; then
   code="$(printf 'header = "Authorization: Bearer %s"\n' "$SMOKE_PAT" |
     status -K - "$base/api/v1/graphs")"
   if [ "$code" = 200 ]; then pass pat-graphs; else fail pat-graphs "$code"; fi
+
+  # datalog_query against the deployed bundle: a value bound by a data pattern must come back.
+  # Without Datascript's externs the release build renamed the Datom field v and every such value
+  # came back null (patch 0040). Tries each ready, non-E2EE graph the list shows until one is not
+  # 403 (a PAT can be scoped to one graph).
+  graphs="$(node -e '
+    const body = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    for (const g of body.graphs ?? []) {
+      if (!g["graph-e2ee?"] && g["graph-ready-for-use?"] !== false) console.log(g["graph-id"]);
+    }' "$body" 2>/dev/null)" || graphs=""
+  query='{"query":"[:find ?id :where [?e :db/ident :logseq.class/Tag] [?e :db/ident ?id]]"}'
+  queried=0
+  for graph in $graphs; do
+    code="$(printf 'header = "Authorization: Bearer %s"\n' "$SMOKE_PAT" |
+      status -K - -X POST -H 'content-type: application/json' -d "$query" "$base/api/v1/graphs/$graph/query")"
+    [ "$code" = 403 ] && continue
+    [ "$code" = 200 ] || fail datalog-query "$code"
+    if node -e '
+      const body = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      process.exit(JSON.stringify(body.rows) === JSON.stringify([["logseq.class/Tag"]]) ? 0 : 1);' "$body" 2>/dev/null; then
+      pass datalog-query
+    else
+      fail datalog-query "rows $(head -c 200 "$body")"
+    fi
+    queried=1
+    break
+  done
+  [ "$queried" = 1 ] || echo "note: no graph this PAT can read, so datalog-query was not checked"
 else
   echo "note: SMOKE_PAT is not set, so the allow-list was not checked end to end"
 fi

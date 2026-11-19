@@ -9,9 +9,11 @@ import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
-import { CODE_BLOCKS_HELP, CONNECTOR_HELP } from "../src/tools/handwritten";
+import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
-import { toAffectedTargets } from "../src/tools/readable";
+import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
+import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
+import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
 import {
   ANNOTATIONS,
@@ -235,6 +237,8 @@ function specWithFakeOperation(): OpenApiSpec {
 
 /** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
 const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file", "suggest_links"];
+// Reads sent as POST because their input can be long (patch 0039).
+const READ_NOT_GET = ["datalog_query", "run_named_query"];
 const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",
@@ -262,7 +266,7 @@ const ADDITIVE_NAMED = [
 
 function expectedHints(name: string, method: string | null) {
   const classes: string[] = [];
-  if (method === "GET" || READ_HANDWRITTEN.includes(name)) classes.push("read");
+  if (method === "GET" || READ_HANDWRITTEN.includes(name) || READ_NOT_GET.includes(name)) classes.push("read");
   if (name.startsWith("delete_") || DESTRUCTIVE_NAMED.includes(name)) classes.push("destructive");
   if (/^(create|insert)_/.test(name) || ADDITIVE_NAMED.includes(name)) classes.push("additive");
   // A new tool must be classified on purpose, and no tool may sit in two classes.
@@ -817,9 +821,69 @@ describe("routing", () => {
     }
     expect(syncRequests).toHaveLength(0);
   });
+
+  it("a read sent as POST runs on a read-mode graph: datalog_query reaches the sync server, while a POST write next to it is refused", async () => {
+    syncHandler = () => Response.json({ columns: [], rows: [], "total-rows": 0, returned: 0, query: "[]", inputs: "[]" });
+    const read = await callTool("datalog_query", { graph: "notes", body: { query: "[:find ?t :where [?e :block/title ?t]]" } });
+    expect(read.isError, read.text).toBe(false);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["POST", `/api/v1/graphs/${NOTES_ID}/query`]]);
+    const write = await callTool("create_page", { graph: "notes", body: { title: "x" } });
+    expect(write).toMatchObject({ isError: true, text: "graph 'notes' is read-only" });
+    expect(syncRequests).toHaveLength(1);
+  });
 });
 
 describe("errors", () => {
+  // Follow-up 5 of docs/spikes/2026-11-09-safe-caller-datalog-queries.md: when the sync server's
+  // Durable Object is stopped mid-request (a query past the CPU limit, a reset), the answer is a 5xx
+  // with no error message of the server's own (Cloudflare's text or HTML, an empty body, JSON
+  // without error), or env.SYNC.fetch rejects. Both used to reach Claude as a bare HTTP code or an
+  // unmapped throw; both now name what happened and what to try.
+  const stopped = (status: number) =>
+    `the sync server stopped the request (HTTP ${status}); a query may have hit the CPU limit; try a narrower query`;
+  const QUERY = { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } };
+
+  it.each([
+    ["datalog_query", QUERY, () => new Response("error code: 1102", { status: 503 }), 503],
+    ["datalog_query", QUERY, () => new Response("<html><body>Worker exceeded resource limits</body></html>", { status: 500, headers: { "content-type": "text/html" } }), 500],
+    ["datalog_query", QUERY, () => new Response(null, { status: 502 }), 502],
+    ["datalog_query", QUERY, () => Response.json({}, { status: 500 }), 500],
+    ["run_named_query", { graph: "work", name: "projects-untouched", body: {} }, () => new Response("error code: 1102", { status: 503 }), 503],
+    ["get_page", { graph: "work", "page-id": "p1" }, () => new Response("", { status: 500 }), 500],
+  ])("%s: a 5xx without the server's own error message is named as a stopped request (%#)", async (name, args, handler, status) => {
+    syncHandler = handler;
+    const result = await callTool(name, args);
+    expect(result).toEqual({ isError: true, text: stopped(status) });
+    expect(syncRequests).toHaveLength(1);
+    expect(logged().at(-1)).toMatch(new RegExp(`^tool ${name} graph=work status=http-${status} `));
+  });
+
+  it.each([
+    ["datalog_query", QUERY],
+    ["run_named_query", { graph: "work", name: "projects-untouched", body: {} }],
+    ["get_page", { graph: "work", "page-id": "p1" }],
+  ])("%s: a rejected env.SYNC.fetch is named as a stopped request, not an unmapped throw", async (name, args) => {
+    syncHandler = () => {
+      throw new Error("The script will never generate a response.");
+    };
+    const result = await callTool(name, args);
+    expect(result).toEqual({
+      isError: true,
+      text: "the sync server stopped the request without answering (The script will never generate a response.); a query may have hit the CPU limit; try a narrower query",
+    });
+    expect(logged().at(-1)).toMatch(new RegExp(`^tool ${name} graph=work status=sync-stopped `));
+  });
+
+  it("a 5xx with the server's own error message keeps it, and a 4xx without one keeps its code", async () => {
+    syncHandler = () => Response.json({ error: "boom" }, { status: 500 });
+    expect(await callTool("datalog_query", QUERY)).toEqual({ isError: true, text: "sync server error (HTTP 500): boom" });
+    syncHandler = () => new Response("not found", { status: 404 });
+    expect(await callTool("get_page", { graph: "work", "page-id": "p1" })).toEqual({
+      isError: true,
+      text: "sync server error (HTTP 404): sync server returned HTTP 404",
+    });
+  });
+
   it("401 maps to reconnect message, 429 maps to retry message using Retry-After and makes exactly one sync call", async () => {
     for (const status of [401, 403]) {
       syncRequests = [];
@@ -1090,6 +1154,127 @@ describe("hand-written tools", () => {
     expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK_ID}/favorites`]]);
   });
 
+  it("datalog_query is generated from datalogQuery: a POST of {query, inputs?, limit?, dry-run?} annotated READ, with no reason and no write tables", async () => {
+    const tools = await listTools();
+    const query = tools.find((t) => t.name === "datalog_query");
+    expect(query).toBeDefined();
+    expect(query.inputSchema.required).toEqual(expect.arrayContaining(["graph", "body"]));
+    expect(query.inputSchema.properties.body.required).toEqual(["query"]);
+    expect(Object.keys(query.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "inputs", "limit", "query"]);
+    expect(query.inputSchema.properties.reason).toBeUndefined();
+    // A POST is taken for a write unless ANNOTATIONS says otherwise (patch 0039: POST only because the query can be long).
+    expect(query.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["read-only", "Private", "E2EE", ":block/uuid", "share a variable", "default 50"]) {
+      expect(query.description, phrase).toContain(phrase);
+    }
+    // Patch 0039 stage 2: the caps Claude has to work within, and how a cut result says so.
+    for (const phrase of ["scan cap", "20,000 datoms", "422", "truncated", "byte-cap", "100,000 characters", "at most 2 levels deep", "at most 50 values", "row cap", "2,500 rows", "There are no rules", "naming run_named_query"]) {
+      expect(query.description, phrase).toContain(phrase);
+    }
+    // A read never needs a delete rule, a snapshot plan or a context class: those tables throw only for write tools.
+    for (const table of [DELETE_RULES, DRY_RUN_TOOLS, SNAPSHOT_PLAN, CONTEXT_TOOLS, NO_CONTEXT_TOOLS]) {
+      expect(Object.hasOwn(table, "datalog_query")).toBe(false);
+    }
+    expect(committedManifest.find((e) => e.name === "datalog_query")).toMatchObject({
+      method: "POST",
+      path: "/api/v1/graphs/{graph-id}/query",
+      annotations: { readOnlyHint: true },
+    });
+    const rows = { columns: ["?t"], rows: [["Projects"]], "total-rows": 1, returned: 1, query: "[:find ?t]", inputs: "[]" };
+    syncHandler = () => Response.json(rows);
+    const body = { query: "[:find ?t :where [?e :block/title ?t]]", limit: 10 };
+    const result = await callTool("datalog_query", { graph: "work", body });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual(rows);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname, JSON.parse(r.body)])).toEqual([
+      ["POST", `/api/v1/graphs/${WORK_ID}/query`, { ...body, "dry-run": false }],
+    ]);
+  });
+
+  it.each([
+    ["datalog_query", { graph: "work", body: { query: "[:find (pull ?b [:block/title {:block/_parent [:block/uuid :block/title]}]) :where [?b :block/title ?t]]", limit: 200 } }],
+    ["run_named_query", { graph: "work", name: "open-tasks-by-client", body: { limit: 200 } }],
+  ])("%s: a result the server's byte cap kept under 100,000 characters of compact JSON reaches Claude whole, though indented it would pass the 150,000-character limit", async (tool, args) => {
+    // 25 pulled parents with 50 children each, the shape a reverse-ref pull returns: the server counts
+    // 98,000-odd characters of compact JSON, but indented it is 1.6 times longer.
+    const rows = Array.from({ length: 25 }, (_, i) => [
+      {
+        "block/title": `zqpar ${i}`,
+        "block/_parent": Array.from({ length: 50 }, (_, j) => ({ "block/uuid": `00000000-0000-4000-8000-${String(i * 100 + j).padStart(12, "0")}`, "block/title": `c${j}` })),
+      },
+    ]);
+    const response = {
+      query: "[:find (pull ?b [...])]",
+      inputs: "[]",
+      columns: ["(pull ?b [...])"],
+      "total-rows": 30,
+      returned: 25,
+      truncated: { by: "byte-cap", note: "returned 25 of 30 rows (the byte cap, about 100,000 characters of JSON); pull fewer attributes, narrow the query or lower limit" },
+      rows,
+    };
+    expect(JSON.stringify(response).length).toBeLessThanOrEqual(100_000);
+    expect(JSON.stringify(response, null, 2).length).toBeGreaterThan(RESULT_CHAR_LIMIT);
+    syncHandler = () => Response.json(response);
+    const result = await callTool(tool, args);
+    expect(result.isError, result.text.slice(-300)).toBe(false);
+    expect(result.text.length).toBeLessThanOrEqual(RESULT_CHAR_LIMIT);
+    expect(result.text, "never the read path's generic notice").not.toContain("[truncated:");
+    expect(JSON.parse(result.text)).toEqual(response);
+  });
+
+  it("datalog_query: a result that fits indented stays indented", async () => {
+    const response = { columns: ["?t"], rows: [["Projects"]], "total-rows": 1, returned: 1, query: "[:find ?t]", inputs: "[]" };
+    syncHandler = () => Response.json(response);
+    const result = await callTool("datalog_query", { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } });
+    expect(result.text).toBe(JSON.stringify(response, null, 2));
+  });
+
+  it("run_named_query is generated from runNamedQuery: a POST of {params?, limit?, dry-run?} on name, annotated READ, with no reason and no write tables", async () => {
+    const tools = await listTools();
+    const named = tools.find((t) => t.name === "run_named_query");
+    expect(named).toBeDefined();
+    expect(named.inputSchema.required).toEqual(expect.arrayContaining(["graph", "name"]));
+    // The body is optional: an empty one runs the query with its defaults.
+    expect(named.inputSchema.required).not.toContain("body");
+    expect(Object.keys(named.inputSchema.properties.body.properties).sort()).toEqual(["dry-run", "limit", "params"]);
+    expect(named.inputSchema.properties.reason).toBeUndefined();
+    expect(named.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    for (const phrase of ["projects-untouched", "meetings-without-decision", "open-tasks-by-client", "pages-missing-property", "can be overridden", "params.<name>", "404", "Private", "E2EE"]) {
+      expect(named.description, phrase).toContain(phrase);
+    }
+    // name is a plain string, not an enum, so an unknown name reaches the server's 404 listing the names.
+    expect(named.inputSchema.properties.name.enum).toBeUndefined();
+    for (const table of [DELETE_RULES, DRY_RUN_TOOLS, SNAPSHOT_PLAN, CONTEXT_TOOLS, NO_CONTEXT_TOOLS]) {
+      expect(Object.hasOwn(table, "run_named_query")).toBe(false);
+    }
+    expect(committedManifest.find((e) => e.name === "run_named_query")).toMatchObject({
+      method: "POST",
+      path: "/api/v1/graphs/{graph-id}/named-queries/{name}",
+      annotations: { readOnlyHint: true },
+    });
+    const rows = { name: "projects-untouched", params: { days: 14 }, columns: ["updated-at", "page"], rows: [], "total-rows": 0, returned: 0, query: "{}", inputs: "[]", rules: "[]" };
+    syncHandler = () => Response.json(rows);
+    const result = await callTool("run_named_query", { graph: "work", name: "projects-untouched", body: { params: { days: 14 } } });
+    expect(result.isError, result.text).toBe(false);
+    expect(JSON.parse(result.text)).toEqual(rows);
+    const bare = await callTool("run_named_query", { graph: "work", name: "open-tasks-by-client" });
+    expect(bare.isError, bare.text).toBe(false);
+    expect(syncRequests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["POST", `/api/v1/graphs/${WORK_ID}/named-queries/projects-untouched`],
+      ["POST", `/api/v1/graphs/${WORK_ID}/named-queries/open-tasks-by-client`],
+    ]);
+    expect(JSON.parse(syncRequests[0].body)).toMatchObject({ params: { days: 14 } });
+  });
+
+  it("run_named_query passes an unknown name through to the server's 404, which lists the names", async () => {
+    const error = "no named query projects_untouched (names: projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property)";
+    syncHandler = () => Response.json({ error }, { status: 404 });
+    const result = await callTool("run_named_query", { graph: "work", name: "projects_untouched" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property");
+    expect(syncRequests.map((r) => new URL(r.url).pathname)).toEqual([`/api/v1/graphs/${WORK_ID}/named-queries/projects_untouched`]);
+  });
+
   it("set_page_favorite is generated from setPageFavorite: a PUT of {favorite, dry-run?} on page-id, annotated destructive and idempotent", async () => {
     const tools = await listTools();
     const set = tools.find((t) => t.name === "set_page_favorite");
@@ -1189,6 +1374,18 @@ describe("hand-written tools", () => {
     expect(help).toContain("as is Journal on a journal that a batch insert creates by its date or journal title");
     expect(help).toContain(
       "A tags list replaces only user tags: Page, Tag, Journal and the other built-in type tags an entity holds are kept",
+    );
+  });
+
+  it("create_page and connector_help say a title can't hold \"/\" (outside a journal title) or \"#\"", async () => {
+    const tools = await listTools();
+    const create = tools.find((t) => t.name === "create_page");
+    expect(create.description).toContain(
+      'Refuses with 400 and writes nothing when the title holds "/" or "#", which Logseq doesn\'t allow in a page title; the error names the character and the title. A "/" is allowed where Logseq allows it: in a journal title that the graph\'s journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead.',
+    );
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      'create_page refuses with a 400 a title holding "/" or "#", which Logseq doesn\'t allow in a page title, and names the character and the title; a "/" is fine in a journal title the graph\'s journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and a page in the Recycle bin is restored under its own title, "/" included.',
     );
   });
 
@@ -1803,6 +2000,31 @@ describe("audit log", () => {
     expect(lookups).toBe(1);
   });
 
+  it("one graph lookup per logged read: datalog_query and run_named_query reuse the graph loggedRead resolved", async () => {
+    // loggedRead wraps the call in withCallGraphs, so request() and the audit row share one lookup;
+    // without it each query reads the graphs row from D1 twice.
+    syncHandler = () => Response.json({ columns: ["?t"], rows: [], "total-rows": 0, returned: 0 });
+    let lookups = 0;
+    const counting = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (/FROM graphs WHERE alias = \?/.test(sql)) lookups += 1;
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const e = testEnv({ DB: counting });
+    await callContent("datalog_query", { graph: "work", body: { query: "[:find ?t :where [?e :block/title ?t]]" } }, connector(e));
+    expect(lookups).toBe(1);
+    lookups = 0;
+    await callContent("run_named_query", { graph: "work", name: "projects-untouched" }, connector(e));
+    expect(lookups).toBe(1);
+  });
+
   it("no secrets: the PAT, the Authorization header, GRAPH_TOKEN_KEY and sent block text appear in no column", async () => {
     const BLOCK_TEXT = "CANARY-BLOCK-TEXT-7f3a";
     const BEARER = "CANARY-OAUTH-TOKEN-91c2";
@@ -2325,6 +2547,135 @@ describe("favourites", () => {
     ["list_favorites", ["in sidebar order", "Works on E2EE graphs"]],
     ["set_page_favorite", ["appended at the bottom of the list, unlike the app", "Unavailable for E2EE graphs (400)", "deletePage hides a favourite and restoring the page brings it back"]],
     ["reorder_favorites", ["Pass the full list", "call listFavorites first", "Unavailable for E2EE graphs (400)"]],
+  ])("%s's generated description carries the openapi text", async (name, phrases) => {
+    const tool = (await listTools()).find((t) => t.name === name);
+    for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
+  });
+});
+
+// Patch 0039: datalog_query and run_named_query, as Claude reads about them in connector_help.
+describe("queries help", () => {
+  // One assertion per point, so dropping any one of them from the paragraph fails.
+  it.each([
+    ["datalog_query", "datalog_query runs a read-only Datalog query"],
+    ["the query's length", "(EDN, at most 4,000 characters)"],
+    ["the inputs' length", "inputs are at most 4,000 characters"],
+    ["no caller rules", "datalog_query takes no rules: a rules field, % in :in or a rule call is refused with 400"],
+    ["why no rules", "a tree of rules expands without reading data and can run for seconds before any cap stops it"],
+    ["a step up without rules", "To step up from a block use get-some ([(get-some $ ?b :block/parent) [_ ?p]])"],
+    ["ancestors without rules", "for every ancestor use run_named_query's meetings-without-decision, or step up one level at a time"],
+    ["named queries as code", "run_named_query runs one of four fixed queries as server code, not Datalog"],
+    ["plan", "Each answer carries plan (the steps and their bounds)"],
+    ["work", "and work (what it counted)"],
+    ["a named query's 422 names its bound", "A query that passes one of its bounds answers 422 naming the bound and what to narrow, such as a smaller days or a narrower tag"],
+    ["a bound's number", "meetings-without-decision stops after 2,000 meetings created within days (its meetings bound)"],
+    ["any depth", "A decision at any depth under a meeting counts"],
+    ["the named dry run", "run_named_query's dry run shows its plan and bounds"],
+    ["run_named_query, preferred", "Prefer run_named_query when one fits"],
+    ["projects-untouched", "when one fits: projects-untouched,"],
+    ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
+    ["open-tasks-by-client", "meetings-without-decision, open-tasks-by-client and"],
+    ["pages-missing-property", "open-tasks-by-client and pages-missing-property, each"],
+    ["defaults can be overridden", "each with defaults you can override in params"],
+    ["a missing default is a 400", "a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param"],
+    ["limit", "cut to limit rows (default 50, maximum 200)"],
+    ["the byte cap", "about 100,000 characters (the byte cap)"],
+    ["truncated", "truncated says which cap applied"],
+    ["total-rows", "total-rows counts every row"],
+    ["the scan cap's number", "scans more than 20,000 datoms (the scan cap)"],
+    ["the row cap's number", "matches more than 2,500 rows (the row cap)"],
+    ["the join cap's number", "builds more than 20,000 rows while joining (the join cap"],
+    ["the aggregate doesn't fold a join", "(which folds rows for the row cap, not the join cap)"],
+    ["no collection constructors", "no vector, list, set, hash-map, array-map or tuple"],
+    ["joining functions take one variable", "str, + and keyword take at most one ?variable"],
+    ["a collection given to a function is a 422", "A function given a collection from inputs is refused with 422 naming it"],
+    ["the functions that take a collection", "unless it only looks into one (count, contains?, get, empty?, not-empty, identity and the like)"],
+    ["how to use a collection", "bind its items with [?x ...] in :in, or test membership with (contains? ?x ?v)"],
+    ["aggregates and collections", "aggregates other than count, count-distinct and distinct refuse collection values"],
+    ["the text cap's number", "5,000,000 characters of text per query (the text cap"],
+    ["what the text cap counts", "text the functions and aggregates return counts toward"],
+    ["the work cap's number", "every not, not-join, or and or-join charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap"],
+    ["the call cap's number", "every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap"],
+    ["the width cap's number", "every function binding charges the rows x columns of the relation it returns toward 100,000 copied values per query (the width cap"],
+    ["the most function bindings", "a query may hold at most 12 function bindings ([(f ?x) ?y], at any depth; predicates don't count; more answer 422 before running)"],
+    ["what fits under the width cap", "from a page and its blocks, 8 bindings fit about 1,900 rows and 12 about 1,000"],
+    ["how to stay under the width cap", "return extra attributes with (pull ?b [...]) in :find, which runs only on the kept rows, bind fewer values with functions or narrow the rows first"],
+    ["the Recycle bin", "and so is anything in the Recycle bin"],
+    ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
+    ["the 422", "is refused with 422, never answered in part"],
+    ["how to narrow", "narrow it with a tag, page or attribute value"],
+    ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
+    ["handles", "Pull :block/uuid and :block/title to get handles for the other tools"],
+    ["pure functions only", "Only pure functions are allowed"],
+    ["the allowed functions", "(comparisons, arithmetic, get-else, get-some, missing?, clojure.string/includes?, starts-with?, lower-case and the like"],
+    ["no regex, range or rand", "no regex, range or rand, and no vector"],
+    ["clauses share variables", "clauses must share variables (a cross product is refused)"],
+    ["private content", "Anything tagged Private, on a private page or under a private block is left out"],
+    ["E2EE", "Unavailable on E2EE graphs (409)"],
+    ["dry-run", "dry-run: true checks the query and shows it without running it"],
+    ["the dry run refuses as the run does", "refusing what the run would refuse before it runs (more than 12 function bindings included)"],
+    ["a decision on a nested page", "on a page nested under the meeting page too (a namespace child, or a page tagged Decision whose parent is the meeting)"],
+    ["a stopped request", "An error saying the sync server stopped the request means it gave no answer of its own, most likely a query past the CPU limit: narrow the query rather than retrying it as it is"],
+    ["the audit row", "Each call is recorded in the audit log as a read"],
+    ["what the row holds", "(a hash of the query, or the named query and the names of its params; never the rows)"],
+    ["not in get_activity_log", "get_activity_log lists writes, so it doesn't show them"],
+  ])("the Queries paragraph says %s", (_point, phrase) => {
+    expect(QUERIES_HELP).toContain(phrase);
+  });
+
+  it("connector_help holds the Queries paragraph once", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help.split(QUERIES_HELP).length).toBe(2);
+    expect(CONNECTOR_HELP.split(QUERIES_HELP).length).toBe(2);
+  });
+
+  // The help repeats the server's caps, so it must name the same numbers as the vendored openapi text.
+  it.each([
+    ["scan cap", /more than ([\d,]+) datoms \(the scan cap/],
+    ["row cap", /more than ([\d,]+) rows \(the row cap/],
+    ["join cap", /more than ([\d,]+) rows while joining \(the join cap/],
+    ["text cap", /([\d,]+) characters of text per query \(the text cap/],
+    ["call cap", /([\d,]+) function calls per query \(the call cap/],
+    ["work cap", /([\d,]+) rows of relation work per query \(the work cap/],
+    ["width cap", /([\d,]+) copied values per query \(the width cap/],
+    ["most function bindings", /at most ([\d,]+) function bindings/],
+  ])("the help's %s matches datalog_query's description", async (_cap, pattern) => {
+    const query = (await listTools()).find((t) => t.name === "datalog_query");
+    const server = query.description.match(pattern)?.[1];
+    expect(server).toBeDefined();
+    expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
+  });
+
+  // run_named_query runs as code under named bounds (patch 0039, named queries as code): the help
+  // repeats one bound's number, which must be the vendored description's.
+  it("the help's meetings bound matches run_named_query's description", async () => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    const pattern = /([\d,]+) meetings created within days \(its meetings bound\)/;
+    const server = named.description.match(pattern)?.[1];
+    expect(server).toBeDefined();
+    expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
+  });
+
+  it("neither the help nor run_named_query's description names a cap or a depth limit for the named queries", async () => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    for (const gone of ["rule cap", "levels deep", "scan cap", "as EDN"]) expect(named.description, gone).not.toContain(gone);
+    for (const gone of ["rule cap", "levels deep", "its own rules", "projects-untouched can reach the scan cap"]) expect(QUERIES_HELP, gone).not.toContain(gone);
+  });
+
+  // Patch 0039 stage 3 removed the rule machinery: datalog_query still refuses rules, but neither its
+  // description nor the help describes a rule cap, a rule depth or rules walking ancestors.
+  it("neither datalog_query's description nor the help describes rules walking ancestors", async () => {
+    const query = (await listTools()).find((t) => t.name === "datalog_query");
+    for (const gone of ["rule cap", "rule work", "levels deep on its page", "ancestors", "vetted rules", "walks up through"]) {
+      expect(query.description, gone).not.toContain(gone);
+    }
+    for (const gone of ["walks up through them", "vetted rules", "rule work"]) expect(QUERIES_HELP, gone).not.toContain(gone);
+  });
+
+  // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
+  it.each([
+    ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
+    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
   ])("%s's generated description carries the openapi text", async (name, phrases) => {
     const tool = (await listTools()).find((t) => t.name === name);
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
