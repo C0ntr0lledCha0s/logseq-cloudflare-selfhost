@@ -12,7 +12,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 33: JSON number read as a db id | ready | `fix/json-number-not-db-id` | [#62](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/62) | `6a629b8` |
 | 45: batch class check uses stale classes | ready | `fix/batch-class-check-final-state` | [#63](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/63) | `5d23b6e` |
 | 36: Tags title takes the first class | ready | `fix/tags-title-scoped` | [#64](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/64) | `425a9da` |
-| 34: value block shared by UUID | running | `fix/value-block-by-uuid-copied` | – | – |
+| 34: value block shared by UUID | ready | `fix/value-block-by-uuid-copied` | [#65](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/65) | `0a75ac4` |
+| 53: indexer stops on a rejected sync | running | `fix/indexer-survives-rejected-sync` | – | – |
 
 ---
 
@@ -177,3 +178,20 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - minor: a user tag sharing a built-in title is refused with bare UUIDs, so you can't tell which is the built-in.
 - **Skill note:** pass a tag's UUID when its title may be shared, such as namespace tags or a tag with a built-in title.
 - **Logseq write-back:** applied (audit entries 297 and 298).
+
+---
+
+## Item 34: a text or URL value given as another block's value-block UUID was shared
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#65](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/65), HEAD `0a75ac4`, full tier, one review round, stacked on PR 64.
+- **Cause:** `refused-by-type` checked only that a value block belonged to the property (patch 0022), never which block held it. B was given A's child value block, and deleting A removed B's value with no error.
+- **Decide-first call (yours to overrule):** refuse rather than copy. The app's single-block editor always gives a block its own value block; only multi-block selection shares. A copy would drop children and can't work on E2EE graphs.
+- **Fix (patch 0047):** a text, URL or number value whose parent is neither the property nor the block being written is refused with a 400 naming the entry, the UUID and its holder, on all four write paths.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `0a75ac4` and it passed (838 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** five new tests failed before the fix (12, 12, 8 and 12 failures across the paths). All five mutants were killed.
+- **Open should-fix (minor):**
+  - a block that already shares a value can't re-send it by UUID
+  - the PropertyValue schema text and the E2EE advice were not updated
+- **Backlog proposals:** major, pre-existing: a number given by value still reuses an imported graph's value block parented to its holder, so it is lost when the holder is deleted. Existing shared refs are still lost on delete (README backlog 28, added by this lane).
+- **Skill note:** pass the text or URL itself, never another block's value-block UUID. Re-sending a block's own value UUID is fine.
+- **Logseq write-back:** applied (audit entries 299 and 300).
