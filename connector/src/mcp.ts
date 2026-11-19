@@ -10,7 +10,7 @@ import { GraphStore } from "./graphs";
 import { registerActivityLogTool } from "./tools/activity-log";
 import { registerAssetTools } from "./tools/assets";
 import { type RequestScope, logTool, requestScope, scopedResolve } from "./tools/common";
-import { registerHandwrittenTools } from "./tools/handwritten";
+import { SERVER_INSTRUCTIONS, registerHandwrittenTools } from "./tools/handwritten";
 import type { OnSuccess } from "./tools/readable";
 import { KB_INDEX_WRITE_TOOLS, markKbIndexDirty, registerKbIndexTool } from "./tools/kb-index";
 import { type GraphAccess, type GraphTool, buildGraphTools, registerGraphTools } from "./tools/semantic";
@@ -132,13 +132,16 @@ export function mcpHandler(
   };
   const handler = createMcpHandler(
     () => {
-      const server = new McpServer({
-        name: "logseq-connector",
-        title: "Logseq",
-        version: "0.0.0",
-        // The icon a client such as claude.ai can show for the connector (src/favicon.ts).
-        icons: [{ src: `https://${connectorHostname(env)}${FAVICON_PATH}`, mimeType: "image/png", sizes: [FAVICON_SIZE] }],
-      });
+      const server = new McpServer(
+        {
+          name: "logseq-connector",
+          title: "Logseq",
+          version: "0.0.0",
+          // The icon a client such as claude.ai can show for the connector (src/favicon.ts).
+          icons: [{ src: `https://${connectorHostname(env)}${FAVICON_PATH}`, mimeType: "image/png", sizes: [FAVICON_SIZE] }],
+        },
+        { instructions: SERVER_INSTRUCTIONS },
+      );
       registerHandwrittenTools(server, env, store, semantic !== null);
       registerActivityLogTool(server, { log, access, timeZone: TIME_ZONE });
       registerGraphTools(server, graphTools, onSuccess, audit);

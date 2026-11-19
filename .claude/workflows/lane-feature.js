@@ -322,7 +322,7 @@ for (const stage of plan.stages) {
   const prevHead = built.length ? built[built.length - 1].change.head_sha : BASE
   // The quick tier skips per-stage checks: its one review pass covers the whole change.
   const check = !T.stage_check ? null : await agent(
-    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
+    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? If the stage changed patches/, rebuild the release bundle with scripts/build.sh .upstream and run scripts/check.sh --upstream on the committed HEAD yourself, and quote the SHA: a red gate, a WARNING naming a skipped test, or a stage commit that isn't pushed is a major finding. Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
     { ...M('stage_check'), label: `check:${stage.id}`, phase: 'Build', agentType: 'adversarial-reviewer', schema: FINDINGS_SCHEMA, effort: 'medium' },
   )
   const serious = ((check && check.findings) || []).filter(f => ['security', 'blocker', 'major'].includes(f.severity)).map((f, i) => ({ ...f, id: `s-${stage.id}-${i + 1}` }))
