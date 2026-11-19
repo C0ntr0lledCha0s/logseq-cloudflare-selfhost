@@ -9,7 +9,7 @@ import { resolveOpenApiRefs } from "../../vendor/semantic_api_tools.mjs";
  * @typedef {{ operationId?: string, summary?: string, description?: string, parameters?: OpenApiParameter[], [key: string]: unknown }} OpenApiOperation
  * @typedef {{ paths: Record<string, Record<string, OpenApiOperation>>, [key: string]: unknown }} OpenApiSpec
  * @typedef {{ operationId: string, name: string, method: string, path: string, operation: OpenApiOperation }} GraphOperation
- * @typedef {{ name: string, method: string | null, path: string | null, annotations: ToolHints }} ManifestEntry
+ * @typedef {{ name: string, method: string | null, path: string | null, annotations: ToolHints, firstLine: string }} ManifestEntry
  */
 
 /** A connected graph's alias, as the connector's GraphStore enforces it. */
@@ -234,6 +234,83 @@ export function transformSpec(spec) {
 }
 
 /**
+ * The first line of every tool's description: what the tool is for and when to choose it, in at most
+ * 100 characters. claude.ai lists a connector's tools with each description cut to its first line and
+ * loads the rest only after a tool search, so this line carries the routing hint (item 58). The
+ * connector puts it first in every description (src/mcp.ts); a tool missing here fails `firstLineFor`.
+ * @type {Readonly<Record<string, string>>}
+ */
+export const FIRST_LINES = Object.freeze({
+  batch_delete_block_property: "Remove property values from many blocks in one call; prefer it to repeated single deletes.",
+  batch_insert_block_trees: "Build or fill several pages in one call, creating missing ones; best for multi-page writes.",
+  batch_move_blocks: "Move many blocks to different places in one call; move_blocks suits a single destination.",
+  batch_set_block_property: "Set tags and properties on many blocks or pages in one call; prefer it for more than one value.",
+  capture_to_today: "Append notes to today's journal; use insert_block_tree for any other page or day.",
+  connector_help: "The connector's writing rules: read once before the first write in a conversation.",
+  create_page: "Create a page by title; a title already in use is refused, naming the existing page.",
+  create_property: "Define a new property with its type, choices or classes; check list_properties first.",
+  create_tag: "Create a tag (class) with what it extends and its properties; check list_tags first.",
+  create_task: "Create a task with status, priority and dates; use it for every action item, never TODO text.",
+  datalog_query: "Read-only Datalog for questions no other tool answers; try run_named_query first.",
+  delete_block: "Delete one block and its children; use delete_blocks for several.",
+  delete_block_property: "Remove one property value from a block or page.",
+  delete_blocks: "Delete up to 100 blocks in one call; dry-run first and show the user what goes.",
+  delete_page: "Move a page and its blocks to the Recycle bin; dry-run first to see its references.",
+  delete_property: "Delete a property definition and its values; dry-run first to see what is lost.",
+  delete_tag: "Delete a tag, which its holders lose; dry-run first to see the counts.",
+  get_activity_log: "What the connector changed in a graph, newest first: the answer to 'what did you change?'",
+  get_block: "One block or page by UUID with its tags and properties, without its children.",
+  get_blocks: "Up to 100 blocks or pages by UUID in one call, optionally with their outlines.",
+  get_graph_health: "A tidy-up report: unused tags and properties, duplicate titles, pages with no summary or tag.",
+  get_page: "One page's tags and properties by UUID, title or date; get_page_outline reads its content.",
+  get_page_backlinks: "How a page is used: links, tagged objects and property values pointing at it, with counts.",
+  get_page_outline: "Read a whole page as markdown with tags, properties and links resolved; the usual way to read.",
+  get_property: "A property's type, choices and classes; check it before setting a choice or node value.",
+  get_tag: "A tag's properties, the tags it extends and the tags that extend it.",
+  insert_block_children: "Add block trees under an existing block; insert_block_tree also takes a page as target.",
+  insert_block_tree: "Write a whole note as one nested block tree on a page or under a block; the usual way to write.",
+  kb_index: "Start here for broad questions: every page grouped by class, with its summary and UUID.",
+  list_assets: "The graph's files and images, with the asset UUIDs read_file takes.",
+  list_favorites: "The pages in the sidebar's Favorites list, in order.",
+  list_graphs: "Call first: the connected graphs and the alias every other tool's graph argument takes.",
+  list_page_blocks: "A page's top-level blocks, paginated; get_page_outline reads the whole tree at once.",
+  list_page_references: "Blocks and pages that link to a page, paginated; get_page_backlinks gives grouped counts.",
+  list_pages: "All pages, paginated, filterable by created or updated date; kb_index suits an overview.",
+  list_properties: "Every property with its type; check here before creating a property.",
+  list_tag_objects: "Every page or block with a given tag, paginated, such as all Person pages.",
+  list_tags: "Every tag in the graph; check here before creating or applying a tag.",
+  list_tasks: "Tasks filtered by status, priority or text: the way to answer what is outstanding.",
+  move_blocks: "Move blocks under or beside a block or page; dry-run a large move first.",
+  promote_page_to_tag: "Turn an existing page into a tag, keeping its blocks and references.",
+  read_file: "Read a saved asset back by its UUID: text as text, images as images.",
+  refresh_refs: "Re-apply link and tag handling to blocks written before it existed; dry-run unless applied.",
+  reorder_favorites: "Set the order of the sidebar favourites; pass the full list from list_favorites.",
+  run_named_query: "Four ready-made questions: stale projects, undecided meetings, open tasks, pages missing a value.",
+  save_document: "Save text or a base64 file into the graph as an asset, linked from a page or the journal.",
+  save_file_from_url: "Download a public https file into the graph as an asset, linked from a page or the journal.",
+  search_graph: "Find pages, blocks, tags and properties by the exact words in their titles and text.",
+  semantic_index_status: "How much of a graph the meaning-based search index covers.",
+  semantic_search: "Find blocks by meaning as well as title words; use it when the exact words may differ.",
+  set_block_property: "Set one tag or property on a block or page; batch_set_block_property sets several.",
+  set_page_favorite: "Add a page to the sidebar favourites, or remove it.",
+  suggest_links: "Before writing notes, find the words that should link to existing pages; never writes.",
+  update_block: "Replace one block's text or display type; set_block_property changes its properties.",
+  update_page: "Rename a page; set_block_property changes its tags and properties.",
+  update_property: "Change a property's title, choices or classes, or convert its text values to choices.",
+  update_tag: "Change a tag's title, the tags it extends or its properties.",
+});
+
+/**
+ * @param {string} name
+ * @returns {string}
+ */
+export function firstLineFor(name) {
+  const line = FIRST_LINES[name];
+  if (line === undefined) throw new Error(`no first line for tool ${name}: add it to FIRST_LINES in src/tools/spec.mjs`);
+  return line;
+}
+
+/**
  * Every tool the connector registers, sorted by name. Hand-written tools have no single operation.
  * @param {OpenApiSpec} spec
  * @returns {ManifestEntry[]}
@@ -241,8 +318,8 @@ export function transformSpec(spec) {
 export function buildManifest(spec) {
   /** @type {ManifestEntry[]} */
   const entries = [
-    ...graphOperations(spec).map(({ name, method, path }) => ({ name, method, path, annotations: annotationsFor(name) })),
-    ...HANDWRITTEN_TOOLS.map((name) => ({ name, method: null, path: null, annotations: annotationsFor(name) })),
+    ...graphOperations(spec).map(({ name, method, path }) => ({ name, method, path, annotations: annotationsFor(name), firstLine: firstLineFor(name) })),
+    ...HANDWRITTEN_TOOLS.map((name) => ({ name, method: null, path: null, annotations: annotationsFor(name), firstLine: firstLineFor(name) })),
   ];
   return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
@@ -271,7 +348,7 @@ function describeHints(entry) {
 /** @param {ManifestEntry} entry */
 function describeEntry(entry) {
   const where = entry.method === null ? `${entry.name} (hand-written)` : `${entry.name} ${entry.method} ${entry.path}`;
-  return `${where} ${describeHints(entry)}`;
+  return `${where} ${describeHints(entry)} "${entry.firstLine ?? "(no first line)"}"`;
 }
 
 /**
