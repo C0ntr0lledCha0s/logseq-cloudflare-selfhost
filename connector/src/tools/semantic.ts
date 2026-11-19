@@ -113,13 +113,16 @@ const HINTS: Record<string, string> = {
 };
 
 function description(op: GraphOperation): string {
-  const parts = [op.operation.summary ?? `${op.method} ${op.path}`];
+  // The first line (spec.mjs FIRST_LINES) is put in front by src/mcp.ts, so the operation's summary,
+  // which said less, is left out when there is anything else to say.
+  const parts: string[] = [];
   if (op.operation.description) parts.push(op.operation.description);
   if (HINTS[op.name]) parts.push(HINTS[op.name]);
   if (FENCE_TOOLS.has(op.name)) parts.push(FENCE_HINT);
   if (DISPLAY_TYPE_TOOLS.has(op.name)) parts.push(DISPLAY_TYPE_HINT);
   if (STAMPING_TOOLS.has(op.name)) parts.push(STAMP_HINT);
   if (HOLDER_STAMPING_TOOLS.has(op.name)) parts.push(HOLDER_STAMP_HINT);
+  if (parts.length === 0) parts.push(op.operation.summary ?? `${op.method} ${op.path}`);
   return parts.join("\n\n");
 }
 

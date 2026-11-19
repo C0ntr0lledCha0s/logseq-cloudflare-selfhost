@@ -7,7 +7,7 @@ description: Add or change an MCP tool the connector exposes to Claude, either g
 
 There are two kinds of tool:
 
-- **Generated tools** come from the vendored upstream `openapi.json` (`connector/src/tools/semantic.ts`, filtered and named in `spec.mjs`). To add one, add the operation upstream with a patch (`add-upstream-patch`), re-vendor, and give it an entry in `ANNOTATIONS` in `spec.mjs` (upstream's method-derived hints are ignored; a tool with no entry fails the manifest and the Worker). `EXCLUDED_OPERATIONS` in `spec.mjs` hides operations Claude shouldn't call.
+- **Generated tools** come from the vendored upstream `openapi.json` (`connector/src/tools/semantic.ts`, filtered and named in `spec.mjs`). To add one, add the operation upstream with a patch (`add-upstream-patch`), re-vendor, and give it an entry in `ANNOTATIONS` and in `FIRST_LINES` in `spec.mjs` (upstream's method-derived hints are ignored; a tool with no entry fails the manifest and the Worker). `EXCLUDED_OPERATIONS` in `spec.mjs` hides operations Claude shouldn't call.
 - **Hand-written tools** are registered with `server.registerTool` in `connector/src/tools/` (`handwritten.ts`, `kb-index.ts`, `semantic-search.ts` and `assets.ts`, wired up in `src/mcp.ts`). Use one when the tool combines calls, reads the connector's own storage (D1, KV, Vectorize) or must not reach the sync server.
 
 ## Steps for a hand-written tool
@@ -19,10 +19,11 @@ There are two kinds of tool:
    - `annotations: annotationsFor("<name>")`, with the tool's entry added to `ANNOTATIONS` in `spec.mjs` (one of `READ`, `DESTRUCTIVE`, `DESTRUCTIVE_IDEMPOTENT` or `ADDITIVE`; `openWorldHint` only when it fetches outside the graph), and
    - for a tool that isn't a read, `reason: reasonSchema` in its schema, with `takeReason` run before anything else and the result passed through `withSummary` (`src/tools/readable.ts`; `registerAssetTools`'s `handle` shows how). Generated tools get this from `registerGraphTools`, and a test fails for any write without it, and
    - its body wrapped in `runTool`, passing `reasonGiven(args)` for a write so the log says `reason=yes|no`.
-3. **List it** in `HANDWRITTEN_TOOLS` in `spec.mjs` (and `SEMANTIC_TOOLS` if it depends on semantic search), then run `npm --prefix connector run update:manifest`.
-4. **Teach Claude.** Update `connector_help` (`CONNECTOR_HELP` in `handwritten.ts`) if the tool changes how Claude should work, and README §11.8.
-5. **Cost.** Write down rows, operations and neurons per call (REVIEW.md, *Cost*). Responses stay compact: IDs and counts, not echoed trees.
-6. **Gate:** `scripts/check.sh`. It needs `connector/vendor`; see `CLAUDE.md` → Commands.
+3. **Give it a first line** in `FIRST_LINES` in `spec.mjs`: what it is for and when to choose it over a neighbouring tool, in at most 100 characters. claude.ai lists tools with only this line until it loads one, and a tool without one can't be registered. Generated tools need one too.
+4. **List it** in `HANDWRITTEN_TOOLS` in `spec.mjs` (and `SEMANTIC_TOOLS` if it depends on semantic search), then run `npm --prefix connector run update:manifest`.
+5. **Teach Claude.** Update `connector_help` (`CONNECTOR_HELP` in `handwritten.ts`) if the tool changes how Claude should work, and README §11.8.
+6. **Cost.** Write down rows, operations and neurons per call (REVIEW.md, *Cost*). Responses stay compact: IDs and counts, not echoed trees.
+7. **Gate:** `scripts/check.sh`. It needs `connector/vendor`; see `CLAUDE.md` → Commands.
 
 ## Rules
 
