@@ -36,7 +36,7 @@ Patch 0027 refused only Tag, so Journal, Whiteboard, PDF Annotation, Property an
 - The choice scope for a tags write was worked out without the real target, so a private tag the target already held (a journal re-sending Journal) dropped the other tags in the list (Food) from scope. Resolve tags against the real target.
 - A batch page entry that creates a journal gets Journal from `outliner-page/create!`, so a new journal may be sent Journal while other private tags stay refused. Count the tags the create will add.
 
-Page as a tags value is still not refused up front (backlog r1-correctness-2).
+Page as a tags value is refused up front by the same held rule since patch 0043 (item 43): a block is pointed to the app's convert-to-page, and a journal, tag or property is refused, since the schema rejects Page on them. A page re-sending Page and a batch page entry that creates a page stay allowed.
 
 Rules kept so retries work: a private tag the target already holds is a no-op, Asset on an asset stays allowed, and the remaining tags in a list still apply. The regression test pairs every refused case with that control.
 
