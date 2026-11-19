@@ -6,6 +6,7 @@ import { type DefaultEnv, authRoute } from "./auth/routes";
 import { ConfigError, checkConfig, connectorHostname } from "./config";
 import { GraphStore } from "./graphs";
 import { purgeAuditLog } from "./audit/log";
+import { faviconResponse } from "./favicon";
 import { mcpApiHandler } from "./mcp";
 import { refreshAllKbIndexes } from "./tools/kb-index";
 import { semanticBindings } from "./semantic/config";
@@ -77,6 +78,8 @@ export function createConnector({ githubFetch }: { githubFetch: GitHubFetch }): 
       if (url.pathname === "/health" && request.method === "GET") return Response.json({ ok: true });
       const host = connectorHostname(env);
       if (url.host !== host) return new Response("Misdirected request", { status: 421 });
+      const icon = faviconResponse(request, url);
+      if (icon) return icon;
       if (pinned?.host !== host) pinned = { host, provider: new OAuthProvider(providerOptions(host, githubFetch)) };
       return pinned.provider.fetch(request, env, ctx);
     },
