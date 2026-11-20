@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Usage: do-cpu-probe.mjs <command> [options]
-//   validate  --durations <ms,ms,...> --websocket <true|false>
+//   validate  --durations <ms,ms,...> --websocket <true|false> [--repeats <n>]
 //   calibrate --out <calibration.json>
 //   preflight
 //   deploy-log <log file> --status <wrangler exit code> --name <worker name> --url-out <file>
 //   run       --url-file <file> --calibration <file> --durations <ms,...> --websocket <true|false>
-//             --name <worker name> --out <results.json> [--analytics-wait <s>]
+//             --name <worker name> --out <results.json> [--repeats <n>] [--analytics-wait <s>]
 //   teardown  --name <worker name>
 // Env: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (preflight, run, teardown), PROBE_KEY (run),
 // GITHUB_STEP_SUMMARY (optional).
@@ -30,6 +30,8 @@ const GRAPHQL = `${API}/graphql`;
 /** Input limits: the probe stays small (dozens of requests) and each run well below the job's timeout. */
 export const MAX_DURATION_MS = 120_000;
 export const MAX_POINTS = 20;
+/** Runs per target duration: several, so an ordinary restart can be told from a CPU kill. */
+export const MAX_REPEATS = 5;
 
 /** Pauses around each burn, so the mark and state requests land in other seconds than the burn in analytics. */
 export const GAP_MS = 3_000;
@@ -72,6 +74,20 @@ export function parseDurations(text) {
     if (ms > MAX_DURATION_MS) throw new Error(`durations: entry ${i} (${entry}): above the ${MAX_DURATION_MS} ms maximum`);
     return ms;
   });
+}
+
+/**
+ * Parses the repeat count: how many times each target runs. A whole number from 1 to MAX_REPEATS;
+ * absent means 1. Throws naming the reason.
+ */
+export function parseRepeats(text) {
+  if (text === undefined) return 1;
+  const raw = String(text).trim();
+  if (!/^\d+$/.test(raw)) throw new Error(`repeats: ${JSON.stringify(text)} is not a whole number`);
+  const n = Number(raw);
+  if (n < 1) throw new Error(`repeats: must be at least 1, got ${n}`);
+  if (n > MAX_REPEATS) throw new Error(`repeats: ${n} is above the maximum of ${MAX_REPEATS}`);
+  return n;
 }
 
 /** Parses a workflow boolean input, which arrives as the string "true" or "false". */
@@ -142,12 +158,14 @@ export function workerdRate(runs, minCpuMs = 20) {
 
 /**
  * Brackets the CPU limit from the runs: the most CPU a completed run used, and the least CPU (or,
- * without analytics, the smallest target) at which a run failed.
+ * without analytics, the smallest target) at which a run was killed for CPU. A restart after a
+ * completed run, or a failure that is not a CPU kill, says nothing about the limit. A run with no
+ * verdict (an older results file) counts as killed when it failed.
  */
 export function bracketLimit(runs) {
   const cpu = (r) => r.analytics?.cpuMs ?? null;
   const done = runs.filter((r) => r.outcome === "completed");
-  const failed = runs.filter((r) => r.outcome !== "completed");
+  const failed = runs.filter((r) => (r.verdict ? r.verdict === "kill" : r.outcome !== "completed"));
   const maxDone = done.length ? Math.max(...done.map((r) => cpu(r) ?? r.targetMs)) : null;
   const minFailed = failed.length ? Math.min(...failed.map((r) => cpu(r) ?? r.targetMs)) : null;
   return { maxCompletedMs: maxDone, minFailedMs: minFailed };
@@ -278,12 +296,12 @@ export async function graphql({ token, query, variables, fetch = globalThis.fetc
 }
 
 /**
- * Field selections for the per-run invocation query, tried in order: Cloudflare's docs do not say
- * which CPU field durableObjectsInvocationsAdaptiveGroups has, so the probe asks for `sum.cpuTime`,
- * then the CPU quantiles, then no CPU field (wall time only), and records which one answered.
+ * Field selections for the per-run invocation query, tried in order. durableObjectsInvocationsAdaptiveGroups
+ * has no `sum.cpuTime` (the first live run, 2026-11-19, was refused with "unknown field"), but it
+ * accepted the CPU quantiles, so the probe asks for those, then for no CPU field (wall time only),
+ * and records which one answered. With one invocation in a run's window, p99 is that invocation's CPU.
  */
 export const INVOCATION_SELECTIONS = [
-  { name: "sum.cpuTime", select: "sum { requests errors wallTime cpuTime } dimensions { status }" },
   { name: "quantiles.cpuTimeP99", select: "sum { requests errors wallTime } quantiles { cpuTimeP50 cpuTimeP99 } dimensions { status }" },
   { name: "none (wall time only)", select: "sum { requests errors wallTime } dimensions { status }" },
 ];
@@ -322,6 +340,18 @@ export function invocationsQuery({ accountId, script, runs, selection }) {
   });
   const query = `query Probe(${params.join(", ")}) {\n  viewer { accounts(filter: {accountTag: $account}) {\n${fields.join("\n")}\n  } }\n}`;
   return { query, variables };
+}
+
+/**
+ * The account's invocations over a window without the script filter, grouped by script name: read
+ * when every run's filtered groups came back empty, to tell a filter that matches nothing from
+ * analytics that have no rows yet.
+ */
+export function unfilteredInvocationsQuery({ accountId, start, end }) {
+  return {
+    query: `query ProbeUnfiltered($account: string!, $start: Time!, $end: Time!) {\n  viewer { accounts(filter: {accountTag: $account}) {\n    all: durableObjectsInvocationsAdaptiveGroups(limit: 20, filter: {datetime_geq: $start, datetime_leq: $end}) { sum { requests } dimensions { scriptName } }\n  } }\n}`,
+    variables: { account: accountId, start: isoSecond(start), end: isoSecond(end, { ceil: true }) },
+  };
 }
 
 /** The periodic totals query over the whole probe, filtered to the probe's namespace. */
@@ -405,7 +435,11 @@ export async function readAnalytics({ accountId, token, script, runs, namespaceI
     result.invocationSelection = answer.selection;
     // Keep to the selection that answered for later polls.
     selections = INVOCATION_SELECTIONS.filter((s) => s.name === answer.selection);
-    const account = answer.data.viewer?.accounts?.[0] ?? {};
+    const account = answer.data.viewer?.accounts?.[0];
+    if (!account) {
+      notes.push(`The invocation answer had no account for the account id: the token cannot see that account's analytics (it needs ${PERMISSIONS.analytics} on it), so the analytics columns are empty.`);
+      break;
+    }
     runs.forEach((run, i) => {
       run.analytics = summariseGroups(account[`r${i}`]);
     });
@@ -413,21 +447,30 @@ export async function readAnalytics({ accountId, token, script, runs, namespaceI
     if (!missing) break;
     if (now() + ANALYTICS_POLL_MS > deadline) {
       notes.push(`${missing} run(s) had no invocation in analytics after ${waitS} s; their analytics columns are empty.`);
+      if (missing === runs.length) notes.push(await unfilteredNote({ accountId, token, start: startedAt, end: now(), fetch, script }));
       break;
     }
     await wait(ANALYTICS_POLL_MS);
   }
   if (namespaceId) {
     try {
+      // The window reaches the time of the read, so a late-ingested invocation is still in it.
+      const end = Math.max(endedAt, now());
       const answer = await queryWithFallback({
         token,
         selections: PERIODIC_SELECTIONS,
         fetch,
-        build: (selection) => periodicQuery({ accountId, namespaceId, start: startedAt, end: endedAt + 60_000, selection }),
+        build: (selection) => periodicQuery({ accountId, namespaceId, start: startedAt, end, selection }),
       });
       for (const t of answer.tried) result.errors.push(`periodic (${t.selection}): ${t.errors.join("; ")}`);
       result.periodicSelection = answer.selection;
       result.periodic = answer.data?.viewer?.accounts?.[0]?.periodic?.[0]?.sum ?? null;
+      const window = `${isoSecond(startedAt)} to ${isoSecond(end, { ceil: true })}`;
+      if (answer.data && !answer.data.viewer?.accounts?.[0]) {
+        notes.push(`The periodic DO totals answer had no account for the account id (${window}): the token cannot see that account's analytics.`);
+      } else if (answer.data && !result.periodic) {
+        notes.push(`The periodic DO totals (durableObjectsPeriodicGroups) came back empty for the probe's namespace, ${window}.`);
+      }
     } catch (error) {
       result.errors.push(error.message);
     }
@@ -436,6 +479,28 @@ export async function readAnalytics({ accountId, token, script, runs, namespaceI
   }
   result.notes = notes;
   return result;
+}
+
+/**
+ * Reads the account's invocations without the script filter and says what it found: whether the
+ * probe's script name appears (then the per-run filter or window is wrong) or nothing does (then
+ * analytics had no rows yet, or the token sees none).
+ */
+async function unfilteredNote({ accountId, token, start, end, fetch, script }) {
+  const what = `Without the script filter, durableObjectsInvocationsAdaptiveGroups for ${isoSecond(start)} to ${isoSecond(end, { ceil: true })}`;
+  try {
+    const { query, variables } = unfilteredInvocationsQuery({ accountId, start, end });
+    const { data, errors } = await graphql({ token, query, variables, fetch });
+    if (errors.length) return `${what} answered with errors: ${errors.join("; ")}`;
+    const account = data?.viewer?.accounts?.[0];
+    if (!account) return `${what} had no account for the account id.`;
+    const groups = account.all ?? [];
+    if (!groups.length) return `${what} had no invocations at all: analytics had no rows for the window yet.`;
+    const scripts = groups.map((g) => `${g.dimensions?.scriptName === script ? "the probe" : (g.dimensions?.scriptName ?? "unknown")}×${g.sum?.requests ?? 0}`);
+    return `${what} had ${scripts.join(", ")}.`;
+  } catch (error) {
+    return `${what} failed: ${error.message}`;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -587,11 +652,26 @@ export async function waitForHealth({ baseUrl, fetch = globalThis.fetch, wait = 
   throw new Error(`the probe did not answer /health with 200 after ${attempts} attempts (last: ${last.status ?? last.error})`);
 }
 
+/** True when a failed burn's response is a CPU-limit kill: Cloudflare's message, or the reset flag. */
+export function isCpuKill(burnResult) {
+  return /exceeded its CPU time limit/i.test(burnResult.body ?? "") || burnResult.json?.durableObjectReset === true;
+}
+
 /**
- * Runs each target duration against the probe: mark the DO's memory, burn, check the memory and
- * the WebSocket. Returns one record per target.
+ * What one run says about the limit. A completed burn is `kept`, or `restart` when the DO instance
+ * changed (a new bootId or the marker lost) although the burn finished: an eviction, not a kill. A
+ * failed burn is `kill` when it is the CPU-limit error, and `error` otherwise.
  */
-export async function runProbe({ baseUrl, key, durations, rate, websocket, fetch = globalThis.fetch, WebSocketImpl = globalThis.WebSocket, wait = sleep, now = Date.now, log = () => {} }) {
+export function runVerdict({ completed, stateKept, bootBefore, bootAfter, burnResult }) {
+  if (completed) return stateKept && bootBefore != null && bootBefore === bootAfter ? "kept" : "restart";
+  return isCpuKill(burnResult) ? "kill" : "error";
+}
+
+/**
+ * Runs each target duration `repeats` times in a row against the probe: mark the DO's memory,
+ * burn, check the memory and the WebSocket. Returns one record per run.
+ */
+export async function runProbe({ baseUrl, key, durations, repeats = 1, rate, websocket, fetch = globalThis.fetch, WebSocketImpl = globalThis.WebSocket, wait = sleep, now = Date.now, log = () => {} }) {
   const runs = [];
   let watch = null;
   if (websocket) {
@@ -601,37 +681,46 @@ export async function runProbe({ baseUrl, key, durations, rate, websocket, fetch
     watch = new SocketWatch({ url: wsUrl.toString(), WebSocketImpl, now });
   }
   for (const [i, targetMs] of durations.entries()) {
-    const iterations = iterationsFor(targetMs, rate);
-    const token = `run-${i}-${Math.random().toString(36).slice(2, 10)}`;
-    let connected = false;
-    if (watch) connected = watch.isOpen || (await watch.connect());
-    const before = await call({ baseUrl, path: "/mark", params: { token }, key, fetch, now });
-    await wait(GAP_MS);
-    const eventsBefore = watch ? watch.events.length : 0;
-    const startedAt = now();
-    const burnResult = await call({ baseUrl, path: "/burn", params: { iterations }, key, timeoutMs: BURN_TIMEOUT_MS, fetch, now });
-    const endedAt = now();
-    await wait(GAP_MS);
-    const closed = watch && connected ? watch.closeAfter(eventsBefore) : null;
-    const pong = watch && connected && !closed ? await watch.ping(String(i)) : null;
-    const after = await call({ baseUrl, path: "/state", key, fetch, now });
-    const completed = burnResult.status === 200 && burnResult.json?.checksum != null;
-    const run = {
-      targetMs,
-      iterations,
-      startedAt,
-      endedAt,
-      outcome: completed ? "completed" : "failed",
-      http: burnResult.status,
-      latencyMs: burnResult.ms,
-      response: burnResult.error ?? burnResult.body,
-      stateKept: before.json?.marker === token && after.json?.marker === token,
-      state: { before: before.json ?? { status: before.status, error: before.error ?? before.body }, after: after.json ?? { status: after.status, error: after.error ?? after.body } },
-      websocket: describeSocket({ enabled: Boolean(watch), connected, closed, pong }),
-      analytics: null,
-    };
-    runs.push(run);
-    log(`target ${targetMs} ms: HTTP ${run.http ?? "none"} in ${run.latencyMs} ms, ${run.outcome}, state ${run.stateKept ? "kept" : "reset"}, WebSocket ${run.websocket}`);
+    for (let repeat = 0; repeat < repeats; repeat++) {
+      const iterations = iterationsFor(targetMs, rate);
+      const token = `run-${i}-${repeat}-${Math.random().toString(36).slice(2, 10)}`;
+      let connected = false;
+      if (watch) connected = watch.isOpen || (await watch.connect());
+      const before = await call({ baseUrl, path: "/mark", params: { token }, key, fetch, now });
+      await wait(GAP_MS);
+      const eventsBefore = watch ? watch.events.length : 0;
+      const startedAt = now();
+      const burnResult = await call({ baseUrl, path: "/burn", params: { iterations }, key, timeoutMs: BURN_TIMEOUT_MS, fetch, now });
+      const endedAt = now();
+      await wait(GAP_MS);
+      const closed = watch && connected ? watch.closeAfter(eventsBefore) : null;
+      const pong = watch && connected && !closed ? await watch.ping(`${i}.${repeat}`) : null;
+      const after = await call({ baseUrl, path: "/state", key, fetch, now });
+      const completed = burnResult.status === 200 && burnResult.json?.checksum != null;
+      const stateKept = before.json?.marker === token && after.json?.marker === token;
+      const bootBefore = before.json?.bootId ?? null;
+      const bootAfter = after.json?.bootId ?? null;
+      const run = {
+        targetMs,
+        repeat,
+        iterations,
+        startedAt,
+        endedAt,
+        outcome: completed ? "completed" : "failed",
+        http: burnResult.status,
+        latencyMs: burnResult.ms,
+        response: burnResult.error ?? burnResult.body,
+        verdict: runVerdict({ completed, stateKept, bootBefore, bootAfter, burnResult }),
+        bootBefore,
+        bootAfter,
+        stateKept,
+        state: { before: before.json ?? { status: before.status, error: before.error ?? before.body }, after: after.json ?? { status: after.status, error: after.error ?? after.body } },
+        websocket: describeSocket({ enabled: Boolean(watch), connected, closed, pong }),
+        analytics: null,
+      };
+      runs.push(run);
+      log(`target ${targetMs} ms, repeat ${repeat + 1} of ${repeats}: HTTP ${run.http ?? "none"} in ${run.latencyMs} ms, ${run.outcome} (${run.verdict}), state ${run.stateKept ? "kept" : "reset"}, WebSocket ${run.websocket}`);
+    }
   }
   if (watch) watch.close();
   return { runs, websocketEvents: watch?.events ?? [], websocketConnects: watch?.connects ?? 0 };
@@ -650,17 +739,26 @@ export function renderSummary(result) {
     "",
     `Worker \`${result.name}\`, ${runs.length} run(s), WebSocket client ${websocket ? "on" : "off"}. Analytics CPU per invocation: ${analytics.invocationSelection ?? "not available"}.`,
     "",
-    "| Target ms | Iterations | HTTP | Latency ms | DO status (analytics) | CPU ms (analytics) | Wall ms (analytics) | DO memory | WebSocket | Response or error |",
-    "|---:|---:|---:|---:|---|---:|---:|---|---|---|",
+    "| Target ms | Iterations | HTTP | Latency ms | DO status (analytics) | CPU ms (analytics) | Wall ms (analytics) | DO memory | WebSocket | Response or error | Verdict |",
+    "|---:|---:|---:|---:|---|---:|---:|---|---|---|---|",
   ];
   for (const r of runs) {
     const statuses = r.analytics ? Object.entries(r.analytics.statuses).map(([s, n]) => `${s}×${n}`).join(", ") : null;
     lines.push(
-      `| ${fmt(r.targetMs)} | ${fmt(r.iterations)} | ${r.http ?? "none"} | ${fmt(r.latencyMs)} | ${cell(statuses)} | ${fmt(r.analytics?.cpuMs, 1)} | ${fmt(r.analytics?.wallMs, 1)} | ${r.stateKept ? "kept" : "reset"} | ${cell(r.websocket)} | ${cell(r.response)} |`,
+      `| ${fmt(r.targetMs)} | ${fmt(r.iterations)} | ${r.http ?? "none"} | ${fmt(r.latencyMs)} | ${cell(statuses)} | ${fmt(r.analytics?.cpuMs, 1)} | ${fmt(r.analytics?.wallMs, 1)} | ${r.stateKept ? "kept" : "reset"} | ${cell(r.websocket)} | ${cell(r.response)} | ${cell(r.verdict)} |`,
     );
   }
   const bracket = bracketLimit(runs);
   const wRate = workerdRate(runs);
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const repeatLines = [];
+  for (const target of [...new Set(runs.filter((r) => r.verdict).map((r) => r.targetMs))]) {
+    const rs = runs.filter((r) => r.verdict && r.targetMs === target);
+    const count = (v) => rs.filter((r) => r.verdict === v).length;
+    const done = rs.filter((r) => r.outcome === "completed").length;
+    repeatLines.push(`- ${fmt(target)} ms: ${done} of ${rs.length} completed, ${plural(count("restart"), "restart")}, ${plural(count("kill"), "kill")}${count("error") ? `, ${plural(count("error"), "other error")}` : ""}.`);
+  }
+  if (repeatLines.length) lines.push("", "**Repeats.** A restart is a new DO instance after a burn that completed (an eviction); a kill is the CPU-limit error.", ...repeatLines);
   lines.push(
     "",
     "**Calibration.**",
@@ -670,7 +768,7 @@ export function renderSummary(result) {
     "**Limit.**",
     `- Most CPU a completed run used: ${bracket.maxCompletedMs == null ? "none completed" : `${fmt(bracket.maxCompletedMs, 1)} ms`}.`,
     `- Least CPU at which a run failed: ${bracket.minFailedMs == null ? "none failed" : `${fmt(bracket.minFailedMs, 1)} ms`}.`,
-    "- Both use the analytics CPU where it was reported, and the target otherwise.",
+    "- Both use the analytics CPU where it was reported, and the target otherwise. Only CPU kills count as failed: restarts and other errors do not.",
   );
   if (analytics.periodic) {
     const p = analytics.periodic;
@@ -683,7 +781,7 @@ export function renderSummary(result) {
   if (notes.length) lines.push("", "**Notes.**", ...notes.map((n) => `- ${cell(n, 400)}`));
   lines.push(
     "",
-    "How to read it: *DO memory* is `reset` when the counter set before the run was gone after it (the DO instance restarted). *WebSocket* is `dropped` with the close code when the connected client was closed during the run. CPU and wall times come from `durableObjectsInvocationsAdaptiveGroups`, reported in microseconds and shown in ms.",
+    "How to read it: *DO memory* is `reset` when the counter set before the run was gone after it (the DO instance restarted). *WebSocket* is `dropped` with the close code when the connected client was closed during the run. *Verdict* is `kept`, `restart` (the burn completed but the instance changed), `kill` (the CPU-limit error) or `error` (any other failure). CPU and wall times come from `durableObjectsInvocationsAdaptiveGroups`, reported in microseconds and shown in ms.",
   );
   return lines.join("\n") + "\n";
 }
@@ -697,30 +795,41 @@ function need(env, names) {
   return names.map((n) => env[n]);
 }
 
+/** The command-line options every command accepts (parseArgs is strict: others are refused). */
+const OPTIONS = {
+  durations: { type: "string" },
+  websocket: { type: "string" },
+  out: { type: "string" },
+  status: { type: "string" },
+  name: { type: "string" },
+  "url-out": { type: "string" },
+  "url-file": { type: "string" },
+  calibration: { type: "string" },
+  repeats: { type: "string" },
+  "analytics-wait": { type: "string" },
+};
+
 /** Runs one command. Returns the exit code; output goes through `out` and `err`. */
 export async function main(argv, { env = process.env, fetch = globalThis.fetch, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), WebSocketImpl = globalThis.WebSocket, wait = sleep } = {}) {
   const [command, ...rest] = argv;
-  const { values, positionals } = parseArgs({
-    args: rest,
-    allowPositionals: true,
-    options: {
-      durations: { type: "string" },
-      websocket: { type: "string" },
-      out: { type: "string" },
-      status: { type: "string" },
-      name: { type: "string" },
-      "url-out": { type: "string" },
-      "url-file": { type: "string" },
-      calibration: { type: "string" },
-      "analytics-wait": { type: "string" },
-    },
-  });
+  let parsed;
+  try {
+    parsed = parseArgs({ args: rest, allowPositionals: true, options: OPTIONS });
+  } catch (error) {
+    // parseArgs refuses a value that starts with a dash (`--repeats -1`): name the option.
+    if (error.code !== "ERR_PARSE_ARGS_INVALID_OPTION_VALUE") throw error;
+    const option = String(error.message).match(/Option '--([a-z-]+)'/)?.[1];
+    out(`::error::${option ? `${option}: ` : ""}${String(error.message).split("\n")[0]}\n`);
+    return 1;
+  }
+  const { values, positionals } = parsed;
   try {
     switch (command) {
       case "validate": {
         const durations = parseDurations(values.durations);
         const websocket = parseBoolean("websocket", values.websocket);
-        out(`durations: ${durations.join(", ")} ms (${durations.length} runs); WebSocket client: ${websocket ? "on" : "off"}\n`);
+        const repeats = parseRepeats(values.repeats);
+        out(`durations: ${durations.join(", ")} ms (${durations.length * repeats} runs); WebSocket client: ${websocket ? "on" : "off"}; ${repeats} ${repeats === 1 ? "repeat" : "repeats"} per target\n`);
         return 0;
       }
       case "calibrate": {
@@ -774,6 +883,7 @@ export async function main(argv, { env = process.env, fetch = globalThis.fetch, 
         if (!values["url-file"] || !values.calibration || !values.name || !values.out) throw new Error("run needs --url-file --calibration --name --out");
         const durations = parseDurations(values.durations);
         const websocket = parseBoolean("websocket", values.websocket);
+        const repeats = parseRepeats(values.repeats);
         const baseUrl = readFileSync(values["url-file"], "utf8").trim();
         const calibration = JSON.parse(readFileSync(values.calibration, "utf8"));
         const host = new URL(baseUrl).host;
@@ -791,7 +901,7 @@ export async function main(argv, { env = process.env, fetch = globalThis.fetch, 
           notes.push(error.message);
         }
         const startedAt = Date.now();
-        const probe = await runProbe({ baseUrl, key, durations, rate: calibration.iterationsPerMs, websocket, fetch, WebSocketImpl, wait, log: say });
+        const probe = await runProbe({ baseUrl, key, durations, repeats, rate: calibration.iterationsPerMs, websocket, fetch, WebSocketImpl, wait, log: say });
         const endedAt = Date.now();
         say("reading analytics (they lag by a minute or two)…");
         const analytics = await readAnalytics({ accountId, token, script: values.name, runs: probe.runs, namespaceId, startedAt, endedAt, fetch, wait, waitS });
@@ -799,6 +909,7 @@ export async function main(argv, { env = process.env, fetch = globalThis.fetch, 
           name: values.name,
           ranAt: new Date(startedAt).toISOString(),
           websocket,
+          repeats,
           calibration,
           runs: probe.runs,
           websocketEvents: probe.websocketEvents,

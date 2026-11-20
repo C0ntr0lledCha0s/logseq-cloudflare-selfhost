@@ -1,0 +1,305 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 9aac442..7d78f60 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1579,7 +1579,7 @@
+          (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
+          (into {}))))
+ 
+-(declare stamp-property-refusal)
++(declare set-property-refusal)
+ 
+ (defn- prepare-properties
+   "Resolves a `properties` object for the block `scope` (see prepare-property-value) to
+@@ -1596,8 +1596,8 @@
+                                  (prepare-property-value db (:db/ident property) value e2ee? scope))]
+                   (cond
+                     (not (property? property)) (reduced {:error (str "property not found: " selector)})
+-                    (stamp-property-refusal (:db/ident property))
+-                    (reduced {:error (stamp-property-refusal (:db/ident property))})
++                    (set-property-refusal (:db/ident property))
++                    (reduced {:error (set-property-refusal (:db/ident property))})
+                     (nil? value) (reduced {:error (str selector ": missing property value")})
+                     (:error prepared) (reduced {:error (str selector ": " (or (::refusal prepared) (:error prepared)))})
+                     :else (update result :properties conj [(:db/ident property) (:value prepared)]))))
+@@ -2085,6 +2085,25 @@
+   (when-let [{:keys [title]} (get stamp-property-idents property-ident)]
+     (str title " is set by the server and can't be written")))
+ 
++(def ^:private class-schema-tools
++  "The class-schema properties a block-property write refuses (item 45), each with the tool that
++  writes it. A batch judges its class checks on the classes and extends it started with, and these
++  writes would skip update_property's and update_tag's own checks."
++  {:logseq.property/classes "update_property (classes)"
++   :logseq.property.class/extends "update_tag (extends)"})
++
++(defn- class-schema-refusal
++  "Why a block-property set naming `property-ident` is refused: a property's classes and a tag's
++  extends are written with update_property and update_tag. nil for any other property."
++  [property-ident]
++  (when-let [tool (get class-schema-tools property-ident)]
++    (str (subs (str property-ident) 1) " can't be set here; use " tool)))
++
++(defn- set-property-refusal
++  "Why a block-property set naming `property-ident` is refused, or nil."
++  [property-ident]
++  (or (stamp-property-refusal property-ident) (class-schema-refusal property-ident)))
++
+ (defn- request-creator [request e2ee?]
+   (when-let [encoded (.get (.-headers request) "x-logseq-sync-actor")]
+     (let [claims (js/JSON.parse (js/decodeURIComponent encoded))]
+@@ -3068,15 +3087,16 @@
+                                     (target-label-param url) (dry-run-option body))))))
+ 
+ (defn- batch-entries-error
+-  "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry resolved."
+-  [entries resolved]
++  "Why a property batch can't be applied, naming the first bad entry by index; nil when every entry
++  resolved. `refusal` names a property the batch may not write (stamp-property-refusal by default)."
++  [entries resolved & [refusal]]
+   (if-not (and (sequential? entries) (seq entries))
+     "entries must be a non-empty array"
+     (some (fn [[index {:keys [block property-ident prepared]}]]
+             (when-let [reason (cond
+                                 (nil? block) "block not found"
+                                 (nil? property-ident) "property not found"
+-                                :else (or (stamp-property-refusal property-ident) (:error prepared)))]
++                                :else (or ((or refusal stamp-property-refusal) property-ident) (:error prepared)))]
+               (str "entry " index ": " reason)))
+           (map-indexed vector resolved))))
+ 
+@@ -3111,8 +3131,8 @@
+       (cond
+         (nil? block) (http/bad-request "block not found")
+         (nil? property-ident) (http/bad-request "property not found")
+-        (stamp-property-refusal property-ident)
+-        (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
++        (set-property-refusal property-ident)
++        (http/bad-request (str "entry 0: " (set-property-refusal property-ident)))
+         (not (contains? body :value)) (http/bad-request "missing property value")
+         (:error prepared) (http/bad-request (cond->> (:error prepared) (::entry? prepared) (str "entry 0: ")))
+         (lang-error writes) (http/bad-request (lang-error writes))
+@@ -3201,7 +3221,7 @@
+                                           (cond-> replace? (update :replaced conj (:db/id block)))))))
+                                 {:entries [] :added {} :replaced #{}}
+                                 entries))))]
+-      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved) (lang-error resolved))]
++      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved set-property-refusal) (lang-error resolved))]
+         (http/bad-request error)
+         (answering-unverified
+          #(refusing-labels
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+index ce28cdb..59c18bc 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
+@@ -4,7 +4,9 @@
+   any entry order and however the value is given (title, UUID or ident; a bare number is a title,
+   never a db id, so a page's db id is refused, naming the entry). A batch whose final
+   state puts an object outside the classes is refused up front, naming the entry, and writes
+-  nothing. Covers batchSetBlockProperty and batchInsertBlockTrees.
++  nothing. Covers batchSetBlockProperty and batchInsertBlockTrees. A property's classes and a
++  tag's extends are not block-property writes: every such write is refused, pointing to
++  update_property or update_tag (item 45).
+   The graph has tags Client, Service and VIP (VIP extends Client), a Client page Acme, a Service
+   page Audit, and untagged pages Acme Ltd, Beta Ltd, Gamma Ltd and Globex (which has an ident).
+   for-client (one) and clients (many) are node properties limited to Client."
+@@ -360,3 +362,154 @@
+             (is (string/includes? (str (get-in response [:body :error])) (str "no #Client object " beta)))
+             (is (= #{"Page"} (tag-titles conn beta)) "the tag entry isn't written")
+             (is (nil? (entity conn n0)) "the block isn't inserted")))))))
++
++;; Item 45: the class check reads a property's classes and each tag's extends as they were before
++;; the call, so a write that changes them in the same batch as a value judged on them stores an
++;; out-of-class value (or refuses a valid one), and it skips update_property's class checks. A
++;; property's classes are written with update_property (classes) and a tag's extends with
++;; update_tag (extends), so every block-property write path refuses them up front, naming the
++;; entry, and writes nothing: batch-set (with and without reset, in either entry position), a
++;; single set, a batch insert's target properties and an inserted block's properties. The property
++;; is named by ident, by title and by UUID.
++
++(defn- extends-titles [conn id]
++  (set (map :block/title (:logseq.property.class/extends (entity conn id)))))
++
++(defn- class-titles [conn property]
++  (set (map :block/title (:logseq.property/classes (d/entity @conn property)))))
++
++(defn- property-forms
++  "The ways a request names a built-in property: its ident, its title and its UUID."
++  [conn ident]
++  (let [property (d/entity @conn ident)]
++    [["ident" (ident-str ident)] ["title" (:block/title property)] ["UUID" (str (:block/uuid property))]]))
++
++(defn- error-of [response] (str (get-in response [:body :error])))
++
++(defn- refused-naming? [response prefix tool]
++  (and (= 400 (:status response))
++       (string/starts-with? (error-of response) prefix)
++       (string/includes? (error-of response) tool)))
++
++(defn- each-graph
++  "Runs (f graph case) on a fresh graph for each case, one after another."
++  [done cases f]
++  (-> (reduce (fn [chain case] (p/then chain (fn [_] (p/let [g (graph!)] (f g case)))))
++              (p/resolved nil)
++              cases)
++      (p/catch #(is false (str %)))
++      (p/finally done)))
++
++(deftest batch-set-refuses-property-classes-write-test
++  ;; Entry 0 moves for-client from Client to Service under reset, entry 1 sets for-client to Acme (a
++  ;; Client page) by title or UUID. Today this answers 200 and stores Acme outside the new classes.
++  (async done
++    (each-graph done (for [form [:ident :title :uuid] value-form [:title :uuid]] [form value-form])
++      (fn [{:keys [conn self blocks acme for-client fc]} [form value-form]]
++        (let [[label property-id] (some #(when (= (name form) (string/lower-case (first %))) %)
++                                        (property-forms conn :logseq.property/classes))
++              fc-uuid (:block/uuid (d/entity @conn for-client))
++              b0 (first blocks)]
++          (p/let [response (batch-set! self [{:block-id (str fc-uuid) :property-id property-id :value ["Service"]}
++                                             {:block-id (str b0) :property-id fc
++                                              :value (if (= value-form :title) "Acme" (str acme))}]
++                                       {:isResetExistingValues true})]
++            (testing (str "classes named by " label ", value by " (name value-form))
++              (is (refused-naming? response "entry 0: " "update_property") (str (:body response)))
++              (is (nil? (stored conn b0 for-client)) "no out-of-class value is stored")
++              (is (= #{"Client"} (class-titles conn for-client)) "for-client keeps its classes"))))))))
++
++(deftest batch-set-refuses-property-classes-write-any-mode-test
++  ;; Without reset, entry 0 adds Service to for-client's classes and entry 1 uses a Service page:
++  ;; today it is refused for the wrong entry ("entry 1: no #Client object"). With the classes entry
++  ;; second, today the batch answers 200 and rewrites classes. Both are refused naming the classes
++  ;; entry.
++  (async done
++    (each-graph done [:add-first :reset-second]
++      (fn [{:keys [conn self blocks audit acme for-client fc]} mode]
++        (let [fc-uuid (:block/uuid (d/entity @conn for-client))
++              b0 (first blocks)
++              classes {:block-id (str fc-uuid) :property-id "logseq.property/classes" :value ["Service"]}]
++          (p/let [response (case mode
++                             :add-first (batch-set! self [classes {:block-id (str b0) :property-id fc :value (str audit)}])
++                             :reset-second (batch-set! self [{:block-id (str b0) :property-id fc :value (str acme)} classes]
++                                                       {:isResetExistingValues true}))]
++            (testing (name mode)
++              (is (refused-naming? response (if (= mode :add-first) "entry 0: " "entry 1: ") "update_property")
++                  (str (:body response)))
++              (is (nil? (stored conn b0 for-client)) "nothing is stored")
++              (is (= #{"Client"} (class-titles conn for-client)) "for-client keeps its classes"))))))))
++
++(deftest batch-set-refuses-tag-extends-write-test
++  ;; Gamma Ltd is a VIP, so a Client. Entry 0 resets VIP's extends from Client to Service, entry 1
++  ;; sets for-client to Gamma Ltd. Today this answers 200 and stores a page that is no longer a
++  ;; Client object. Without reset, entry 0 makes Service extend Client and entry 1 uses Audit (a
++  ;; Service page): today that is refused for the wrong entry.
++  (async done
++    (each-graph done (for [form [:ident :title :uuid] mode [:reset :add]] [form mode])
++      (fn [{:keys [conn self blocks vip service gamma audit for-client fc]} [form mode]]
++        (let [[label property-id] (some #(when (= (name form) (string/lower-case (first %))) %)
++                                        (property-forms conn :logseq.property.class/extends))
++              [b0 b1] blocks
++              vip-extends (extends-titles conn (:block/uuid vip))
++              service-extends (extends-titles conn (:block/uuid service))]
++          (p/let [tagged (batch-set! self [(tag-entry gamma "VIP")])
++                  response (case mode
++                             :reset (batch-set! self [{:block-id (str (:block/uuid vip)) :property-id property-id :value ["Service"]}
++                                                      {:block-id (str b0) :property-id fc :value "Gamma Ltd"}]
++                                                {:isResetExistingValues true})
++                             :add (batch-set! self [{:block-id (str (:block/uuid service)) :property-id property-id :value ["Client"]}
++                                                    {:block-id (str b1) :property-id fc :value (str audit)}]))]
++            (testing (str "extends named by " label ", " (name mode))
++              (is (= 200 (:status tagged)) (str "Gamma Ltd is a VIP " (:body tagged)))
++              (is (refused-naming? response "entry 0: " "update_tag") (str (:body response)))
++              (is (nil? (stored conn b0 for-client)) "nothing is stored")
++              (is (nil? (stored conn b1 for-client)) "nothing is stored")
++              (is (= vip-extends (extends-titles conn (:block/uuid vip))) "VIP keeps its extends")
++              (is (= service-extends (extends-titles conn (:block/uuid service))) "Service keeps its extends"))))))))
++
++(deftest single-set-refuses-class-schema-writes-test
++  ;; setBlockProperty on the property page sets classes to a plain page (not a class), and on a
++  ;; tag replaces its extends. Today both answer 200, skipping update_property's class checks.
++  (async done
++    (run done
++      (fn [{:keys [conn self vip for-client]}]
++        (let [fc-uuid (:block/uuid (d/entity @conn for-client))
++              vip-extends (extends-titles conn (:block/uuid vip))]
++          (p/let [classes (request! self "PUT" (str "/semantic/blocks/" fc-uuid "/properties/logseq.property%2Fclasses")
++                                    {:value "Acme Ltd"})
++                  extends (request! self "PUT" (str "/semantic/blocks/" (:block/uuid vip)
++                                                    "/properties/logseq.property.class%2Fextends")
++                                    {:value "Service"})]
++            (is (refused-naming? classes "entry 0: " "update_property") (str (:body classes)))
++            (is (= #{"Client"} (class-titles conn for-client)) "for-client keeps its classes")
++            (is (refused-naming? extends "entry 0: " "update_tag") (str (:body extends)))
++            (is (= vip-extends (extends-titles conn (:block/uuid vip))) "VIP keeps its extends")))))))
++
++(deftest batch-insert-refuses-class-schema-writes-test
++  ;; batchInsertBlockTrees: a target's properties add Service to for-client's classes before another
++  ;; entry uses a Service page (today refused for the wrong entry), add Service to VIP's extends
++  ;; (today 201), or an inserted block's properties carry classes (today stored on a plain block).
++  (async done
++    (each-graph done [:target-classes :target-extends :block-classes]
++      (fn [{:keys [conn self page-id vip audit for-client fc]} kind]
++        (let [n0 (random-uuid)
++              fc-uuid (:block/uuid (d/entity @conn for-client))
++              vip-extends (extends-titles conn (:block/uuid vip))]
++          (p/let [response (insert-batch!
++                            self
++                            (case kind
++                              :target-classes [{:target-id (str fc-uuid) :properties {"logseq.property/classes" "Service"}}
++                                               {:target-id (str page-id)
++                                                :blocks [{:uuid (str n0) :title "Inserted" :properties {fc (str audit)}}]}]
++                              :target-extends [{:target-id (str (:block/uuid vip)) :properties {"Extends" "Service"}}]
++                              :block-classes [{:target-id (str page-id)
++                                               :blocks [{:uuid (str n0) :title "Inserted"
++                                                         :properties {"logseq.property/classes" "Client"}}]}]))]
++            (testing (name kind)
++              (is (refused-naming? response (if (= kind :block-classes) "entries[0].blocks[0]" "entries[0]")
++                                   (if (= kind :target-extends) "update_tag" "update_property"))
++                  (str (:body response)))
++              (is (nil? (entity conn n0)) "nothing is inserted")
++              (is (= #{"Client"} (class-titles conn for-client)) "for-client keeps its classes")
++              (is (= vip-extends (extends-titles conn (:block/uuid vip))) "VIP keeps its extends"))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+index bbdda0a..0c70279 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
+@@ -477,9 +477,10 @@
+           (is (= ["#Unknown"] (:escaped batched)) "batch inserts escape and report like single inserts")
+           (is (= "See \\#Unknown" (:block/title (entity conn (:uuid batched))))))))))
+ 
+-(deftest batch-reset-of-two-tags-extends-syncs-to-clients-test
++(deftest reset-of-two-tags-extends-syncs-to-clients-test
+   ;; A reset removes extends (Logseq puts Root back), then adds the new parent, which drops Root as
+   ;; redundant. Clients replay the logged, normalized tx-data and must end up as the server did.
++  ;; Extends are written with update_tag: batch-set refuses them (item 45).
+   (async done
+     (with-graph done
+       (fn [{:keys [conn self]}]
+@@ -487,24 +488,20 @@
+                                    (get-in r [:body :uuid])))
+                 thing (tag! "Thing")
+                 org (tag! "Org")
+-                _ (request! self "PUT" (str "/semantic/blocks/" org "/properties/logseq.property.class%2Fextends")
+-                            {:value thing})
++                _ (request! self "PATCH" (str "/semantic/tags/" org) {:extends [thing]})
+                 business (tag! "Business")
+                 department (tag! "Department")
+                 client (d/conn-from-db @conn)
+                 logged (atom [])
+                 _ (d/listen! conn ::log (fn [{:keys [db-after db-before tx-data]}]
+                                           (swap! logged conj (db-normalize/normalize-tx-data db-after db-before tx-data))))
+-                response (request! self "POST" "/semantic/block-properties/batch-set"
+-                                   {:isResetExistingValues true
+-                                    :entries (mapv (fn [id] {:block-id id :property-id "logseq.property.class/extends"
+-                                                             :value [org]})
+-                                                   [business department])})
++                first-reset (request! self "PATCH" (str "/semantic/tags/" business) {:extends [org]})
++                second-reset (request! self "PATCH" (str "/semantic/tags/" department) {:extends [org]})
+                 _ (d/unlisten! conn ::log)
+                 _ (doseq [tx-data @logged] (d/transact! client tx-data))
+                 extends (fn [db] (mapv (fn [id] (set (map :block/title (:logseq.property.class/extends
+                                                                          (d/entity db [:block/uuid (uuid id)])))))
+                                        [business department]))]
+-          (is (= 200 (:status response)))
++          (is (= [200 200] (mapv :status [first-reset second-reset])))
+           (is (= [#{"Org"} #{"Org"}] (extends @conn)))
+           (is (= (extends @conn) (extends @client))))))))

@@ -1,0 +1,508 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index f2aa3a7..f8b1672 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1731,19 +1731,43 @@
+   (str "edit stamps: property " (:block/title entity) " (" (entity-ident entity) ") is not the stamp"
+        " property; rename it in the app or turn off \"Mark Claude's edits\" for this graph"))
+ 
++(defn- stranded-choice?
++  "Whether `choice` is a choice of some entity, and every entity it is a choice of has neither a
++  :db/ident nor a title: an owner whose datoms were retracted (the ref dangles, and d/entity is nil)
++  or one left nameless. Neither can be named or claim the choice (Connector #27). An owner with
++  only one of them (a page, or a property without a title) is a real holder."
++  [db choice]
++  (let [owners (choice-owners db choice)]
++    (and (seq owners) (every? #(not (or (:db/ident %) (:block/title %))) owners))))
++
++(defn- stranded-stamp-choice?
++  "Whether `choice`, the entity holding the claude choice's UUID, is stranded: as stranded-choice?,
++  or left with no owner at all, as :db/retractEntity on its property leaves it (every ref to the
++  property goes, the choice's :block/page and :block/parent too). Only an entity that still reads
++  claude and is neither on a page nor a page itself counts as that choice."
++  [db choice]
++  (or (stranded-choice? db choice)
++      (and (empty? (choice-owners db choice))
++           (nil? (:block/page choice))
++           (nil? (:block/name choice))
++           (= stamp-header-value (:block/title choice)))))
++
+ (defn- stamp-choice-conflict [db]
+   (let [choice (d/entity db [:block/uuid editedby-choice-uuid])
+         property (d/entity db editedby-ident)]
+     (cond
+-      (and choice (not (contains? (set (map :db/ident (choice-owners db choice))) editedby-ident)))
++      (and choice
++           (not (contains? (set (map :db/ident (choice-owners db choice))) editedby-ident))
++           ;; A stranded claude choice is re-parented to editedBy by ensure-stamp-schema!.
++           (not (stranded-stamp-choice? db choice)))
+       (str "edit stamps: the claude choice's UUID (" editedby-choice-uuid ") is held by "
+            (if-let [owner (first (choice-owners db choice))]
+              (str "a choice of " (:block/title owner) " (" (entity-ident owner) ")")
+              (str "a " (block-kind choice)))
+            ", not by editedBy; turn off \"Mark Claude's edits\" for this graph")
+ 
+-      ;; Re-adding the choice would collide with the owner's own claude choice.
+-      (and property (nil? choice)
++      ;; Re-adding or re-parenting the choice would collide with the owner's own claude choice.
++      (and property (or (nil? choice) (stranded-stamp-choice? db choice))
+            (some #(= stamp-header-value (str (db-property/closed-value-content (d/entity db (:e %)))))
+                  (d/datoms db :avet :block/closed-value-property (:db/id property))))
+       (str "edit stamps: editedBy has a claude choice that isn't the stamp's (" editedby-choice-uuid
+@@ -1791,9 +1815,25 @@
+                                                       :db/cardinality :db.cardinality/one}
+                                           {:property-name title
+                                            :properties {:logseq.property/hide? true}})))
+-  (when-not (d/entity @conn [:block/uuid editedby-choice-uuid])
+-    (outliner-property/upsert-closed-value! conn editedby-ident {:id editedby-choice-uuid
+-                                                                 :value stamp-header-value}))
++  (let [choice (d/entity @conn [:block/uuid editedby-choice-uuid])]
++    (cond
++      (nil? choice)
++      (outliner-property/upsert-closed-value! conn editedby-ident {:id editedby-choice-uuid
++                                                                   :value stamp-header-value})
++
++      ;; Its owner is gone or nameless: make it editedBy's choice again, in this write's transaction,
++      ;; with a key after the graph's max (seeded by `handle`) so it shares none with editedBy's choices.
++      (stranded-stamp-choice? @conn choice)
++      (let [id (:db/id choice)
++            by (:db/id (d/entity @conn editedby-ident))]
++        (ldb/transact! conn
++                       (into (mapv (fn [dt] [:db/retract id :block/closed-value-property (:v dt)])
++                                   (d/datoms @conn :eavt id :block/closed-value-property))
++                             (conj (for [a [:block/closed-value-property :block/parent :block/page
++                                            :logseq.property/created-from-property]]
++                                     [:db/add id a by])
++                                   [:db/add id :block/order (db-order/gen-key)]))
++                       {:outliner-op :upsert-closed-value}))))
+   (mapv #(:db/id (d/entity @conn %))
+         [editedby-ident :user.property/claude-editedAt [:block/uuid editedby-choice-uuid]]))
+ 
+@@ -4882,7 +4922,23 @@
+ 
+ (def ^:private health-checks
+   ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"
+-   "mismatched-choice-values"])
++   "mismatched-choice-values" "orphan-choices"])
++
++(defn- orphan-choices
++  "Every choice whose owners are all gone or nameless (stranded-choice?)."
++  [db]
++  (->> (d/datoms db :avet :block/closed-value-property)
++       (map :e)
++       distinct
++       (map #(d/entity db %))
++       (filter #(stranded-choice? db %))))
++
++(defn- orphan-choice-response [choice]
++  (let [db (d/entity-db choice)]
++    {:uuid (uuid-string (:block/uuid choice))
++     :value (choice-content choice)
++     ;; d/entity is nil for an owner id that has no datoms left.
++     :reason (if (every? nil? (choice-owners db choice)) "owner-deleted" "owner-unnamed")}))
+ 
+ (defn- mismatched-choice-response [{:keys [holder property value reason]}]
+   (let [value-property (first (choice-owners (d/entity-db value) value))]
+@@ -4919,7 +4975,11 @@
+                              [(uuid-string (:block/uuid holder))
+                               (str (entity-ident property) " " (uuid-string (:block/uuid value)))])
+                            (graph-insights/mismatched-choice-values db) limit cursor)
+-              :items #(mapv mismatched-choice-response %)))))
++              :items #(mapv mismatched-choice-response %))
++      "orphan-choices"
++      (update (paginate-by (fn [choice] [(string/lower-case (choice-content choice)) (uuid-string (:block/uuid choice))])
++                           (orphan-choices db) limit cursor)
++              :items #(mapv orphan-choice-response %)))))
+ 
+ (defn- knowledge-index-aliases
+   "Titles of the page's :block/alias targets, sorted: none hidden or in the Recycle bin (itself or
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 99f38aa..7f8ba00 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -157,7 +157,7 @@
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+-   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
+@@ -570,7 +570,7 @@
+             :description "Most items listed per relation. Counts are always complete."}])
+     (= "getGraphHealth" operation-id)
+     (into (concat [{:name "checks" :in "query" :schema {:type "string"}
+-                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags, mismatched-choice-values. Defaults to all; any other value is rejected."}
++                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags, mismatched-choice-values, orphan-choices. Defaults to all; any other value is rejected."}
+                    {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
+                     :description "Most items listed per check. Counts are always complete."}
+                    {:name "cursor" :in "query" :schema {:type "string"}
+@@ -1023,7 +1023,7 @@
+                :HealthCheckResult {:type "object" :required ["count" "items"]
+                                    :properties {:count {:type "integer"}
+                                                 :items {:type "array"
+-                                                        :description "Tags for orphan-tags, property definitions for orphan-properties, {title, entities} groups for duplicate-titles, and pages for the page checks."
++                                                        :description "Tags for orphan-tags, property definitions for orphan-properties, {title, entities} groups for duplicate-titles, pages for the page checks, and {uuid, value, reason} choices for orphan-choices."
+                                                         :items {}}
+                                                 :next-cursor {:type "string"}}}
+                :GraphHealthResponse {:type "object" :required ["checks"]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+index e3a00c4..f285538 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+@@ -167,7 +167,7 @@
+                            checks (get-in all [:body :checks])]
+                      (is (= 200 (:status all)))
+                      (is (= #{:orphan-tags :orphan-properties :duplicate-titles :pages-without-summary :pages-without-tags
+-                            :mismatched-choice-values}
++                            :mismatched-choice-values :orphan-choices}
+                             (set (keys checks))))
+                      (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))
+                          "classes with holders or subclasses are not orphans; built-in classes are left out")
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_stranded_stamp_choice_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_stranded_stamp_choice_test.cljs
+new file mode 100644
+index 0000000..2c29382
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_stranded_stamp_choice_test.cljs
+@@ -0,0 +1,328 @@
++(ns logseq.db-sync.semantic-stranded-stamp-choice-test
++  "Connector #27: a choice whose owner is gone or has no name. The claude choice keeps its fixed UUID,
++  so once its owner is stranded every flagged write after it was refused with a 409 that named an
++  empty owner (\"held by a choice of  ()\"), and no repair was offered. Two kinds of stranded owner:
++  one whose datoms were all retracted (the choice's ref dangles), and one that is left without a
++  :db/ident or a title (a nameless property). Each graph is uploaded from the app and opened by the
++  real handler, as in semantic-uploaded-graph-schema-test, whose helpers this reuses."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test :as u]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(def ^:private by-ident :user.property/claude-editedBy)
++(def ^:private choice-uuid #uuid "3072a652-18e8-4dcb-bb37-e1aa38c8e3e9")
++
++(def ^:private request! @#'u/request!)
++(def ^:private with-uploaded @#'u/with-uploaded)
++(def ^:private notes-page! @#'u/notes-page!)
++(def ^:private owner-idents @#'u/owner-idents)
++(def ^:private stamps @#'u/stamps)
++(def ^:private signed @#'u/signed)
++(def ^:private stamped @#'u/stamped)
++
++(defn- retract-all!
++  "Strands every choice of `owner-id`: retracts each of the owner's datoms one by one (not
++  :db/retractEntity), so the choices' :block/closed-value-property, :block/parent and :block/page
++  still point at an id that has no datoms."
++  [conn owner-id]
++  (d/transact! conn (mapv (fn [dt] [:db/retract (:e dt) (:a dt) (:v dt)]) (d/datoms @conn :eavt owner-id))))
++
++(defn- unname!
++  "Leaves `owner-id` a nameless property: its :db/ident, :block/title and :block/name are retracted
++  and its other datoms stay."
++  [conn owner-id]
++  (d/transact! conn (vec (for [a [:db/ident :block/title :block/name]
++                               dt (d/datoms @conn :eavt owner-id a)]
++                           [:db/retract (:e dt) (:a dt) (:v dt)]))))
++
++(defn- retract-entity!
++  "Deletes `owner-id` the way datascript does, with :db/retractEntity: every ref to it goes too, so
++  its choices keep no :block/closed-value-property, :block/parent or :block/page at all."
++  [conn owner-id]
++  (d/transact! conn [[:db/retractEntity owner-id]]))
++
++(defn- property! [conn title]
++  (:db/ident (outliner-property/upsert-property!
++              conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++              {:property-name title})))
++
++(def ^:private strandings
++  [["an owner whose datoms are all retracted" retract-all!]
++   ["a nameless owner" unname!]
++   ["an owner deleted with :db/retractEntity" retract-entity!]])
++
++(defn- claude-choices
++  "The ids of every choice whose content is claude, whatever owns it."
++  [db]
++  (set (keep (fn [dt] (let [e (d/entity db (:e dt))]
++                        (when (= "claude" (:block/title e)) (:db/id e))))
++             (d/datoms db :avet :block/closed-value-property))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The precheck
++
++(deftest flagged-writes-succeed-after-the-claude-choice-is-stranded-test
++  ;; The first flagged write creates the claude choice; its owner is then stranded. Every flagged
++  ;; write after that (an edit of a block written before, a block tree, a property definition) must
++  ;; succeed and stamp, with the claude choice re-parented to editedBy rather than a second claude
++  ;; choice created.
++  (async done
++    (-> (p/doseq [[label strand!] strandings]
++          (p/let [_ (js/Promise.
++                     (fn [resolve]
++                       (with-uploaded resolve
++                         (fn [{:keys [conn self]}]
++                           (p/let [[page a] (notes-page! self)
++                                   first-write (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                                   _ (strand! conn (:db/id (d/entity @conn by-ident)))
++                                   edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)
++                                   child (str (random-uuid))
++                                   tree (request! self "POST" "/semantic/block-trees"
++                                                  {:target-id page :blocks [{:uuid child :title "N"}]} stamped)
++                                   property (request! self "POST" "/semantic/properties" {:title "mood" :type "default"} stamped)
++                                   choice (d/entity @conn [:block/uuid choice-uuid])]
++                             (testing label
++                               (is (= 201 (:status first-write)) (pr-str first-write))
++                               (is (= 200 (:status edited)) (pr-str edited))
++                               (is (= 201 (:status tree)) (pr-str tree))
++                               (is (= 201 (:status property)) (pr-str property))
++                               (is (= {:by choice-uuid :at? true} (stamps @conn a)) "the edited block carries both stamps")
++                               (is (= {:by choice-uuid :at? true} (stamps @conn child)) "the tree's block carries both stamps")
++                               (is (= #{by-ident} (owner-idents @conn (:db/id choice)))
++                                   "the claude choice is editedBy's again")
++                               (is (= [by-ident by-ident by-ident]
++                                      (mapv #(:db/ident (get choice %))
++                                            [:block/parent :block/page :logseq.property/created-from-property]))
++                                   "its parent, page and created-from-property are editedBy too")
++                               (is (= "editedBy" (:block/title (d/entity @conn by-ident))))
++                               (is (= #{(:db/id choice)} (claude-choices @conn)) "no second claude choice is created"))))
++                         :stale? true)))]
++            nil))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(deftest editedby-is-named-in-the-transaction-that-creates-its-choice-test
++  ;; Guard (Connector #27, acceptance 1): the first flagged write commits editedBy's title in the same
++  ;; transaction as the claude choice that points at it, so no stored state has the choice hanging off
++  ;; a nameless property. This holds before the fix too; it fails if the schema is made in its own
++  ;; writes ahead of the flagged one.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [_ (notes-page! self)
++                created (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                by (d/entity @conn by-ident)
++                choice-id (:db/id (d/entity @conn [:block/uuid choice-uuid]))
++                title-tx (:tx (first (d/datoms @conn :eavt (:db/id by) :block/title)))
++                owner-tx (:tx (first (d/datoms @conn :eavt choice-id :block/closed-value-property)))]
++          (is (= 201 (:status created)) (pr-str created))
++          (is (= "editedBy" (:block/title by)))
++          (is (some? owner-tx))
++          (is (= title-tx owner-tx) "editedBy's title and its choice's owner are committed in one transaction")))
++      :stale? true)))
++
++(defn- re-own!
++  "Makes the claude choice a choice of `owner-ids` only."
++  [conn owner-ids]
++  (let [id (:db/id (d/entity @conn [:block/uuid choice-uuid]))]
++    (d/transact! conn (into (mapv (fn [dt] [:db/retract id :block/closed-value-property (:v dt)])
++                                  (d/datoms @conn :eavt id :block/closed-value-property))
++                            (map (fn [owner] [:db/add id :block/closed-value-property owner]) owner-ids)))))
++
++(defn- detach!
++  "Retracts the claude choice's :block/parent and :block/page, keeping whatever owns it."
++  [conn]
++  (let [id (:db/id (d/entity @conn [:block/uuid choice-uuid]))]
++    (d/transact! conn (vec (for [a [:block/parent :block/page] dt (d/datoms @conn :eavt id a)]
++                             [:db/retract (:e dt) (:a dt) (:v dt)])))))
++
++(deftest a-claimed-claude-choice-is-not-repaired-test
++  ;; Guards: an owner that still has a title or an ident holds the choice, so the write is refused
++  ;; (naming it) and nothing is re-parented, and get_graph_health doesn't list the choice. Only an
++  ;; owner with neither, or one that's gone, counts as stranded.
++  (async done
++    (-> (p/doseq [[label setup expected stale-too?]
++                  [["a page" (fn [conn page] (re-own! conn [(:db/id (d/entity @conn [:block/uuid (uuid page)]))]))
++                    "is held by a choice of Notes ()" true]
++                   ["a property without a title"
++                    (fn [conn _page]
++                      (p/let [ident (property! conn "mood")
++                              mood (:db/id (d/entity @conn ident))]
++                        (re-own! conn [mood])
++                        (d/transact! conn (vec (for [a [:block/title :block/name] dt (d/datoms @conn :eavt mood a)]
++                                                 [:db/retract (:e dt) (:a dt) (:v dt)])))))
++                    "is held by a choice of  (user.property/mood" true]
++                   ;; A real holder still counts when the choice has lost its own page and parent.
++                   ["a page, with the choice's parent and page retracted"
++                    (fn [conn page]
++                      (re-own! conn [(:db/id (d/entity @conn [:block/uuid (uuid page)]))])
++                      (detach! conn))
++                    "is held by a choice of Notes ()" true]
++                   ;; Two owners can't be held on a conn whose schema has them at cardinality one.
++                   ["a live property and a deleted one"
++                    (fn [conn _page]
++                      (p/let [ident (property! conn "mood")]
++                        (re-own! conn [(:db/id (d/entity @conn ident)) (+ 100000 (:max-eid @conn))])))
++                    "is held by a choice of" false]]]
++          (p/let [_ (js/Promise.
++                     (fn [resolve]
++                       (with-uploaded resolve
++                         (fn [{:keys [conn self]}]
++                           (when (or stale-too? (= :db.cardinality/many
++                                                  (get-in (d/schema @conn) [:block/closed-value-property :db/cardinality])))
++                             (p/let [[page a] (notes-page! self)
++                                     _ (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                                     _ (setup conn page)
++                                     choice-id (:db/id (d/entity @conn [:block/uuid choice-uuid]))
++                                     owners (owner-idents @conn choice-id)
++                                     max-tx (:max-tx @conn)
++                                     edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)
++                                     health (request! self "GET" "/semantic/health?checks=orphan-choices" nil signed)]
++                               (testing label
++                                 (is (= 409 (:status edited)) (pr-str edited))
++                                 (is (string/includes? (str (get-in edited [:body :error])) expected) (pr-str edited))
++                                 (is (= max-tx (:max-tx @conn)) "nothing is transacted")
++                                 (is (= owners (owner-idents @conn choice-id)) "the choice keeps its owners")
++                                 (is (= 0 (get-in health [:body :checks :orphan-choices :count])) (pr-str health))))))
++                         :stale? true)))]
++            nil))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(deftest an-ownerless-entity-that-is-not-the-claude-choice-is-not-repaired-test
++  ;; Guards: once :db/retractEntity has taken the claude choice's owner, only an entity with the
++  ;; choice's UUID that still reads claude, and is on no page and isn't a page itself, is re-parented.
++  ;; A page or a block holding that UUID, or one with another title, still refuses, naming it, and
++  ;; nothing is written.
++  (async done
++    (-> (p/doseq [[label setup expected]
++                  [["a page titled claude"
++                    (fn [conn id _page] (d/transact! conn [[:db/add id :block/name "claude"]
++                                                           [:db/add id :block/tags :logseq.class/Page]]))
++                    "is held by a page"]
++                   ["a block titled claude on a page"
++                    (fn [conn id page] (d/transact! conn [[:db/add id :block/page
++                                                           (:db/id (d/entity @conn [:block/uuid (uuid page)]))]]))
++                    "is held by a block"]
++                   ["an entity with another title"
++                    (fn [conn id _page] (d/transact! conn [[:db/add id :block/title "other"]]))
++                    "is held by a block"]]]
++          (p/let [_ (js/Promise.
++                     (fn [resolve]
++                       (with-uploaded resolve
++                         (fn [{:keys [conn self]}]
++                           (p/let [[page a] (notes-page! self)
++                                   _ (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                                   _ (retract-entity! conn (:db/id (d/entity @conn by-ident)))
++                                   choice-id (:db/id (d/entity @conn [:block/uuid choice-uuid]))
++                                   _ (setup conn choice-id page)
++                                   max-tx (:max-tx @conn)
++                                   edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)]
++                             (testing label
++                               (is (= 409 (:status edited)) (pr-str edited))
++                               (is (string/includes? (str (get-in edited [:body :error])) expected) (pr-str edited))
++                               (is (= max-tx (:max-tx @conn)) "nothing is transacted"))))
++                         :stale? true)))]
++            nil))
++        (p/catch #(is false (str % (some-> % .-stack))))
++        (p/finally done))))
++
++(deftest a-stranded-claude-choice-is-not-re-parented-next-to-another-claude-choice-test
++  ;; Guard: when editedBy already has a claude choice of its own, re-parenting the stranded one would
++  ;; leave two, so the write is refused as when the choice is missing, and nothing is written.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [[_page a] (notes-page! self)
++                _ (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                mood (property! conn "mood")
++                _ (re-own! conn [(:db/id (d/entity @conn mood))])
++                _ (unname! conn (:db/id (d/entity @conn mood)))
++                _ (outliner-property/upsert-closed-value! conn by-ident {:id (random-uuid) :value "claude"})
++                max-tx (:max-tx @conn)
++                edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)]
++          (is (= 409 (:status edited)) (pr-str edited))
++          (is (string/includes? (str (get-in edited [:body :error])) "editedBy has a claude choice that isn't the stamp's")
++              (pr-str edited))
++          (is (= max-tx (:max-tx @conn)) "nothing is transacted")))
++      :stale? true)))
++
++(deftest a-re-parented-claude-choice-takes-a-fresh-order-key-test
++  ;; The re-parent gives the choice a new :block/order, so it never shares a key with a choice editedBy
++  ;; already has.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [[_page a] (notes-page! self)
++                _ (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                mood (property! conn "mood")
++                _ (re-own! conn [(:db/id (d/entity @conn mood))])
++                _ (unname! conn (:db/id (d/entity @conn mood)))
++                other (random-uuid)
++                _ (outliner-property/upsert-closed-value! conn by-ident {:id other :value "other"})
++                edited (request! self "PATCH" (str "/semantic/blocks/" a) {:title "A edited"} stamped)
++                orders (mapv #(:block/order (d/entity @conn [:block/uuid %])) [choice-uuid other])]
++          (is (= 200 (:status edited)) (pr-str edited))
++          (is (= #{by-ident} (owner-idents @conn (:db/id (d/entity @conn [:block/uuid choice-uuid])))))
++          (is (every? some? orders) (pr-str orders))
++          (is (apply distinct? orders) (str "editedBy's choices share an order key: " (pr-str orders)))))
++      :stale? true)))
++
++;; ---------------------------------------------------------------------------------------------
++;; get_graph_health
++
++(deftest health-lists-orphaned-choices-test
++  ;; orphan-choices lists every choice whose owner is gone or has no name, with a complete count, and
++  ;; leaves healthy choices (a user property's and the live claude choice) out. It runs by default.
++  (async done
++    (with-uploaded done
++      (fn [{:keys [conn self]}]
++        (p/let [_ (notes-page! self)
++                _ (request! self "POST" "/semantic/pages" {:title "Stamp Test"} stamped)
++                mood (property! conn "mood")
++                phase (property! conn "phase")
++                tone (property! conn "tone")
++                happy (random-uuid)
++                ;; Value order (Active, calm, ignoring case) is neither uuid order nor insertion order.
++                active #uuid "ffffffff-0000-4000-8000-000000000001"
++                calm #uuid "00000000-0000-4000-8000-000000000002"
++                _ (outliner-property/upsert-closed-value! conn mood {:id happy :value "happy"})
++                _ (outliner-property/upsert-closed-value! conn tone {:id calm :value "calm"})
++                _ (outliner-property/upsert-closed-value! conn phase {:id active :value "Active"})
++                phase-id (:db/id (d/entity @conn phase))
++                _ (retract-all! conn phase-id)
++                _ (unname! conn (:db/id (d/entity @conn tone)))
++                ;; Where the schema holds two owners, calm has two stranded ones and is still listed once.
++                _ (when (= :db.cardinality/many (get-in (d/schema @conn) [:block/closed-value-property :db/cardinality]))
++                    (d/transact! conn [[:db/add [:block/uuid calm] :block/closed-value-property phase-id]]))
++                one (request! self "GET" "/semantic/health?checks=orphan-choices" nil signed)
++                all (request! self "GET" "/semantic/health" nil signed)
++                paged (request! self "GET" "/semantic/health?checks=orphan-choices&limit=1" nil signed)
++                cursor (get-in paged [:body :checks :orphan-choices :next-cursor])
++                second-page (request! self "GET" (str "/semantic/health?checks=orphan-choices&limit=1&cursor="
++                                                      (js/encodeURIComponent (str cursor)))
++                                      nil signed)
++                check (get-in one [:body :checks :orphan-choices])]
++          (is (= 200 (:status one)) (pr-str one))
++          (is (= 2 (:count check)) (pr-str check))
++          (is (= [(str active) (str calm)] (mapv :uuid (:items check)))
++              "the stranded Active and calm choices, not happy or claude, in value order ignoring case")
++          (is (= {"Active" "owner-deleted" "calm" "owner-unnamed"}
++                 (into {} (map (juxt :value :reason)) (:items check)))
++              "each item names why its owner doesn't count")
++          (is (= 200 (:status all)) (pr-str all))
++          (is (= 2 (get-in all [:body :checks :orphan-choices :count])) "the check runs by default")
++          (testing "a page of one keeps the complete count and a cursor"
++            (is (= 200 (:status paged)) (pr-str paged))
++            (is (= 2 (get-in paged [:body :checks :orphan-choices :count])))
++            (is (= ["Active"] (mapv :value (get-in paged [:body :checks :orphan-choices :items]))))
++            (is (some? cursor)))
++          (testing "its cursor gives the next choice in value order, and the last page ends the feed"
++            (is (= 200 (:status second-page)) (pr-str second-page))
++            (is (= 2 (get-in second-page [:body :checks :orphan-choices :count])))
++            (is (= ["calm"] (mapv :value (get-in second-page [:body :checks :orphan-choices :items]))))
++            (is (nil? (get-in second-page [:body :checks :orphan-choices :next-cursor]))))))
++      :stale? true)))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 7c49e9c..c4603e9 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -26,6 +26,7 @@
+             [logseq.db-sync.semantic-readable-writes-test]
+             [logseq.db-sync.semantic-edit-stamps-test]
+             [logseq.db-sync.semantic-uploaded-graph-schema-test]
++            [logseq.db-sync.semantic-stranded-stamp-choice-test]
+             [logseq.db-sync.semantic-signals-view-test]
+             [logseq.db-sync.semantic-knowledge-index-aliases-test]
+             [logseq.db-sync.semantic-display-type-test]
