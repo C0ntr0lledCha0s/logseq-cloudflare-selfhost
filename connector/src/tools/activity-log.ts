@@ -246,7 +246,10 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           .optional()
           .describe("Only entries that touched or named this page, refused and failed calls included: its UUID or its exact title, ignoring case (not a prefix)."),
         tool: z.string().optional().describe("Only entries for this tool, e.g. delete_blocks."),
-        session: z.string().optional().describe("Only entries from this MCP session id."),
+        session: z
+          .string()
+          .optional()
+          .describe("No longer supported, and refused whenever given: MCP calls carry no session id, so no entry could match. Leave it out."),
         status: z
           .enum(STATUSES)
           .optional()
@@ -269,6 +272,11 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
     (args) =>
       runTool("get_activity_log", args.graph, async () => {
         const alias = args.graph;
+        // The stateless MCP handler never issues an mcp-session-id, so every entry's session is null and
+        // a session filter could only ever answer no entries: refuse it by name rather than ignore it.
+        if (args.session !== undefined) {
+          throw new ToolError("session: no longer supported; MCP calls carry no session id, so no entry could match. Leave it out.", "refused");
+        }
         const { graphId } = await resolveGraph(access, alias, false);
 
         if (args.id !== undefined) {
@@ -291,7 +299,6 @@ export function registerActivityLogTool(server: McpServer, { log, access, timeZo
           until,
           page: args.page,
           tool: args.tool,
-          session: args.session,
           status: args.status,
           limit: args.limit ?? DEFAULT_LIMIT,
           cursor,

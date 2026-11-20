@@ -16,6 +16,10 @@ on:
         description: Keep a WebSocket client connected to the DO during the runs
         type: boolean
         default: true
+      repeats:
+        description: Runs per target duration (1 to 5), so an ordinary DO restart can be told from a CPU kill
+        type: string
+        default: "3"
 
 permissions:
   contents: read
@@ -46,7 +50,8 @@ jobs:
         env:
           DURATIONS: ${{ inputs.durations }}
           WEBSOCKET: ${{ inputs.websocket }}
-        run: node scripts/do-cpu-probe.mjs validate --durations "$DURATIONS" --websocket "$WEBSOCKET"
+          REPEATS: ${{ inputs.repeats }}
+        run: node scripts/do-cpu-probe.mjs validate --durations "$DURATIONS" --websocket "$WEBSOCKET" --repeats "$REPEATS"
 
       # The same loop the DO runs, timed with process CPU time on the runner.
       - name: Calibrate in Node
@@ -86,12 +91,14 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DURATIONS: ${{ inputs.durations }}
           WEBSOCKET: ${{ inputs.websocket }}
+          REPEATS: ${{ inputs.repeats }}
         run: >-
           node scripts/do-cpu-probe.mjs run
           --url-file "$RUNNER_TEMP/probe-url"
           --calibration "$RUNNER_TEMP/calibration.json"
           --durations "$DURATIONS"
           --websocket "$WEBSOCKET"
+          --repeats "$REPEATS"
           --name "$PROBE_NAME"
           --out "$RUNNER_TEMP/do-cpu-probe.json"
 

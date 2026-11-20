@@ -1,0 +1,276 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index b2e4059..3704114 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -624,6 +624,15 @@
+       (re-find #"^#+\s" title) {:title (str "\\" title)}
+       :else {:title title})))
+ 
++(defn- name-heading-refusal
++  "The 400 message for a heading prefix (`# ` to `###### `, as markdown-heading reads it) in the
++  title of a page, tag or property (`kind`), or nil. Such a title is a name, not block text: it
++  can't hold \"#\", and the heading step would store the heading on the page itself."
++  [kind title]
++  (when (:level (markdown-heading title))
++    (str "title: a " kind " title can't include \"#\" (" title "); a heading prefix makes a heading"
++         " on a block only")))
++
+ (defn- reads-heading?
+   "Whether a block's title can hold a markdown heading, given the block's final display type
+   `type` (nil for a text block). A code, math or quote block holds text, where a leading `# ` is a
+@@ -2831,8 +2840,12 @@
+     (p/let [body (body-clj request)]
+       (with-page-selector db e2ee? "page-id" (:page-id path-params) find-entity
+         (fn [page]
+-          (if (or (not (page? page)) (not (non-blank-string? (:title body))))
++          (cond
++            (or (not (page? page)) (not (non-blank-string? (:title body))))
+             (http/bad-request "invalid page-id or title")
++            (and (not e2ee?) (name-heading-refusal "page" (:title body)))
++            (http/bad-request (name-heading-refusal "page" (:title body)))
++            :else
+             (do
+               (authored-write! conn creator outliner-core/save-block! {:block/uuid (:block/uuid page) :block/title (:title body)}
+                                :encrypted-title? e2ee? :encrypted-name (:name body))
+@@ -3023,6 +3036,9 @@
+           (= ::invalid convert?) (http/bad-request convert-fences-refusal)
+           (some (comp :error second) fields) (http/bad-request (some (comp :error second) fields))
+           fence-error (http/bad-request fence-error)
++          (and (not e2ee?) (contains? #{"page" "tag" "property"} (block-kind block))
++               (name-heading-refusal (block-kind block) (:title body)))
++          (http/bad-request (name-heading-refusal (block-kind block) (:title body)))
+           (and (some? lang) (not= :code final-type)) (http/bad-request "lang needs display-type code")
+           :else
+           (let [prepared (volatile! nil)]
+@@ -3522,6 +3538,8 @@
+           (not (tag? tag)) (http/bad-request "invalid tag-id or title")
+           (and (contains? body :title) (or (not (string? (:title body))) (string/blank? (:title body))))
+           (http/bad-request "title: give a title that isn't blank")
++          (and (not e2ee?) (contains? body :title) (name-heading-refusal "tag" (:title body)))
++          (http/bad-request (name-heading-refusal "tag" (:title body)))
+           (not-any? #(contains? body %) [:title :extends :properties])
+           (http/bad-request "give at least one of title, extends or properties")
+           error (http/bad-request error)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index f60a2be..39eccae 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -161,7 +161,7 @@
+    "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+-   "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
++   "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
+    "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
+    "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
+@@ -169,7 +169,10 @@
+    "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
+    "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped, and code and math blocks keep their titles as stored). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
+-   "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
++   "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note
++                                               " To remove a block's heading, delete logseq.property/heading with deleteBlockProperty."
++                                               " A page's, tag's or property's title is a name, not block text: a title for one starting with # to ###### and whitespace is refused with 400 naming the title, and nothing changes. "
++                                               typed-block-note)]
+    "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty. Answers the block's page, breadcrumb and snippet (affected), read before the delete; a block still there afterwards answers 500, naming it in the error and under not-removed."]
+    "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order. Each moved block is named under affected with where it was (from) and is (to): page and breadcrumb. Pass dry-run=true to move them in a throwaway copy of the graph instead and get the same answer with dry-run: true, changing nothing."]
+    "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+@@ -189,7 +192,7 @@
+    "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title and, in the same transaction, the tags it extends and its tag properties, and returns the tag with both. Each extends entry is a tag and each properties entry a visible property, by UUID, ident or title; anything else (such as a page with that title), and a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like), is refused, naming the entry, and nothing is created. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag: when a page promotePageToTag would accept holds the title, the error says to call promote_page_to_tag with that page's UUID, which turns it into a tag keeping its blocks and references, and its existing entry has promote: true. Not checked on E2EE graphs, whose names are ciphertext."]
+    "getTag" ["Get a tag" "Returns one tag by UUID or ident (as updateTag takes it), with the tags it extends and its tag properties. Answers 404 for an id that names no visible tag."]
+    "listTagObjects" ["List objects with a tag" "Returns a cursor-paginated flat list of blocks and pages tagged with the addressed tag. Results are not recursively expanded."]
+-   "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
++   "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. A title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, as a tag's title is a name, not block text. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
+    "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
+    "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
+    "createProperty" ["Create a property definition" "Creates a typed property definition in a DB graph with its name, value type, and cardinality, for a node property the classes (tags) it is limited to, and for a default (text), number or url property its choices, in one transaction. Choices are listed in the order given, each with a title and an optional icon and description; titles must differ ignoring case, a number property's must be numbers and a url property's URLs, and they are refused on E2EE graphs. The response lists each choice with its UUID. A node property limited to classes takes only objects with one of those tags (or a tag extending one) as values, whether given by title, UUID or ident; any other value is refused. Each class is a tag UUID, ident or title; anything that isn't a tag (such as a page with the same title), and Root Tag (logseq.class/Root, which would allow any node; leave classes out instead), is refused, naming the entry, and nothing is created. Use the returned UUID or ident to set values; never use legacy file-graph key:: value syntax."]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_page_title_heading_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_page_title_heading_test.cljs
+new file mode 100644
+index 0000000..bc9f389
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_page_title_heading_test.cljs
+@@ -0,0 +1,171 @@
++(ns logseq.db-sync.semantic-page-title-heading-test
++  "A page's, tag's or property's title is a name, not block text, so a leading markdown heading
++  (`#` to `######`, then whitespace) is never turned into :logseq.property/heading on it. Patch
++  0024's heading step ran for any entity updateBlock wrote, so `# New name` on a page stored
++  `New name` with heading 1 on the page itself. A page or tag title can't hold \"#\" (the outliner
++  refuses it, and createPage and createTag answer 400), so every write that renames a page or tag
++  with a heading prefix (updateBlock, updatePage, updateTag) answers 400 naming \"#\" and the
++  title, and changes nothing. A normal block still gets the heading, and a code block keeps its
++  title verbatim."
++  (:require [cljs.test :refer [async deftest is]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++;; Every heading level, a tab after the hashes, and leading whitespace (the app trims it).
++(def heading-titles ["# New name" "## Two" "### Three" "###### Six" "##\tTabbed" "  ## Indented"])
++
++(defn- stored [conn id]
++  (let [e (d/entity @conn [:block/uuid id])]
++    {:title (:block/title e) :heading (:logseq.property/heading e)}))
++
++(defn- with-graph [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self}))
++      (p/catch #(is false (str "unexpected error: " % (.-stack %))))
++      (p/finally done)))
++
++(defn- refused-unchanged!
++  "Asserts `response` is a 400 naming \"#\" and `title`, and that the entity kept `before` with no heading."
++  [label title response conn id before]
++  (is (= 400 (:status response)) (str label " " (pr-str title) ": answers 400, got " (pr-str response)))
++  (is (string/includes? (str (get-in response [:body :error])) "can't include \"#\"")
++      (str label " " (pr-str title) ": the error names \"#\""))
++  (is (string/includes? (str (get-in response [:body :error])) title)
++      (str label " " (pr-str title) ": the error names the title"))
++  (is (= {:title before :heading nil} (stored conn id))
++      (str label " " (pr-str title) ": the entity keeps its title and gets no heading")))
++
++(defn- rename-cases!
++  "For each heading title, makes a fresh page (or tag, with `class?`) and renames it through `path-of`."
++  [conn self label class? path-of]
++  (p/doseq [[i title] (map-indexed vector heading-titles)]
++    (p/let [before (str (string/replace label "/" " ") " " i)
++            [_ id] (outliner-page/create! conn before (if class? {:class? true} {}))
++            response (request! self "PATCH" (path-of id) {:title title})]
++      (refused-unchanged! label title response conn id before))))
++
++(deftest update-block-on-page-sets-no-heading-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (rename-cases! conn self "updateBlock/page" false #(str "/semantic/blocks/" %))))))
++
++(deftest update-block-on-tag-sets-no-heading-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (rename-cases! conn self "updateBlock/tag" true #(str "/semantic/blocks/" %))))))
++
++(deftest update-page-sets-no-heading-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (rename-cases! conn self "updatePage" false #(str "/semantic/pages/" %))))))
++
++(deftest update-tag-sets-no-heading-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (rename-cases! conn self "updateTag" true #(str "/semantic/tags/" %))))))
++
++(deftest get-page-shows-no-heading-after-update-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [[_ id] (outliner-page/create! conn "Shown page" {})
++                _ (request! self "PATCH" (str "/semantic/blocks/" id) {:title "# Shown name"})
++                got (request! self "GET" (str "/semantic/pages/" id) nil)]
++          (is (= 200 (:status got)))
++          (is (not-any? #(= "logseq.property/heading" (:ident %)) (get-in got [:body :properties]))
++              (str "getPage shows no heading property: " (pr-str (get-in got [:body :properties])))))))))
++
++;; A property is written through updateBlock too. Its title is a name: whatever the answer, no
++;; heading lands on it and the prefix is not silently dropped.
++(deftest update-block-on-property-sets-no-heading-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/doseq [[i title] (map-indexed vector heading-titles)]
++          (p/let [before (str "prop title " i)
++                  created (request! self "POST" "/semantic/properties" {:title before :type "default"})
++                  _ (is (= 201 (:status created)) (pr-str created))
++                  id (uuid (get-in created [:body :uuid]))
++                  response (request! self "PATCH" (str "/semantic/blocks/" id) {:title title})
++                  after (stored conn id)]
++            (is (nil? (:heading after)) (str "updateBlock/property " (pr-str title) ": no heading, got " (pr-str after)))
++            (if (= 400 (:status response))
++              (is (= before (:title after)) (str "updateBlock/property " (pr-str title) ": refused, title kept"))
++              (is (= title (:title after))
++                  (str "updateBlock/property " (pr-str title) ": accepted, title stored as sent, got " (pr-str after))))))))))
++
++;; Guard: the refusal reads only a heading prefix, so a plain rename still works on every path.
++(deftest plain-renames-still-work-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/doseq [[label class? path] [["updateBlock/page" false "/semantic/blocks/"]
++                                       ["updateBlock/tag" true "/semantic/blocks/"]
++                                       ["updatePage" false "/semantic/pages/"]
++                                       ["updateTag" true "/semantic/tags/"]]]
++          (p/let [before (str "plain " label)
++                  after (str "Renamed " (string/replace label "/" " "))
++                  [_ id] (outliner-page/create! conn before (if class? {:class? true} {}))
++                  response (request! self "PATCH" (str path id) {:title after})]
++            (is (= 200 (:status response)) (str label ": plain rename answers 200, got " (pr-str response)))
++            (is (= {:title after :heading nil} (stored conn id)) (str label ": plain rename stored"))))
++        (p/let [created (request! self "POST" "/semantic/properties" {:title "plain prop" :type "default"})
++                id (uuid (get-in created [:body :uuid]))
++                response (request! self "PATCH" (str "/semantic/blocks/" id) {:title "Renamed prop"})]
++          (is (= 200 (:status response)) (str "updateBlock/property: plain rename answers 200, got " (pr-str response)))
++          (is (= {:title "Renamed prop" :heading nil} (stored conn id))))))))
++
++;; Controls: block behaviour is unchanged.
++(deftest blocks-keep-heading-behaviour-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [[_ page-id] (outliner-page/create! conn "Host" {})
++                blk (random-uuid)
++                code (random-uuid)
++                _ (outliner-core/insert-blocks! conn [{:block/uuid blk :block/title "placeholder"}
++                                                      {:block/uuid code :block/title "placeholder"}]
++                                                (d/entity @conn [:block/uuid page-id])
++                                                {:sibling? false :keep-uuid? true :bottom? true})
++                _ (d/transact! conn [[:db/add [:block/uuid code] :logseq.property.node/display-type :code]])
++                r1 (request! self "PATCH" (str "/semantic/blocks/" blk) {:title "# Block heading"})
++                r2 (request! self "PATCH" (str "/semantic/blocks/" code) {:title "# install\nnpm i"})]
++          (is (= 200 (:status r1)))
++          (is (= {:title "Block heading" :heading 1} (stored conn blk)) "a normal block still gets the heading")
++          ;; The way to remove a heading, as connector_help gives it: a title without a prefix keeps
++          ;; it, and deleting logseq.property/heading removes it.
++          (p/let [kept (request! self "PATCH" (str "/semantic/blocks/" blk) {:title "Plain again"})
++                  _ (is (= 200 (:status kept)))
++                  _ (is (= {:title "Plain again" :heading 1} (stored conn blk)) "no prefix keeps the heading")
++                  removed (request! self "DELETE" (str "/semantic/blocks/" blk "/properties/"
++                                                       (js/encodeURIComponent "logseq.property/heading")) nil)]
++            (is (= 200 (:status removed)) (pr-str removed))
++            (is (= {:title "Plain again" :heading nil} (stored conn blk)) "deleting the heading property removes it"))
++          (is (= 200 (:status r2)))
++          (is (= {:title "# install\nnpm i" :heading nil} (stored conn code)) "a code block stays verbatim"))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 79c83b1..1a146f3 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -38,6 +38,7 @@
+             [logseq.db-sync.semantic-json-number-value-test]
+             [logseq.db-sync.semantic-tags-title-scoped-test]
+             [logseq.db-sync.semantic-value-block-by-uuid-test]
++            [logseq.db-sync.semantic-page-title-heading-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
