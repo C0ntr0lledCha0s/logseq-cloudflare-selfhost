@@ -876,14 +876,20 @@ test("the workflow has a repeats input (default 3) and passes it to validate and
 });
 
 /** A GraphQL endpoint like the live run's: sum.cpuTime unknown on invocations, every group set empty. */
-function liveLikeAnalytics({ accounts = "empty" } = {}) {
+// `periodic` and `unfiltered` override the answer to that one query: "none" answers with no account,
+// an { errors } object answers with those GraphQL errors and no data.
+function liveLikeAnalytics({ accounts = "empty", periodic, unfiltered } = {}) {
   const queries = [];
+  const noAccount = () => Response.json({ data: { viewer: { accounts: [] } }, errors: null });
+  const override = (how) => (how === "none" ? noAccount() : Response.json({ data: null, errors: how.errors }));
   const fetch = async (u, init) => {
     const url = new URL(u);
     if (url.pathname !== "/client/v4/graphql") return Response.json({ success: false }, { status: 404 });
     const { query, variables } = JSON.parse(init.body);
     queries.push({ query, variables });
-    if (accounts === "none") return Response.json({ data: { viewer: { accounts: [] } }, errors: null });
+    if (accounts === "none") return noAccount();
+    if (periodic && query.includes("durableObjectsPeriodicGroups")) return override(periodic);
+    if (unfiltered && query.includes("ProbeUnfiltered")) return override(unfiltered);
     if (query.includes("durableObjectsPeriodicGroups")) return Response.json({ data: { viewer: { accounts: [{ periodic: [] }] } }, errors: null });
     if (/sum \{[^}]*cpuTime/.test(query) && query.includes("durableObjectsInvocationsAdaptiveGroups")) {
       return Response.json({ data: null, errors: [{ message: 'unknown field "cpuTime"' }] });
@@ -933,6 +939,24 @@ test("readAnalytics tells an answer with no account (the token cannot see it) fr
   const empty = await readLiveLike({ accounts: "empty" });
   assert.match(none.text, /no account/i, none.text);
   assert.notEqual(none.text, empty.text);
+});
+
+test("readAnalytics names a refused unfiltered read as a query error, not as a missing account", async () => {
+  const { text } = await readLiveLike({ unfiltered: { errors: [{ message: 'unknown field "scriptName"' }] } });
+  assert.match(text, /without the script filter.*answered with errors: unknown field "scriptName"/i, text);
+  assert.doesNotMatch(text, /no account/i, text);
+});
+
+test("readAnalytics names a periodic answer with no account as such, not as empty", async () => {
+  const { text } = await readLiveLike({ periodic: "none" });
+  assert.match(text, /periodic DO totals answer had no account/i, text);
+  assert.doesNotMatch(text, /came back empty/i, text);
+});
+
+test("readAnalytics names an unfiltered answer with no account as such", async () => {
+  const { text } = await readLiveLike({ unfiltered: "none" });
+  assert.match(text, /without the script filter.*had no account for the account id/i, text);
+  assert.doesNotMatch(text, /failed: /i, text);
 });
 
 test("parseRepeats takes 1 to MAX_REPEATS, defaults to 1 when absent, and names each refusal", () => {
