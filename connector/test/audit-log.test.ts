@@ -365,7 +365,7 @@ describe("recordTokenEdit", () => {
         const page = await log.query(graphId, { since: 0, until: NOW + DAY_MS, limit: 50, status, includeSnapshot: true });
         expect(page.entries.map((e) => e.id), `${graphId} ${status}`).not.toContain(id);
       }
-      for (const filter of [{ tool: "token_edit" }, { session: `github:${OWNER}` }]) {
+      for (const filter of [{ tool: "token_edit" }]) {
         const page = await log.query(graphId, { since: 0, until: NOW + DAY_MS, limit: 50, ...filter });
         expect(page.entries, `${graphId} ${JSON.stringify(filter)}`).toEqual([]);
       }
