@@ -4,6 +4,7 @@ area: api
 tags: [classes, root, property-classes, validation, app-parity, picker, silent-success, set-block-property, hidden-property]
 seen:
   - 2026-11-07 – item 26 defect 3, patch 0032 (createProperty classes and updateProperty classes.set/add accepted Root)
+  - 2026-11-20 – item 47 (the set_block_property gap was already closed by patch 0045)
 promoted_to: []
 ---
 
@@ -17,7 +18,7 @@ Patch 0026's `validate-property-classes` resolved classes with `resolve-tag-sele
 
 ## Fix
 
-Patch 0032: `validate-property-classes` refuses Root on create, `classes.set` and `classes.add`, naming the entry (`classes.add 1: Root Tag is not a valid class restriction (it would allow any node; leave classes empty instead)`), before anything is written. `classes.remove` still takes a stored Root off so existing graphs can be cleaned up. Only Root is refused, because it is the only class the app's picker hides. Review left one gap: `setBlockProperty` on a property's hidden `logseq.property/classes` still stores Root, so that write path is unguarded.
+Patch 0032: `validate-property-classes` refuses Root on create, `classes.set` and `classes.add`, naming the entry (`classes.add 1: Root Tag is not a valid class restriction (it would allow any node; leave classes empty instead)`), before anything is written. `classes.remove` still takes a stored Root off so existing graphs can be cleaned up. Only Root is refused, because it is the only class the app's picker hides. Review left one gap: `setBlockProperty` on a property's hidden `logseq.property/classes` still stored Root, so that write path was unguarded. Patch 0045 closed it (item 47, not-a-bug at HEAD): the single set, batch set and insert paths now answer 400 `entry N: logseq.property/classes can't be set here; use update_property (classes)`. See [the item 47 note](../connector/an-issue-found-in-review-may-be-fixed-by-the-work-it-was-found-in.md).
 
 ## How to catch it next time
 

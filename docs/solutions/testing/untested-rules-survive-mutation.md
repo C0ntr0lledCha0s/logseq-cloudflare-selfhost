@@ -19,6 +19,7 @@ seen:
   - 2026-11-17 – item 40, named queries as code (should-fix deferred): three named bounds (tasks, page-blocks, decisions) can never be the one that refuses, because the reads backstop trips first, so their documented 422s are unreachable and untested
 promoted_to: ["REVIEW.md"]
   - 2026-11-17 – item 40, named queries as code (should-fix deferred): three named bounds (tasks, page-blocks, decisions) can never be the one that refuses, because the reads backstop trips first, so their documented 422s are untested and unreachable; a bound that no test makes decide the outcome is dead text
+  - 2026-11-19 – item 33, patch 0044, review (should-fix): the same `isFinite` rule, now in `free-text-value?`, survived mutation while the commit claimed every rule was mutation-checked; it is unreachable over HTTP, so say so in the test or commit instead of claiming a check
 ---
 
 ## Symptom
