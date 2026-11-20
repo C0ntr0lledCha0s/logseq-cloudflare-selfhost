@@ -24,7 +24,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 56: flaky release-check timing | not a bug (already fixed) | `fix/release-check-timing-steady` | – | `829670c` |
 | 51: CPU probe analytics find nothing | ready (not verified live) | `fix/do-cpu-probe-analytics` | [#70](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/70) | `5506eac` |
 | 68 (formerly 58): routing hints | spec awaiting approval | `feat/tool-routing-hints` | [#71](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/71) | `2f6998e` |
-| 49: Query blocks | spec running | `feat/query-blocks` | – | – |
+| 49: Query blocks | spec awaiting approval | `feat/query-blocks` | [#72](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/72) | `c7bb092` |
+| 50: change feed, schema export, health checks | spec running | `feat/changes-schema-health` | – | – |
 
 ---
 
@@ -357,3 +358,23 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - the file name
 - **To build:** rerun `lane-feature` with `args.spec`.
 - **Logseq write-back:** pr-url and a spec note (audit entries 358 and 359). Status was left as it is.
+
+---
+
+## Item 49: a query fence or query field makes a real Query block
+
+- **Status:** spec written, awaiting your approval. Nothing is built. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#72](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/72), spec `docs/superpowers/specs/2026-11-20-query-fence-makes-query-block-design.md` (`c7bb092`).
+- **Design:**
+  - Use the app's own Query block shape: the Query tag, plus `logseq.property/query` holding a code value entity with lang clojure. Patch 0034 already writes this shape for the Claude Activity page.
+  - A new `check-query-block` reuses `datalog_query`'s static checks. Only `:query`, `:inputs`, `:title` and a few booleans are allowed. `:rules`, `:result-transform` and `:view` are refused.
+  - An advanced-query fence, or a new `query` field on an insert node, makes the block. Simple (DSL) queries stay as text. E2EE graphs refuse it.
+  - This is patch 0050, which clashes with item 50's number if both are built.
+- **Your calls (spec section 11):**
+  - runtime cost in the app, or a server check-run
+  - whether Private blocks may show in the query's results in your app
+  - simple queries out of scope
+  - how far the `update_block` guard reaches over your own Query blocks
+  - the caption title
+  - refusing the Query tag on property writes
+  - the file name
+- **Logseq write-back:** pr-url and a spec note (audit entries 362 and 363).
