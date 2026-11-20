@@ -23,7 +23,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 48: activity log session filter never matches | ready | `fix/audit-log-session-filter` | [#69](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/69) | `ecdca09` |
 | 56: flaky release-check timing | not a bug (already fixed) | `fix/release-check-timing-steady` | – | `829670c` |
 | 51: CPU probe analytics find nothing | ready (not verified live) | `fix/do-cpu-probe-analytics` | [#70](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/70) | `5506eac` |
-| 68 (formerly 58): routing hints | spec running | `feat/tool-routing-hints` | – | – |
+| 68 (formerly 58): routing hints | spec awaiting approval | `feat/tool-routing-hints` | [#71](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/71) | `2f6998e` |
+| 49: Query blocks | spec running | `feat/query-blocks` | – | – |
 
 ---
 
@@ -335,3 +336,24 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - one summary clause is unpinned
 - **Owed:** rerun do-cpu-probe from Actions after merge and check the CPU column and the Repeats line.
 - **Logseq write-back:** applied (audit entries 341 and 342).
+
+---
+
+## Item 68 (formerly 58): each tool description's first line as a routing hint
+
+- **Status:** spec written, awaiting your approval. Nothing is built. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#71](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/71), spec `docs/superpowers/specs/2026-11-20-tool-routing-hints-first-line-design.md` (`2f6998e`).
+- **Design:**
+  - `connector/src/tools/first-lines.mjs` beside `spec.mjs` holds one routing sentence for each of the 57 tools. The spec includes draft lines for all of them.
+  - Generated tools use the line in place of the OpenAPI summary, and hand-written tools wrap their description with it.
+  - The manifest records each line, and a tools/list test fails for a missing or over-long line.
+  - The budget is 100 characters. That is an assumption, not a measured limit.
+  - Cost: about +4.1 KB per tools/list, with no D1 or AI cost.
+- **Your calls (spec section 11):**
+  - the budget
+  - whether claude.ai attached the server instructions to a tool result, and on which surface
+  - `search_graph` naming `semantic_search` when semantic search is off
+  - whether to drop the OpenAPI summary or keep it as the second paragraph
+  - the wording of the draft lines
+  - the file name
+- **To build:** rerun `lane-feature` with `args.spec`.
+- **Logseq write-back:** pr-url and a spec note (audit entries 358 and 359). Status was left as it is.
