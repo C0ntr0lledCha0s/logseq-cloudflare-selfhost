@@ -2,6 +2,34 @@
 
 This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The branches are stacked, each cut from the one before it, and every PR is a draft against main. Nothing was merged or deployed. At the owner's request (2026-11-19, evening), the issue tasks in Logseq are updated as each lane finishes: Status, phase, branch and pr-url, plus a dated Built note. The write-backs below were applied for items 67, 38, 43 and 33 (audit entries 293 and 294); later items say whether theirs was applied.
 
+## Morning summary (2026-11-20)
+
+The queue is finished. Nothing was merged or deployed.
+
+- **Fixes ready for review (12 draft PRs, CI green on each):** PRs 59 to 70 cover items 67, 38, 43, 33, 45, 36, 34, 53, 44, 35, 48 and 51. They form one stack, so merge them in order, starting with 59. Each PR's body lists its open minor should-fix findings and its proposed backlog items. Items 51's live analytics check and every PR's live verification are still to do after deploy.
+- **Calls for you on fix PRs:**
+  - PR 65 (item 34) refuses another block's value UUID rather than copying the value.
+  - PR 68 (item 35) refuses a `#` heading prefix in page titles.
+  - PR 69 (item 48) drops the session filter rather than hashing grants.
+- **Already fixed, nothing to build (close in Logseq):**
+  - 46: fixed by 2376d5a, on main.
+  - 39: the count was right; the summary line was probably misread.
+  - 37: code and math were fixed by 0037; quote escaping is by design.
+  - 47: fixed by 0045 in PR 63.
+  - 56: fixed by fa88b69, on main.
+  - Their learnings commits ride along in the next PR in the stack.
+- **Specs awaiting approval (4 draft PRs, nothing built):**
+  - PR 71: item 68, routing hints
+  - PR 72: item 49, Query blocks
+  - PR 73: item 50, change feed, schema export and health checks
+  - PR 74: item 52, client param
+  - Each lists its open questions in section 11. To build one, rerun `lane-feature` with `args.spec`.
+- **Patch numbers:** the fixes use 0041 to 0049. The specs plan 0050 (item 49), 0051 to 0053 (item 50) and 0054 (item 52), in that merge order.
+- **Incidents:**
+  - The container restarted once during item 44. Its lane resumed from its cache with nothing lost.
+  - Item 51's first run returned a self-contradicting "blocked" at intake, and a fresh rerun went through.
+  - `search_graph` returned HTTP 500 "dispatch error" twice around 02:50Z and then recovered.
+
 ## Summary
 
 | Item | Status | Branch | PR | HEAD |
@@ -26,7 +54,7 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 68 (formerly 58): routing hints | spec awaiting approval | `feat/tool-routing-hints` | [#71](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/71) | `2f6998e` |
 | 49: Query blocks | spec awaiting approval | `feat/query-blocks` | [#72](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/72) | `c7bb092` |
 | 50: change feed, schema export, health checks | spec awaiting approval | `feat/changes-schema-health` | [#73](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/73) | `f3d5413` |
-| 52: client param for open-tasks-by-client | spec running | `feat/open-tasks-client-param` | – | – |
+| 52: client param for open-tasks-by-client | spec awaiting approval | `feat/open-tasks-client-param` | [#74](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/74) | `30d61ff` |
 
 ---
 
@@ -399,3 +427,20 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - the patch numbers
   - the file name
 - **Logseq write-back:** pr-url and a spec note (audit entries 364 and 365).
+
+---
+
+## Item 52: a client param for open-tasks-by-client
+
+- **Status:** spec written, awaiting your approval. Nothing is built. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#74](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/74), spec `docs/superpowers/specs/2026-11-20-open-tasks-client-param-design.md` (`30d61ff`).
+- **Design:**
+  - An optional `client` param (title or UUID), resolved before anything runs. An unknown, ambiguous, private or recycled client is refused and never widened to all clients.
+  - With a client, the query walks from that client's referrers, so the same bounds hold where the full listing would refuse.
+  - It is patch 0054 if items 49 and 50 merge first.
+- **Your calls (spec section 11):**
+  - whether `forClient` is a node property (text clients are refused)
+  - shared page and tag titles are refused rather than preferring the page
+  - whether a task inherits its client from a parent block
+  - case-only matches
+  - the patch number
+- **Logseq write-back:** pr-url and a spec note (audit entries 366 and 367).
