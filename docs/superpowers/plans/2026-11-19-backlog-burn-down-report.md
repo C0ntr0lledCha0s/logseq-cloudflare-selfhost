@@ -21,7 +21,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 37: code block #word escaped | not a bug | `fix/code-block-text-verbatim` | – | `3f190ea` |
 | 47: set can write Root to a property's classes | not a bug (fixed by PR 63) | `fix/property-classes-write-refused` | – | `54d2a0c` |
 | 48: activity log session filter never matches | ready | `fix/audit-log-session-filter` | [#69](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/69) | `ecdca09` |
-| 56: flaky release-check timing | running | `fix/release-check-timing-steady` | – | – |
+| 56: flaky release-check timing | not a bug (already fixed) | `fix/release-check-timing-steady` | – | `829670c` |
+| 51: CPU probe analytics find nothing | running | `fix/do-cpu-probe-analytics` | – | – |
 
 ---
 
@@ -303,3 +304,12 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - the refusal over-claims that no entry could match
 - **Skill note:** don't pass `session`. Use `client`, `tool`, `status` and the date range.
 - **Logseq write-back:** applied (audit entries 333 and 334).
+
+---
+
+## Item 56: a flaky release-bundle timing check (F1, 100 ms)
+
+- **Status:** not a bug any more (confidence 0.9). Quick tier.
+- **Evidence:** the 103 ms median was seen at PR 52's stage 6 gate (f4ff06d). At that point the F1 shapes ran over the blocks until the width cap stopped them, at 88–145 ms. PR 52's own review round (fa88b69, s-2-1) added the 12-function-binding refusal, so the 422 now comes before anything runs. On the release bundle as last built, 20 rounds gave a median of 1–2 ms (max 3), and none came near 100 ms. Widening the bound would only loosen a check that already has about a 50× margin.
+- **Commits:** a learnings note (`829670c`). It has no PR of its own and rides along in item 51's PR.
+- **Your call:** close item 56. A "Checked" note was added (audit entry 337).
