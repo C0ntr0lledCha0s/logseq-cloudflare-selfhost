@@ -1,0 +1,979 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index f8b1672..9af4dab 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1213,6 +1213,19 @@
+                     :else
+                     "property value must resolve to an existing entity by UUID, ident, or title")})))))
+ 
++(defn- kept-tag?
++  "Whether the tag with db id `id` in `db` is one the server never removes from a block's tags: a
++  private tag (ldb/private-tags: Page, Tag, Journal, Property, Asset and the like), which the
++  outliner refuses to remove, or a display class, which only display-type writes (patch 0037)."
++  [db id]
++  (or (contains? ldb/private-tags (:db/ident (d/entity db id))) (display-class? db id)))
++
++(defn- held-property-values
++  "What block `block-id` holds for `property-ident`, read from datoms (a graph uploaded from the app
++  may store a many attribute as cardinality one): db ids for a ref property."
++  [db block-id property-ident]
++  (map :v (d/datoms db :eavt block-id property-ident)))
++
+ (defn- set-prepared-tags!
+   "Writes a resolved :block/tags `value` (one id or several) on `block-id`. A tag the block already
+   holds isn't set again, because the outliner refuses Tag even on a tag that holds it. Under reset a
+@@ -1225,7 +1238,7 @@
+   [conn block-id value reset-existing-values?]
+   (let [ids (if (coll? value) value [value])
+         held #(set (map :db/id (:block/tags (d/entity @conn block-id))))
+-        kept? #(or (contains? ldb/private-tags (:db/ident (d/entity @conn %))) (display-class? @conn %))]
++        kept? #(kept-tag? @conn %)]
+     (when (and reset-existing-values? (coll? value))
+       (doseq [id (remove (some-fn (set ids) kept?) (held))]
+         (outliner-property/delete-property-value! conn block-id :block/tags id)))
+@@ -1365,11 +1378,125 @@
+ 
+ (defn- remove-prepared-property!
+   "Removes `property-ident` from `block-id`; removing display-type also removes its class tag and
+-  lang (patch 0037)."
+-  [conn block-id property-ident]
+-  (if (= display-type-ident property-ident)
+-    (clear-display-type! conn block-id)
+-    (outliner-property/remove-block-property! conn block-id property-ident)))
++  lang (patch 0037). Removing Tags from a block that holds a tag the server keeps (kept-tag?: every
++  page holds Page, every journal Journal) removes only its other tags, one by one, since the
++  outliner refuses to remove a private tag and answered the whole delete with a server error. With
++  `value-id` (see prepare-value-delete), removes only that value."
++  ([conn block-id property-ident] (remove-prepared-property! conn block-id property-ident nil))
++  ([conn block-id property-ident value-id]
++   (cond
++     (some? value-id)
++     (outliner-property/delete-property-value! conn block-id property-ident value-id)
++     (= display-type-ident property-ident)
++     (clear-display-type! conn block-id)
++     (and (= :block/tags property-ident)
++          (some #(kept-tag? @conn %) (held-property-values @conn block-id :block/tags)))
++     (doseq [id (remove #(kept-tag? @conn %) (held-property-values @conn block-id :block/tags))]
++       (outliner-property/delete-property-value! conn block-id :block/tags id))
++     :else
++     (outliner-property/remove-block-property! conn block-id property-ident))))
++
++(defn- held-value-matches?
++  "Whether the value with db id `id` that a block holds for `property` is the one `value` names: by
++  UUID, ident or content (a page's title, a text, URL or number value's text, a journal's title),
++  compared with `same?` (exact, or ignoring case). A UUID names an entity, never text that reads as
++  one. A number property's value may be given as a number or as numeric text. A node value stored in
++  a value block of this property also answers to its target."
++  [db property value id same?]
++  (let [entity (d/entity db id)
++        target (when (= :node (:logseq.property/type property))
++                 (when-let [target-uuid (and (= (:db/id property) (:db/id (:logseq.property/created-from-property entity)))
++                                             (some-> (:block/title entity) parse-uuid))]
++                   (d/entity db [:block/uuid target-uuid])))
++        uuid? (and (string? value) (common-util/uuid-string? value))
++        text (or (number-text property value) (str value))]
++    (some (fn [e]
++            (or (and uuid? (= value (str (:block/uuid e))))
++                (and (string? value) (qualified-keyword? (keyword value)) (= (keyword value) (:db/ident e)))
++                (and (not uuid?) (same? text (choice-content e)))))
++          (remove nil? [entity target]))))
++
++(defn- internal-property?
++  "A built-in property that isn't public (ldb's :logseq.property/public?): Node references, which
++  follow the block's text, and the other properties Logseq keeps for itself."
++  [property]
++  (and (ldb/built-in? property) (not (db-property/public-built-in-property? property))))
++
++(defn- prepare-value-delete
++  "For a delete of one value of `property-ident` from `block`: {:value id}, the db id of the one value
++  the block holds that `value` names (held-value-matches?, by exact content first and then ignoring
++  case, as set resolves a title), or {:error reason}. Only the block's own values are searched, so a
++  page or text elsewhere with the same title is never picked. An internal property is refused, and
++  so is a Tags value the server keeps (kept-tag?), as the outliner refuses to remove a private tag."
++  [db block property-ident value]
++  (let [property (d/entity db property-ident)
++        label (or (:block/title property) (entity-ident property))
++        many-ref? (and (db-property/many? property) (= :db.type/ref (:db/valueType property)))
++        held (when (and many-ref? (or (string? value) (number? value)))
++               (held-property-values db (:db/id block) property-ident))
++        matching (fn [same?] (not-empty (vec (filter #(held-value-matches? db property value % same?) held))))
++        matches (or (matching =) (matching #(= (string/lower-case %1) (string/lower-case %2))))
++        tag (some->> (first matches) (d/entity db))]
++    (cond
++      (not many-ref?)
++      {:error (str label " doesn't hold several values; omit value to delete the whole property")}
++      (internal-property? property)
++      {:error (str label " is internal to Logseq and its values can't be removed one by one"
++                   (when (= :block/refs property-ident) "; edit the block's text to remove a link"))}
++      (not (or (string? value) (number? value)))
++      {:error "value must be one value: a UUID, ident, title or number"}
++      (empty? matches)
++      {:error (str "the block holds no " label " value " (pr-str (str value)))}
++      (next matches)
++      {:error (str (pr-str (str value)) " names " (count matches) " of the block's " label
++                   " values; name one by UUID")}
++      (and (= :block/tags property-ident) (display-class? db (:db/id tag)))
++      {:error (str (:block/title tag) ": remove it by deleting display-type, not as a tag")}
++      (and (= :block/tags property-ident) (kept-tag? db (:db/id tag)))
++      {:error (str (:block/title tag) " is a built-in tag Logseq sets itself and can't be removed")}
++      :else {:value (first matches)})))
++
++(defn- delete-body
++  "deleteBlockProperty's body, read from `request` as {:body b} (b nil when there is none) or
++  {:error reason}. The body takes value alone, so a misspelt or misplaced value, or malformed JSON,
++  is refused rather than read as no value, which would delete the whole property."
++  [request]
++  (p/let [text (.text request)]
++    (if (string/blank? text)
++      {:body nil}
++      (let [body (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                      (catch :default _ ::malformed))]
++        (cond
++          (= ::malformed body) {:error "body: not valid JSON"}
++          (not (map? body)) {:error "body: give an object with value, or no body"}
++          :else
++          (if-let [unknown (seq (remove #{:value} (keys body)))]
++            {:error (string/join "; " (map #(str (subs (str %) 1) ": not a field; the body takes value"
++                                                 (when (= :target-label %) " (target-label goes in the query)"))
++                                           unknown))}
++            {:body body}))))))
++
++(def ^:private batch-delete-entry-fields #{:block-id :property-id :value :target-label})
++
++(defn- batch-delete-fields-error
++  "Why batchDeleteBlockProperty's `body` has a field it doesn't take, naming the entry, or nil: a
++  misspelt or misplaced value must not be read as no value, which deletes the whole property."
++  [body]
++  (or (when-let [unknown (and (map? body) (seq (remove #{:entries} (keys body))))]
++        (string/join "; " (map #(str (subs (str %) 1) ": not a field; the body takes entries, and each entry its value") unknown)))
++      (when (sequential? (:entries body))
++        (some (fn [[index entry]]
++                (when-let [unknown (and (map? entry) (seq (remove batch-delete-entry-fields (keys entry))))]
++                  (str "entry " index ": "
++                       (string/join "; " (map #(str (subs (str %) 1) ": not a field; an entry takes block-id, property-id, value and target-label") unknown)))))
++              (map-indexed vector (:entries body))))))
++
++(defn- read-back-value-delete!
++  "Throws, answered as a 500, when block `block-id` in `db` still holds `value-id`, the value entry
++  `entry` (\"entry 0\") removed."
++  [db entry block-id property-ident value-id]
++  (when (and (some? value-id) (some #{value-id} (held-property-values db block-id property-ident)))
++    (unverified! [(str entry ": the value was not removed")])))
+ 
+ ;; Block tree nodes and batch insert entries may carry property values, as a JSON object keyed by
+ ;; property UUID, ident or title. They are resolved before anything is written.
+@@ -2940,6 +3067,17 @@
+   (map-indexed (fn [index [entry item]] {:entry index :id (:db/id (target item)) :label (:target-label entry)})
+                (map vector entries resolved)))
+ 
++(defn- naming-entry
++  "Calls `write`, turning an outliner notification (such as removing a tag from a built-in node)
++  into a refusal naming `entry` (\"entry 0\"), which rejecting answers as a 400."
++  [entry write]
++  (try (write)
++       (catch :default error
++         (let [data (ex-data error)]
++           (if (= :notification (:type data))
++             (reject! (str entry ": " (or (get-in data [:payload :message]) (ex-message error))))
++             (throw error))))))
++
+ (defn- handle-block-properties [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
+   (case handler
+ 
+@@ -2973,24 +3111,31 @@
+                                        (display-warnings writes false) (assoc :warnings (display-warnings writes false)))))))))
+ 
+     :semantic/blocks-delete-property
+-    (let [block (find-entity db (:block-id path-params))
+-          property-ident (resolve-property-ident db (:property-id path-params))]
++    (p/let [{:keys [body] :as read} (delete-body request)
++            block (find-entity db (:block-id path-params))
++            property-ident (resolve-property-ident db (:property-id path-params))
++            ;; An optional value removes only that value (patch 0042).
++            prepared (when (and block property-ident (contains? body :value))
++                       (prepare-value-delete db block property-ident (:value body)))]
+       (cond
+         (or (nil? block) (nil? property-ident))
+         (http/bad-request "invalid block or property")
++        (:error read) (http/bad-request (str "entry 0: " (:error read)))
+         (stamp-property-refusal property-ident)
+         (http/bad-request (str "entry 0: " (stamp-property-refusal property-ident)))
++        (:error prepared) (http/bad-request (str "entry 0: " (:error prepared)))
+         :else
+-        (answering-unverified
+-         #(refusing-labels
+-           (fn []
+-            (atomic-write! conn creator false :remove-block-property
+-                           (fn [tx-conn]
+-                             (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
+-                             (remove-prepared-property! tx-conn (:db/id block) property-ident)
+-                             (read-back-display! @tx-conn "entry 0" (:db/id block) property-ident nil)))
+-            (broadcast-change! self)
+-            (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?)))))))))
++        (rejecting
++         (fn []
++           (atomic-write! conn creator false :remove-block-property
++                          (fn [tx-conn]
++                            (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
++                            (naming-entry "entry 0"
++                                          #(remove-prepared-property! tx-conn (:db/id block) property-ident (:value prepared)))
++                            (read-back-value-delete! @tx-conn "entry 0" (:db/id block) property-ident (:value prepared))
++                            (read-back-display! @tx-conn "entry 0" (:db/id block) property-ident nil)))
++           (broadcast-change! self)
++           (http/json-response nil (with-context-or-unavailable {:deleted true} (fn [] (target-context @conn block e2ee?))))))))
+ 
+     :semantic/blocks-batch-set-property
+     (p/let [body (body-clj request)
+@@ -3057,23 +3202,30 @@
+     (p/let [body (body-clj request)
+             entries (:entries body)
+             resolved (when (sequential? entries)
+-                       (mapv (fn [{:keys [block-id property-id]}]
+-                               {:block (find-entity db block-id)
+-                                :property-ident (resolve-property-ident db property-id)}) entries))]
+-      (if-let [error (or (labels-error entries) (batch-entries-error entries resolved))]
++                       (mapv (fn [entry]
++                               (let [block (find-entity db (:block-id entry))
++                                     property-ident (resolve-property-ident db (:property-id entry))]
++                                 {:block block
++                                  :property-ident property-ident
++                                  ;; An optional value removes only that value (patch 0042).
++                                  :prepared (when (and block property-ident (contains? entry :value))
++                                              (prepare-value-delete db block property-ident (:value entry)))}))
++                             entries))]
++      (if-let [error (or (batch-delete-fields-error body) (labels-error entries) (batch-entries-error entries resolved))]
+         (http/bad-request error)
+-        (answering-unverified
+-         #(refusing-labels
+-           (fn []
+-             (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
+-               (fn [temp-conn]
+-                 (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
+-                 (doseq [[index {:keys [block property-ident]}] (map-indexed vector resolved)]
+-                   (remove-prepared-property! temp-conn (:db/id block) property-ident)
+-                   (read-back-display! @temp-conn (str "entry " index) (:db/id block) property-ident nil))))
+-             (broadcast-change! self)
+-             (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
+-                                       (fn [] (affected-context @conn (map :block resolved) e2ee?)))))))))))
++        (rejecting
++         (fn []
++           (authored-write! conn creator ldb/batch-transact-with-temp-conn! {:outliner-op :batch-remove-property}
++             (fn [temp-conn]
++               (check-labels! @temp-conn e2ee? (entry-label-checks entries resolved :block))
++               (doseq [[index {:keys [block property-ident prepared]}] (map-indexed vector resolved)
++                       :let [entry (str "entry " index)]]
++                 (naming-entry entry #(remove-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)))
++                 (read-back-value-delete! @temp-conn entry (:db/id block) property-ident (:value prepared))
++                 (read-back-display! @temp-conn entry (:db/id block) property-ident nil))))
++           (broadcast-change! self)
++           (http/json-response nil (with-context-or-unavailable {:deleted (count resolved)}
++                                     (fn [] (affected-context @conn (map :block resolved) e2ee?))))))))))
+ 
+ (declare find-tag resolve-tag-selector validate-tag-schema write-tag-schema! expected-tag-schema verify-tag-schema!
+          unverified!)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 7f8ba00..f551a38 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -174,9 +174,9 @@
+    "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+    "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+    "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept. " value-notes " " display-type-note)]
+-   "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Answers the block's page, breadcrumb and snippet (target)."]
++   "deleteBlockProperty" ["Delete a block property" "Removes one property from one block; repeating a whole-property delete changes nothing more. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class. With value in the body, removes only that value of a many-valued property (one tag, one node, text, URL, number or date value) and keeps the others; it answers 400, naming the entry and writing nothing, when the property doesn't hold several values, the block holds no such value (or more than one, when it is named by title), the value is a built-in tag or display class, or the property is internal to Logseq (such as Node references, block/refs, which follow the block's text). Once a value is gone, repeating its delete answers 400 the same way, so read the block before reporting that a repeated delete failed. The body takes value alone: any other field (a misspelt values, a target-label, which goes in the query) or malformed JSON is refused with 400, never read as a whole-property delete. Answers the block's page, breadcrumb and snippet (target)."]
+    "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) and its Code, Math or Quote tag are kept, so a page given [\"Food\"] stays a page. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link. " display-type-note " lang is judged on each block's type once every entry has applied, so lang may come before display-type for the same block; warnings name their entry. A display-type entry swaps the block's Code, Math or Quote tag, so a property limited to one of those tags judges the block by the type the batch leaves it with, in any entry order.")]
+-   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too."]
++   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class. An entry with value removes only that value of a many-valued property and keeps the others; once it is gone, repeating that entry answers 400. An entry takes block-id, property-id, value and target-label, and the body takes entries alone: any other field is refused with 400, never read as a whole-property delete. A failing entry refuses the whole batch with 400, naming the entry (entry 1: ...), and nothing is written."]
+    "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
+@@ -269,6 +269,10 @@
+ (def ^:private target-label-schema
+   {:type "string" :description target-label-description})
+ 
++(def ^:private delete-value-schema
++  {:type ["string" "number"]
++   :description "Optional. One value to remove, leaving the property's other values: a UUID, ident or title (a page's or tag's title, a text or URL value's text, a number, a journal's title; matched exactly, then ignoring case), looked up only among the values the block holds for the property. Only for a many-valued property; omit it to remove the whole property."})
++
+ (def ^:private label-checked-operations
+   #{"insertBlockChildren" "insertBlockTree" "updateBlock" "deleteBlock" "setBlockProperty"
+     "deleteBlockProperty" "moveBlocks"})
+@@ -440,12 +444,16 @@
+                                                                          :property-id {:type "string"}
+                                                                          :value {:$ref "#/components/schemas/PropertyValue"}
+                                                                          :target-label target-label-schema}}}}}
++    "deleteBlockProperty" {:properties {:value delete-value-schema} :additionalProperties false}
+     "batchDeleteBlockProperty" {:required ["entries"]
+                                 :properties {:entries {:type "array"
+                                                        :items {:type "object" :required ["block-id" "property-id"]
+                                                                :properties {:block-id {:type "string"}
+                                                                             :property-id {:type "string"}
+-                                                                            :target-label target-label-schema}}}}}
++                                                                            :value delete-value-schema
++                                                                            :target-label target-label-schema}
++                                                               :additionalProperties false}}}
++                                :additionalProperties false}
+     "captureToToday" {:required ["blocks"]
+                       :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+     "createTask" {:required ["title"]
+@@ -622,8 +630,9 @@
+                {:schema {:type "string" :format "binary"}}}}
+     (when-let [schema (request-schema operation-id)]
+       ;; promotePageToTag's body is optional: an empty one promotes the page as it is. So is
+-      ;; runNamedQuery's: an empty one runs the query with its defaults.
+-      {:required (not (contains? #{"promotePageToTag" "runNamedQuery"} operation-id))
++      ;; runNamedQuery's: an empty one runs the query with its defaults. deleteBlockProperty's: without
++      ;; one the whole property is removed.
++      {:required (not (contains? #{"promotePageToTag" "runNamedQuery" "deleteBlockProperty"} operation-id))
+        :content {"application/json" {:schema (assoc schema :type "object")}}})))
+ 
+ (defn- list-response [response-key schema description]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_delete_property_value_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_delete_property_value_test.cljs
+new file mode 100644
+index 0000000..89568f4
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_delete_property_value_test.cljs
+@@ -0,0 +1,631 @@
++(ns logseq.db-sync.semantic-delete-property-value-test
++  "Item 38, second pass: deleting a property, or one of its values.
++
++  A whole-property delete of Tags (deleteBlockProperty, batchDeleteBlockProperty) went straight to
++  the outliner's remove-block-property!, which throws a notification for any private tag the block
++  holds. Every page holds Page and every journal holds Journal, so the delete answered 500 with no
++  entry index. A Tags delete keeps the tags the server never removes (ldb/private-tags and the
++  display classes, the kept? rule of set-prepared-tags!): it removes only the user tags and answers
++  200, or refuses 400 naming the entry, and never 500.
++
++  No call removed one value of a many-valued property. Both delete routes take an optional value,
++  resolved as a set value is, and remove only that value. They refuse 400 naming the entry when the
++  property is not cardinality many, the block does not hold the value, the value does not resolve,
++  or (for Tags) the value is a private tag or a display class.
++
++  Pages, tags and properties are made through the API; the journal through outliner-page/create!,
++  as the app makes one; the whiteboard and asset are transacted as the app stores them."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- entity [conn id] (d/entity @conn [:block/uuid (uuid (str id))]))
++
++(defn- tag-titles [conn id]
++  (set (map :block/title (:block/tags (entity conn id)))))
++
++(defn- held-values
++  "The values block `id` holds for `ident`, as comparable data: a number value's number, a date's
++  journal uuid, otherwise the value's title."
++  [conn id ident]
++  (let [v (get (entity conn id) ident)]
++    (set (map (fn [e] (cond
++                        (some? (:logseq.property/value e)) (:logseq.property/value e)
++                        (:block/journal-day e) (str (:block/uuid e))
++                        :else (:block/title e)))
++              (if (or (set? v) (sequential? v)) v (when v [v]))))))
++
++(def ^:private tags-property (js/encodeURIComponent "block/tags"))
++
++(defn- path-ident
++  "A property ident as a path segment: its full name, encoded."
++  [ident]
++  (js/encodeURIComponent (subs (str ident) 1)))
++
++(defn- in-turn
++  "Calls `f` on each of `xs` in turn, each call after the last one settles; resolves to the results."
++  [xs f]
++  (reduce (fn [acc x] (p/let [acc acc r (f x)] (conj acc r))) (p/resolved []) xs))
++
++(defn- delete-property!
++  "deleteBlockProperty on block `id`: the whole property, or with `value`, that one value."
++  ([self id property]
++   (request! self "DELETE" (str "/semantic/blocks/" id "/properties/" property) nil))
++  ([self id property value]
++   (request! self "DELETE" (str "/semantic/blocks/" id "/properties/" property) {:value value})))
++
++(defn- batch-delete! [self entries]
++  (request! self "POST" "/semantic/block-properties/batch-delete" {:entries entries}))
++
++(defn- batch-set! [self entries]
++  (request! self "POST" "/semantic/block-properties/batch-set" {:entries entries}))
++
++(defn- raw-page [id title & {:as more}]
++  (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++         more))
++
++(def ^:private many-types
++  "Every property type that can be cardinality many, but asset, with the property's title."
++  [["Related" "node"] ["Owners" "default"] ["Sites" "url"] ["Scores" "number"] ["Days" "date"]])
++
++(defn- seed-graph
++  "Tags Project and CourseInstance; a page Course A, a journal, a whiteboard and an asset, each
++  tagged Project and CourseInstance; a plain block and a code block on Course A, tagged the same;
++  pages Alpha and Beta, and a decoy page Gamma; a cardinality-many property of each type in
++  many-types holding two values on the plain block (and Related on Course A too); a
++  cardinality-one node property Lead holding Alpha; and a property page rating."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          project (request! self "POST" "/semantic/tags" {:title "Project"})
++          course (request! self "POST" "/semantic/tags" {:title "CourseInstance"})
++          page-r (request! self "POST" "/semantic/pages" {:title "Course A"})
++          page (get-in page-r [:body :uuid])
++          [_ journal] (outliner-page/create! conn "Nov 6th, 2026" {:journal? true})
++          [_ journal-2] (outliner-page/create! conn "Nov 7th, 2026" {:journal? true})
++          [board asset] (repeatedly 2 random-uuid)
++          _ (d/transact! conn [(raw-page board "Board" :block/tags #{:logseq.class/Whiteboard})])
++          _ (d/transact! conn [{:block/uuid asset :block/title "photo" :block/order "a9"
++                                :block/page [:block/uuid (uuid page)] :block/parent [:block/uuid (uuid page)]
++                                :block/tags #{:logseq.class/Asset} :logseq.property.asset/type "png"
++                                :logseq.property.asset/checksum "abc" :logseq.property.asset/size 1
++                                :block/created-at 1 :block/updated-at 1}])
++          [block code-block] [(str (random-uuid)) (str (random-uuid))]
++          tree (request! self "POST" "/semantic/block-trees"
++                         {:target-id page :blocks [{:uuid block :title "Plain block"}
++                                                   {:uuid code-block :title "(+ 1 2)"}]})
++          code (request! self "PUT" (str "/semantic/blocks/" code-block "/properties/"
++                                         (js/encodeURIComponent "logseq.property.node/display-type"))
++                         {:value "code"})
++          tagged (p/all (for [id [page (str journal) (str board) (str asset) block code-block]]
++                          (batch-set! self [{:block-id id :property-id "Tags" :value ["Project"]}
++                                            {:block-id id :property-id "Tags" :value ["CourseInstance"]}])))
++          pages (p/all (for [t ["Alpha" "Beta" "Gamma"]] (request! self "POST" "/semantic/pages" {:title t})))
++          properties (p/all (for [[t type] many-types]
++                              (request! self "POST" "/semantic/properties"
++                                        {:title t :type type :cardinality "db.cardinality/many"})))
++          lead (request! self "POST" "/semantic/properties" {:title "Lead" :type "node"})
++          rating (request! self "POST" "/semantic/properties" {:title "rating" :type "default"})
++          values {"Related" ["Alpha" "Beta"] "Owners" ["Ann" "Bob"] "Sites" ["https://a.example.com" "https://b.example.com"]
++                  "Scores" [3 5] "Days" [(str journal) (str journal-2)]}
++          set-values (p/all (for [[t] many-types]
++                              (batch-set! self [{:block-id block :property-id t :value (get values t)}])))
++          set-page (batch-set! self [{:block-id page :property-id "Related" :value ["Alpha" "Beta"]}
++                                     {:block-id block :property-id "Lead" :value "Alpha"}])
++          setup (concat [project course page-r tree code lead rating set-page] tagged pages properties set-values)]
++    (is (every? #(<= 200 (:status %) 201) setup) (pr-str (remove #(<= 200 (:status %) 201) setup)))
++    {:conn conn :self self :page page :journal (str journal) :journal-2 (str journal-2)
++     :board (str board) :asset (str asset) :block block :code-block code-block
++     :project (get-in project [:body :uuid])
++     :alpha (get-in (first pages) [:body :uuid])
++     :rating (get-in rating [:body :uuid])
++     :idents (into {} (map (fn [[t] r] [t (keyword (get-in r [:body :ident]))]) many-types properties))
++     :lead (keyword (get-in lead [:body :ident]))}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(defn- removed-user-tags
++  "A whole-property Tags delete on `id` answered 200 and left only the `kept` tags: the user tags go,
++  and the built-in ones stay. A 400 here would be a regression: the owner could no longer clear a
++  page's user tags with a whole-property delete."
++  [conn response id kept label]
++  (testing label
++    (is (= 200 (:status response)) (str label ": " (pr-str response)))
++    (is (= kept (tag-titles conn id)) (str label ": only the user tags go"))))
++
++;; ---------------------------------------------------------------------------------------------
++;; A whole-property Tags delete
++
++(deftest delete-tags-keeps-private-tags-test
++  ;; Every kind of entity that holds a private tag the outliner refuses to remove: a page (Page), a
++  ;; journal (Journal), a whiteboard (Whiteboard), an asset (Asset), a tag (Tag) and a property
++  ;; page (Property), each through the single delete with the property as Tags and as block/tags.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page journal board asset project rating]}]
++        (p/let [cases [[page #{"Page"} "Tags" "a page"]
++                       [journal #{"Journal"} tags-property "a journal"]
++                       [board #{"Whiteboard"} "Tags" "a whiteboard"]
++                       [asset #{"Asset"} tags-property "an asset"]
++                       [project #{"Tag"} "Tags" "a tag"]
++                       [rating #{"Property"} tags-property "a property page"]]
++                results (in-turn cases
++                                 (fn [[id kept property label]]
++                                   (p/let [response (delete-property! self id property)]
++                                     [response id kept label])))]
++          (doseq [[response id kept label] results]
++            (removed-user-tags conn response id kept label)))))))
++
++(deftest delete-tags-keeps-display-class-test
++  ;; A code block holds Code-block, a display class the server keeps as set-prepared-tags! does: a
++  ;; Tags delete leaves it with its display type, and removes only Project and CourseInstance.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self code-block]}]
++        (p/let [response (delete-property! self code-block "Tags")]
++          (removed-user-tags conn response code-block #{"Code"} "a code block")
++          (is (= :code (:logseq.property.node/display-type (entity conn code-block)))
++              "the block is still a code block"))))))
++
++(deftest batch-delete-tags-names-the-entry-test
++  ;; A batch whose second entry deletes a journal's Tags answers 200, keeping Journal, and the first
++  ;; entry applies too. Never a 500 without an entry.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block journal idents]}]
++        (p/let [response (batch-delete! self [{:block-id block :property-id "Related"}
++                                              {:block-id journal :property-id "Tags"}])]
++          (removed-user-tags conn response journal #{"Journal"} "batch, a journal at entry 1")
++          (is (= #{} (held-values conn block (idents "Related"))) "entry 0 applied"))))))
++
++(deftest delete-tags-on-a-plain-block-removes-every-tag-test
++  ;; Guard: a plain block holds no private tag, so a Tags delete removes every tag (as on HEAD).
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block]}]
++        (p/let [response (delete-property! self block tags-property)]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{} (tag-titles conn block))))))))
++
++(deftest tags-reset-to-one-user-tag-keeps-page-test
++  ;; Guard (acceptance 2, already true since patch 0027): a page that holds a user tag, set up
++  ;; through the API, reset to a single user tag keeps Page.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page]}]
++        (p/let [response (request! self "POST" "/semantic/block-properties/batch-set"
++                                   {:isResetExistingValues true
++                                    :entries [{:block-id page :property-id "Tags" :value ["CourseInstance"]}]})]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{"Page" "CourseInstance"} (tag-titles conn page))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Deleting one value
++
++(deftest delete-one-tag-leaves-the-others-test
++  ;; Removing Project from a page tagged Project and CourseInstance leaves it tagged CourseInstance
++  ;; (and Page), through the single delete by title and the batch by UUID; and likewise on a journal.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page journal project]}]
++        (p/let [single (delete-property! self page "Tags" "Project")
++                batch (batch-delete! self [{:block-id journal :property-id "block/tags" :value project}])
++                read (request! self "GET" (str "/semantic/blocks/" page) nil)]
++          (is (= 200 (:status single)) (pr-str single))
++          (is (= #{"Page" "CourseInstance"} (tag-titles conn page)) "the page keeps CourseInstance and Page")
++          (is (= 200 (:status batch)) (pr-str batch))
++          (is (= #{"Journal" "CourseInstance"} (tag-titles conn journal)) "the journal keeps CourseInstance and Journal")
++          (is (not (string/includes? (pr-str (:body read)) "\"Project\"")) (str "getBlock no longer shows Project: " (pr-str (:body read))))
++          (is (string/includes? (pr-str (:body read)) "CourseInstance") (str "getBlock shows CourseInstance: " (pr-str (:body read)))))))))
++
++(deftest delete-one-value-of-each-many-type-test
++  ;; For every cardinality-many type, removing one of the block's two values leaves the other.
++  ;; A node value is named by title in the single delete and by UUID in the batch.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block page journal journal-2 alpha idents]}]
++        (p/let [cases [["Related" "Alpha" #{"Beta"}]
++                       ["Owners" "Ann" #{"Bob"}]
++                       ["Sites" "https://a.example.com" #{"https://b.example.com"}]
++                       ["Scores" 3 #{5}]
++                       ["Days" journal #{journal-2}]]
++                singles (in-turn cases (fn [[t value]] (delete-property! self block (path-ident (idents t)) value)))
++                by-uuid (batch-delete! self [{:block-id page :property-id "Related" :value alpha}])]
++          (doseq [[[t value left] response] (map vector cases singles)]
++            (testing (str t " (" value ")")
++              (is (= 200 (:status response)) (pr-str response))
++              (is (= left (held-values conn block (idents t))) "the other value stays")))
++          (is (= 200 (:status by-uuid)) (pr-str by-uuid))
++          (is (= #{"Beta"} (held-values conn page (idents "Related"))) "by UUID in a batch, Beta stays"))))))
++
++(deftest delete-value-refusals-name-the-entry-test
++  ;; Each refusal answers 400 naming the entry, and writes nothing: a cardinality-one property, a
++  ;; value the block doesn't hold (a real page, Gamma), a value that resolves to nothing, and for Tags
++  ;; a private tag (Page) or a display class (Code-block) as the value.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block page code-block lead idents]}]
++        (p/let [cases [[block (path-ident lead) "Alpha" "a cardinality-one property" "doesn't hold several values"]
++                       [block "Related" "Gamma" "a value the block does not hold" "holds no Related value \"Gamma\""]
++                       [block "Related" "Nowhere" "a value that does not resolve" "holds no Related value \"Nowhere\""]
++                       [block "Scores" 4 "a number the block does not hold" "holds no Scores value \"4\""]
++                       [page "Tags" "Page" "a private tag" "Page is a built-in tag Logseq sets itself"]
++                       [code-block tags-property "Code" "a display class" "Code: remove it by deleting display-type"]]
++                results (in-turn cases
++                                 (fn [[id property value label reason]]
++                                   (p/let [before (snapshot conn)
++                                           r (delete-property! self id property value)]
++                                     [r before (snapshot conn) label reason])))]
++          (doseq [[response before after label reason] results]
++            (testing label
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/starts-with? (str (get-in response [:body :error])) "entry 0:") (pr-str response))
++              (is (string/includes? (str (get-in response [:body :error])) reason) (pr-str response))
++              (is (= before after) "nothing is written")))
++          (is (= #{"Alpha" "Beta"} (held-values conn block (idents "Related"))))
++          (is (= #{"Alpha"} (held-values conn block lead))))))))
++
++(deftest batch-delete-value-refusal-names-its-index-test
++  ;; A batch whose second entry names a value the block doesn't hold is refused whole, naming entry 1,
++  ;; and the first entry's value is not removed.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block page idents]}]
++        (p/let [before (snapshot conn)
++                response (batch-delete! self [{:block-id block :property-id "Related" :value "Alpha"}
++                                              {:block-id page :property-id "Tags" :value "Gamma"}])]
++          (is (= 400 (:status response)) (pr-str response))
++          (is (string/starts-with? (str (get-in response [:body :error])) "entry 1:") (pr-str response))
++          (is (= before (snapshot conn)) "nothing is written")
++          (is (= #{"Alpha" "Beta"} (held-values conn block (idents "Related")))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Guards on the new rules (each found by removing the rule and seeing a test fail)
++
++(deftest delete-tags-on-a-page-without-user-tags-is-a-no-op-test
++  ;; A page holding only Page: a Tags delete answers 200 and the page keeps Page.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [created (request! self "POST" "/semantic/pages" {:title "Bare"})
++                id (get-in created [:body :uuid])
++                response (delete-property! self id "Tags")]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{"Page"} (tag-titles conn id))))))))
++
++(deftest delete-value-reads-back-through-page-reads-test
++  ;; Removing Project from a page shows in getPage, getPageOutline and listPageBlocks' page, as it
++  ;; does in getBlock; removing Alpha from the page's Related shows too.
++  (async done
++    (with-graph done
++      (fn [{:keys [self page]}]
++        (p/let [_ (delete-property! self page "Tags" "Project")
++                _ (delete-property! self page "Related" "Alpha")
++                reads (p/all (for [path [(str "/semantic/pages/" page) (str "/semantic/pages/" page "/outline")
++                                         (str "/semantic/blocks/" page)]]
++                               (request! self "GET" path nil)))]
++          (doseq [read reads
++                  ;; The page's own tags and properties, not its blocks' (the outline lists those too).
++                  :let [own (pr-str (select-keys (:body read) [:tags :properties]))]]
++            (is (= 200 (:status read)) (pr-str read))
++            (is (not (string/includes? own "Project")) own)
++            (is (string/includes? own "CourseInstance") own)
++            (is (not (string/includes? own "Alpha")) own)
++            (is (string/includes? own "Beta") own)))))))
++
++(deftest delete-value-by-each-form-test
++  ;; A tag named by its ident (Project), a number named as numeric text ("5.0"), and a URL held by two blocks:
++  ;; removing it from one keeps the other's.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block page project idents]}]
++        (p/let [ident (subs (str (:db/ident (entity conn project))) 1)
++                by-ident (delete-property! self block tags-property ident)
++                by-text (delete-property! self block (path-ident (idents "Scores")) "5.0")
++                shared (batch-set! self [{:block-id page :property-id "Sites" :value ["https://a.example.com"]}])
++                url (delete-property! self block "Sites" "https://a.example.com")]
++          (is (= 200 (:status by-ident)) (pr-str by-ident))
++          (is (= #{"CourseInstance"} (tag-titles conn block)))
++          (is (= 200 (:status by-text)) (pr-str by-text))
++          (is (= #{3} (held-values conn block (idents "Scores"))))
++          (is (= 200 (:status shared)) (pr-str shared))
++          (is (= 200 (:status url)) (pr-str url))
++          (is (= #{"https://b.example.com"} (held-values conn block (idents "Sites"))))
++          (is (= #{"https://a.example.com"} (held-values conn page (idents "Sites"))) "the other holder keeps its URL"))))))
++
++(deftest delete-one-choice-and-last-value-test
++  ;; A many-valued property with choices: removing one choice keeps the other; removing the last
++  ;; value of a property removes the property.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block idents]}]
++        (p/let [created (request! self "POST" "/semantic/properties"
++                                  {:title "Colours" :type "default" :cardinality "db.cardinality/many"
++                                   :choices [{:title "Red"} {:title "Green"}]})
++                ident (keyword (get-in created [:body :ident]))
++                set-r (batch-set! self [{:block-id block :property-id "Colours" :value ["Red" "Green"]}])
++                one (delete-property! self block "Colours" "Red")
++                _ (delete-property! self block "Related" "Alpha")
++                last-one (delete-property! self block "Related" "Beta")]
++          (is (= 200 (:status set-r)) (pr-str set-r))
++          (is (= 200 (:status one)) (pr-str one))
++          (is (= #{"Green"} (held-values conn block ident)))
++          (is (= 200 (:status last-one)) (pr-str last-one))
++          (is (= #{} (held-values conn block (idents "Related")))))))))
++
++(deftest delete-value-of-a-node-value-block-test
++  ;; A node value stored in a value block whose title is its target's UUID answers to the target's
++  ;; title and UUID.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page alpha idents]}]
++        (let [related (d/entity @conn (idents "Related"))
++              value-block (random-uuid)
++              page-id (:db/id (entity conn page))]
++          (d/transact! conn [{:block/uuid value-block :block/title alpha :block/order "a8"
++                              :block/page page-id :block/parent page-id
++                              :logseq.property/created-from-property (:db/id related)
++                              :block/created-at 1 :block/updated-at 1}])
++          (d/transact! conn [[:db/retract page-id (idents "Related") (:db/id (entity conn alpha))]
++                             [:db/add page-id (idents "Related") [:block/uuid value-block]]])
++          (p/let [response (delete-property! self page "Related" "Alpha")]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (not (contains? (set (map :db/id (get (entity conn page) (idents "Related"))))
++                                (:db/id (entity conn value-block))))
++                "the value block is no longer held")
++            (is (= #{"Beta"} (held-values conn page (idents "Related"))))))))))
++
++(deftest delete-value-malformed-and-ambiguous-test
++  ;; null, a list and an object as value are refused naming the entry; so is a title two held values
++  ;; share. Nothing is written.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block idents]}]
++        (p/let [dup (batch-set! self [{:block-id block :property-id "Owners" :value ["Cy" "Cy"]}])
++                cases [[nil "null" "value must be one value"] [["Ann"] "a list" "value must be one value"]
++                       [{:title "Ann"} "an object" "value must be one value"]
++                       ["Cy" "two held values" "\"Cy\" names 2 of the block's Owners values; name one by UUID"]]
++                results (in-turn cases
++                                 (fn [[value label reason]]
++                                   (p/let [before (snapshot conn)
++                                           r (delete-property! self block "Owners" value)]
++                                     [r before (snapshot conn) label reason])))
++                batch (batch-delete! self [{:block-id block :property-id "Owners" :value "Ann"}
++                                           {:block-id block :property-id "Owners" :value nil}])]
++          (is (= 200 (:status dup)) (pr-str dup))
++          (doseq [[response before after label reason] results]
++            (testing label
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/starts-with? (str (get-in response [:body :error])) "entry 0:") (pr-str response))
++              (is (string/includes? (str (get-in response [:body :error])) reason) (pr-str response))
++              (is (= before after))))
++          (is (= 400 (:status batch)) (pr-str batch))
++          (is (string/starts-with? (str (get-in batch [:body :error])) "entry 1:") (pr-str batch))
++          (is (contains? (held-values conn block (idents "Owners")) "Ann")))))))
++
++(deftest outliner-refusal-names-the-entry-test
++  ;; A built-in tag (Task) that also holds a user tag: the outliner refuses to remove any tag from a
++  ;; built-in node. The single delete and a batch answer 400 naming the entry, not 500.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block project]}]
++        (let [task (d/entity @conn :logseq.class/Task)
++              project (entity conn project)]
++          (d/transact! conn [[:db/add (:db/id task) :block/tags (:db/id project)]])
++          (p/let [before (snapshot conn)
++                  single (delete-property! self (:block/uuid task) "Tags")
++                  value (delete-property! self (:block/uuid task) "Tags" "Project")
++                  batch (batch-delete! self [{:block-id block :property-id "Related"}
++                                             {:block-id (str (:block/uuid task)) :property-id "Tags"}])]
++            (doseq [[response entry] [[single "entry 0:"] [value "entry 0:"] [batch "entry 1:"]]]
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/starts-with? (str (get-in response [:body :error])) entry) (pr-str response)))
++            (is (= before (snapshot conn)) "nothing is written")))))))
++
++(deftest delete-value-that-the-outliner-skips-is-not-a-silent-success-test
++  ;; A property set on its own entity: the outliner's delete-property-value! skips a block that is
++  ;; the property, so the value stays. The call must not answer 200 as if it had removed it.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self idents]}]
++        (let [related (d/entity @conn (idents "Related"))]
++          (p/let [set-r (batch-set! self [{:block-id (str (:block/uuid related)) :property-id "Related" :value ["Alpha" "Beta"]}])
++                  held (held-values conn (:block/uuid related) (idents "Related"))
++                  response (delete-property! self (:block/uuid related) "Related" "Alpha")]
++            (is (= 200 (:status set-r)) (pr-str set-r))
++            (is (= #{"Alpha" "Beta"} held))
++            (is (not= 200 (:status response)) (pr-str response))
++            (is (string/includes? (str (pr-str (:body response))) "entry 0: the value was not removed") (pr-str response))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Review round 1
++
++(deftest delete-value-skips-held-blocks-titled-with-the-targets-uuid-test
++  ;; Only a value block of this property answers to the target its title names. A plain block whose
++  ;; text is Alpha's UUID, and a value block of another property (Lead) titled the same, held for
++  ;; Related beside Alpha, are not Alpha: deleting Alpha removes only Alpha. With only those blocks
++  ;; held, the delete is refused and writes nothing.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page block alpha idents lead]}]
++        (let [related (idents "Related")
++              page-id (:db/id (entity conn page))
++              block-id (:db/id (entity conn block))
++              [plain other] (repeatedly 2 random-uuid)
++              decoy (fn [id order more]
++                      (merge {:block/uuid id :block/title alpha :block/order order
++                              :block/page page-id :block/parent page-id
++                              :block/created-at 1 :block/updated-at 1}
++                             more))]
++          (d/transact! conn [(decoy plain "a7" {})
++                             (decoy other "a6" {:logseq.property/created-from-property (:db/id (d/entity @conn lead))})])
++          (d/transact! conn [[:db/add page-id related [:block/uuid plain]]
++                             [:db/add page-id related [:block/uuid other]]
++                             [:db/retract block-id related (:db/id (entity conn alpha))]
++                             [:db/add block-id related [:block/uuid plain]]
++                             [:db/add block-id related [:block/uuid other]]])
++          (p/let [response (delete-property! self page "Related" "Alpha")
++                  before (snapshot conn)
++                  by-title (delete-property! self block "Related" "Alpha")
++                  by-uuid (delete-property! self block "Related" alpha)
++                  after (snapshot conn)]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= #{"Beta" alpha} (held-values conn page related)) "only Alpha goes; both decoys stay")
++            (is (= 2 (count (filter #(= alpha (:block/title %)) (get (entity conn page) related)))))
++            (doseq [r [by-title by-uuid]]
++              (is (= 400 (:status r)) (pr-str r))
++              (is (string/starts-with? (str (get-in r [:body :error])) "entry 0: the block holds no Related value") (pr-str r)))
++            (is (= before after) "nothing is written")))))))
++
++(defn- raw-request!
++  "A request whose body is sent as `text`, unparsed (malformed JSON)."
++  [self method path text]
++  (p/let [response (sync-handler/handle-http
++                    self
++                    (js/Request. (str "http://localhost" path "?graph-id=graph-1")
++                                 #js {:method method :headers #js {"content-type" "application/json"} :body text}))
++          body (.text response)]
++    {:status (.-status response)
++     :body (try (js->clj (js/JSON.parse body) :keywordize-keys true) (catch :default _ body))}))
++
++(deftest delete-refuses-a-misplaced-or-misspelt-value-test
++  ;; A value delete whose value is misspelt (values), sits beside an unknown field, is in a body that
++  ;; isn't an object, or is in malformed JSON must not fall back to deleting the whole property: the
++  ;; call is refused naming the entry and the field, and nothing is written. The same for a batch
++  ;; entry, and for value at the top of a batch body. A body-less delete still removes the property.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page block]}]
++        (p/let [path (str "/semantic/blocks/" page "/properties/Tags")
++                singles [[{:values "Project"} "entry 0: values: not a field"]
++                         [{:value "Project" :extra true} "entry 0: extra: not a field"]
++                         [{:target-label "Course A"} "entry 0: target-label: not a field"]
++                         ["Project" "entry 0: body: give an object"]
++                         [["Project"] "entry 0: body: give an object"]]
++                results (in-turn singles
++                                 (fn [[body reason]]
++                                   (p/let [before (snapshot conn)
++                                           r (request! self "DELETE" path body)]
++                                     [r before (snapshot conn) reason])))
++                before (snapshot conn)
++                malformed (raw-request! self "DELETE" (str "/semantic/blocks/" page "/properties/Tags") "{value: Project")
++                entry (batch-delete! self [{:block-id block :property-id "Related"}
++                                           {:block-id page :property-id "Tags" :values "Project"}])
++                top (request! self "POST" "/semantic/block-properties/batch-delete"
++                              {:entries [{:block-id page :property-id "Tags"}] :value "Project"})
++                after (snapshot conn)]
++          (doseq [[response before after reason] (conj results [malformed before before "entry 0: body: not valid JSON"]
++                                                       [entry before before "entry 1: values: not a field"]
++                                                       [top before before "value: not a field"])]
++            (testing reason
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/starts-with? (str (get-in response [:body :error])) reason) (pr-str response))
++              (is (= before after) "nothing is written")))
++          (is (= before after) "nothing is written")
++          (is (= #{"Page" "Project" "CourseInstance"} (tag-titles conn page))))))))
++
++(deftest delete-value-refuses-internal-properties-test
++  ;; Node references (block/refs) follow the block's text, and the other internal (non-public)
++  ;; built-in properties aren't the owner's to edit: a value delete is refused naming the entry, and
++  ;; the text still matches the refs. A public built-in many property (Alias) still takes one.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page alpha]}]
++        (p/let [linked (str (random-uuid))
++                tree (request! self "POST" "/semantic/block-trees"
++                               {:target-id page :blocks [{:uuid linked :title "see [[Alpha]] and [[Beta]]"}]})
++                refs-before (set (map :block/title (:block/refs (entity conn linked))))
++                page-id (:db/id (entity conn page))
++                _ (d/transact! conn [[:db/add page-id :logseq.property.linked-references/excludes (:db/id (entity conn alpha))]])
++                alias (batch-set! self [{:block-id page :property-id "Alias" :value ["Alpha" "Beta"]}])
++                before (snapshot conn)
++                refs (delete-property! self linked (path-ident :block/refs) "Alpha")
++                batch (batch-delete! self [{:block-id page :property-id "logseq.property.linked-references/excludes" :value "Alpha"}])
++                after (snapshot conn)
++                one-alias (delete-property! self page "Alias" "Alpha")]
++          (is (= 201 (:status tree)) (pr-str tree))
++          (is (contains? refs-before "Alpha"))
++          (doseq [[r reason] [[refs "entry 0: Node references is internal to Logseq"]
++                              [batch "entry 0: "]]]
++            (is (= 400 (:status r)) (pr-str r))
++            (is (string/starts-with? (str (get-in r [:body :error])) reason) (pr-str r))
++            (is (string/includes? (str (get-in r [:body :error])) "is internal to Logseq") (pr-str r)))
++          (is (string/includes? (str (get-in refs [:body :error])) "edit the block's text to remove a link") (pr-str refs))
++          (is (= before after) "nothing is written")
++          (is (= refs-before (set (map :block/title (:block/refs (entity conn linked))))))
++          (is (= 200 (:status alias)) (pr-str alias))
++          (is (= 200 (:status one-alias)) (pr-str one-alias))
++          (is (= #{"Beta"} (set (map :block/title (:block/alias (entity conn page)))))))))))
++
++(deftest delete-value-matches-a-title-ignoring-case-test
++  ;; Set matches a title ignoring case, so a value delete does too, after an exact match: a choice
++  ;; set as "red", a page named "alpha", a text value. Two held values that differ only by case are
++  ;; told apart by an exact title, and a title matching both only ignoring case is refused.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self block idents]}]
++        (p/let [created (request! self "POST" "/semantic/properties"
++                                  {:title "Colours" :type "default" :cardinality "db.cardinality/many"
++                                   :choices [{:title "Red"} {:title "Green"}]})
++                colours (keyword (get-in created [:body :ident]))
++                set-r (batch-set! self [{:block-id block :property-id "Colours" :value ["red" "green"]}
++                                        {:block-id block :property-id "Owners" :value ["ann"]}])
++                red (delete-property! self block "Colours" "red")
++                alpha (delete-property! self block "Related" "alpha")
++                before (snapshot conn)
++                both (delete-property! self block "Owners" "ANN")
++                after (snapshot conn)
++                exact (delete-property! self block "Owners" "ann")]
++          (is (= 200 (:status set-r)) (pr-str set-r))
++          (is (= 200 (:status red)) (pr-str red))
++          (is (= #{"Green"} (held-values conn block colours)))
++          (is (= 200 (:status alpha)) (pr-str alpha))
++          (is (= #{"Beta"} (held-values conn block (idents "Related"))))
++          (is (= 400 (:status both)) (pr-str both))
++          (is (string/includes? (str (get-in both [:body :error])) "\"ANN\" names 2 of the block's Owners values") (pr-str both))
++          (is (= before after) "nothing is written")
++          (is (= 200 (:status exact)) (pr-str exact))
++          (is (= #{"Ann" "Bob"} (held-values conn block (idents "Owners")))))))))
++
++(deftest repeated-value-delete-answers-400-and-writes-nothing-test
++  ;; A value delete is not repeated silently: once the value is gone, the same call answers 400
++  ;; naming the entry (the tool text says so), and writes nothing.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self page]}]
++        (p/let [first-r (delete-property! self page "Tags" "Project")
++                before (snapshot conn)
++                again (delete-property! self page "Tags" "Project")]
++          (is (= 200 (:status first-r)) (pr-str first-r))
++          (is (= 400 (:status again)) (pr-str again))
++          (is (= "entry 0: the block holds no Tags value \"Project\"" (get-in again [:body :error])) (pr-str again))
++          (is (= before (snapshot conn))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index c4603e9..d9e4b77 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -32,6 +32,7 @@
+             [logseq.db-sync.semantic-display-type-test]
+             [logseq.db-sync.semantic-favorites-test]
+             [logseq.db-sync.semantic-datalog-query-test]
++            [logseq.db-sync.semantic-delete-property-value-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

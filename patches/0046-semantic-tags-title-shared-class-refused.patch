@@ -1,0 +1,313 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 7d78f60..ff85ac5 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -824,10 +824,19 @@
+       (every? own-value? ranked) (take 1 (sort-by :db/id ranked))
+       :else ranked)))
+ 
++(defn- shared-title-error
++  "The refusal for a title that several `entities` share, naming their UUIDs oldest first."
++  [value entities noun]
++  {::error (str (pr-str value) " matches " (count entities) " " noun " ("
++                (string/join ", " (map (comp str :block/uuid) (sort-by :db/id entities)))
++                "); give the one you mean by UUID")})
++
+ (defn- resolve-ref-entity
+   "The db id of the entity `value` names for a ref property, nil when none, or {::error reason}
+-  when a title names more than one. A JSON number is a title (a page or tag titled 2026), never a
+-  db id: db ids aren't stable or visible over the API, so an existing entity is named by UUID."
++  when a title names more than one. A Tags title names a class that isn't hidden or recycled, and
++  one several such classes share is refused. A JSON number is a title (a page or tag titled 2026),
++  never a db id: db ids aren't stable or visible over the API, so an existing entity is named by
++  UUID."
+   [db property-ident value]
+   (let [value (cond
+                 (number? value) (str value)
+@@ -840,19 +849,19 @@
+                  (d/entity db [:block/uuid (uuid value)])
+                  (and (string? value) (= property-ident :block/tags))
+                  (or (d/entity db (keyword value))
+-                     (some->> (d/datoms db :avet :block/title value)
+-                              (map #(d/entity db (:e %)))
+-                              (filter entity-util/class?)
+-                              first))
++                     (let [classes (->> (d/datoms db :avet :block/title value)
++                                        (map #(d/entity db (:e %)))
++                                        (filter entity-util/class?)
++                                        (remove entity-util/hidden?))]
++                       (if (next classes)
++                         (shared-title-error value classes "classes")
++                         (first classes))))
+                  (string? value)
+                  (or (d/entity db (keyword value))
+                      (let [candidates (title-candidates db (d/entity db property-ident) value)]
+                        (cond
+                          (::error candidates) candidates
+-                         (next candidates)
+-                         {::error (str (pr-str value) " matches " (count candidates) " entities ("
+-                                       (string/join ", " (map (comp str :block/uuid) (sort-by :db/id candidates)))
+-                                       "); give the one you mean by UUID")}
++                         (next candidates) (shared-title-error value candidates "entities")
+                          :else (first candidates))))
+                  :else nil)]
+     (cond
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 02e797c..f60a2be 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -1233,7 +1233,7 @@
+                                                :properties {:page-id {:type "string"}
+                                                             :page-title {:type "string"}}}]}
+                :PropertyValue
+-               {:description "For ref properties, pass an existing entity by UUID, ident, or title. A title never resolves to another property's choice or value block: pages come before blocks, an exact title before one differing in case, and a title several pages share is refused with their UUIDs. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH. A property with choices takes only its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value. A JSON number is never a db id: a text property stores it as text, a node, date or URL property or Tags matches it as a title, and one that matches nothing is refused; name an existing entity by UUID."
++               {:description "For ref properties, pass an existing entity by UUID, ident, or title. A title never resolves to another property's choice or value block: pages come before blocks, an exact title before one differing in case, and a title several pages share is refused with their UUIDs. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH. A property with choices takes only its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number. Class properties such as Tags accept a class UUID, ident, or exact title, or an array of those selectors; a title several classes share is refused with their UUIDs, and a hidden or recycled class never matches by title. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value. A JSON number is never a db id: a text property stores it as text, a node, date or URL property or Tags matches it as a title, and one that matches nothing is refused; name an existing entity by UUID."
+                 :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
+                         {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
+               write-guard-schemas)
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs
+new file mode 100644
+index 0000000..e252522
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_tags_title_scoped_test.cljs
+@@ -0,0 +1,228 @@
++(ns logseq.db-sync.semantic-tags-title-scoped-test
++  "A Tags value given by a title several classes share is refused, naming their UUIDs (item 36).
++  resolve-ref-entity gave :block/tags its own title branch, which took the first class with the
++  exact title in AVET (db id) order, so the oldest class was stored with no error, while every
++  other ref property refuses a shared title through title-candidates. The classes are made the
++  way the app makes namespace tags (outliner-page/create! \"Movies/Review\" and \"Books/Review\"
++  with :class? and :split-namespace?), so both are titled \"Review\" and extend different parents;
++  \"Movies/2027\" and \"Books/2027\" do the same for a title a JSON number reaches (patch 0044).
++  Each write path (set, batch set, insert tree, batch insert trees) must refuse the shared title,
++  alone or inside a Tags array, naming its entry and both UUIDs and writing nothing. A unique
++  class title (with a block of the same title as a decoy), a UUID and an ident still resolve."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- notes-child [conn title]
++  (some #(when (= title (:block/title %)) %) (:block/_parent (ldb/get-page @conn "Notes"))))
++
++(defn- classes-titled
++  "The classes titled `title`, oldest first."
++  [db title]
++  (->> (d/datoms db :avet :block/title title)
++       (map #(d/entity db (:e %)))
++       (filter ldb/class?)
++       (sort-by :db/id)))
++
++(defn- tag-ids [conn title]
++  (set (map :db/id (:block/tags (notes-child conn title)))))
++
++(defn- seed-graph []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          _ (outliner-page/create! conn "Movies/Review" {:class? true :split-namespace? true})
++          _ (outliner-page/create! conn "Books/Review" {:class? true :split-namespace? true})
++          _ (outliner-page/create! conn "Movies/2027" {:class? true :split-namespace? true})
++          _ (outliner-page/create! conn "Books/2027" {:class? true :split-namespace? true})
++          ;; A block titled Movies: a non-class decoy for the unique class title.
++          seeded (request! self "POST" "/semantic/block-trees/batch"
++                           {:entries [{:page "Notes" :blocks [{:title "Movies"}]}]})
++          _ (is (= 201 (:status seeded)) (pr-str seeded))
++          reviews (classes-titled @conn "Review")
++          y2027s (classes-titled @conn "2027")
++          movies (classes-titled @conn "Movies")]
++    (is (= 2 (count reviews)) "two classes titled Review")
++    (is (= 2 (count y2027s)) "two classes titled 2027")
++    (is (= 1 (count movies)) "one class titled Movies")
++    {:conn conn :self self
++     :notes (str (:block/uuid (ldb/get-page @conn "Notes")))
++     :reviews reviews :y2027s y2027s :movies (first movies)}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(def ^:private paths [:set :batch-set :tree :batch-tree])
++
++(def ^:private path-prefix
++  "How each path names the one entry it was given in a refusal."
++  {:set "" :batch-set "entry 0: " :tree "blocks[0]: " :batch-tree "entries[0].blocks[0]: "})
++
++(defn- write-four!
++  "Writes `value` to Tags through each write path, each on its own block of Notes titled
++  `<path>-<label>`; set and batch set write to a block inserted first. Returns
++  {path {:status :error :title :unchanged?}}, :unchanged? comparing snapshots around the write."
++  [{:keys [conn self notes]} value label]
++  (p/let [prop "block/tags"
++          titles (into {} (map (fn [path] [path (str (name path) "-" label)])) paths)
++          made (request! self "POST" "/semantic/block-trees"
++                         {:target-id notes :blocks [{:title (titles :set)} {:title (titles :batch-set)}]})
++          _ (is (= 201 (:status made)) (pr-str made))
++          uuid-of #(str (:block/uuid (notes-child conn %)))
++          calls {:set #(request! self "PUT" (str "/semantic/blocks/" (uuid-of (titles :set))
++                                                 "/properties/" (js/encodeURIComponent prop))
++                                 {:value value})
++                 :batch-set #(request! self "POST" "/semantic/block-properties/batch-set"
++                                       {:entries [{:block-id (uuid-of (titles :batch-set)) :property-id prop :value value}]})
++                 :tree #(request! self "POST" "/semantic/block-trees"
++                                  {:target-id notes :blocks [{:title (titles :tree) :properties {prop value}}]})
++                 :batch-tree #(request! self "POST" "/semantic/block-trees/batch"
++                                        {:entries [{:target-id notes
++                                                    :blocks [{:title (titles :batch-tree) :properties {prop value}}]}]})}]
++    (p/loop [i 0 acc {}]
++      (if (= i (count paths))
++        acc
++        (p/let [path (nth paths i)
++                before (snapshot conn)
++                r ((calls path))]
++          (p/recur (inc i) (assoc acc path {:status (:status r)
++                                            :error (get-in r [:body :error])
++                                            :title (titles path)
++                                            :unchanged? (= before (snapshot conn))})))))))
++
++(defn- refused-naming-both
++  "Each path answered 400 naming its entry and the UUIDs of both `classes`, with nothing written
++  and no tag stored on the block."
++  [conn results value classes]
++  (doseq [path paths :let [{:keys [status error unchanged? title]} (results path)
++                           error (str error)]]
++    (testing (str (name path) ": tags = " (pr-str value) " is refused, naming both classes")
++      (is (= 400 status) (pr-str (results path) :stored (tag-ids conn title)
++                                 :classes (mapv :db/id classes)))
++      (is (string/starts-with? error (path-prefix path)) (pr-str error))
++      (doseq [c classes]
++        (is (string/includes? error (str (:block/uuid c))) (pr-str error)))
++      (is unchanged? "nothing is written")
++      (is (not-any? (set (map :db/id classes)) (tag-ids conn title)) "no class with that title is stored"))))
++
++;; Before the fix: 200/201 on every path, with the older Review class stored.
++(deftest tags-title-shared-by-two-classes-is-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews] :as graph}]
++        (p/let [results (write-four! graph "Review" "review")]
++          (refused-naming-both conn results "Review" reviews))))))
++
++;; A Tags array holding a shared title is refused whole, though its other element is unique.
++(deftest tags-array-with-a-shared-title-is-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews movies] :as graph}]
++        (p/let [results (write-four! graph ["Movies" "Review"] "array")]
++          (refused-naming-both conn results ["Movies" "Review"] reviews)
++          (doseq [path paths]
++            (is (not (contains? (tag-ids conn (:title (results path))) (:db/id movies)))
++                (str (name path) ": the unique element isn't stored either"))))))))
++
++;; A JSON number is a title (patch 0044), so a number two classes share is refused the same way.
++(deftest tags-number-shared-by-two-classes-is-refused-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn y2027s] :as graph}]
++        (p/let [results (write-four! graph 2027 "y2027")]
++          (refused-naming-both conn results 2027 y2027s))))))
++
++;; A unique class title (a block titled Movies is no candidate), either Review class's UUID and
++;; its ident still resolve on every path.
++(deftest tags-unique-title-uuid-and-ident-still-resolve-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews movies] :as graph}]
++        (let [[older newer] reviews]
++          (p/doseq [[label value expected] [["title" "Movies" movies]
++                                            ["uuid" (str (:block/uuid newer)) newer]
++                                            ["ident" (subs (str (:db/ident older)) 1) older]]]
++            (p/let [results (write-four! graph value (str "ok-" label))]
++              (doseq [path paths :let [{:keys [status title]} (results path)]]
++                (testing (str (name path) ": tags = " (pr-str value) " stores that class")
++                  (is (#{200 201} status) (pr-str (results path)))
++                  (is (= #{(:db/id expected)} (tag-ids conn title))))))))))))
++
++;; A recycled class is no candidate for a title, so the live class sharing its title resolves, by
++;; string and by number, and a title only a recycled class has stores nothing.
++(deftest tags-title-skips-a-recycled-class-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews y2027s] :as graph}]
++        (let [[older-2027 newer-2027] y2027s
++              [older-review newer-review] reviews]
++          (d/transact! conn [{:db/id (:db/id older-2027) :logseq.property/deleted-at 1700000000000}
++                             {:db/id (:db/id older-review) :logseq.property/deleted-at 1700000000000}
++                             {:db/id (:db/id newer-review) :logseq.property/deleted-at 1700000000000}])
++          (p/let [by-string (write-four! graph "2027" "live-string")
++                  by-number (write-four! graph 2027 "live-number")
++                  only-recycled (write-four! graph "Review" "only-recycled")]
++            (doseq [[label results] [["string" by-string] ["number" by-number]]
++                    path paths :let [{:keys [status title]} (results path)]]
++              (testing (str (name path) ": " label " 2027 stores the live class")
++                (is (#{200 201} status) (pr-str (results path)))
++                (is (= #{(:db/id newer-2027)} (tag-ids conn title)))))
++            (doseq [path paths :let [{:keys [status title unchanged?]} (only-recycled path)]]
++              (testing (str (name path) ": a title only recycled classes have is refused")
++                (is (= 400 status) (pr-str (only-recycled path)))
++                (is unchanged?)
++                (is (empty? (tag-ids conn title)))))))))))
++
++;; A hidden class (hide? on the class itself) is no candidate for a title either: the live class
++;; sharing its title resolves, by string and by number, and a title only hidden classes have is
++;; refused. (Hiding through a parent is out of reach here: the app gives a class no :block/parent;
++;; namespace tags use :logseq.property.class/extends.)
++(deftest tags-title-skips-a-hidden-class-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn reviews y2027s] :as graph}]
++        (let [[older-2027 newer-2027] y2027s
++              [older-review newer-review] reviews]
++          (d/transact! conn [{:db/id (:db/id older-2027) :logseq.property/hide? true}
++                             {:db/id (:db/id older-review) :logseq.property/hide? true}
++                             {:db/id (:db/id newer-review) :logseq.property/hide? true}])
++          (p/let [by-string (write-four! graph "2027" "hidden-string")
++                  by-number (write-four! graph 2027 "hidden-number")
++                  only-hidden (write-four! graph "Review" "only-hidden")]
++            (doseq [[label results] [["string" by-string] ["number" by-number]]
++                    path paths :let [{:keys [status title]} (results path)]]
++              (testing (str (name path) ": " label " 2027 stores the class that isn't hidden")
++                (is (#{200 201} status) (pr-str (results path)))
++                (is (= #{(:db/id newer-2027)} (tag-ids conn title)))))
++            (doseq [path paths :let [{:keys [status title unchanged?]} (only-hidden path)]]
++              (testing (str (name path) ": a title only hidden classes have is refused")
++                (is (= 400 status) (pr-str (only-hidden path)))
++                (is unchanged?)
++                (is (empty? (tag-ids conn title)))))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 91a5dfc..ba4fb5d 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -35,6 +35,7 @@
+             [logseq.db-sync.semantic-datalog-query-test]
+             [logseq.db-sync.semantic-delete-property-value-test]
+             [logseq.db-sync.semantic-json-number-value-test]
++            [logseq.db-sync.semantic-tags-title-scoped-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
