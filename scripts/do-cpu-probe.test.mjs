@@ -9,6 +9,7 @@ import {
   INVOCATION_SELECTIONS,
   MAX_DURATION_MS,
   MAX_POINTS,
+  MAX_REPEATS,
   bracketLimit,
   calibrate,
   cell,
@@ -24,9 +25,11 @@ import {
   parseBoolean,
   parseDeployUrl,
   parseDurations,
+  parseRepeats,
   readAnalytics,
   renderSummary,
   runProbe,
+  runVerdict,
   runWindow,
   scrub,
   summariseGroups,
@@ -328,7 +331,7 @@ test("invocationsQuery filters each run's window to the probe script", () => {
   const runs = [{ startedAt: 0, endedAt: 1500 }, { startedAt: 10_000, endedAt: 10_100 }];
   const { query, variables } = invocationsQuery({ accountId: "acc", script: "do-cpu-probe-7-1", runs, selection: INVOCATION_SELECTIONS[0] });
   assert.match(query, /r0: durableObjectsInvocationsAdaptiveGroups\(limit: 20, filter: \{scriptName: \$script, datetime_geq: \$s0, datetime_leq: \$e0\}\)/);
-  assert.match(query, /r1: .*sum \{ requests errors wallTime cpuTime \} dimensions \{ status \}/);
+  assert.match(query, /r1: .*sum \{ requests errors wallTime \} quantiles \{ cpuTimeP50 cpuTimeP99 \} dimensions \{ status \}/);
   assert.equal(variables.script, "do-cpu-probe-7-1");
   assert.equal(variables.s1, "1970-01-01T00:00:10Z");
   assert.equal(variables.e1, "1970-01-01T00:00:12Z");
@@ -358,7 +361,7 @@ test("summariseGroups converts microseconds and reads whichever CPU field answer
 });
 
 /** A fake GraphQL endpoint: refuses sum.cpuTime as an unknown field and answers the quantile query. */
-function graphqlAnswer(groupsFor, { periodic = { cpuTime: 1_000, activeTime: 2_000, exceededCpuErrors: 1, exceededMemoryErrors: 0 } } = {}) {
+function graphqlAnswer(groupsFor, { periodic = { cpuTime: 1_000, activeTime: 2_000, exceededCpuErrors: 1, exceededMemoryErrors: 0 }, refuseQuantiles = false } = {}) {
   const queries = [];
   const handler = async (url, init) => {
     if (url.pathname === "/client/v4/graphql") {
@@ -369,6 +372,9 @@ function graphqlAnswer(groupsFor, { periodic = { cpuTime: 1_000, activeTime: 2_0
       }
       if (/wallTime cpuTime/.test(query)) {
         return Response.json({ data: null, errors: [{ message: 'unknown field "cpuTime"' }] });
+      }
+      if (refuseQuantiles && /quantiles/.test(query)) {
+        return Response.json({ data: null, errors: [{ message: 'unknown field "quantiles"' }] });
       }
       const account = {};
       for (const k of Object.keys(variables).filter((k) => /^s\d+$/.test(k))) account[`r${k.slice(1)}`] = groupsFor(Number(k.slice(1)));
@@ -382,7 +388,7 @@ function graphqlAnswer(groupsFor, { periodic = { cpuTime: 1_000, activeTime: 2_0
   return { handler, queries };
 }
 
-test("readAnalytics falls back past a CPU field the schema lacks and fills each run", async () => {
+test("readAnalytics asks for the CPU quantiles first and fills each run", async () => {
   const runs = [
     { startedAt: 1_000, endedAt: 1_100, outcome: "completed", iterations: 1 },
     { startedAt: 9_000, endedAt: 40_000, outcome: "failed", iterations: 2 },
@@ -392,11 +398,22 @@ test("readAnalytics falls back past a CPU field the schema lacks and fills each 
   ]);
   const a = await readAnalytics({ accountId: "acc", token: "t", script: "do-cpu-probe-7-1", runs, namespaceId: "ns-probe", startedAt: 0, endedAt: 41_000, fetch: (u, i) => handler(new URL(u), i), wait: noWait });
   assert.equal(a.invocationSelection, "quantiles.cpuTimeP99");
-  assert.match(a.errors[0], /invocations \(sum\.cpuTime\): unknown field "cpuTime"/);
+  assert.deepEqual(a.errors, []);
   assert.equal(runs[0].analytics.cpuMs, 0.9);
   assert.deepEqual(runs[1].analytics.statuses, { exceededCpu: 1 });
   assert.equal(a.periodic.exceededCpuErrors, 1);
   assert.equal(a.periodicSelection, "cpuTime, exceeded errors");
+  assert.equal(queries.length, 2);
+});
+
+test("readAnalytics falls back to wall time only when the schema lacks the CPU quantiles", async () => {
+  const runs = [{ startedAt: 1_000, endedAt: 1_100, outcome: "completed", iterations: 1 }];
+  const { handler, queries } = graphqlAnswer(() => [{ sum: { requests: 1, errors: 0, wallTime: 4_000 }, dimensions: { status: "success" } }], { refuseQuantiles: true });
+  const a = await readAnalytics({ accountId: "acc", token: "t", script: "s", runs, namespaceId: "ns-probe", startedAt: 0, endedAt: 2_000, fetch: (u, i) => handler(new URL(u), i), wait: noWait });
+  assert.equal(a.invocationSelection, "none (wall time only)");
+  assert.match(a.errors[0], /invocations \(quantiles\.cpuTimeP99\): unknown field "quantiles"/);
+  assert.equal(runs[0].analytics.cpuMs, null);
+  assert.equal(runs[0].analytics.wallMs, 4);
   assert.equal(queries.length, 3);
 });
 
@@ -423,7 +440,7 @@ test("readAnalytics polls until every run is reported, then gives up with a note
   assert.equal(runs[1].analytics, null);
   assert.match(a.notes.join("\n"), /1 run\(s\) had no invocation in analytics after 100 s/);
   assert.match(a.notes.join("\n"), /namespace was not found/);
-  // First poll tries two selections; each later poll only the one that answered.
+  // One query per poll: the quantile selection answers first time.
   assert.ok(queries.length >= 4 && queries.length <= 7, String(queries.length));
 });
 
@@ -715,7 +732,276 @@ test("the validate step refuses a bad duration list when run as GitHub would", (
   const lines = step("Validate inputs");
   const run = lines.find((l) => l.startsWith("        run: ")).slice("        run: ".length);
   for (const [durations, status] of [["5,50", 0], ["5,120001", 1], ["", 1]]) {
-    const r = spawnSync("bash", ["-e", "-c", run], { cwd: root, env: { ...process.env, DURATIONS: durations, WEBSOCKET: "true" }, encoding: "utf8" });
+    const r = spawnSync("bash", ["-e", "-c", run], { cwd: root, env: { ...process.env, DURATIONS: durations, WEBSOCKET: "true", REPEATS: "3" }, encoding: "utf8" });
     assert.equal(r.status, status, `${durations}: ${r.stdout}${r.stderr}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Connector #51: repeats per target, so an ordinary restart can be told from a CPU kill, and an
+// analytics query built on what the live run (44481130870) showed the schema exposes.
+
+/**
+ * The real Worker and DO behind a namespace that can also restart the instance after a burn that
+ * completed (an eviction, not a kill): `restartAfter(iterations, nth)` is asked after the nth
+ * completed burn of that size, and a true answer replaces the instance as Cloudflare does.
+ */
+function restartingEnv({ killAbove = Infinity, restartAfter = () => false } = {}) {
+  const env = probeEnv({ killAbove });
+  const seen = new Map();
+  const inner = env.PROBE.get;
+  env.PROBE.get = (id) => {
+    const stub = inner(id);
+    return {
+      fetch: async (request) => {
+        const response = await stub.fetch(request);
+        const url = new URL(request.url);
+        if (url.pathname === "/burn" && response.status === 200) {
+          const iterations = Number(url.searchParams.get("iterations"));
+          const nth = (seen.get(iterations) ?? 0) + 1;
+          seen.set(iterations, nth);
+          if (restartAfter(iterations, nth)) env.PROBE.instance = new ProbeDO({ acceptWebSocket() {} }, {});
+        }
+        return response;
+      },
+    };
+  };
+  return env;
+}
+
+const byTarget = (runs) => {
+  const groups = new Map();
+  for (const r of runs) groups.set(r.targetMs, [...(groups.get(r.targetMs) ?? []), r]);
+  return groups;
+};
+
+test("main validate takes a repeat count and refuses each kind of bad one, naming it", async () => {
+  let printed = "";
+  assert.equal(await main(["validate", "--durations", "5,50", "--websocket", "true", "--repeats", "3"], { out: (s) => (printed += s) }), 0, printed);
+  assert.match(printed, /3 repeats/);
+  for (const bad of ["0", "-1", "1.5", "abc", "", "1000"]) {
+    printed = "";
+    assert.equal(await main(["validate", "--durations", "5", "--websocket", "true", "--repeats", bad], { out: (s) => (printed += s) }), 1, `${bad}: ${printed}`);
+    assert.match(printed, /::error::repeats: /, bad);
+  }
+});
+
+test("runProbe with repeats runs each target N times and classifies a restart after a completed burn as a restart, not a kill", async () => {
+  // Target 5 at rate 100 is 500 iterations: the instance restarts after the second of them completes.
+  const env = restartingEnv({ restartAfter: (iterations, nth) => iterations === 500 && nth === 2 });
+  const { fetch } = fakeFetch(env);
+  const { runs } = await runProbe({ baseUrl: PROBE, key: KEY, durations: [5, 50], repeats: 3, rate: 100, websocket: false, fetch, wait: noWait });
+  assert.equal(runs.length, 6);
+  const groups = byTarget(runs);
+  for (const [target, rs] of groups) {
+    assert.equal(rs.length, 3, `target ${target}`);
+    assert.deepEqual(rs.map((r) => r.repeat), [0, 1, 2], `target ${target}`);
+    assert.ok(rs.every((r) => r.outcome === "completed"), `target ${target}`);
+  }
+  assert.deepEqual(groups.get(5).map((r) => r.verdict), ["kept", "restart", "kept"]);
+  assert.deepEqual(groups.get(50).map((r) => r.verdict), ["kept", "kept", "kept"]);
+  const restarted = groups.get(5)[1];
+  assert.equal(restarted.stateKept, false);
+  assert.ok(restarted.bootBefore && restarted.bootAfter && restarted.bootBefore !== restarted.bootAfter, JSON.stringify(restarted));
+  const kept = groups.get(5)[0];
+  assert.equal(kept.bootBefore, kept.bootAfter);
+  // The restart is not a failure, so the limit bracket ignores it.
+  assert.deepEqual(bracketLimit(runs), { maxCompletedMs: 50, minFailedMs: null });
+});
+
+test("runProbe with repeats classifies every kind of failed burn: a CPU kill by message or by flag, and other errors", async () => {
+  const env = probeEnv({ killAbove: 1000 });
+  const { fetch: real } = fakeFetch(env);
+  // Target 7 (700 iterations): first a 502 with only the reset flag, then a 500 that is no kill,
+  // then a network error. Target 50 (5,000 iterations) is killed by the real namespace each time.
+  let sevens = 0;
+  const fetch = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname === "/burn" && u.searchParams.get("iterations") === "700") {
+      sevens += 1;
+      if (sevens === 1) return Response.json({ error: "internal error", durableObjectReset: true }, { status: 502 });
+      if (sevens === 2) return Response.json({ error: "something else broke" }, { status: 500 });
+      throw new TypeError("fetch failed");
+    }
+    return real(url, init);
+  };
+  const { runs } = await runProbe({ baseUrl: PROBE, key: KEY, durations: [7, 50], repeats: 3, rate: 100, websocket: false, fetch, wait: noWait });
+  const groups = byTarget(runs);
+  assert.deepEqual(groups.get(7).map((r) => r.verdict), ["kill", "error", "error"]);
+  assert.deepEqual(groups.get(50).map((r) => r.verdict), ["kill", "kill", "kill"]);
+  assert.match(groups.get(50)[0].response, /exceeded its CPU time limit/);
+});
+
+test("bracketLimit takes the failed side only from CPU kills, not from restarts or other errors", () => {
+  const runs = [
+    { targetMs: 5, outcome: "completed", verdict: "restart", analytics: null },
+    { targetMs: 10, outcome: "failed", verdict: "error", analytics: null },
+    { targetMs: 15_000, outcome: "completed", verdict: "kept", analytics: null },
+    { targetMs: 35_000, outcome: "failed", verdict: "kill", analytics: null },
+  ];
+  assert.deepEqual(bracketLimit(runs), { maxCompletedMs: 15_000, minFailedMs: 35_000 });
+  assert.deepEqual(bracketLimit([{ targetMs: 10, outcome: "failed", verdict: "error", analytics: null }]), { maxCompletedMs: null, minFailedMs: null });
+});
+
+test("renderSummary sums up each target's repeats: completed, restarts and kills", () => {
+  const run = (targetMs, repeat, verdict) => ({
+    targetMs,
+    repeat,
+    verdict,
+    iterations: targetMs * 10,
+    http: verdict === "kill" ? 502 : verdict === "error" ? null : 200,
+    latencyMs: targetMs,
+    outcome: verdict === "kill" || verdict === "error" ? "failed" : "completed",
+    stateKept: verdict === "kept",
+    websocket: "off",
+    response: "",
+    analytics: null,
+  });
+  const md = renderSummary({
+    name: "p",
+    websocket: false,
+    calibration: { iterationsPerMs: 10, samples: [10] },
+    runs: [run(5, 0, "kept"), run(5, 1, "restart"), run(5, 2, "kept"), run(35_000, 0, "kill"), run(35_000, 1, "error")],
+    analytics: {},
+  });
+  assert.match(md, /5 ms: 3 of 3 completed, 1 restarts?, 0 kills?/);
+  assert.match(md, /35,000 ms: 0 of 2 completed, 0 restarts?, 1 kills?/);
+});
+
+test("the workflow has a repeats input (default 3) and passes it to validate and run", () => {
+  const on = workflow.slice(workflow.indexOf("\non:\n"), workflow.indexOf("\npermissions:"));
+  assert.match(on, /repeats:\n[\s\S]*?default: "?3"?\n/);
+  assert.ok(step("Validate inputs").join("\n").includes('--repeats "$REPEATS"'));
+  assert.ok(step("Run the probe").join("\n").includes('--repeats "$REPEATS"'));
+});
+
+/** A GraphQL endpoint like the live run's: sum.cpuTime unknown on invocations, every group set empty. */
+function liveLikeAnalytics({ accounts = "empty" } = {}) {
+  const queries = [];
+  const fetch = async (u, init) => {
+    const url = new URL(u);
+    if (url.pathname !== "/client/v4/graphql") return Response.json({ success: false }, { status: 404 });
+    const { query, variables } = JSON.parse(init.body);
+    queries.push({ query, variables });
+    if (accounts === "none") return Response.json({ data: { viewer: { accounts: [] } }, errors: null });
+    if (query.includes("durableObjectsPeriodicGroups")) return Response.json({ data: { viewer: { accounts: [{ periodic: [] }] } }, errors: null });
+    if (/sum \{[^}]*cpuTime/.test(query) && query.includes("durableObjectsInvocationsAdaptiveGroups")) {
+      return Response.json({ data: null, errors: [{ message: 'unknown field "cpuTime"' }] });
+    }
+    const account = {};
+    for (const m of query.matchAll(/(\w+): durableObjects\w+/g)) account[m[1]] = [];
+    return Response.json({ data: { viewer: { accounts: [account] } }, errors: null });
+  };
+  return { fetch, queries };
+}
+
+// The live run's times, with the default ANALYTICS_WAIT_S of 240 s.
+const T0 = Date.parse("2026-11-19T07:38:45Z");
+const T1 = Date.parse("2026-11-19T07:40:49Z");
+
+async function readLiveLike(options) {
+  const f = liveLikeAnalytics(options);
+  let clock = T1;
+  const runs = [{ startedAt: T0 + 5_000, endedAt: T0 + 5_128, outcome: "completed", iterations: 1 }];
+  const a = await readAnalytics({ accountId: "acc", token: "t", script: "s", runs, namespaceId: "ns", startedAt: T0, endedAt: T1, fetch: f.fetch, wait: async (ms) => { clock += ms; }, now: () => clock });
+  return { a, queries: f.queries, clock, text: [...(a.notes ?? []), ...a.errors].join("\n") };
+}
+
+test("the invocation query asks for CPU only through fields the dataset answered (quantiles), never sum.cpuTime", () => {
+  for (const s of INVOCATION_SELECTIONS) assert.doesNotMatch(s.select, /sum \{[^}]*cpuTime/, s.name);
+  assert.match(INVOCATION_SELECTIONS[0].select, /quantiles \{[^}]*cpuTimeP99/);
+});
+
+test("readAnalytics, when every invocation group is empty, reads the account without the script filter and says what it found", async () => {
+  const { queries, text } = await readLiveLike();
+  const diagnostic = queries.find(({ query }) => /durableObjectsInvocationsAdaptiveGroups\(/.test(query) && !/scriptName: \$script/.test(query));
+  assert.ok(diagnostic, "expected an invocation read without the scriptName filter");
+  assert.match(diagnostic.query, /dimensions \{[^}]*scriptName/);
+  assert.match(text, /without the script filter/i);
+});
+
+test("readAnalytics reports an empty periodic answer, and its window reaches the time of the read", async () => {
+  const { queries, text, clock } = await readLiveLike();
+  const periodic = queries.filter(({ query }) => query.includes("durableObjectsPeriodicGroups"));
+  assert.ok(periodic.length >= 1);
+  assert.ok(Date.parse(periodic.at(-1).variables.end) >= clock - 1000, `periodic window ends ${periodic.at(-1).variables.end}, read at ${new Date(clock).toISOString()}`);
+  assert.match(text, /periodic/i, `an empty periodic answer must be reported; got: ${text}`);
+});
+
+test("readAnalytics tells an answer with no account (the token cannot see it) from one with no rows yet", async () => {
+  const none = await readLiveLike({ accounts: "none" });
+  const empty = await readLiveLike({ accounts: "empty" });
+  assert.match(none.text, /no account/i, none.text);
+  assert.notEqual(none.text, empty.text);
+});
+
+test("parseRepeats takes 1 to MAX_REPEATS, defaults to 1 when absent, and names each refusal", () => {
+  assert.equal(parseRepeats(undefined), 1);
+  assert.equal(parseRepeats("1"), 1);
+  assert.equal(parseRepeats(" 3 "), 3);
+  assert.equal(parseRepeats(String(MAX_REPEATS)), MAX_REPEATS);
+  assert.throws(() => parseRepeats(String(MAX_REPEATS + 1)), new RegExp(`repeats: ${MAX_REPEATS + 1} is above the maximum of ${MAX_REPEATS}`));
+  assert.throws(() => parseRepeats("0"), /repeats: must be at least 1/);
+  for (const bad of ["", "-1", "1.5", "1e1", "abc", "3x"]) assert.throws(() => parseRepeats(bad), /repeats: .* is not a whole number/, bad);
+});
+
+test("main names the option when a value starts with a dash, for any option", async () => {
+  let printed = "";
+  assert.equal(await main(["validate", "--durations", "-5", "--websocket", "true"], { out: (s) => (printed += s) }), 1);
+  assert.match(printed, /^::error::durations: /);
+});
+
+test("runVerdict: kept only when the same instance kept the marker; kill by message or flag; else error", () => {
+  const ok = { status: 200, json: { checksum: 1 } };
+  assert.equal(runVerdict({ completed: true, stateKept: true, bootBefore: "a", bootAfter: "a", burnResult: ok }), "kept");
+  // A new instance, whether or not the marker survived, and an unreadable state, are restarts.
+  assert.equal(runVerdict({ completed: true, stateKept: true, bootBefore: "a", bootAfter: "b", burnResult: ok }), "restart");
+  assert.equal(runVerdict({ completed: true, stateKept: false, bootBefore: "a", bootAfter: "a", burnResult: ok }), "restart");
+  assert.equal(runVerdict({ completed: true, stateKept: false, bootBefore: "a", bootAfter: null, burnResult: ok }), "restart");
+  const failed = (burnResult) => runVerdict({ completed: false, stateKept: false, bootBefore: "a", bootAfter: "b", burnResult });
+  assert.equal(failed({ status: 503, body: "Error 1102: Durable Object exceeded its CPU time limit and was reset.", json: null }), "kill");
+  assert.equal(failed({ status: 502, body: "{}", json: { error: "x", durableObjectReset: true } }), "kill");
+  assert.equal(failed({ status: 502, body: "{}", json: { error: "x", durableObjectReset: false } }), "error");
+  assert.equal(failed({ status: 500, body: "boom", json: null }), "error");
+  assert.equal(failed({ status: null, error: "TypeError: fetch failed", json: null }), "error");
+});
+
+test("readAnalytics, when the unfiltered read finds the probe's script, names it so the filter is the suspect", async () => {
+  const fetch = async (u, init) => {
+    const { query } = JSON.parse(init.body);
+    if (query.includes("ProbeUnfiltered")) {
+      return Response.json({ data: { viewer: { accounts: [{ all: [{ sum: { requests: 4 }, dimensions: { scriptName: "s" } }, { sum: { requests: 2 }, dimensions: { scriptName: "logseq-sync" } }] }] } }, errors: null });
+    }
+    if (query.includes("durableObjectsPeriodicGroups")) return Response.json({ data: { viewer: { accounts: [{ periodic: [{ sum: { cpuTime: 5, activeTime: 6 } }] }] } }, errors: null });
+    return Response.json({ data: { viewer: { accounts: [{ r0: [], r1: [] }] } }, errors: null });
+  };
+  let clock = 0;
+  const runs = [{ startedAt: 1_000, endedAt: 1_100 }, { startedAt: 5_000, endedAt: 5_100 }];
+  const a = await readAnalytics({ accountId: "acc", token: "t", script: "s", runs, namespaceId: "ns", startedAt: 0, endedAt: 6_000, fetch, wait: async (ms) => { clock += ms; }, now: () => clock, waitS: 60 });
+  const text = a.notes.join("\n");
+  assert.match(text, /without the script filter.*had the probe×4, logseq-sync×2/i);
+  // A periodic answer with rows is shown, not noted as empty.
+  assert.equal(a.periodic.cpuTime, 5);
+  assert.doesNotMatch(text, /periodic/i);
+});
+
+test("readAnalytics skips the unfiltered read when some runs were reported", async () => {
+  const queries = [];
+  const fetch = async (u, init) => {
+    const { query } = JSON.parse(init.body);
+    queries.push(query);
+    return Response.json({ data: { viewer: { accounts: [{ r0: [{ sum: { requests: 1, errors: 0, wallTime: 1 }, dimensions: { status: "success" } }], r1: [] }] } }, errors: null });
+  };
+  let clock = 0;
+  const runs = [{ startedAt: 1_000, endedAt: 1_100 }, { startedAt: 5_000, endedAt: 5_100 }];
+  const a = await readAnalytics({ accountId: "acc", token: "t", script: "s", runs, namespaceId: null, startedAt: 0, endedAt: 6_000, fetch, wait: async (ms) => { clock += ms; }, now: () => clock, waitS: 60 });
+  assert.ok(!queries.some((q) => q.includes("ProbeUnfiltered")));
+  assert.doesNotMatch(a.notes.join("\n"), /without the script filter/i);
+});
+
+test("readAnalytics stops polling at once when the answer has no account", async () => {
+  const f = liveLikeAnalytics({ accounts: "none" });
+  const runs = [{ startedAt: T0 + 5_000, endedAt: T0 + 5_128 }];
+  await readAnalytics({ accountId: "acc", token: "t", script: "s", runs, namespaceId: null, startedAt: T0, endedAt: T1, fetch: f.fetch, wait: noWait, now: () => T1 });
+  assert.equal(f.queries.length, 1);
 });
