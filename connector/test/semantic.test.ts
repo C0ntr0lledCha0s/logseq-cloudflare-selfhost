@@ -544,6 +544,111 @@ describe("indexer", () => {
     expect((await semanticStore().state(WORK_ID))?.status).toBe("building");
   });
 
+  describe("a sync request the server never answers (issue 53)", () => {
+    /**
+     * The real fake sync server, except that `env.SYNC.fetch` itself rejects (the Durable Object was
+     * stopped or reset mid-request) for each request `rejectWith` returns a value for.
+     */
+    function rejectingEnv(rejectWith: (request: Request, nth: number) => unknown): Env {
+      const inner = fakeSync([work, home]);
+      const counts = new Map<string, number>();
+      const SYNC = {
+        fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+          const request = new Request(input, init);
+          const auth = request.headers.get("Authorization") ?? "";
+          const nth = (counts.get(auth) ?? 0) + 1;
+          counts.set(auth, nth);
+          const reason = rejectWith(request, nth);
+          if (reason !== undefined) throw reason;
+          return inner.fetch(request);
+        },
+      } as unknown as Fetcher;
+      return testEnv({ SYNC });
+    }
+
+    const reset = new Error("The Durable Object was reset");
+    const bearer = (token: string) => (r: Request) => (r.headers.get("Authorization") === `Bearer ${token}` ? reset : undefined);
+
+    async function connectHome(): Promise<void> {
+      await graphs().add({
+        alias: "home", graphId: HOME_ID, graphName: "Home", mode: "read", permission: "read", expiresAt: null, token: HOME_TOKEN,
+      });
+      home.addBlock(home.addPage("Home"), "Book the WOF");
+    }
+
+    it("records the failure on the first graph visited and still indexes the next graph", async () => {
+      seedWork(3);
+      await connectHome(); // 'home' sorts first, so it is visited first
+      const report = await run(undefined, rejectingEnv(bearer(HOME_TOKEN)));
+      expect(report.graphs.map((g) => [g.alias, g.status])).toEqual([["home", "error"], ["work", "ready"]]);
+      expect(await semanticStore().state(HOME_ID)).toMatchObject({
+        status: "error",
+        error: "the sync server gave no answer: The Durable Object was reset",
+      });
+      expect(work.feedRequests.length).toBeGreaterThan(0);
+      expect(logged()).toContainEqual(expect.stringMatching(/^semantic index graph=home status=error pages=1 /));
+
+      await expireLeases();
+      await run();
+      expect(await semanticStore().state(HOME_ID)).toMatchObject({ status: "ready", error: null });
+    });
+
+    it("records the failure on a later graph instead of leaving it leased as building", async () => {
+      seedWork(3);
+      await connectHome();
+      const report = await run(undefined, rejectingEnv(bearer(WORK_TOKEN)));
+      expect(report.graphs.map((g) => [g.alias, g.status])).toEqual([["home", "ready"], ["work", "error"]]);
+      expect(await semanticStore().state(WORK_ID)).toMatchObject({
+        status: "error",
+        error: "the sync server gave no answer: The Durable Object was reset",
+      });
+    });
+
+    it("keeps the pages already committed when a later page of the same graph is not answered, and resumes", async () => {
+      seedWork(120);
+      const report = await run(undefined, rejectingEnv((r, nth) => (nth === 2 ? reset : undefined)));
+      expect(report.graphs).toEqual([{ alias: "work", status: "error", pages: 2, embedded: PAGE_SIZE, deleted: 0 }]);
+      const state = await semanticStore().state(WORK_ID);
+      expect(state).toMatchObject({ status: "error", error: "the sync server gave no answer: The Durable Object was reset" });
+      expect(state?.cursor).not.toBeNull(); // page 1's cursor was committed and is kept
+      expect(index.vectors.size).toBe(PAGE_SIZE);
+
+      await expireLeases();
+      await runUntilReady();
+      expect(index.vectors.size).toBe(120);
+      expect(await semanticStore().state(WORK_ID)).toMatchObject({ status: "ready", error: null });
+    });
+
+    it("treats a rejection that is not an Error (a bare string) the same way", async () => {
+      seedWork(3);
+      const report = await run(undefined, rejectingEnv(() => "connection lost"));
+      expect(report.graphs[0].status).toBe("error");
+      expect((await semanticStore().state(WORK_ID))?.error).toBe("the sync server gave no answer: connection lost");
+    });
+
+    it("costs no more D1 statements than a sync server error does", async () => {
+      seedWork(3);
+      await connectHome();
+      const statements = async (e: Env): Promise<number> => {
+        await env.DB.exec("DELETE FROM semantic_state;");
+        const d1 = vi.spyOn(env.DB, "prepare");
+        try {
+          await run(undefined, e);
+          return d1.mock.calls.length;
+        } finally {
+          d1.mockRestore();
+        }
+      };
+      work.failStatus = 500;
+      home.failStatus = 500;
+      const httpError = await statements(testEnv());
+      work.failStatus = null;
+      home.failStatus = null;
+      const rejected = await statements(rejectingEnv(() => reset));
+      expect(rejected).toBe(httpError);
+    });
+  });
+
   it("refuses an index with the wrong dimensions", async () => {
     seedWork(3);
     index.dimensions = 768;

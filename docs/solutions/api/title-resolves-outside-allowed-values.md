@@ -1,11 +1,12 @@
 ---
 title: A value given by title must resolve only among the property's allowed values, because nothing downstream checks
 area: api
-tags: [identifiers, titles, closed-values, choices, node-property, classes, value-blocks, url, silent-success, resolve-ref-entity, title-candidates]
+tags: [tags, identifiers, titles, closed-values, choices, node-property, classes, value-blocks, url, silent-success, resolve-ref-entity, title-candidates]
 seen:
   - 2026-11-06 – item 25, patch 0021 (relationship-status "active" stored project-status's "active" choice)
   - 2026-11-06 – item 25, review rounds 2 and 3 (r2-correctness-1, r3-correctness-1, r3-integrity-1): the fix's own title ranking repeated the class
   - 2026-11-06 – item 23, patch 0022, review round 3 (r3-correctness-1): a bare JSON integer is still read as a db id for node and text properties
+  - 2026-11-19 – item 36, patch 0046: the `:block/tags` branch that 0021 split out kept upstream's `first`, so Tags "Review" stored the oldest of two classes
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
@@ -24,7 +25,16 @@ promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 
 Patch 0021 (`patches/0021-semantic-choice-values-scoped-to-property.patch`): for a property with choices, every input form (UUID, db id, ident, title, case-insensitive) resolves only among `:block/_closed-value-property` of that property, scoped to the block's tags, and anything else is refused with an error that names the property, the entry and the valid choices. `resolve-property-choice` looks inside the property first. Node properties skip other properties' choices and value blocks and refuse a title several pages share. `get_graph_health` flags values whose choice belongs to another property. Two review findings were still open when the lane ended (class order and URL value blocks); see the lane's PR.
 
+### Item 36: the Tags branch kept the `first`
+
+Patch 0021 moved every other ref property onto `title-candidates` but split `:block/tags` into its own branch that still took `first` of the exact-title class matches. Two namespace classes ("Movies/Review", "Books/Review") both have the title "Review", so Tags "Review" (or the number 2027) stored the older class on set, batch set, insert tree and batch insert trees, with no error. Patch 0046 gives Tags the same refusal ("matches N classes (uuids); give the one you mean by UUID"), skips hidden or recycled classes, and keeps exact-title matching only. Trade-off: a namespace tag that shares a built-in class title (Work/Task) now makes Tags "Task" refuse, and the message can't say which UUID is the built-in. Review also found the same silent first-match on other class-title inputs (a property's `classes`, a tag's `extends`, a named query's tag param); those are backlog, not fixed.
+
+Test lessons: a mutation that narrowed the `hidden?` filter to deleted-at survived until a test hid one of two same-titled classes and then both; each filter in a resolver needs its own test.
+
 ## How to catch it next time
+
+- When a fix splits a branch out of a shared lookup, grep the whole resolver (and its siblings) for every `:avet :block/title` followed by `first`; the split-out branch is where the old behaviour survives.
+- A refusal that makes a README backlog item "closed" must list the sibling inputs still open, or the item is marked closed too early.
 
 - For any title lookup, ask what the allowed set is (the property's choices, its classes, its own value blocks, pages) and resolve inside that set first. Never take `first` of a graph-wide title match.
 - Test with a decoy: two properties (or a page and a block, or a tagged and an untagged object) sharing a title, with the decoy created first so it has the lower entity id.
