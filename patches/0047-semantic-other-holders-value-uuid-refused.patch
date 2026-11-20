@@ -1,0 +1,478 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index ff85ac5..62ccfa1 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -1106,9 +1106,13 @@
+   "Why the property refuses a value, or nil: the property's type doesn't take it (a page for a
+   text property, a non-journal page for a date one, text for a datetime one), or, for a text, URL
+   or number property, the value names an entity that isn't one of the property's own values (a
+-  content block, another property's value). Every value of a list is checked. Found here, the
+-  call is refused up front, naming the property, not failed as a server error."
+-  [db property values resolved]
++  content block, another property's value), or one that another block or page holds (its
++  parent is that holder, so deleting the holder would take the value with it; connector #34).
++  `scope` is the block the value is for (see prepare-property-value): a value block whose parent is
++  the scope's block is its own, and one whose parent is the property (a default value, a number)
++  belongs to no holder, so both are taken. Every value of a list is checked. Found here, the call
++  is refused up front, naming the property, not failed as a server error."
++  [db property values resolved scope]
+   (when (and (:logseq.property/type property) (not= :block/tags (:db/ident property)))
+     (let [own-values-only? (and (contains? db-property-type/value-ref-property-types
+                                            (:logseq.property/type property))
+@@ -1130,7 +1134,12 @@
+                                (not= (:db/id property)
+                                      (:db/id (:logseq.property/created-from-property (d/entity db id)))))
+                       (str (pr-str (str value)) " is not a value of "
+-                           (or (:block/title property) (entity-ident property)))))))
++                           (or (:block/title property) (entity-ident property))))
++                    (when-let [holder (and own-values-only?
++                                           (:block/parent (d/entity db id)))]
++                      (when-not (contains? #{(:db/id property) (:db/id scope)} (:db/id holder))
++                        (str (pr-str (str value)) " is " (:block/uuid holder)
++                             "'s own value, and deleting that would delete it here too; give the value itself, not its UUID"))))))
+             (map vector values resolved)))))
+ 
+ (defn- refusal
+@@ -1204,7 +1213,7 @@
+       (display-value db property-ident value scope)
+ 
+       (not= :db.type/ref (:db/valueType property))
+-      (if-let [refused (when (some? value) (refused-by-type db property [value] [value]))]
++      (if-let [refused (when (some? value) (refused-by-type db property [value] [value] scope))]
+         (refusal property refused)
+         {:value value})
+       (nil? value) {:error "missing property value"}
+@@ -1217,7 +1226,7 @@
+           (some ::error resolved) {:error (some ::error resolved)}
+           (every? some? resolved)
+           (if-let [refused (or (when (= :block/tags property-ident) (tag-value-refusal db scope resolved))
+-                               (refused-by-type db property values resolved))]
++                               (refused-by-type db property values resolved scope))]
+             (refusal property refused)
+             {:value (if many-input? resolved (first resolved))})
+           ;; Text that isn't a finite number (NaN, Infinity) for a number property without choices,
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
+index 2591008..ac83d6e 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_node_value_read_test.cljs
+@@ -325,10 +325,12 @@
+                   points-value (value-uuid b15 points)
+                   estimate-other-value (batch-set! self (set-entry b16 (ident-id estimate) (str points-value)))
+                   link-content (batch-set! self (set-entry b16 (ident-id link) (str link-block)))
+-                  ;; Control: a UUID of the property's own value still reuses that value.
++                  ;; Control: a UUID of the block's own value still reuses that value.
+                   project-first (put! b17 (ident-id project) "Shared project")
+                   project-value (value-uuid b17 project)
+-                  project-reuse (put! b16 (ident-id project) (str project-value))
++                  project-reuse (put! b17 (ident-id project) (str project-value))
++                  ;; Another block's own value is refused: deleting b17 would delete it (patch 0047).
++                  project-other-holder (put! b16 (ident-id project) (str project-value))
+                   ;; The insert tools name the property once.
+                   insert (request! self "POST" (str "/semantic/blocks/" host-id "/children")
+                                    {:position "append"
+@@ -368,7 +370,14 @@
+               (is (nil? (stored b16 (:db/ident link)))))
+             (testing "control: the property's own value is reused by UUID"
+               (is (= 200 (:status project-first)) (pr-str (:body project-first)))
+-              (is (= 200 (:status project-reuse)) (pr-str (:body project-reuse))))
++              (is (= 200 (:status project-reuse)) (pr-str (:body project-reuse)))
++              (is (= project-value (value-uuid b17 project)) "b17 keeps its own value block"))
++            (testing "a text property given another block's own value is refused"
++              (is (= 400 (:status project-other-holder)) (pr-str (:body project-other-holder)))
++              (is (= (str "project: " (pr-str (str project-value)) " is " b17
++                          "'s own value, and deleting that would delete it here too; give the value itself, not its UUID")
++                     (get-in project-other-holder [:body :error])))
++              (is (nil? (stored b16 (:db/ident project)))))
+             (testing "another block's value survives a delete on the block that was offered it"
+               (is (= objective-value (value-uuid b15 objective)))
+               (is (= "Ship it" (:block/title (stored b15 (:db/ident objective)))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_value_block_by_uuid_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_value_block_by_uuid_test.cljs
+new file mode 100644
+index 0000000..0cc46bd
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_value_block_by_uuid_test.cljs
+@@ -0,0 +1,372 @@
++(ns logseq.db-sync.semantic-value-block-by-uuid-test
++  "A text or URL property given another holder's value block by UUID (connector #34). The handler
++  passed the UUID through as a ref, so block B was given block A's hidden value block, whose
++  parent is A. The call answered 200, and deleting A deleted that value block, so B's value
++  disappeared with no error. Fixed, the call either gives B its own value block holding the same
++  text (its parent is B, not A's block) or is refused up front, naming the entry, with nothing
++  written. Either way deleting A never changes B's value.
++
++  The class covered: a single text value, a URL value and one value of a many-text list, each
++  held by a block, and a text value held by a page; on every write path (set, batch set, insert
++  tree, batch insert trees); and on an E2EE graph. Controls that hold before and after the fix:
++  B re-sending its own value's UUID keeps that block, a property's default-value block (parented
++  to the property, so no holder's delete removes it) is still accepted by UUID, and a number value
++  (parented to the property too) still reads after A is deleted.
++
++  The graph is made through the real handler: the properties project (text), link (url), remarks
++  (text, many) and count (number), and block A on Notes holding project \"Shared project\", link
++  https://example.com, remarks m1 and m2, and count 42."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}. With `e2ee?`, the
++  graph is marked E2EE for this request."
++  ([self method path body] (request! self method path body false))
++  ([self method path body e2ee?]
++   (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1"
++                    (when e2ee? "&graph-e2ee=true"))
++           response (sync-handler/handle-http
++                     self
++                     (js/Request. url (clj->js (cond-> {:method method
++                                                        :headers {"content-type" "application/json"}}
++                                                 body (assoc :body (js/JSON.stringify (clj->js body)))))))
++           text (.text response)]
++     {:status (.-status response)
++      :body (when (seq text)
++              (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                   (catch :default _ text)))})))
++
++(defn- snapshot
++  "What a refused call must leave unchanged: the graph's last tx and its datom count."
++  [conn]
++  {:max-tx (:max-tx @conn) :datoms (count (d/datoms @conn :eavt))})
++
++(defn- notes-child [conn title]
++  (some #(when (= title (:block/title %)) %) (:block/_parent (ldb/get-page @conn "Notes"))))
++
++(defn- held
++  "The values block `title` on Notes holds for `ident`, as a vector of {:id :title :parent}, where
++  :parent is the db id of the value block's parent."
++  [conn title ident]
++  (let [v (get (notes-child conn title) ident)]
++    (mapv (fn [e] {:id (:db/id e)
++                   :title (or (:block/title e) (some-> (:logseq.property/value e) str))
++                   :parent (:db/id (:block/parent e))})
++          (cond (nil? v) [] (set? v) (sort-by :title v) :else [v]))))
++
++(defn- seed-graph []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          prop! (fn [body] (p/let [r (request! self "POST" "/semantic/properties" body)]
++                             (is (= 201 (:status r)) (pr-str body r))
++                             (get-in r [:body :ident])))
++          project (prop! {:title "project" :type "default"})
++          link (prop! {:title "link" :type "url"})
++          remarks (prop! {:title "remarks" :type "default" :cardinality "db.cardinality/many"})
++          count-id (prop! {:title "count" :type "number"})
++          seeded (request! self "POST" "/semantic/block-trees/batch"
++                           {:entries [{:page "Notes" :blocks [{:title "A" :properties {project "Shared project"
++                                                                                       link "https://example.com"
++                                                                                       remarks ["m1" "m2"]
++                                                                                       count-id 42}}]}
++                                      {:page "Holder Page" :blocks [{:title "h"}]}]})
++          _ (is (= 201 (:status seeded)) (pr-str seeded))
++          a (notes-child conn "A")
++          k keyword]
++    (is (= "Shared project" (:block/title (get a (k project)))))
++    (is (= (:db/id a) (:db/id (:block/parent (get a (k project))))) "A's project value block is A's child")
++    (is (= "https://example.com" (:block/title (get a (k link)))))
++    (is (= #{"m1" "m2"} (set (map :block/title (get a (k remarks))))))
++    {:conn conn :self self
++     :notes (str (:block/uuid (ldb/get-page @conn "Notes")))
++     :a (str (:block/uuid a))
++     :ids {:project project :link link :remarks remarks :count count-id}
++     :project-vblock (get a (k project))
++     :link-vblock (get a (k link))
++     :remarks-m1 (some #(when (= "m1" (:block/title %)) %) (get a (k remarks)))
++     :count-vblock (get a (k count-id))}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++(def ^:private paths [:set :batch-set :tree :batch-tree])
++
++(def ^:private path-prefix
++  "How each path names the one entry it was given in a refusal."
++  {:set "" :batch-set "entry 0: " :tree "blocks[0]: " :batch-tree "entries[0].blocks[0]: "})
++
++(defn- <encrypted-title
++  "An encrypted package for `text`, as an E2EE client sends a block's title."
++  [text]
++  (p/let [key (.generateKey js/crypto.subtle #js {:name "AES-GCM" :length 256} true #js ["encrypt" "decrypt"])
++          iv (js/crypto.getRandomValues (js/Uint8Array. 12))
++          payload (.encrypt js/crypto.subtle #js {:name "AES-GCM" :iv iv} key
++                            (.encode (js/TextEncoder.) (ldb/write-transit-str text)))]
++    (ldb/write-transit-str [iv (js/Uint8Array. payload)])))
++
++(defn- write-four!
++  "Writes `value` to property `prop` through each write path, each on its own block of Notes
++  titled `<path>-<label>`; set and batch set write to a block inserted first. Returns
++  {path {:status :error :title :unchanged?}}, :unchanged? comparing snapshots around the write.
++  With `e2ee?`, the writes are made on an E2EE graph, and the blocks the tree paths insert have
++  encrypted titles."
++  ([graph prop value label] (write-four! graph prop value label false))
++  ([{:keys [conn self notes]} prop value label e2ee?]
++   (p/let [tree-title (fn [path] (let [t (str (name path) "-" label)] (if e2ee? (<encrypted-title t) t)))
++           tree (tree-title :tree)
++           batch-tree (tree-title :batch-tree)
++           titles (merge (into {} (map (fn [path] [path (str (name path) "-" label)])) paths)
++                         {:tree tree :batch-tree batch-tree})
++           made (request! self "POST" "/semantic/block-trees"
++                          {:target-id notes :blocks [{:title (titles :set)} {:title (titles :batch-set)}]})
++           _ (is (= 201 (:status made)) (pr-str made))
++           uuid-of #(str (:block/uuid (notes-child conn %)))
++           calls {:set #(request! self "PUT" (str "/semantic/blocks/" (uuid-of (titles :set))
++                                                  "/properties/" (js/encodeURIComponent prop))
++                                  {:value value} e2ee?)
++                  :batch-set #(request! self "POST" "/semantic/block-properties/batch-set"
++                                        {:entries [{:block-id (uuid-of (titles :batch-set)) :property-id prop :value value}]}
++                                        e2ee?)
++                  :tree #(request! self "POST" "/semantic/block-trees"
++                                   {:target-id notes :blocks [{:title (titles :tree) :properties {prop value}}]}
++                                   e2ee?)
++                  :batch-tree #(request! self "POST" "/semantic/block-trees/batch"
++                                         {:entries [{:target-id notes
++                                                     :blocks [{:title (titles :batch-tree) :properties {prop value}}]}]}
++                                         e2ee?)}]
++     (p/loop [i 0 acc {}]
++       (if (= i (count paths))
++         acc
++         (p/let [path (nth paths i)
++                 before (snapshot conn)
++                 r ((calls path))]
++           (p/recur (inc i) (assoc acc path {:status (:status r)
++                                             :error (get-in r [:body :error])
++                                             :title (titles path)
++                                             :unchanged? (= before (snapshot conn))}))))))))
++
++(defn- own-copy-or-refused
++  "Each path either answered 400 naming its entry, the property and the UUID it was given, with
++  nothing written and no value held, or answered 2xx and holds its own value blocks with
++  `expected` titles: none of them is one of `others` (the other holder's value block ids), and
++  each one's parent is the holder itself. Returns {path held-values} for the after-delete check."
++  [conn results ident prop-name given-uuid others expected]
++  (into {}
++        (for [path paths
++              :let [{:keys [status error unchanged? title]} (results path)
++                    error (str error)
++                    holder (:db/id (notes-child conn title))
++                    stored (held conn title ident)]]
++          (do
++            (testing (str (name path) ": " prop-name " given another holder's value block " given-uuid)
++              (if (= 400 status)
++                (do
++                  (is (string/starts-with? error (path-prefix path)) (pr-str error))
++                  (is (string/includes? (string/lower-case error) prop-name) (pr-str error))
++                  (is (string/includes? error given-uuid) (pr-str error))
++                  (is unchanged? "a refused call writes nothing")
++                  (is (empty? stored) (pr-str stored)))
++                (do
++                  (is (#{200 201} status) (pr-str (results path)))
++                  (is (= (sort expected) (sort (map :title stored))) (pr-str stored))
++                  (is (not-any? (set others) (map :id stored))
++                      (str "holds its own value block, not the other holder's " (pr-str stored)))
++                  (is (every? #(= holder (:parent %)) stored)
++                      (str "each value block's parent is the holder " holder ": " (pr-str stored))))))
++            [path stored]))))
++
++(defn- unchanged-after-delete
++  "After the other holder was deleted, every path still holds exactly what it held before."
++  [conn results ident before]
++  (doseq [path paths :let [{:keys [title]} (results path)]]
++    (testing (str (name path) ": deleting the other holder leaves this holder's value as it was")
++      (is (= (before path) (held conn title ident))
++          (str "before " (pr-str (before path)) " after " (pr-str (held conn title ident)))))))
++
++(defn- delete-a! [{:keys [self a]}]
++  (p/let [r (request! self "DELETE" (str "/semantic/blocks/" a) nil)]
++    (is (= 200 (:status r)) (pr-str r))))
++
++;; Before the fix: 200/201 on every path, each holding A's own value block (parent A); after A was
++;; deleted each held nothing.
++(deftest text-value-by-another-blocks-value-uuid-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn project-vblock ids] :as graph}]
++        (p/let [ident (keyword (:project ids))
++                given (str (:block/uuid project-vblock))
++                results (write-four! graph (:project ids) given "project")
++                before (own-copy-or-refused conn results ident "project" given
++                                            [(:db/id project-vblock)] ["Shared project"])
++                _ (delete-a! graph)]
++          (unchanged-after-delete conn results ident before))))))
++
++;; Before the fix: as for text, with A's URL value block.
++(deftest url-value-by-another-blocks-value-uuid-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn link-vblock ids] :as graph}]
++        (p/let [ident (keyword (:link ids))
++                given (str (:block/uuid link-vblock))
++                results (write-four! graph (:link ids) given "link")
++                before (own-copy-or-refused conn results ident "link" given
++                                            [(:db/id link-vblock)] ["https://example.com"])
++                _ (delete-a! graph)]
++          (unchanged-after-delete conn results ident before))))))
++
++;; Before the fix: the list held A's m1 value block beside its own "own", and lost m1 with A.
++(deftest many-text-value-by-another-blocks-value-uuid-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn remarks-m1 ids] :as graph}]
++        (p/let [ident (keyword (:remarks ids))
++                given (str (:block/uuid remarks-m1))
++                a-values (map :db/id (get (notes-child conn "A") ident))
++                results (write-four! graph (:remarks ids) [given "own"] "remarks")
++                before (own-copy-or-refused conn results ident "remarks" given a-values ["m1" "own"])
++                _ (delete-a! graph)]
++          (unchanged-after-delete conn results ident before))))))
++
++;; A page holds its value blocks as a block does. Before the fix: each path held the page's value
++;; block (parent the page).
++(deftest text-value-by-a-pages-value-uuid-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids] :as graph}]
++        (p/let [ident (keyword (:project ids))
++                page (ldb/get-page @conn "Holder Page")
++                r (request! self "PUT" (str "/semantic/blocks/" (:block/uuid page) "/properties/"
++                                            (js/encodeURIComponent (:project ids)))
++                            {:value "Page project"})
++                _ (is (= 200 (:status r)) (pr-str r))
++                page-vblock (get (ldb/get-page @conn "Holder Page") ident)
++                _ (is (= (:db/id page) (:db/id (:block/parent page-vblock))) "the page's value block is its child")
++                given (str (:block/uuid page-vblock))
++                results (write-four! graph (:project ids) given "page-project")]
++          (own-copy-or-refused conn results ident "project" given [(:db/id page-vblock)] ["Page project"]))))))
++
++;; On an E2EE graph a value's text is ciphertext the server can't read. Before the fix: 200/201
++;; on every path, sharing A's value block, and losing it with A.
++(deftest e2ee-value-by-another-blocks-value-uuid-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn project-vblock ids] :as graph}]
++        (p/let [ident (keyword (:project ids))
++                given (str (:block/uuid project-vblock))
++                results (write-four! graph (:project ids) given "e2ee-project" true)
++                before (own-copy-or-refused conn results ident "project" given
++                                            [(:db/id project-vblock)] ["Shared project"])
++                _ (delete-a! graph)]
++          (unchanged-after-delete conn results ident before))))))
++
++;; Controls: these pass before and after the fix.
++
++(deftest own-value-uuid-keeps-the-same-value-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes ids]}]
++        (p/let [made (request! self "POST" "/semantic/block-trees"
++                               {:target-id notes :blocks [{:title "B-own" :properties {(:project ids) "Mine"
++                                                                                       (:link ids) "https://b.example.com"}}]})
++                _ (is (= 201 (:status made)) (pr-str made))
++                b (notes-child conn "B-own")]
++          (p/doseq [k [:project :link]]
++            (p/let [ident (keyword (k ids))
++                    own (get (notes-child conn "B-own") ident)
++                    r1 (request! self "PUT" (str "/semantic/blocks/" (:block/uuid b) "/properties/"
++                                                 (js/encodeURIComponent (k ids)))
++                                 {:value (str (:block/uuid own))})
++                    r2 (request! self "POST" "/semantic/block-properties/batch-set"
++                                 {:entries [{:block-id (str (:block/uuid b)) :property-id (k ids)
++                                             :value (str (:block/uuid own))}]})]
++              (is (= 200 (:status r1)) (pr-str r1))
++              (is (= 200 (:status r2)) (pr-str r2))
++              (is (= (:db/id own) (:db/id (get (notes-child conn "B-own") ident)))
++                  (str (name k) ": re-sending B's own value keeps that value block")))))))))
++
++(deftest default-value-block-by-uuid-is-accepted-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn ids] :as graph}]
++        (p/let [ident (keyword (:project ids))
++                property (d/entity @conn ident)
++                _ (outliner-property/create-property-text-block! conn (:db/id property)
++                                                                 :logseq.property/default-value "Default project" {})
++                default (:logseq.property/default-value (d/entity @conn ident))
++                _ (is (= (:db/id property) (:db/id (:block/parent default))) "the default is the property's child")
++                results (write-four! graph (:project ids) (str (:block/uuid default)) "default")
++                _ (doseq [path paths]
++                    (is (#{200 201} (:status (get results path))) (pr-str (results path))))
++                _ (delete-a! graph)]
++          (doseq [path paths]
++            (is (= ["Default project"] (map :title (held conn (:title (results path)) ident)))
++                (str (name path) ": the default value still reads after A is deleted"))))))))
++
++(deftest number-value-by-uuid-survives-the-holders-delete-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn count-vblock ids] :as graph}]
++        (p/let [ident (keyword (:count ids))
++                results (write-four! graph (:count ids) (str (:block/uuid count-vblock)) "count")
++                _ (doseq [path paths]
++                    (is (#{200 201} (:status (get results path))) (pr-str (results path))))
++                _ (delete-a! graph)]
++          (doseq [path paths]
++            (is (= ["42"] (map :title (held conn (:title (results path)) ident)))
++                (str (name path) ": count still reads 42 after A is deleted"))))))))
++
++;; The holder rule is for a property's own values (text, URL, number). A node property takes any
++;; block by UUID, whose parent is its page, and a choice property takes its choices by UUID: both
++;; are refs to entities, not value blocks, so neither is refused.
++(deftest node-and-choice-values-by-uuid-are-unaffected-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a] :as graph}]
++        (p/let [r1 (request! self "POST" "/semantic/properties" {:title "related" :type "node"})
++                _ (is (= 201 (:status r1)) (pr-str r1))
++                related (get-in r1 [:body :ident])
++                r2 (request! self "POST" "/semantic/properties"
++                             {:title "colour" :type "default" :choices [{:title "red"} {:title "blue"}]})
++                _ (is (= 201 (:status r2)) (pr-str r2))
++                colour (get-in r2 [:body :ident])
++                red (some #(when (= "red" (:block/title %)) %)
++                          (:block/_closed-value-property (d/entity @conn (keyword colour))))
++                node-results (write-four! graph related a "related")
++                choice-results (write-four! graph colour (str (:block/uuid red)) "colour")]
++          (doseq [path paths]
++            (is (#{200 201} (:status (node-results path))) (str "node: " (pr-str (node-results path))))
++            (is (= ["A"] (map :title (held conn (:title (node-results path)) (keyword related))))
++                (str (name path) ": the node value is block A"))
++            (is (#{200 201} (:status (choice-results path))) (str "choice: " (pr-str (choice-results path))))
++            (is (= [(:db/id red)] (map :id (held conn (:title (choice-results path)) (keyword colour))))
++                (str (name path) ": the choice value is the choice red"))))))))
++
++;; A page re-sending its own value's UUID keeps that value block, as a block does.
++(deftest page-own-value-uuid-keeps-the-same-value-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [ident (keyword (:project ids))
++                page (ldb/get-page @conn "Holder Page")
++                path (str "/semantic/blocks/" (:block/uuid page) "/properties/" (js/encodeURIComponent (:project ids)))
++                r1 (request! self "PUT" path {:value "Page project"})
++                _ (is (= 200 (:status r1)) (pr-str r1))
++                own (get (ldb/get-page @conn "Holder Page") ident)
++                r2 (request! self "PUT" path {:value (str (:block/uuid own))})
++                r3 (request! self "POST" "/semantic/block-trees/batch"
++                             {:entries [{:page "Holder Page" :properties {(:project ids) (str (:block/uuid own))}
++                                         :blocks [{:title "p2"}]}]})]
++          (is (= 200 (:status r2)) (pr-str r2))
++          (is (= 201 (:status r3)) (pr-str r3))
++          (is (= (:db/id own) (:db/id (get (ldb/get-page @conn "Holder Page") ident)))
++              "re-sending the page's own value keeps that value block"))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index ba4fb5d..0eb5c51 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -36,6 +36,7 @@
+             [logseq.db-sync.semantic-delete-property-value-test]
+             [logseq.db-sync.semantic-json-number-value-test]
+             [logseq.db-sync.semantic-tags-title-scoped-test]
++            [logseq.db-sync.semantic-value-block-by-uuid-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

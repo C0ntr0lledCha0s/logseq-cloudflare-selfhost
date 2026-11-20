@@ -91,6 +91,17 @@ export const DISPLAY_TYPE_HINT =
   "Setting display-type keeps the stored title: to make a text block code or math with its title stored verbatim, call update_block with the title and display-type together. connector_help's Code, math and quote blocks section has the rules.";
 const DISPLAY_TYPE_TOOLS = new Set(["set_block_property", "batch_set_block_property"]);
 
+/** The sentence on each block-property write tool that refuses a property's classes and a tag's extends (item 45). */
+export const CLASS_SCHEMA_HINT =
+  "A property's classes (logseq.property/classes) and a tag's extends (logseq.property.class/extends) are not block properties: this tool refuses them, however they are named, naming the entry (logseq.property/classes can't be set here; use update_property (classes); for extends, use update_tag (extends)). Change them in their own update_property or update_tag call before writing values that depend on them.";
+const CLASS_SCHEMA_TOOLS = new Set([
+  "set_block_property",
+  "batch_set_block_property",
+  "insert_block_tree",
+  "insert_block_children",
+  "batch_insert_block_trees",
+]);
+
 /** Usage conventions added to the generated descriptions of the tools they concern. */
 const HINTS: Record<string, string> = {
   insert_block_tree:
@@ -120,6 +131,7 @@ function description(op: GraphOperation): string {
   if (HINTS[op.name]) parts.push(HINTS[op.name]);
   if (FENCE_TOOLS.has(op.name)) parts.push(FENCE_HINT);
   if (DISPLAY_TYPE_TOOLS.has(op.name)) parts.push(DISPLAY_TYPE_HINT);
+  if (CLASS_SCHEMA_TOOLS.has(op.name)) parts.push(CLASS_SCHEMA_HINT);
   if (STAMPING_TOOLS.has(op.name)) parts.push(STAMP_HINT);
   if (HOLDER_STAMPING_TOOLS.has(op.name)) parts.push(HOLDER_STAMP_HINT);
   if (parts.length === 0) parts.push(op.operation.summary ?? `${op.method} ${op.path}`);
@@ -242,6 +254,13 @@ async function request(access: GraphAccess, req: UpstreamRequest, routes: Delete
 }
 
 /**
+ * Tools whose unknown top-level arguments are refused rather than stripped: a delete_block_property
+ * value given beside body instead of in it would otherwise be dropped, and the call would delete the
+ * whole property (patch 0042).
+ */
+const STRICT_ARGUMENTS: ReadonlySet<string> = new Set(["delete_block_property", "batch_delete_block_property"]);
+
+/**
  * Builds one tool per graph operation of the sync server's OpenAPI `spec`. Nothing request-scoped is
  * captured: each call resolves its graph from the alias in its own path.
  */
@@ -271,7 +290,7 @@ export function buildGraphTools(spec: OpenApiSpec, access: GraphAccess): GraphTo
         name: op.name,
         config: {
           description: description(op),
-          inputSchema: z.object(shape),
+          inputSchema: STRICT_ARGUMENTS.has(op.name) ? z.object(shape).strict() : z.object(shape),
           annotations,
         },
         handler,

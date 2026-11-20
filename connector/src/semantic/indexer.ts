@@ -1,6 +1,6 @@
 import { connectorHostname } from "../config";
 import type { GraphStore } from "../graphs";
-import { SyncError, syncFetch } from "../sync";
+import { SyncError, SyncStoppedError, syncFetch } from "../sync";
 import { DIMENSIONS, LEASE_MS, ORPHAN_BATCH, PAGES_PER_RUN, PAGE_SIZE, type SemanticBindings } from "./config";
 import { type BlockDocument, type FeedPage, parseFeedPage, toDocument } from "./document";
 import type { IndexState, SemanticStore, StoredBlock } from "./store";
@@ -244,7 +244,9 @@ export async function runIndexer(deps: IndexerDeps): Promise<RunReport> {
           next = restart(state);
         } else if (error instanceof SyncError) {
           next = syncErrorState(state, error, graph.alias, deps.env);
-        } else if (error instanceof BindingError) {
+        } else if (error instanceof BindingError || error instanceof SyncStoppedError) {
+          // A failed binding call, or a sync request the server never answered (stopped or reset):
+          // record it on this graph, which the next run retries, and go on to the next graph.
           next = { ...state, status: "error", error: error.message };
         } else {
           throw error;

@@ -5,6 +5,7 @@ tags: [cpu, durable-object, free-plan, cpu-limit, exceededCpu, websocket, datalo
 seen:
   - 2026-11-16 – probe built (`.github/workflows/do-cpu-probe.yml`)
   - 2026-11-19 – first run, workflow run 44481130870 (8 targets, WebSocket client on)
+  - 2026-11-20 – analytics query and repeat count fixed in the probe (Connector #51); live rerun pending
 promoted_to: []
 ---
 
@@ -39,8 +40,10 @@ Measured on the owner's Free account on 2026-11-19 (`do-cpu-probe` run 444811308
 - **The query caps can stay as designed.** The worst cases measured in the release bundle (about 184 ms for `datalog_query` with every cap near its limit, about 127 ms for a named query at the reads backstop) are two orders of magnitude below the kill. At the runner-to-Cloudflare ratio above they are perhaps 200 to 300 ms on Cloudflare, still far inside it. The caps exist to keep sync responsive, not to avoid the kill.
 - **The fuel counter loses urgency.** It no longer guards against a 10 ms limit. It stays the route to bring caller rules back safely (README backlog 23), so keep it as a backlog item, not a blocker.
 - **The Paid plan buys nothing for queries.** Its main gain here would be the front Worker's 10 ms CPU limit, which this probe did not test.
-- **Probe follow-ups:** fix the analytics query (find the CPU field `durableObjectsInvocationsAdaptiveGroups` actually exposes, and wait or filter so invocations appear), and add a repeat count so a reset can be told apart from a kill.
+- **Probe follow-ups (done, not yet run live):** the probe now reads CPU from the `cpuTimeP99` quantile of `durableObjectsInvocationsAdaptiveGroups` (the dataset has no `sum.cpuTime`), says what an unfiltered read of the account and the periodic totals found when no invocation is reported, and takes a `repeats` input (default 3, at most 5) that runs each target several times. Each run gets a verdict: `kept`, `restart` (the burn completed but the instance changed), `kill` (the CPU-limit error) or `error`, and the *Limit* bracket takes its failed side only from kills. The unit tests pin this against stubbed GraphQL answers, so the live behaviour of the query is unconfirmed until the rerun below.
 
 ## How to catch it next time
 
-Re-run `do-cpu-probe` (Actions → do-cpu-probe, defaults) after a Cloudflare limits change or a move to Workers Paid, and compare the latency bracket with the table here. Remember that runner milliseconds are not Cloudflare milliseconds: the same work took about 1.65 times longer on Cloudflare, so release-bundle timings from a fast machine understate DO CPU by roughly that much.
+Re-run `do-cpu-probe` (Actions → do-cpu-probe, defaults) after a Cloudflare limits change or a move to Workers Paid, and compare the latency bracket with the table here. The first rerun after the probe fix is still owed: run it with the defaults, check that the CPU ms column is filled from analytics for completed runs (if it is still empty, read the summary notes, which say what the unfiltered read found), and use the *Repeats* line to see whether restarts after completed runs recur (an ordinary restart) or only the long targets are killed. Remember that runner milliseconds are not Cloudflare milliseconds: the same work took about 1.65 times longer on Cloudflare, so release-bundle timings from a fast machine understate DO CPU by roughly that much.
+
+A trap from the fix's investigation: the first hypothesis blamed `sum.cpuTime`, the unknown field in the log. It was noise. The probe falls back to the next selection (the `cpuTimeP99` quantile) and keeps it for every later poll, so the 240 s of polling asked a valid query and got no rows. Both the invocations read (filtered by script name, a window of seconds) and the periodic read came back empty, so the cause was in the window, filter or ingestion lag, not the field. When a fallback chain ends on a selection that worked, read the error from an earlier option as a clue to the schema, not as the reason the result was empty. A skeptic caught this by reading which query the later polls used.
