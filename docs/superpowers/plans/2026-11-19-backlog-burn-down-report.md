@@ -25,7 +25,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 51: CPU probe analytics find nothing | ready (not verified live) | `fix/do-cpu-probe-analytics` | [#70](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/70) | `5506eac` |
 | 68 (formerly 58): routing hints | spec awaiting approval | `feat/tool-routing-hints` | [#71](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/71) | `2f6998e` |
 | 49: Query blocks | spec awaiting approval | `feat/query-blocks` | [#72](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/72) | `c7bb092` |
-| 50: change feed, schema export, health checks | spec running | `feat/changes-schema-health` | – | – |
+| 50: change feed, schema export, health checks | spec awaiting approval | `feat/changes-schema-health` | [#73](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/73) | `f3d5413` |
+| 52: client param for open-tasks-by-client | spec running | `feat/open-tasks-client-param` | – | – |
 
 ---
 
@@ -378,3 +379,23 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - refusing the Query tag on property writes
   - the file name
 - **Logseq write-back:** pr-url and a spec note (audit entries 362 and 363).
+
+---
+
+## Item 50: change feed, schema export and deeper health checks
+
+- **Status:** spec written, awaiting your approval. Nothing is built. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#73](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/73), spec `docs/superpowers/specs/2026-11-20-changes-schema-health-checks-design.md` (`f3d5413`).
+- **Design:** three read-only Durable Object routes, one patch each. They are numbered from 0051 on the assumption that item 49 takes 0050.
+  - 0051 adds `broken-refs` and `missing-tag-properties` to `get_graph_health`. "Choice from another property" is already covered by `mismatched-choice-values`.
+  - 0052 adds `list_changes_since`: an index range on `:block/updated-at`, grouped by page, refused above 20,000 changes.
+  - 0053 is optional and adds `get_graph_schema`.
+  - None of them reads D1. Durable Object CPU is estimated, and a bench during the build replaces the estimate.
+- **Your calls (spec section 11):**
+  - split out the schema export
+  - how noisy `missing-tag-properties` will be (add a filter or a "required" marker?)
+  - whether moves need naming per block
+  - Private and Recycle-bin content in the old checks
+  - `since` in milliseconds or as an ISO date
+  - the patch numbers
+  - the file name
+- **Logseq write-back:** pr-url and a spec note (audit entries 364 and 365).
