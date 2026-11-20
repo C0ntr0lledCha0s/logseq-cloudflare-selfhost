@@ -20,7 +20,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 35: '# ' page title sets a heading | ready | `fix/page-title-no-heading` | [#68](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/68) | `712e319` |
 | 37: code block #word escaped | not a bug | `fix/code-block-text-verbatim` | – | `3f190ea` |
 | 47: set can write Root to a property's classes | not a bug (fixed by PR 63) | `fix/property-classes-write-refused` | – | `54d2a0c` |
-| 48: activity log session filter never matches | running | `fix/audit-log-session-filter` | – | – |
+| 48: activity log session filter never matches | ready | `fix/audit-log-session-filter` | [#69](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/69) | `ecdca09` |
+| 56: flaky release-check timing | running | `fix/release-check-timing-steady` | – | – |
 
 ---
 
@@ -286,3 +287,19 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Evidence:** the exact repro, replayed through the real handler on patches up to 0049, now answers 400 `entry 0: logseq.property/classes can't be set here; use update_property (classes)` and stores nothing. The same holds for batch set in either mode, batch insert, `insert_block_tree` and `insert_block_children`.
 - **Commits:** a learnings note (`54d2a0c`). It has no PR of its own and rides along in item 48's PR.
 - **Your call:** close item 47 once PR 63 merges and deploys. A "Checked" note was added (audit entry 324).
+
+---
+
+## Item 48: get_activity_log's session filter never matched
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#69](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/69), HEAD `ecdca09`, standard tier, one review round. Stacked on items 47 and 37's learnings commits and PR 68. Connector only, no migration.
+- **Cause:** the agents SDK MCP handler is stateless and never issues `mcp-session-id`, so claude.ai and Claude Code never send one. Every row's session is null, and the filter returned no entries for any value.
+- **Fix:** the `session` input is refused by name, including when `id` is given, and the query no longer filters on it. The column stays.
+- **Decide-first call (yours to overrule):** the lane dropped the filter rather than keying sessions by a grant hash. One OAuth grant spans many conversations, so the hash would group by grant, not session. It would also need an HMAC secret and a migration. `client` already tells callers apart.
+- **Gate:** the lane ran `scripts/check.sh` on `ecdca09` and it passed (1019 connector tests). `--upstream` was not needed. tofu fmt was skipped.
+- **Regression tests:** real-Worker tests on three lanes, which failed before the fix. A premise guard fails if the SDK ever starts issuing session ids. The mutant was killed.
+- **Open should-fix (minor, wording):**
+  - the `id` input's text still says the other inputs are ignored
+  - the refusal over-claims that no entry could match
+- **Skill note:** don't pass `session`. Use `client`, `tool`, `status` and the date range.
+- **Logseq write-back:** applied (audit entries 333 and 334).
