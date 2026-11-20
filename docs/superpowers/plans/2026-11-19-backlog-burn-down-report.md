@@ -16,7 +16,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 53: indexer stops on a rejected sync | ready | `fix/indexer-survives-rejected-sync` | [#66](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/66) | `7dd3e49` |
 | 46: batch insert marked non-destructive | not a bug (already fixed) | `fix/batch-insert-destructive-hint` | – | `34357b6` |
 | 44: batch ignores the Task tag Status adds | ready | `fix/batch-status-adds-task-tag` | [#67](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/67) | `fc0b4cc` |
-| 39: delete_blocks under-counts descendants | running | `fix/delete-blocks-counts-descendants` | – | – |
+| 39: delete_blocks under-counts descendants | not a bug | `fix/delete-blocks-counts-descendants` | – | `a689030` |
+| 35: '# ' page title sets a heading | running | `fix/page-title-no-heading` | – | – |
 
 ---
 
@@ -238,3 +239,12 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Learnings:** a new CLAUDE.md gotcha (`final-tags` copies the tag rules and the implicit Task rule; change them together) and a REVIEW.md rule.
 - **Skill note:** drop any workaround that splits a batch because Status on an untagged block made a later Task-limited property fail.
 - **Logseq write-back:** applied (audit entries 305 and 306).
+
+---
+
+## Item 39: delete_blocks under-counted descendants in total-removed
+
+- **Status:** not a bug (confidence 0.85, one skeptic did not refute it). Standard tier.
+- **Evidence:** since patch 0012 was first committed (d07f186), the handler has built `removed` from each block plus `get-block-full-children-ids` and answered `total-removed` as its size, in the dry run and in the real call. Each affected entry carries `descendants`. An existing test asserts `total-removed` 4 for blocks with 2 and 0 children, and the semantic-bulk suite passes on HEAD. The connector passes the count through unchanged. The likely cause of the report is that the summary line ("Deleted 2 blocks … +1 child") was read as the total.
+- **Commits:** a learnings note (`a689030`) and a new CLAUDE.md gotcha (repro the exact call on HEAD and read the raw field before investigating; four lanes have now ended as not-a-bug). It has no PR of its own and rides along in item 35's PR.
+- **Your call:** close item 39, or check the raw `total-removed` in the original response if you still have it. A "Checked" note was added (audit entry 308).
