@@ -18,7 +18,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 44: batch ignores the Task tag Status adds | ready | `fix/batch-status-adds-task-tag` | [#67](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/67) | `fc0b4cc` |
 | 39: delete_blocks under-counts descendants | not a bug | `fix/delete-blocks-counts-descendants` | – | `a689030` |
 | 35: '# ' page title sets a heading | ready | `fix/page-title-no-heading` | [#68](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/68) | `712e319` |
-| 37: code block #word escaped | running | `fix/code-block-text-verbatim` | – | – |
+| 37: code block #word escaped | not a bug | `fix/code-block-text-verbatim` | – | `3f190ea` |
+| 47: set can write Root to a property's classes | running | `fix/property-classes-write-refused` | – | – |
 
 ---
 
@@ -266,3 +267,12 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
   - no journal or E2EE test
 - **Skill note:** don't send a `#` prefix in page, tag or property titles. To remove a block's heading, delete `logseq.property/heading`.
 - **Logseq write-back:** applied (audit entries 313 and 315).
+
+---
+
+## Item 37: an unknown #word was escaped inside code and math blocks
+
+- **Status:** not a bug (confidence 0.85). Quick tier.
+- **Evidence:** a repro through the real handler on HEAD shows patch 0037 already keeps code and math titles verbatim on `update_block`, and that `refresh_refs` neither lists nor changes them. Existing tests pin this. Quote blocks still escape an unknown `#word`, which was a documented design choice (spec 2026-11-08). The app parses tags in a quote, so an unescaped `#word` would turn into a stray tag at the quote's next edit.
+- **Commits:** a learnings note (`3f190ea`). It has no PR of its own and rides along in item 47's PR.
+- **Your call:** close item 37, or log a feature if you want quote titles kept verbatim too. A "Checked" note was added (audit entry 320).
