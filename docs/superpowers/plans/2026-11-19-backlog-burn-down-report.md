@@ -17,7 +17,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 46: batch insert marked non-destructive | not a bug (already fixed) | `fix/batch-insert-destructive-hint` | – | `34357b6` |
 | 44: batch ignores the Task tag Status adds | ready | `fix/batch-status-adds-task-tag` | [#67](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/67) | `fc0b4cc` |
 | 39: delete_blocks under-counts descendants | not a bug | `fix/delete-blocks-counts-descendants` | – | `a689030` |
-| 35: '# ' page title sets a heading | running | `fix/page-title-no-heading` | – | – |
+| 35: '# ' page title sets a heading | ready | `fix/page-title-no-heading` | [#68](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/68) | `712e319` |
+| 37: code block #word escaped | running | `fix/code-block-text-verbatim` | – | – |
 
 ---
 
@@ -248,3 +249,20 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Evidence:** since patch 0012 was first committed (d07f186), the handler has built `removed` from each block plus `get-block-full-children-ids` and answered `total-removed` as its size, in the dry run and in the real call. Each affected entry carries `descendants`. An existing test asserts `total-removed` 4 for blocks with 2 and 0 children, and the semantic-bulk suite passes on HEAD. The connector passes the count through unchanged. The likely cause of the report is that the summary line ("Deleted 2 blocks … +1 child") was read as the total.
 - **Commits:** a learnings note (`a689030`) and a new CLAUDE.md gotcha (repro the exact call on HEAD and read the raw field before investigating; four lanes have now ended as not-a-bug). It has no PR of its own and rides along in item 35's PR.
 - **Your call:** close item 39, or check the raw `total-removed` in the original response if you still have it. A "Checked" note was added (audit entry 308).
+
+---
+
+## Item 35: a '# ' page or tag title set the heading property on the page
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#68](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/68), HEAD `712e319`, quick tier, one review round, stacked on item 39's learnings commit and PR 67.
+- **Cause:** in `update_block`, patch 0024's heading step only exempted code, math and quote blocks, not pages, tags or properties. `update_page` and `update_tag` had a second defect: the outliner silently dropped the prefix, or answered 500 when the prefix had leading whitespace.
+- **Fix (patch 0049):** all three routes refuse such a title with a 400 that names `#` and the title, and write nothing. Refusing was chosen over stripping because the outliner refuses `#` in any page name, as `create_page` already does. Docs now say how to remove a heading: delete `logseq.property/heading`.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `712e319` and it passed (856 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** six tests failed before the fix, plus a guard and a control. All three mutants were killed.
+- **Open:** none.
+- **Backlog proposals:**
+  - README 30: a `#` elsewhere in a page title still answers 500
+  - README 31: asset titles still take the heading step
+  - no journal or E2EE test
+- **Skill note:** don't send a `#` prefix in page, tag or property titles. To remove a block's heading, delete `logseq.property/heading`.
+- **Logseq write-back:** applied (audit entries 313 and 315).
