@@ -22,7 +22,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 47: set can write Root to a property's classes | not a bug (fixed by PR 63) | `fix/property-classes-write-refused` | – | `54d2a0c` |
 | 48: activity log session filter never matches | ready | `fix/audit-log-session-filter` | [#69](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/69) | `ecdca09` |
 | 56: flaky release-check timing | not a bug (already fixed) | `fix/release-check-timing-steady` | – | `829670c` |
-| 51: CPU probe analytics find nothing | running | `fix/do-cpu-probe-analytics` | – | – |
+| 51: CPU probe analytics find nothing | ready (not verified live) | `fix/do-cpu-probe-analytics` | [#70](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/70) | `5506eac` |
+| 68 (formerly 58): routing hints | spec running | `feat/tool-routing-hints` | – | – |
 
 ---
 
@@ -313,3 +314,24 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Evidence:** the 103 ms median was seen at PR 52's stage 6 gate (f4ff06d). At that point the F1 shapes ran over the blocks until the width cap stopped them, at 88–145 ms. PR 52's own review round (fa88b69, s-2-1) added the 12-function-binding refusal, so the 422 now comes before anything runs. On the release bundle as last built, 20 rounds gave a median of 1–2 ms (max 3), and none came near 100 ms. Widening the bound would only loosen a check that already has about a 50× margin.
 - **Commits:** a learnings note (`829670c`). It has no PR of its own and rides along in item 51's PR.
 - **Your call:** close item 56. A "Checked" note was added (audit entry 337).
+
+---
+
+## Item 51: the CPU probe's analytics found no invocations and no CPU field
+
+- **Status:** ready, but **acceptance 1 is not verified live**, because this session has no Cloudflare credentials. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#70](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/70), HEAD `5506eac`, standard tier, two review rounds. Stacked on item 56's learnings commit and PR 69. The first run stopped at intake with a self-contradicting "blocked" result, and a fresh rerun went through.
+- **Cause:**
+  - The probe made one burn per target, so it couldn't tell an ordinary restart from a CPU kill.
+  - The `sum.cpuTime` error was noise from a fallback chain. Analytics came back empty because of the time window, the script filter or ingestion lag.
+- **Fix:**
+  - `--repeats` (workflow default 3, at most 5), with a verdict per run: kept, restart, kill or error. The limit bracket now comes from kills only.
+  - CPU is read from the quantile fields.
+  - The analytics window now reaches the time of the read.
+  - When the answer is empty, the probe reads again without the script filter and says why nothing came back.
+- **Gate:** the lane ran `scripts/check.sh` on `5506eac` and it passed (389 scripts tests). `--upstream` was not needed. tofu fmt was skipped.
+- **Open should-fix (minor):**
+  - repeats × durations can outrun the job's 30-minute timeout, and the results are written only at the end, so they are lost
+  - a failed state read counts as a restart
+  - one summary clause is unpinned
+- **Owed:** rerun do-cpu-probe from Actions after merge and check the CPU column and the Repeats line.
+- **Logseq write-back:** applied (audit entries 341 and 342).
