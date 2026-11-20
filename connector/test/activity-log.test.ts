@@ -8,7 +8,7 @@ import { RESULT_CHAR_LIMIT } from "../src/tools/common";
 import { GraphStore } from "../src/graphs";
 import { ServiceTokenStore } from "../src/auth/service-tokens";
 import { createConnector } from "../src/index";
-import { mcpHandler } from "../src/mcp";
+import { mcpApiHandler, mcpHandler } from "../src/mcp";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS } from "../src/tools/readable";
 import { LOGGED_READS } from "../src/tools/semantic";
@@ -343,7 +343,7 @@ describe("filters", () => {
     expect((await activity()).json.entries).toHaveLength(6);
   });
 
-  it("tool, session and each status, dry-run included; pending shows as outcome unknown", async () => {
+  it("tool and each status, dry-run included; session refused even for stored values; pending shows as outcome unknown", async () => {
     const now = Date.now() - 1000;
     const ok = await row({ at: now - 7, tool: "update_block", session: "s-1", reason: "fix typo" });
     const dry = await row({ at: now - 6, tool: "delete_blocks", dry_run: 1, session: "s-1" });
@@ -355,20 +355,24 @@ describe("filters", () => {
       [{ tool: "delete_blocks" }, [err, dry]],
       [{ tool: "update_block" }, [pending, ok]],
       [{ tool: "update" }, []],
-      [{ session: "s-1" }, [dry, ok]],
-      [{ session: "s-2" }, [pending, refused]],
       [{ status: "ok" }, [ok]],
       [{ status: "dry-run" }, [refusedDry, dry]],
       [{ status: "error" }, [err]],
       [{ status: "refused" }, [refusedDry, refused]],
       [{ status: "pending" }, [pending]],
       [{ status: "refused", tool: "delete_page" }, [refusedDry]],
-      [{ status: "ok", session: "s-2" }, []],
     ];
     for (const [args, ids] of cases) {
       const got = await activity(args);
       expect(got.isError, got.text).toBe(false);
       expect(got.json.entries.map((e) => e.id), JSON.stringify(args)).toEqual(ids);
+    }
+    // A session value a row does hold (a client that sent the header) is refused too, with id and
+    // other filters alike: the input is gone, never silently ignored or answered with no entries.
+    for (const args of [{ session: "s-1" }, { session: "s-2", status: "ok" }, { session: "s-1", id: ok }]) {
+      const got = await activity(args);
+      expect(got.isError, JSON.stringify(args)).toBe(true);
+      expect(got.text).toContain("session: no longer supported; MCP calls carry no session id");
     }
     const all = await activity();
     const byId = new Map(all.json.entries.map((e, i) => [e.id, all.lines[i]]));
@@ -1166,7 +1170,7 @@ describe("service tokens", () => {
       ["work", work],
       ["home", home],
     ] as const) {
-      for (const filter of [{}, { tool: "token_edit" }, { session: "github:1001" }, { status: "ok" }]) {
+      for (const filter of [{}, { tool: "token_edit" }, { status: "ok" }]) {
         const label = `${graph} ${JSON.stringify(filter)}`;
         const oauth = await activity({ graph, ...filter });
         expect(oauth.isError, label).toBe(false);
@@ -1183,6 +1187,131 @@ describe("service tokens", () => {
       expect(byId.text).toContain(`id ${edit}: no such entry for graph ${graph}`);
       const serviceById = (await viaToken(token, "get_activity_log", { graph, id: edit }, "session-ci")).join("\n");
       expect(serviceById).toContain(`id ${edit}: no such entry for graph ${graph}`);
+    }
+  });
+});
+
+// Item 48: get_activity_log's `session` input filtered on audit_log.session, which is copied from the
+// mcp-session-id request header. The SDK handler is stateless, so initialize never issues that header
+// and real clients (claude.ai, Claude Code, service-token scripts) never send it: every MCP write row
+// stores session NULL and `session = ?` can never match. These tests reach the real Worker the way
+// those clients do, on both lanes (OAuth grant and service token), with no mcp-session-id header.
+describe("session filter from real clients (no mcp-session-id header)", () => {
+  type Lane = "oauth" | "service";
+
+  /** One JSON-RPC message through the real front door for `lane`, with the headers a real client sends. */
+  async function viaLane(lane: Lane, token: string, method: string, params: Record<string, unknown>, userAgent: string) {
+    const e = testEnv();
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "MCP-Protocol-Version": "2025-06-18",
+      "User-Agent": userAgent,
+    };
+    const ctx = createExecutionContext();
+    let res: Response;
+    if (lane === "service") {
+      headers.Authorization = `Bearer ${token}`;
+      const connector = createConnector({ githubFetch: () => Promise.reject(new Error("no GitHub in tests")) });
+      const request = new Request("https://mcp.example.com/mcp", { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      res = await connector.fetch!(request as Request<unknown, IncomingRequestCfProperties>, e, ctx);
+    } else {
+      // The OAuth provider's apiHandler with a grant's props, as the provider calls it after checking the token.
+      (ctx as unknown as { props: unknown }).props = { githubUserId: 1001, login: "owner" };
+      const request = new Request("https://mcp.example.com/mcp", { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      res = await mcpApiHandler.fetch(request, e, ctx);
+    }
+    await waitOnExecutionContext(ctx);
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    const json = res.headers.get("Content-Type")?.includes("text/event-stream")
+      ? text
+          .split("\n")
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice(6)))
+          .find((msg) => msg.id === 1)
+      : JSON.parse(text);
+    return { res, json };
+  }
+
+  async function serviceToken(): Promise<string> {
+    await env.DB.exec("DELETE FROM service_tokens");
+    const now = Date.now();
+    const { token } = await new ServiceTokenStore(env.DB).create({
+      name: "ci",
+      ownerId: 1001,
+      graphIds: [WORK_ID],
+      access: "write",
+      createdAt: now - DAY,
+      expiresAt: now + DAY,
+    });
+    return token;
+  }
+
+  const LANES: [Lane, string][] = [
+    ["oauth", "Claude-User (claude.ai)"],
+    ["oauth", "claude-code/2.0.31 (cli)"],
+    ["service", "logseq-mcp/1.0 (node)"],
+  ];
+
+  it("initialize issues no mcp-session-id on either lane, so a client never has one to send", async () => {
+    const token = await serviceToken();
+    for (const [lane, ua] of LANES) {
+      const { res, json } = await viaLane(
+        lane,
+        token,
+        "initialize",
+        { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+        ua,
+      );
+      expect(json.error, `${lane} ${ua}`).toBeUndefined();
+      expect(res.headers.get("mcp-session-id"), `${lane} ${ua}`).toBeNull();
+    }
+  });
+
+  it("a real write is stored with session null, and every session value is refused by name, never answered with no entries", async () => {
+    const token = await serviceToken();
+    writeResponse = () => Response.json({ updated: true, target: affected("Meeting", MEETING, ["Agenda"], "Book the room", B1) });
+    for (const [lane, ua] of LANES) {
+      const label = `${lane} ${ua}`;
+      await env.DB.exec("DELETE FROM audit_log");
+      const write = await viaLane(
+        lane,
+        token,
+        "tools/call",
+        { name: "set_block_property", arguments: { graph: "work", reason: REASON, "block-id": B1, "property-id": "Venue", body: { value: "Library" } } },
+        ua,
+      );
+      expect(write.json.result.isError ?? false, label).toBe(false);
+      const stored = await env.DB.prepare("SELECT session, client FROM audit_log WHERE kind = 'write'").all<{ session: string | null; client: string }>();
+      expect(stored.results, label).toHaveLength(1);
+      // The premise: a real client's write carries no session.
+      expect(stored.results[0].session, label).toBeNull();
+
+      // Unfiltered, the write is listed.
+      const all = await viaLane(lane, token, "tools/call", { name: "get_activity_log", arguments: { graph: "work" } }, ua);
+      expect(JSON.parse(all.json.result.content[1].text).entries, label).toHaveLength(1);
+
+      // Every kind of session value an old caller could pass: empty, the literal "null", the owner-side
+      // token_edit form, a service client name, a client family, a header-style id, and combined with
+      // another filter. None can match a stored row, so each must be refused naming `session`.
+      const values: Record<string, unknown>[] = [
+        { session: "" },
+        { session: "null" },
+        { session: "github:1001" },
+        { session: "service:ci" },
+        { session: "claude-ai" },
+        { session: "3f1c9a52-7b0e-4c1d-9e2a-5d8b6f4a1c07" },
+        { session: "session-ci", status: "ok" },
+        { session: "session-ci", tool: "set_block_property" },
+      ];
+      for (const filter of values) {
+        const what = `${label} ${JSON.stringify(filter)}`;
+        const got = await viaLane(lane, token, "tools/call", { name: "get_activity_log", arguments: { graph: "work", ...filter } }, ua);
+        const text = got.json.result.content.map((c: { text: string }) => c.text).join("\n");
+        expect.soft(got.json.result.isError === true, `${what}: ${text}`).toBe(true);
+        expect.soft(text, what).toMatch(/\bsession\b/);
+      }
     }
   });
 });

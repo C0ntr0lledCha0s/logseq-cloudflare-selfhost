@@ -113,7 +113,6 @@ export interface AuditQuery {
   /** A page UUID or title, matched as one whole line of `pages`, ignoring case. */
   page?: string;
   tool?: string;
-  session?: string;
   /** A status; `ok` leaves dry runs out, and `dry-run` is every dry run whatever its status. */
   status?: AuditStatus | "dry-run";
   limit: number;
@@ -340,10 +339,6 @@ export class AuditLog {
       filters.push("tool = ?");
       binds.push(q.tool);
     }
-    if (q.session !== undefined) {
-      filters.push("session = ?");
-      binds.push(q.session);
-    }
     if (q.status === "dry-run") {
       filters.push("dry_run = 1");
     } else if (q.status === "ok") {
@@ -363,7 +358,7 @@ export class AuditLog {
         `SELECT count(*) AS scanned, min(printf('%015d.%015d', at, id)) AS last,
                 json_group_array(json_array(id, at)) FILTER (WHERE ${filters.join(" AND ")}) AS hits
          FROM (
-           SELECT id, at, kind, tool, session, status, dry_run, pages FROM audit_log
+           SELECT id, at, kind, tool, status, dry_run, pages FROM audit_log
            WHERE graph_id = ? AND at >= ? AND at <= ? AND (at, id) < (?, ?)
            ORDER BY at DESC, id DESC LIMIT ${scanCap}
          )`,
