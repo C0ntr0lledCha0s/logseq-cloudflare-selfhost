@@ -19,7 +19,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 39: delete_blocks under-counts descendants | not a bug | `fix/delete-blocks-counts-descendants` | – | `a689030` |
 | 35: '# ' page title sets a heading | ready | `fix/page-title-no-heading` | [#68](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/68) | `712e319` |
 | 37: code block #word escaped | not a bug | `fix/code-block-text-verbatim` | – | `3f190ea` |
-| 47: set can write Root to a property's classes | running | `fix/property-classes-write-refused` | – | – |
+| 47: set can write Root to a property's classes | not a bug (fixed by PR 63) | `fix/property-classes-write-refused` | – | `54d2a0c` |
+| 48: activity log session filter never matches | running | `fix/audit-log-session-filter` | – | – |
 
 ---
 
@@ -276,3 +277,12 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Evidence:** a repro through the real handler on HEAD shows patch 0037 already keeps code and math titles verbatim on `update_block`, and that `refresh_refs` neither lists nor changes them. Existing tests pin this. Quote blocks still escape an unknown `#word`, which was a documented design choice (spec 2026-11-08). The app parses tags in a quote, so an unescaped `#word` would turn into a stray tag at the quote's next edit.
 - **Commits:** a learnings note (`3f190ea`). It has no PR of its own and rides along in item 47's PR.
 - **Your call:** close item 37, or log a feature if you want quote titles kept verbatim too. A "Checked" note was added (audit entry 320).
+
+---
+
+## Item 47: set_block_property could write Root to a property's classes
+
+- **Status:** not a bug on this stack (confidence 0.95). It is already fixed by patch 0045 (PR 63, item 45). Quick tier.
+- **Evidence:** the exact repro, replayed through the real handler on patches up to 0049, now answers 400 `entry 0: logseq.property/classes can't be set here; use update_property (classes)` and stores nothing. The same holds for batch set in either mode, batch insert, `insert_block_tree` and `insert_block_children`.
+- **Commits:** a learnings note (`54d2a0c`). It has no PR of its own and rides along in item 48's PR.
+- **Your call:** close item 47 once PR 63 merges and deploys. A "Checked" note was added (audit entry 324).
