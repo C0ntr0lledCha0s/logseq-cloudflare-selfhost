@@ -4,7 +4,7 @@ area: api
 tags: [uuid, case, not-a-bug, parse-uuid, uuid-string, selector, path-param, false-premise]
 seen:
   - 2026-11-07 – item 26 defect 5 (bug lane, closed as not a bug, no patch 0032)
-promoted_to: []
+promoted_to: ["CLAUDE.md Gotchas"]
 ---
 
 ## Symptom
