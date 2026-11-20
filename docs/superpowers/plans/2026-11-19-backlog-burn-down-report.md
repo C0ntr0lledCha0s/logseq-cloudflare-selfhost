@@ -15,7 +15,8 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 | 34: value block shared by UUID | ready | `fix/value-block-by-uuid-copied` | [#65](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/65) | `0a75ac4` |
 | 53: indexer stops on a rejected sync | ready | `fix/indexer-survives-rejected-sync` | [#66](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/66) | `7dd3e49` |
 | 46: batch insert marked non-destructive | not a bug (already fixed) | `fix/batch-insert-destructive-hint` | – | `34357b6` |
-| 44: batch ignores the Task tag Status adds | running | `fix/batch-status-adds-task-tag` | – | – |
+| 44: batch ignores the Task tag Status adds | ready | `fix/batch-status-adds-task-tag` | [#67](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/67) | `fc0b4cc` |
+| 39: delete_blocks under-counts descendants | running | `fix/delete-blocks-counts-descendants` | – | – |
 
 ---
 
@@ -220,3 +221,20 @@ This run follows `docs/superpowers/plans/2026-11-19-backlog-burn-down.md`. The b
 - **Evidence:** `connector/src/tools/spec.mjs` classes the tool as DESTRUCTIVE. `tools-manifest.json`, connector_help and README 11.8 agree, and `connector/test/tools.test.ts` pins it (241 tests pass). `insert_block_tree` and `insert_block_children` rightly stay additive, because they reuse an existing block unchanged.
 - **Commits:** one learnings note (`34357b6`, "an issue logged in review may already be fixed at HEAD"). It has no PR of its own and rides along in item 44's PR.
 - **Your call:** close item 46. I left its Status alone and added a "Checked" note (audit entry 304).
+
+---
+
+## Item 44: a batch ignored the Task tag that setting Status adds
+
+- **Status:** ready. Draft PR [C0ntr0lledCha0s/logseq-cloudflare-selfhost#67](https://github.com/C0ntr0lledCha0s/logseq-cloudflare-selfhost/pull/67), HEAD `fc0b4cc`, standard tier, two review rounds plus a targeted round. Stacked on item 46's learnings commit and PR 66. The container restarted mid-lane; the run resumed from its cache with nothing lost.
+- **Cause:** the batch class check's `final-tags` overlay counted only explicit tag writes. The outliner also adds Task when Status, Scheduled or Deadline is set on a block whose tags don't provide them, so a Task-limited value pointing at that block was refused in validation.
+- **Fix (patch 0048):** both batch paths emit an implicit-Task write in request order, which `final-tags` applies as the outliner would: no Task for a null or empty value, a Scheduled or Deadline already held, or a tag that provides the property. A later reset drops it again.
+- **Gate:** the lane ran `scripts/check.sh --upstream` on `fc0b4cc` and it passed (848 db-sync tests). tofu fmt was skipped.
+- **Regression tests:** a new namespace with fail-before quotes on both paths. All six mutants (M1–M6) were killed.
+- **Open should-fix (minor, all false refusals, nothing written):**
+  - batch insert judges an entry's tags before its Status regardless of key order
+  - a repeated Status after a tag reset is treated as a no-op
+  - an earlier commit body over-claimed its mutation results
+- **Learnings:** a new CLAUDE.md gotcha (`final-tags` copies the tag rules and the implicit Task rule; change them together) and a REVIEW.md rule.
+- **Skill note:** drop any workaround that splits a batch because Status on an untagged block made a later Task-limited property fail.
+- **Logseq write-back:** applied (audit entries 305 and 306).
