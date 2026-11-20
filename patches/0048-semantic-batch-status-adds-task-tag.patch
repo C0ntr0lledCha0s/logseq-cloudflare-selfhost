@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 62ccfa1..216638a 100644
+index 62ccfa1..b2e4059 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1272,7 +1272,9 @@
@@ -13,7 +13,7 @@ index 62ccfa1..216638a 100644
    [conn block-id value reset-existing-values?]
    (let [ids (if (coll? value) value [value])
          held #(set (map :db/id (:block/tags (d/entity @conn block-id))))
-@@ -1579,21 +1581,59 @@
+@@ -1579,21 +1581,61 @@
    (when-let [type (parse-display-type value)]
      [id [(:db/id (d/entity db (display-type-classes type)))] false true]))
  
@@ -26,10 +26,12 @@ index 62ccfa1..216638a 100644
 +  "The final-tags write of setting `property-ident` to `value` on the entity with db id `id` when the
 +  property is Status, Scheduled or Deadline, or nil. final-tags adds Task only where the outliner
 +  would at that point in the batch. A nil value (a removal) is a write too, so final-tags knows the
-+  block no longer holds the value."
++  block no longer holds the value. An empty list counts as nil: set-prepared-property! writes no
++  value for it (under reset it only removes the property), so the outliner adds no Task."
 +  [db id property-ident value]
 +  (when (and id (contains? task-tag-properties property-ident))
-+    [id [(:db/id (d/entity db :logseq.class/Task))] false false property-ident value]))
++    [id [(:db/id (d/entity db :logseq.class/Task))] false false property-ident
++     (when-not (and (coll? value) (empty? value)) value)]))
 +
 +(defn- classes-provide-property?
 +  "Whether the tags with db ids `ids`, or the classes they extend, provide `property-ident` as a
@@ -85,7 +87,7 @@ index 62ccfa1..216638a 100644
           (map (fn [[id ids]] [id (mapv #(d/entity db %) ids)]))
           (into {}))))
  
-@@ -3211,7 +3251,11 @@
+@@ -3211,7 +3253,11 @@
                                       (when-let [ids (:value (prepare-property-value db :block/tags value e2ee? block))]
                                         [(:db/id block) (tag-ids ids) (and reset? (coll? ids))])
                                       (= display-type-ident property-ident)
@@ -98,7 +100,7 @@ index 62ccfa1..216638a 100644
                                 entries))
              ;; An entry's block is scoped with the tags earlier entries in the batch give it. As
              ;; set-prepared-property! writes them, under reset a list of tags replaces the block's
-@@ -4875,7 +4919,7 @@
+@@ -4875,7 +4921,7 @@
  
  (defn- insert-tag-writes
    "The tag writes (see final-tags) of batch insert entries' `properties` on an existing target or
@@ -107,7 +109,7 @@ index 62ccfa1..216638a 100644
    [db e2ee? entries]
    (mapcat (fn [entry]
              (when (and (map? entry) (map? (:properties entry)))
-@@ -4889,9 +4933,13 @@
+@@ -4889,9 +4935,13 @@
                                        (when (= display-type-ident (resolve-property-ident db (property-selector k)))
                                          (display-tag-write db (:db/id existing) value)))
                                      (:properties entry)))]
@@ -126,10 +128,10 @@ index 62ccfa1..216638a 100644
  (defn- insert-display-writes
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_task_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_task_tag_test.cljs
 new file mode 100644
-index 0000000..312235d
+index 0000000..4466198
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_task_tag_test.cljs
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,384 @@
 +(ns logseq.db-sync.semantic-batch-task-tag-test
 +  "A property limited to Task, written in a batch that also sets Status, Scheduled or Deadline on
 +  the value's block (item 44). The outliner tags a block Task when it gets one of those three and
@@ -330,17 +332,25 @@ index 0000000..312235d
 +  ;; - Block 0 is a SubProject, which extends Project, so a class it extends provides Status;
 +  ;; - an earlier entry tags Block 0 Project, so Project provides Status by the time it is set;
 +  ;; - Block 0 already holds the Scheduled or Deadline the batch sets, so the outliner skips the
-+  ;;   write as a no-op and adds no Task (item 44 review, r1-correctness-1).
++  ;;   write as a no-op and adds no Task (item 44 review, r1-correctness-1);
++  ;; - Block 0 holds a Scheduled or Deadline with no Task tag, and an earlier entry removes it
++  ;;   (value null): a removal adds no Task (item 44 review, r2-tests-1);
++  ;; - Status given as an empty list, with and without reset: set-prepared-property! writes no
++  ;;   value (under reset it only removes Status), so the outliner adds no Task (r2-correctness-1).
 +  (async done
 +    (each-graph done [:no-task-write :other-block :reset-drops-task :class-provides-status :null-status
 +                      :parent-class-provides-status :tagged-earlier-in-batch
-+                      :holds-same-scheduled :holds-same-deadline]
++                      :holds-same-scheduled :holds-same-deadline
++                      :removes-held-scheduled :removes-held-deadline
++                      :empty-status-list :empty-status-list-reset]
 +      (fn [{:keys [conn self blocks project for-task ft]} kind]
 +        (let [[b0 b1 b2] blocks
 +              status (fn [b] {:block-id (str b) :property-id "logseq.property/status" :value "Todo"})
 +              value-entry {:block-id (str b1) :property-id ft :value (str b0)}
 +              held-datetime ({:holds-same-scheduled :logseq.property/scheduled
-+                              :holds-same-deadline :logseq.property/deadline} kind)]
++                              :holds-same-deadline :logseq.property/deadline
++                              :removes-held-scheduled :logseq.property/scheduled
++                              :removes-held-deadline :logseq.property/deadline} kind)]
 +          (p/let [_ (when (= kind :class-provides-status)
 +                      (d/transact! conn [[:db/add [:block/uuid b0] :block/tags (:db/id project)]]))
 +                  sub (when (= kind :parent-class-provides-status)
@@ -369,7 +379,13 @@ index 0000000..312235d
 +                             (:holds-same-scheduled :holds-same-deadline)
 +                             (batch-set! self [{:block-id (str b0) :property-id (ident-str held-datetime)
 +                                                :value deadline-ms}
-+                                               value-entry]))
++                                               value-entry])
++                             (:removes-held-scheduled :removes-held-deadline)
++                             (batch-set! self [{:block-id (str b0) :property-id (ident-str held-datetime) :value nil}
++                                               value-entry])
++                             :empty-status-list (batch-set! self [(assoc (status b0) :value []) value-entry])
++                             :empty-status-list-reset (batch-set! self [(assoc (status b0) :value []) value-entry]
++                                                                  {:isResetExistingValues true}))
 +                  expected (case kind
 +                             :reset-drops-task "entry 2: no #Task object titled \"Block 0\""
 +                             :tagged-earlier-in-batch (str "entry 2: no #Task object " b0)
@@ -380,6 +396,23 @@ index 0000000..312235d
 +              (is (= expected (get-in response [:body :error])))
 +              (is (nil? (stored conn b1 for-task)) "no value is written")
 +              (is (not (contains? (tag-titles conn b0) "Task")) "Block 0 isn't tagged Task"))))))))
++
++(deftest batch-set-status-list-adds-task-test
++  ;; A non-empty Status list is written item by item, and the outliner adds Task for it, so the
++  ;; value entry is in class, with and without reset, in either order. Only an empty list is
++  ;; treated as no write (r2-correctness-1).
++  (async done
++    (each-graph done (for [reset? [false true] task-first? [true false]] [reset? task-first?])
++      (fn [{:keys [conn self blocks for-task ft]} [reset? task-first?]]
++        (let [[b0 b1] blocks
++              task-entry {:block-id (str b0) :property-id "logseq.property/status" :value ["Todo"]}
++              value-entry {:block-id (str b1) :property-id ft :value (str b0)}]
++          (p/let [response (batch-set! self (if task-first? [task-entry value-entry] [value-entry task-entry])
++                                       {:isResetExistingValues reset?})]
++            (testing (str (if reset? "reset" "no reset") (if task-first? ", task entry first" ", value entry first"))
++              (is (= 200 (:status response)) (str (:body response)))
++              (is (= b0 (stored conn b1 for-task)) "the value reads back")
++              (is (contains? (tag-titles conn b0) "Task") "the Task tag reads back"))))))))
 +
 +(deftest batch-insert-counts-implicit-task-tag-test
 +  ;; batchInsertBlockTrees: one entry sets Status, Scheduled or Deadline on existing Block 0 through
@@ -404,23 +437,29 @@ index 0000000..312235d
 +              (is (contains? (tag-titles conn b0) "Task") "the Task tag reads back"))))))))
 +
 +(deftest batch-insert-without-implicit-task-tag-still-refused-test
-+  ;; With no Status, Scheduled or Deadline write on Block 0, the inserted block's for-task is refused.
++  ;; With no write on Block 0 that adds Task, the inserted block's for-task is refused: Status set on
++  ;; Block 1 instead; Status given as an empty list, which writes nothing (r2-correctness-1). (A
++  ;; null property value is refused up front here, so batch insert has no removal case.)
 +  (async done
-+    (each-graph done [nil]
-+      (fn [{:keys [conn self page-id blocks ft]} _]
++    (each-graph done [:other-block :empty-status-list]
++      (fn [{:keys [conn self page-id blocks ft]} kind]
 +        (let [b0 (first blocks)
 +              n0 (random-uuid)]
-+          (p/let [response (insert-batch! self [{:target-id (str (second blocks))
-+                                                 :properties {"logseq.property/status" "Todo"}}
++          (p/let [response (insert-batch! self [(case kind
++                                                  :other-block {:target-id (str (second blocks))
++                                                                :properties {"logseq.property/status" "Todo"}}
++                                                  :empty-status-list {:target-id (str b0)
++                                                                      :properties {"logseq.property/status" []}})
 +                                                {:target-id (str page-id)
 +                                                 :blocks [{:uuid (str n0) :title "Inserted"
 +                                                           :properties {ft (str b0)}}]}])]
-+            (is (= 400 (:status response)) (str (:body response)))
-+            (is (string/starts-with? (str (get-in response [:body :error])) "entries[1].blocks[0]")
-+                (str (:body response)))
-+            (is (string/includes? (str (get-in response [:body :error])) (str "no #Task object " b0)))
-+            (is (nil? (entity conn n0)) "the block isn't inserted")
-+            (is (not (contains? (tag-titles conn b0) "Task")))))))))
++            (testing (name kind)
++              (is (= 400 (:status response)) (str (:body response)))
++              (is (string/starts-with? (str (get-in response [:body :error])) "entries[1].blocks[0]")
++                  (str (:body response)))
++              (is (string/includes? (str (get-in response [:body :error])) (str "no #Task object " b0)))
++              (is (nil? (entity conn n0)) "the block isn't inserted")
++              (is (not (contains? (tag-titles conn b0) "Task"))))))))))
 +
 +(deftest batch-set-held-task-property-value-test
 +  ;; The outliner skips a Scheduled or Deadline write that matches the value the block holds, but
