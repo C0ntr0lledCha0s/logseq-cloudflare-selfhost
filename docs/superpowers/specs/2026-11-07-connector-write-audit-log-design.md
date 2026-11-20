@@ -248,6 +248,8 @@ It shows entries kept, entries today, rows written by the log, rows read by `get
 - `client` is a short User-Agent family (`claude-ai`, `claude-code`, `other`), since `ctx.props` doesn't carry the OAuth client id. Extending `GrantProps` with the client id at `completeAuthorization` would only take effect for new grants (section 11, question 4).
 - `session` is the `mcp-session-id` request header when present, else null. claude.ai's stateless requests may not send one, so the session filter may often match nothing.
 
+**As built (item 48).** The guess that the session filter "may often match nothing" was too kind: the stateless MCP handler never issues an `mcp-session-id`, so no client has one to send and every MCP write row's `session` is null. `get_activity_log` therefore refuses its `session` input whenever it is given (`session: no longer supported; MCP calls carry no session id, so no entry could match. Leave it out.`), also alongside `id`, instead of answering no entries. The input stays in the schema only so that it can be refused by name. The `session` column and the header read stay, with no migration, and entries still show `session`. A key derived from the OAuth grant was rejected because one grant spans many conversations, so it would mean "grant", not "session".
+
 Neither is a token. The OAuth access token, the graph PAT and any other header are never read into the row.
 
 ## 4. Tool contract
