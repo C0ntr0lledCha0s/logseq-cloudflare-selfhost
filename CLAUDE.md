@@ -62,6 +62,7 @@ Traps anyone changing the code would hit. The compound step adds an entry when a
 - Favourites are app worker code, not a db-sync API, so patch 0038 reimplements them. Find `$$$favorites` by its uuid (never by name), refuse writes on E2EE graphs, append new favourites at the bottom (the app prepends), and treat a remove as a delete (`docs/solutions/api/favourites-are-app-worker-code-the-server-must-reimplement-them.md`).
 - `scripts/build.sh` runs `pnpm clean`, which deletes `worker/dist/worker-test.js`. A warm `scripts/upstream-test.sh` watch then fails with `MODULE_NOT_FOUND`, and the bench and release tests skip themselves, until the watch is stopped (`--stop`) and started again. `scripts/check.sh` names each skipped test in a WARNING line (`docs/solutions/testing/a-test-that-skips-on-build-state-hides-a-red-gate.md`).
 - A graph uploaded from the app stores `:block/closed-value-property` as cardinality one, so an entity read returns one entity, not a set. Read it from `:eavt` datoms and test on an upload-path graph (`docs/solutions/sync/uploaded-graph-keeps-the-apps-schema-drift.md`).
+- The batch class check's `final-tags` overlay is a second copy of the tag rules in `set-prepared-tags!` and of the outliner's implicit Task tag (Status, Scheduled, Deadline). Change them together, in request order (`docs/solutions/api/validate-final-state-apply-in-order.md`).
 - Feeds end with a null next-cursor, and `count(*)` scans rows on D1. Both have cost the Free plan before (`docs/solutions/cost/d1-reads-from-indexer-scans.md`).
 
 ## Lanes
