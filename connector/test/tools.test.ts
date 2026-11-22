@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
 import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP, SERVER_INSTRUCTIONS } from "../src/tools/handwritten";
-import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
+import { FENCE_HINT, buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
 import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
 import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
@@ -2635,13 +2635,69 @@ describe("code, math and quote blocks", () => {
     ["convert-fences", "convert-fences=false"],
     ["verbatim titles", "stored exactly as sent"],
     ["mermaid", "```mermaid is highlighted code"],
-    ["query fences", "```query fences stay text"],
+    ["an advanced query fence makes a Query block", "an advanced ```query fence"],
+    ["the query field", "a node's query field"],
+    ["the query check", "checked as datalog_query checks a query"],
+    ["the vector form", ":query must be a vector starting with :find"],
+    ["refusals name the node", "refuse the whole call naming the node (blocks[0]: query: …)"],
+    ["a simple query stays text", "A simple query stays text"],
+    ["update_block makes none", "update_block never makes a Query block"],
+    ["update_block changes only Claude's Query blocks", "update_block changes only the Query blocks Claude made"],
+    ["the new query is checked on update", "only with a new text that passes the same check (title: query: …)"],
+    ["no display-type or lang on a query", "with no display-type or lang"],
+    ["the owner's Query blocks are refused", "the owner's own Query blocks, and any it can't tell, are refused with 409 naming the block"],
+    ["the hidden marker", "hidden claudeQueryBlock property, which the property tools refuse"],
+    ["it runs in the app", "runs in the owner's app, not on the server"],
+    ["no server caps or Private filter", "without datalog_query's caps or its Private filter"],
     ["kept", "listed under kept"],
     ["converting an existing block", "update_block with the title and display-type together"],
     ["the \\# warning", "\\# escapes"],
     ["quote keeps tag handling", "A quote block keeps tag and link handling"],
+    ["Query refused as a tag", "Query can't be given as a tag"],
+    ["the query property refused on the property paths", "refuse logseq.property/query, naming the entry"],
+    ["a reset keeps Query", "a reset tag list keeps a Query block's Query tag"],
+    ["the delete paths keep Query", "refuse removing the Query tag or the query from a Query block"],
+    ["a query stays Clojure code", "A Query block's query (the block holding its text) stays Clojure code"],
   ])("the section names %s", (_point, phrase) => {
     expect(CODE_BLOCKS_HELP).toContain(phrase);
+  });
+
+  // Patch 0050: an advanced ```query fence (or a query field) makes a Query block on the insert tools.
+  it("FENCE_HINT no longer says query fences always stay text, and names Query blocks", () => {
+    expect(FENCE_HINT).not.toContain("```query fences stay text");
+    expect(FENCE_HINT).toContain("an advanced ```query fence (or a node's query field) becomes a Query block");
+    expect(FENCE_HINT).toContain("a simple query fence stays text");
+  });
+
+  it("the four insert tools' vendored descriptions say how a Query block is made, and update_block's that it makes none", async () => {
+    const tools = await listTools();
+    for (const name of TREE_TOOLS) {
+      const description = tools.find((t) => t.name === name).description;
+      for (const phrase of ["becomes a Query block", "checked as datalog_query checks a query", "a simple ```query fence stays text"]) {
+        expect(description, `${name}: ${phrase}`).toContain(phrase);
+      }
+      expect(description, name).not.toContain("a Query block is not supported yet");
+    }
+    expect(tools.find((t) => t.name === "update_block").description).toContain("updateBlock doesn't make Query blocks");
+    expect(tools.find((t) => t.name === "update_block").description).toContain("only on the Query blocks Claude created");
+  });
+
+  // Patch 0050 stage 3: the property paths can't store a query or the Query tag, or strand one.
+  it("the property tools' vendored descriptions name the query and Query tag refusals", async () => {
+    const tools = await listTools();
+    const description = (name: string) => tools.find((t) => t.name === name).description;
+    for (const name of ["set_block_property", "batch_set_block_property"]) {
+      expect(description(name), name).toContain("logseq.property/query and the Query tag are refused");
+      expect(description(name), name).toContain("a Query block's Query tag are kept");
+    }
+    for (const name of ["delete_block_property", "batch_delete_block_property"]) {
+      expect(description(name), name).toContain("Removing the Query tag or logseq.property/query from a Query block is refused");
+      expect(description(name), name).toContain("Removing display-type or lang from a Query block's query");
+    }
+    for (const name of ["set_block_property", "batch_set_block_property"]) {
+      expect(description(name), name).toContain("A Query block's query (the block holding logseq.property/query's text) stays Clojure code");
+    }
+    expect(description("batch_insert_block_trees")).toContain("refused on a Query block's query");
   });
 
   it("the heading sentence agrees with the section: no heading for a code, math or quote block, and quote keeps tag handling", () => {
@@ -2693,6 +2749,7 @@ describe("favourites", () => {
 describe("queries help", () => {
   // One assertion per point, so dropping any one of them from the paragraph fails.
   it.each([
+    ["Query blocks", "To store a query as a Query block that runs in the owner's app, insert a node with a query field or an advanced ```query fence"],
     ["datalog_query", "datalog_query runs a read-only Datalog query"],
     ["the query's length", "(EDN, at most 4,000 characters)"],
     ["the inputs' length", "inputs are at most 4,000 characters"],
