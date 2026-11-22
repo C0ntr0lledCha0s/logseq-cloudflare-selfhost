@@ -2874,3 +2874,17 @@ describe("queries help", () => {
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
   });
 });
+
+// Patch 0051 stage 1: every get_graph_health check leaves out Private and Recycle-bin content.
+describe("get_graph_health and Private content", () => {
+  it("connector_help says Private content and the Recycle bin are left out of get_graph_health", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("get_graph_health leaves out Private content and the Recycle bin");
+  });
+
+  it("get_graph_health's vendored description says Private content and the bin are left out, and Private usage counts", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description).toContain("Private content and the Recycle bin are left out of every check");
+    expect(tool.description).toContain("a tag or property used only by Private objects is in use");
+  });
+});

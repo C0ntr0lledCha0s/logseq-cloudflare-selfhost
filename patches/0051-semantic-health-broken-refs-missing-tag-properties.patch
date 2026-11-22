@@ -1,0 +1,431 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index d22c921..32d475e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -5536,16 +5536,25 @@
+   (let [raw (.get (.-searchParams url) param)]
+     (when (seq raw) (vec (distinct (string/split raw #","))))))
+ 
+-(defn- health-check [db check {:keys [prefix time-filters limit cursor]}]
+-  (let [by-title (fn [entities] (paginate-by (partial title-key db) entities limit cursor))
++(defn- health-check
++  "One check's page of items. `private` (datalog/private-ids, built once per call) is left out of
++  every check: no Private or Recycle-bin entity is an item, a holder or a duplicate-title member, and a
++  group left with fewer than two members is not reported. Usage by a Private object still counts."
++  [db check {:keys [prefix time-filters limit cursor private]}]
++  (let [visible (fn [entities] (remove #(contains? private (:db/id %)) entities))
++        by-title (fn [entities] (paginate-by (partial title-key db) entities limit cursor))
+         pages-check (fn [pages]
+-                      (update (by-title (filter #(after-time-filters? % time-filters) pages))
++                      (update (by-title (filter #(after-time-filters? % time-filters) (visible pages)))
+                               :items #(mapv page-ref-response %)))
+         duplicate-key (fn [group] [(string/lower-case (or (:block/title (first group)) "")) ""])]
+     (case check
+-      "orphan-tags" (update (by-title (graph-insights/orphan-tags db)) :items #(mapv tag-response %))
+-      "orphan-properties" (update (by-title (graph-insights/orphan-properties db)) :items #(mapv property-response %))
+-      "duplicate-titles" (update (paginate-by duplicate-key (graph-insights/duplicate-titles db) limit cursor)
++      "orphan-tags" (update (by-title (visible (graph-insights/orphan-tags db))) :items #(mapv tag-response %))
++      "orphan-properties" (update (by-title (visible (graph-insights/orphan-properties db))) :items #(mapv property-response %))
++      "duplicate-titles" (update (paginate-by duplicate-key
++                                              (->> (graph-insights/duplicate-titles db)
++                                                   (map visible)
++                                                   (filter #(> (count %) 1)))
++                                              limit cursor)
+                                  :items #(mapv (fn [group]
+                                                  {:title (:block/title (first group))
+                                                   :entities (mapv page-ref-response group)})
+@@ -5556,11 +5565,13 @@
+       (update (paginate-by (fn [{:keys [holder property value]}]
+                              [(uuid-string (:block/uuid holder))
+                               (str (entity-ident property) " " (uuid-string (:block/uuid value)))])
+-                           (graph-insights/mismatched-choice-values db) limit cursor)
++                           (remove #(contains? private (:db/id (:holder %)))
++                                   (graph-insights/mismatched-choice-values db))
++                           limit cursor)
+               :items #(mapv mismatched-choice-response %))
+       "orphan-choices"
+       (update (paginate-by (fn [choice] [(string/lower-case (choice-content choice)) (uuid-string (:block/uuid choice))])
+-                           (orphan-choices db) limit cursor)
++                           (visible (orphan-choices db)) limit cursor)
+               :items #(mapv orphan-choice-response %)))))
+ 
+ (defn- knowledge-index-aliases
+@@ -5611,7 +5622,8 @@
+             (and cursor (not= 1 (count checks))) (http/bad-request "cursor needs exactly one check")
+             (:invalid? time-filters) (http/bad-request "invalid time filter")
+             :else
+-            (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor}]
++            (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor
++                           :private (datalog/private-ids db)}]
+               (http/json-response nil {:checks (into {} (map (fn [check] [check (health-check db check options)]))
+                                                      checks)}))))
+ 
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index cbf0844..70336d5 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -167,7 +167,7 @@
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+-   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+    "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs
+new file mode 100644
+index 0000000..8d2204f
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs
+@@ -0,0 +1,338 @@
++(ns logseq.db-sync.semantic-graph-health-private-test
++  "getGraphHealth leaves out Private and Recycle-bin content in every check (patch 0051). An entity
++  in datalog/private-ids (tagged with a class titled Private or with a class extending one, in the
++  Recycle bin, or under one of those) is never an item and never a member of a duplicate-title group;
++  a group left with fewer than two members is not reported. Usage by a Private object still counts as
++  usage, so a tag or property only Private objects use is not an orphan.
++
++  The graph is written through the real handler where the API can write it (tags, pages, page tags,
++  blocks, property values, deletePage) and transacted directly for what it can't: a second page with
++  a title another page has, a child page under a page (as a namespace stores it), the Private tag on
++  a tag or property entity, a tag or property in the Recycle bin, and a value that isn't one of its
++  property's choices. Tags: Private, zz Secret (extends Private), zz Book, zz Dormant, zz Hidden Tag
++  (tagged Private), zz Binned Tag (in the bin) and zz Private Only (held only by a Private page).
++  Every fixture title holds zz."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test :as uploaded]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- uuid-of [response] (uuid (get-in response [:body :uuid])))
++
++(defn- eid [conn id] (:db/id (d/entity @conn [:block/uuid id])))
++
++(defn- raw-page
++  "A page transacted as-is, as the app or a sync would store it."
++  [id title & {:as more}]
++  (merge {:block/uuid id :block/name (string/lower-case title) :block/title title
++          :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}
++         more))
++
++(defn- property! [conn title]
++  (:db/ident (outliner-property/upsert-property!
++              conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++              {:property-name title})))
++
++(defn- choice! [conn property value]
++  (let [id (random-uuid)]
++    (outliner-property/upsert-closed-value! conn property {:id id :value value})
++    id))
++
++(defn- retract-all!
++  "Strands the choices of `owner`: every datom of the property goes, its choices still point at it."
++  [conn owner]
++  (let [owner-id (:db/id (d/entity @conn owner))]
++    (d/transact! conn (mapv (fn [dt] [:db/retract (:e dt) (:a dt) (:v dt)]) (d/datoms @conn :eavt owner-id)))))
++
++(defn- in-bin!
++  "Puts `id` in the Recycle bin as the app's recycle leaves it marked (deleted-at), for kinds deletePage
++  retracts instead of recycling (tags, properties, choices)."
++  [conn id]
++  (d/transact! conn [[:db/add (eid conn id) :logseq.property/deleted-at 1]]))
++
++(defn- seed-graph
++  "The graph the namespace docstring describes; returns the conn, the handler context and the uuids
++  by name, with :private naming every entity a health check must leave out."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          tag! (fn [body] (p/let [r (ok! (request! self "POST" "/semantic/tags" body) 201)] (uuid-of r)))
++          page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++          set-tags! (fn [id titles]
++                      (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent "block/tags"))
++                                     {:value titles})
++                           200))
++          insert! (fn [target blocks]
++                    (p/let [r (ok! (request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks}) 201)]
++                      (mapv #(uuid (:uuid %)) (get-in r [:body :blocks]))))
++          private-tag (tag! {:title "Private"})
++          _secret (tag! {:title "zz Secret" :extends ["Private"]})
++          _book (tag! {:title "zz Book"})
++          dormant (tag! {:title "zz Dormant"})
++          hidden-tag (tag! {:title "zz Hidden Tag"})
++          binned-tag (tag! {:title "zz Binned Tag"})
++          private-only (tag! {:title "zz Private Only"})
++          ;; Pages
++          novel (page! "zz Novel")
++          plain (page! "zz Plain")
++          private-page (page! "zz Private Page")
++          secret-page (page! "zz Secret Page")
++          binned-page (page! "zz Binned Page")
++          _ (set-tags! novel ["zz Book"])
++          _ (set-tags! private-page ["Private" "zz Private Only"])
++          _ (set-tags! secret-page ["zz Secret"])
++          _ (insert! novel [{:title "**Summary:** A story."}])
++          [plain-block plain-private-block] (insert! plain [{:title "zz plain block"} {:title "zz private block"}])
++          _ (set-tags! plain-private-block ["Private"])
++          [private-block] (insert! private-page [{:title "zz block on a private page"}])
++          [secret-block] (insert! secret-page [{:title "zz block on a secret page"}])
++          [binned-block] (insert! binned-page [{:title "zz block on a binned page"}])
++          ;; Child pages (no tags of their own) under a Private page and under a zz Secret page, and
++          ;; duplicate titles: a pair with one Private member, a pair with one zz Secret member, a
++          ;; triple with one Private member, a triple with one member in the bin.
++          [private-child secret-child twin twin-private pair pair-secret trio-a trio-b trio-private
++           quad-a quad-b quad-binned] (repeatedly 12 random-uuid)
++          _ (d/transact! conn [(raw-page private-child "zz Private Child" :block/parent [:block/uuid private-page])
++                               (raw-page secret-child "zz Secret Child" :block/parent [:block/uuid secret-page])
++                               (raw-page twin "zz Twin")
++                               (raw-page twin-private "zz twin")
++                               (raw-page pair "zz Pair")
++                               (raw-page pair-secret "zz PAIR")
++                               (raw-page trio-a "zz Trio")
++                               (raw-page trio-b "zz trio")
++                               (raw-page trio-private "zz TRIO")
++                               (raw-page quad-a "zz Quad")
++                               (raw-page quad-b "zz quad")
++                               (raw-page quad-binned "zz QUAD")])
++          _ (set-tags! twin-private ["Private"])
++          _ (set-tags! pair-secret ["zz Secret"])
++          _ (set-tags! trio-private ["Private"])
++          ;; Properties: unused (listed), tagged Private, in the bin, used only on a Private page.
++          _unused (property! conn "zz unused")
++          hidden-prop (property! conn "zz hidden prop")
++          binned-prop (property! conn "zz binned prop")
++          private-only-prop (property! conn "zz private-only prop")
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" private-page "/properties/"
++                                           (js/encodeURIComponent (subs (str private-only-prop) 1)))
++                           {:value "zz secret value"})
++                 200)
++          ;; Choices: zz mood holds red, zz colour's choice, on a visible block (listed) and on Private
++          ;; and to-be-binned holders.
++          mood (property! conn "zz mood")
++          colour (property! conn "zz colour")
++          _happy (choice! conn mood "zz happy")
++          red (choice! conn colour "zz red")
++          _ (d/transact! conn (vec (for [holder [plain-block private-page private-block secret-block binned-block]]
++                                     [:db/add (eid conn holder) mood (eid conn red)])))
++          ;; Stranded choices: one visible (listed), one tagged Private, one under a Private parent,
++          ;; one in the bin.
++          stranded (fn [title value] (p/let [property (property! conn title)
++                                             choice (choice! conn property value)]
++                                       (retract-all! conn property)
++                                       choice))
++          alpha (stranded "zz stranded a" "zz alpha")
++          beta (stranded "zz stranded b" "zz beta")
++          gamma (stranded "zz stranded c" "zz gamma")
++          delta (stranded "zz stranded d" "zz delta")
++          _ (d/transact! conn [[:db/add (eid conn beta) :block/tags (eid conn private-tag)]
++                               [:db/add (eid conn gamma) :block/parent (eid conn private-page)]])
++          _ (in-bin! conn delta)
++          ;; Private on a tag and a property, and the bin.
++          _ (d/transact! conn [[:db/add (eid conn hidden-tag) :block/tags (eid conn private-tag)]
++                               [:db/add (:db/id (d/entity @conn hidden-prop)) :block/tags (eid conn private-tag)]])
++          _ (in-bin! conn binned-tag)
++          _ (in-bin! conn (:block/uuid (d/entity @conn binned-prop)))
++          _ (ok! (request! self "DELETE" (str "/semantic/pages/" binned-page) nil) 200)
++          _ (ok! (request! self "DELETE" (str "/semantic/pages/" quad-binned) nil) 200)]
++    {:conn conn :self self
++     :dormant dormant :plain plain :plain-block plain-block :alpha alpha
++     :twin twin :pair pair :trio-a trio-a :trio-b trio-b :quad-a quad-a :quad-b quad-b
++     :private-only private-only
++     :private {"zz Hidden Tag" hidden-tag "zz Binned Tag" binned-tag
++               "zz Private Page" private-page "zz Secret Page" secret-page "zz Binned Page" binned-page
++               "zz Private Child" private-child "zz Secret Child" secret-child
++               "zz twin" twin-private "zz PAIR" pair-secret "zz TRIO" trio-private "zz QUAD" quad-binned
++               "zz hidden prop" (:block/uuid (d/entity @conn hidden-prop))
++               "zz binned prop" (:block/uuid (d/entity @conn binned-prop))
++               "zz private block" plain-private-block
++               "zz block on a private page" private-block "zz block on a secret page" secret-block
++               "zz block on a binned page" binned-block
++               "zz beta" beta "zz gamma" gamma "zz delta" delta}}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(defn- check! [self check]
++  (p/let [response (request! self "GET" (str "/semantic/health?limit=200&checks=" check) nil)]
++    (assert (= 200 (:status response)) (pr-str response))
++    (get-in response [:body :checks (keyword check)])))
++
++(defn- item-uuids
++  "Every uuid an item of `check` names: its own, or its members' for a duplicate-title group."
++  [check]
++  (set (mapcat #(if (:entities %) (map :uuid (:entities %)) [(:uuid %)]) (:items check))))
++
++(defn- leaked
++  "The private fixture names whose uuid appears among `check`'s items."
++  [private check]
++  (let [uuids (item-uuids check)]
++    (sort (keep (fn [[title id]] (when (contains? uuids (str id)) title)) private))))
++
++(defn- titles [check] (set (map :title (:items check))))
++
++(deftest orphan-tags-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private dormant private-only]}]
++        (p/let [check (check! self "orphan-tags")]
++          (is (= [] (leaked private check)) "a tag tagged Private and a tag in the Recycle bin are not listed")
++          (is (contains? (item-uuids check) (str dormant)) "an unused visible tag still is")
++          (is (not (contains? (item-uuids check) (str private-only)))
++              "a tag only a Private page carries is in use")
++          (is (= (count (:items check)) (:count check))))))))
++
++(deftest orphan-properties-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private]}]
++        (p/let [check (check! self "orphan-properties")]
++          (is (= [] (leaked private check)) "a property tagged Private and a property in the bin are not listed")
++          (is (contains? (titles check) "zz unused") "an unused visible property still is")
++          (is (not (contains? (titles check) "zz private-only prop"))
++              "a property whose only value is on a Private page is in use")
++          (is (= (count (:items check)) (:count check))))))))
++
++(deftest duplicate-titles-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private trio-a trio-b quad-a quad-b]}]
++        (p/let [check (check! self "duplicate-titles")
++                groups (into {} (map (juxt #(string/lower-case (:title %)) #(set (map :uuid (:entities %)))))
++                             (:items check))]
++          (is (= [] (leaked private check)) "no Private or binned page is a member of a group")
++          (is (not (contains? groups "zz twin")) "a pair with one Private member is not reported")
++          (is (not (contains? groups "zz pair")) "a pair with one member tagged with a class extending Private is not reported")
++          (is (= #{(str trio-a) (str trio-b)} (get groups "zz trio")) "a triple with one Private member keeps two")
++          (is (= #{(str quad-a) (str quad-b)} (get groups "zz quad")) "a triple with one member in the bin keeps two")
++          (is (= (count (:items check)) (:count check))))))))
++
++(deftest pages-without-summary-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private plain]}]
++        (p/let [check (check! self "pages-without-summary")]
++          (is (= [] (leaked private check))
++              "a Private page, a page tagged zz Secret, pages under them and a page in the bin are not listed")
++          (is (contains? (item-uuids check) (str plain))
++              "a visible page is still listed, though it holds a Private block (the check is about pages)")
++          (is (not (contains? (titles check) "zz Novel")) "a page with a summary is not listed")
++          (is (= (count (:items check)) (:count check))))))))
++
++(deftest pages-without-tags-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private plain]}]
++        (p/let [check (check! self "pages-without-tags")]
++          (is (= [] (leaked private check))
++              "an untagged page under a Private page, one under a zz Secret page and one in the bin are not listed")
++          (is (contains? (item-uuids check) (str plain)) "an untagged visible page still is")
++          (is (= (count (:items check)) (:count check))))))))
++
++(deftest mismatched-choice-values-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private plain-block]}]
++        (p/let [check (check! self "mismatched-choice-values")]
++          (is (= [] (leaked private check))
++              "a Private holder, blocks under a Private or zz Secret page and a block in the bin are not listed")
++          (is (= [(str plain-block)] (mapv :uuid (:items check))) "the visible holder still is")
++          (is (= 1 (:count check))))))))
++
++(deftest orphan-choices-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private alpha]}]
++        (p/let [check (check! self "orphan-choices")]
++          (is (= [] (leaked private check))
++              "a stranded choice tagged Private, one under a Private parent and one in the bin are not listed")
++          (is (= [(str alpha)] (mapv :uuid (:items check))) "the visible stranded choice still is")
++          (is (= 1 (:count check))))))))
++
++(deftest default-call-leaves-out-private-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self private]}]
++        (p/let [started (js/Date.now)
++                response (request! self "GET" "/semantic/health?limit=200" nil)
++                elapsed (- (js/Date.now) started)
++                checks (get-in response [:body :checks])]
++          (println "default health call on the private fixture:" elapsed "ms")
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= 7 (count checks)))
++          (doseq [[check result] checks]
++            (testing (name check)
++              (is (= [] (leaked private result)))
++              (is (= (count (:items result)) (:count result)) "the count matches the items"))))))))
++
++(deftest private-filter-upload-path-test
++  ;; The same filter on a graph that arrived through the app's snapshot upload, whose stored schema is
++  ;; the app's.
++  (async done
++    (let [request! #'uploaded/request!
++          signed @#'uploaded/signed]
++      (-> (p/let [{:keys [self]} (#'uploaded/uploaded-graph)
++                  conn (#'uploaded/open! self)
++                  tag! (fn [title] (p/let [r (request! self "POST" "/semantic/tags" {:title title} signed)]
++                                     (assert (= 201 (:status r)) (pr-str r))
++                                     (uuid-of r)))
++                  page! (fn [title] (p/let [r (request! self "POST" "/semantic/pages" {:title title} signed)]
++                                      (assert (= 201 (:status r)) (pr-str r))
++                                      (uuid-of r)))
++                  private-tag (tag! "Private")
++                  hidden-tag (tag! "zz Hidden Tag")
++                  dormant (tag! "zz Dormant")
++                  private-page (page! "zz Private Page")
++                  plain (page! "zz Plain")
++                  child (random-uuid)
++                  _ (d/transact! conn [(raw-page child "zz Private Child" :block/parent [:block/uuid private-page])
++                                       [:db/add [:block/uuid private-page] :block/tags [:block/uuid private-tag]]
++                                       [:db/add [:block/uuid hidden-tag] :block/tags [:block/uuid private-tag]]])
++                  tags-check (request! self "GET" "/semantic/health?limit=200&checks=orphan-tags" nil signed)
++                  pages-check (request! self "GET" "/semantic/health?limit=200&checks=pages-without-tags" nil signed)
++                  orphan-uuids (set (map :uuid (get-in tags-check [:body :checks :orphan-tags :items])))
++                  page-uuids (set (map :uuid (get-in pages-check [:body :checks :pages-without-tags :items])))]
++            (is (= 200 (:status tags-check)) (pr-str tags-check))
++            (is (not (contains? orphan-uuids (str hidden-tag))) "a tag tagged Private is not listed")
++            (is (contains? orphan-uuids (str dormant)) "an unused visible tag still is")
++            (is (= 200 (:status pages-check)) (pr-str pages-check))
++            (is (not (contains? page-uuids (str child))) "an untagged page under a Private page is not listed")
++            (is (contains? page-uuids (str plain)) "an untagged visible page still is"))
++          (p/catch #(is false (str % "\n" (.-stack %))))
++          (p/finally done)))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 90c1ced..c4bda03 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -15,6 +15,7 @@
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.semantic-index-health-test]
++            [logseq.db-sync.semantic-graph-health-private-test]
+             [logseq.db-sync.semantic-block-changes-test]
+             [logseq.db-sync.semantic-choice-values-test]
+             [logseq.db-sync.semantic-headings-test]
