@@ -197,3 +197,13 @@ Run `scripts/check.sh --upstream` on the final commit, name that commit in the P
 3. **Inherited clients.** A task matches when its own client, else its page's, is the client, as the full listing does. Should a task under a block that holds the client also match? That would change the full listing too.
 4. **Case-only matches.** Lookup is exact title first, then page name ignoring case, as `title-candidates` does; so `Acme` picks the page titled exactly `Acme` even when a page `acme` exists. Keep that, or refuse whenever the case-insensitive name matches more than one?
 5. **Patch number.** 0054 assumes PRs 72 and 73 merge first; 0050 if built alone, 0053 if item 49 is dropped.
+
+## 12. Owner answers (2026-11-22)
+
+Approved for build with these answers to section 11:
+
+1. **Text clients:** not needed. `forClient` is a node property on the owner's graph, so `client` stays refused for a default or url `client_property`, with advice.
+2. **Shared titles:** a page wins when exactly one candidate is a page, as property writes already resolve titles. When there is no page or more than one, refuse naming every candidate's UUID.
+3. **Inherited clients:** no. A task matches its own client, else its page's, as the full listing does.
+4. **Case-only matches:** keep exact title first, then page name ignoring case.
+5. **Patch number:** 0054. PRs 72 and 73 are being built in another session and take 0050 to 0053; renumber at merge if they land differently.
