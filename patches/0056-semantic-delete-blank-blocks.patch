@@ -1,0 +1,999 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 2895632..e6eb930 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -5035,6 +5035,199 @@
+                      (nil? existing) (assoc :page (insert-page-title db page)))))
+                (map vector entries resolved)))
+ 
++;; deleteBlankBlocks (patch 0056) deletes the plain blank leaves on up to 20 named pages: a dry run
++;; lists them, and an apply takes exactly the block-ids a dry run listed. Every page must resolve to
++;; one visible, plain, non-Private page, or the whole call is refused naming page-ids[i], before any
++;; block is read. E2EE graphs are refused: a blank title can't be told from ciphertext there.
++
++(def ^:private max-blank-pages 20)
++(def ^:private max-blank-deletes 100)
++(def ^:private max-blank-scan 10000)
++(def ^:private max-kept-examples 20)
++
++(def ^:private blank-attribute-allow-list
++  "Every attribute a plain blank block may hold: the outliner's bookkeeping, its creator and Claude's
++  two stamps (patch 0034), as blocks made through the API, by the outliner and by the app (then
++  uploaded) hold them. Anything else keeps the block: tags (an empty Task), a property, a display
++  type, a heading, a value block's or choice's owner, pre-block?, a page's name. So does anything
++  new, which is safe but keeps every block holding it; the allow-list test pins the set."
++  #{:block/uuid :block/parent :block/page :block/order :block/title :block/created-at :block/updated-at
++    :block/tx-id :logseq.property/created-by-ref :user.property/claude-editedBy :user.property/claude-editedAt})
++
++(def ^:private blank-body-fields #{:page-ids :dry-run :block-ids})
++
++(def ^:private kept-reasons
++  "The reasons a blank block is kept that the caller can act on, as the dry run names them."
++  {:has-children "has children" :referenced "referenced" :being-edited "being edited"})
++
++(defn- blank-body-error
++  "The first problem with deleteBlankBlocks' body, naming the field, or nil."
++  [body]
++  (let [page-ids (:page-ids body)
++        block-ids (:block-ids body)
++        unknown (when (map? body) (remove blank-body-fields (keys body)))]
++    (cond
++      (not (map? body)) "body: give an object with page-ids"
++      (seq unknown) (string/join "; " (map #(str (subs (str %) 1) ": not a field; the body takes page-ids, dry-run and block-ids")
++                                           unknown))
++      (not (sequential? page-ids)) "page-ids: must be an array of page UUIDs, titles or YYYY-MM-DD dates"
++      (not (<= 1 (count page-ids) max-blank-pages)) (str "page-ids: 1 to " max-blank-pages " pages")
++      :else
++      (or (some (fn [[i selector]]
++                  (when-not (non-blank-string? selector)
++                    (str "page-ids[" i "]: must be a page UUID, title or YYYY-MM-DD date")))
++                (map-indexed vector page-ids))
++          (let [dry-run? (dry-run-option body)]
++            (cond
++              (= ::invalid dry-run?) "dry-run: must be true or false"
++              (and dry-run? (some? block-ids)) "block-ids: a dry run takes no block-ids; it lists them"
++              dry-run? nil
++              (nil? block-ids) "block-ids is required unless dry-run is true"
++              (not (and (sequential? block-ids) (<= 1 (count block-ids) max-blank-deletes)))
++              (str "block-ids: 1 to " max-blank-deletes " block UUIDs")))))))
++
++(defn- whiteboard? [entity]
++  (some #{:logseq.class/Whiteboard} (map :db/ident (:block/tags entity))))
++
++(defn- blank-page-refusal
++  "Why the visible entity a page selector found can't have its blank blocks judged, or nil."
++  [entity private]
++  (cond
++    (whiteboard? entity) "is a whiteboard"
++    (tag? entity) "is a tag"
++    (property? entity) "is a property"
++    (not (page? entity)) "is not a page"
++    (contains? private (:db/id entity)) "is Private"))
++
++(defn- resolve-blank-pages
++  "The pages `selectors` name, in order, as {:pages [entity]}, or the first refusal as
++  {:status :error}, naming page-ids[i] (with :candidates for an ambiguous title). A hidden or
++  recycled page reads as not found. `private` is datalog/private-ids."
++  [db e2ee? private selectors]
++  (if e2ee?
++    {:status 409 :error "blank blocks can't be judged on E2EE graphs: titles are ciphertext"}
++    (reduce (fn [{:keys [pages seen] :as acc} [i selector]]
++              (let [field (str "page-ids[" i "]")
++                    {:keys [ok status error candidates]} (resolve-page-selector db selector field {:find find-visible-entity})
++                    refusal (when ok (blank-page-refusal ok private))]
++                (cond
++                  (= 409 status) (reduced {:status 409 :candidates candidates
++                                           :error (str field ": ambiguous title; " (subs error (+ 2 (count field))))})
++                  (or error (nil? ok)) (reduced {:status 404 :error (str field ": page not found (" (pr-str selector) ")")})
++                  refusal (reduced {:status 400 :error (str field ": " refusal)})
++                  (contains? seen (:db/id ok)) (reduced {:status 400
++                                                         :error (str field ": same page as page-ids[" (get seen (:db/id ok)) "]")})
++                  :else (assoc acc :pages (conj pages ok) :seen (assoc seen (:db/id ok) i)))))
++            {:pages [] :seen {}}
++            (map-indexed vector selectors))))
++
++(defn- blank-scan-refusal
++  "A 422 naming page-ids[i] when page i holds more than max-outline-blocks blocks, or the pages up to
++  it more than max-blank-scan, counted from :block/page datoms before any block is judged; else nil."
++  [db pages]
++  (let [result (reduce (fn [total [i page]]
++                         (let [n (count (d/datoms db :avet :block/page (:db/id page)))
++                               total (+ total n)]
++                           (cond
++                             (> n max-outline-blocks)
++                             (reduced {:status 422 :error (str "page-ids[" i "]: over " max-outline-blocks " blocks")})
++                             (> total max-blank-scan)
++                             (reduced {:status 422 :error (str "page-ids[" i "]: the call is over " max-blank-scan " blocks")})
++                             :else total)))
++                       0
++                       (map-indexed vector pages))]
++    (when (map? result) result)))
++
++(defn- blank-reference-attributes
++  "reference-attributes once each, without :block/parent and :block/page: blank-candidate judges a
++  child by its own clause first, and only a page is ever a block's page. referrer-ids runs for every
++  blank leaf (5,000 at the caps), so each attribute left out saves that many index reads."
++  [db]
++  (into [] (comp (remove #{:block/parent :block/page}) (distinct)) (reference-attributes db)))
++
++(defn- blank-title? [title]
++  (or (nil? title) (and (string? title) (string/blank? title))))
++
++(defn- blank-candidate
++  "nil when `entity` is a plain blank leaf that may be deleted; else why it is kept: :has-text,
++  :not-plain (an attribute outside blank-attribute-allow-list, which a page, tag, property, asset,
++  tagged block, typed block, value block or choice always holds), :hidden (under a recycled
++  block), :private, :has-children, :referenced or :being-edited. private-ids holds everything in
++  or under the Recycle bin, so entity-util/hidden? (a walk up the parents, about 0.1 ms a block)
++  runs only for the blocks in it, to tell recycled from Private; hide? marks pages and properties,
++  and a hidden page is refused before any block is judged. A title of
++  whitespace (string/blank?: spaces, tabs, U+00A0) is blank; a zero-width space is not. Attributes
++  are read from :eavt datoms, so an uploaded graph's stored cardinality can't change the answer.
++  `context` holds what a call reads once: :private (datalog/private-ids), :editing
++  (presence/editing-block-uuids) and :attributes (blank-reference-attributes)."
++  [db entity {:keys [private editing attributes]}]
++  (let [id (:db/id entity)]
++    (cond
++      (not (blank-title? (:v (first (d/datoms db :eavt id :block/title))))) :has-text
++      (some #(not (contains? blank-attribute-allow-list (:a %))) (d/datoms db :eavt id)) :not-plain
++      (contains? private id) (if (entity-util/hidden? entity) :hidden :private)
++      (seq (d/datoms db :avet :block/parent id)) :has-children
++      (seq (referrer-ids db entity attributes)) :referenced
++      (contains? editing (:block/uuid entity)) :being-edited)))
++
++(defn- blank-note [total listed]
++  (cond
++    (zero? total) "no blank blocks to delete on these pages"
++    (> total listed) (str "pass these block-ids with dry-run false to delete them; " (- total listed) " more "
++                          (if (= 1 (- total listed)) "wasn't" "weren't") " listed: run the dry run again after the apply")
++    :else "pass these block-ids with dry-run false to delete them"))
++
++(defn- blank-dry-run
++  "The dry run's answer: for each page in request order, the blank leaves it would delete (at most
++  max-blank-deletes across the call), the blank blocks kept for a reason the caller can act on
++  (counted, with the first max-kept-examples), and the blank leaves under Private content (counted
++  only). Every other blank-looking block is left out."
++  [db t pages context]
++  (let [total (volatile! 0)
++        listed (volatile! 0)
++        entries (mapv (fn [page]
++                        (let [kept (volatile! {:has-children 0 :referenced 0 :being-edited 0})
++                              examples (volatile! [])
++                              would-delete (volatile! [])
++                              private (volatile! 0)]
++                          (doseq [datom (d/datoms db :avet :block/page (:db/id page))
++                                  :let [block (d/entity db (:e datom))
++                                        reason (blank-candidate db block context)]]
++                            (cond
++                              (nil? reason)
++                              (do (vswap! total inc)
++                                  (when (< @listed max-blank-deletes)
++                                    (vswap! listed inc)
++                                    (vswap! would-delete conj {:uuid (uuid-string (:block/uuid block))
++                                                               :parent (uuid-string (:block/uuid (:block/parent block)))})))
++                              (contains? kept-reasons reason)
++                              (do (vswap! kept update reason inc)
++                                  (when (< (count @examples) max-kept-examples)
++                                    (vswap! examples conj {:uuid (uuid-string (:block/uuid block)) :reason (kept-reasons reason)})))
++                              (= :private reason) (vswap! private inc)))
++                          {:page (:block/title page)
++                           :uuid (uuid-string (:block/uuid page))
++                           :would-delete @would-delete
++                           :kept (assoc @kept :examples @examples)
++                           :skipped-private @private}))
++                      pages)]
++    {:dry-run true :t t :total @total :listed @listed :pages entries :note (blank-note @total @listed)}))
++
++(defn- delete-blank-blocks [^js self request db e2ee?]
++  (p/let [body (body-clj request)]
++    (if-let [error (blank-body-error body)]
++      (http/bad-request error)
++      (let [private (when-not e2ee? (datalog/private-ids db))
++            resolved (resolve-blank-pages db e2ee? private (:page-ids body))
++            refusal (or (when (:error resolved) resolved) (blank-scan-refusal db (:pages resolved)))]
++        (cond
++          refusal (selector-refusal refusal)
++          (not (true? (:dry-run body))) (http/error-response "apply is not built yet: only dry-run true is answered" 501)
++          :else (http/json-response nil (blank-dry-run db (storage/get-t (.-sql self)) (:pages resolved)
++                                                       {:private private
++                                                        :editing (presence/editing-block-uuids self)
++                                                        :attributes (blank-reference-attributes db)})))))))
++
+ (defn- bulk-write-response
+   "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
+   [body dry-run? status]
+@@ -5044,6 +5237,8 @@
+ 
+ (defn- handle-bulk [{:keys [^js self request ^js url conn db handler e2ee? creator]}]
+   (case handler
++    :semantic/blank-blocks-delete (delete-blank-blocks self request db e2ee?)
++
+     :semantic/blocks-get-many
+     (let [ids (parse-ids (.get (.-searchParams url) "ids"))
+           view (or (.get (.-searchParams url) "view") "summary")
+@@ -5852,7 +6047,7 @@
+ 
+ (def ^:private bulk-handlers
+   #{:semantic/blocks-get-many :semantic/blocks-delete-many :semantic/blocks-batch-move
+-    :semantic/blocks-batch-insert-tree})
++    :semantic/blocks-batch-insert-tree :semantic/blank-blocks-delete})
+ 
+ (def ^:private property-and-search-handlers
+   #{:semantic/properties-list :semantic/properties-create :semantic/properties-get
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 88a506e..be8c63e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -42,6 +42,8 @@
+     :handler :semantic/blocks-get-many :operation-id "getBlocks" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks" :internal-path "/semantic/blocks"
+     :handler :semantic/blocks-delete-many :operation-id "deleteBlocks" :scope "logseq/write" :rate-class :write}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/blank-blocks/delete" :internal-path "/semantic/blank-blocks/delete"
++    :handler :semantic/blank-blocks-delete :operation-id "deleteBlankBlocks" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/refresh-refs" :internal-path "/semantic/refresh-refs"
+     :handler :semantic/refresh-refs :operation-id "refreshRefs" :scope "logseq/write" :rate-class :write}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
+@@ -168,6 +170,14 @@
+    "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
+    "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
+    "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
++   "deleteBlankBlocks" ["Delete blank blocks on pages"
++                        (str "Deletes the plain blank leaf blocks on 1 to 20 pages, in two steps: a dry run (dry-run true) lists them, and an apply (dry-run false) takes the block-ids the dry run listed. dry-run defaults to false, and an apply without block-ids is refused with 400."
++                             " page-ids are page UUIDs, titles or YYYY-MM-DD journal dates; journals are allowed, today's included. The whole call is refused, naming page-ids[i] and writing nothing, when a page isn't found (a hidden page or one in the Recycle bin reads as not found; 404), a title names several pages (409, with candidates), two entries name the same page, or a page is a whiteboard, a tag, a property, not a page, or Private (400). E2EE graphs are refused with 409: a blank title can't be told from ciphertext."
++                             " A block is blank when its title is empty or only whitespace (spaces, tabs, no-break spaces; a zero-width space is text) and it holds nothing but its place, its creator and Claude's edit stamps: an empty Task or tagged block, a block with a property, a heading, a Code, Math or Quote block, a property value block, a choice and a pre-block are kept and not reported."
++                             " A blank block is kept and counted under kept, with up to 20 examples per page, when it has children (they are never lifted), when something references it (a link, an embed, a property value) or when a connected app reports it as the block being edited. Blank blocks on or under Private content are counted per page in skipped-private and never named."
++                             " The dry run writes nothing and lists at most 100 blocks across the call, page by page in request order, under would-delete with each one's parent; total counts them all, listed counts those listed, and note says to run the dry run again after the apply when some weren't listed."
++                             " A page with more than 2000 blocks, or pages with more than 10000 together, are refused with 422 naming the page where the bound was passed. A page may end with no blocks; the app may add an empty block back when it is opened."
++                             " Apply is not built yet: an apply with block-ids answers 501.")]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
+    "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
+@@ -416,6 +426,16 @@
+                                                             "target-label is on the single-block writes. A different length is refused "
+                                                             "with 400. " target-label-description)}
+                                  :dry-run dry-run-schema}}
++    "deleteBlankBlocks" {:required ["page-ids"]
++                         :properties {:page-ids {:type "array" :minItems 1 :maxItems 20
++                                                 :description (str "1 to 20 pages, each named once. " page-selector-description)
++                                                 :items {:type "string"}}
++                                      :dry-run {:type "boolean" :default false
++                                                :description "true lists the blank blocks without deleting anything; false (the default) deletes block-ids."}
++                                      :block-ids {:type "array" :minItems 1 :maxItems 100 :uniqueItems true
++                                                  :description "Required unless dry-run is true, and refused with it: the block UUIDs a dry run listed under would-delete."
++                                                  :items {:type "string"}}}
++                         :additionalProperties false}
+     "batchInsertBlockTrees"
+     {:required ["entries"]
+      :properties {:entries {:type "array" :minItems 1 :maxItems 100
+@@ -699,6 +719,7 @@
+                    :content {"application/json" {:schema {:anyOf [{:$ref "#/components/schemas/BlocksResponse"}
+                                                                   {:$ref "#/components/schemas/SignalsResponse"}]}}}}
+                   "deleteBlocks" (entity-response "DeleteBlocksResponse" "How many blocks were deleted, and each one named")
++                  "deleteBlankBlocks" (entity-response "BlankBlocksDryRunResponse" "With dry-run true: the blank blocks on each page; nothing was deleted")
+                   "deleteBlock" (entity-response "DeleteBlocksResponse" "The deleted block, named")
+                   "moveBlocks" (entity-response "MovedBlocksResponse" "The moved blocks, with where each was and is")
+                   "batchMoveBlocks" (entity-response "MoveBlocksResponse" "How many blocks were moved, with where each was and is")
+@@ -755,6 +776,12 @@
+             "500" (entity-response "NotRemoved" "The page is still in the graph after the delete")}
+            ("deleteBlock" "deleteBlocks")
+            {"500" (entity-response "NotRemoved" "Blocks still in the graph after the delete")}
++           "deleteBlankBlocks"
++           {"400" {:description "A malformed body (an unknown field, a non-boolean dry-run, page-ids not 1 to 20 strings, block-ids missing on an apply or given on a dry run), or page-ids[i] naming the same page as an earlier entry, a whiteboard, a tag, a property, something that isn't a page, or a Private page; nothing was written"}
++            "404" {:description "page-ids[i] names no visible page; nothing was written"}
++            "409" {:description "page-ids[i] names several pages (candidates names each one's uuid and title), or the graph is E2EE; nothing was written"}
++            "422" {:description "page-ids[i] has more than 2000 blocks, or the pages up to it more than 10000; nothing was written"}
++            "501" {:description "An apply (dry-run false with block-ids) is not built yet"}}
+            ("deleteTag" "deleteProperty")
+            {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
+             "204" {:description "Deleted"}
+@@ -950,6 +977,30 @@
+                                                                 :property-values {:type ["array" "null"] :items {:type "string"}
+                                                                                   :description "null without property; else the property's values as text on the entity, else on its page, else []."}}}}
+                                   :missing {:type "array" :items {:type "string"}}}}
++   :BlankBlocksDryRunResponse
++   {:type "object" :required ["dry-run" "t" "total" "listed" "pages" "note"]
++    :properties {:dry-run {:type "boolean"}
++                 :t {:type "integer" :description "The graph's t when the dry run read it."}
++                 :total {:type "integer" :description "Every blank block the pages would lose."}
++                 :listed {:type "integer" :maximum 100 :description "Those listed under would-delete, at most 100 across the call."}
++                 :pages {:type "array"
++                         :items {:type "object" :required ["page" "uuid" "would-delete" "kept" "skipped-private"]
++                                 :properties {:page {:type "string" :description "The page's title."}
++                                              :uuid {:type "string"}
++                                              :would-delete {:type "array"
++                                                             :items {:type "object" :required ["uuid" "parent"]
++                                                                     :properties {:uuid {:type "string"}
++                                                                                  :parent {:type "string" :description "The parent block's or page's UUID."}}}}
++                                              :kept {:type "object" :required ["has-children" "referenced" "being-edited" "examples"]
++                                                     :properties {:has-children {:type "integer"}
++                                                                  :referenced {:type "integer"}
++                                                                  :being-edited {:type "integer"}
++                                                                  :examples {:type "array" :maxItems 20
++                                                                             :items {:type "object" :required ["uuid" "reason"]
++                                                                                     :properties {:uuid {:type "string"}
++                                                                                                  :reason {:enum ["has children" "referenced" "being edited"]}}}}}}
++                                              :skipped-private {:type "integer" :description "Blank blocks on or under Private content, counted and never named."}}}}
++                 :note {:type "string"}}}
+    :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
+                           :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
+                                        :total-removed {:type "integer" :description "Those blocks and all their descendants."}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
+new file mode 100644
+index 0000000..72717d5
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
+@@ -0,0 +1,662 @@
++(ns logseq.db-sync.semantic-delete-blank-blocks-test
++  "deleteBlankBlocks (patch 0056), Stage 3: page resolution, the blank predicate and the dry run.
++  A call names 1 to 20 pages; any page that doesn't resolve to one visible, plain, non-Private page
++  refuses the whole call naming page-ids[i]. A dry run judges every block on the pages and lists the
++  plain blank leaves (an empty or whitespace title, no children, no tags, nothing but the built-in
++  bookkeeping and Claude's stamps, no referrer, not Private, not being edited) without writing.
++  Blank blocks kept for a reason the caller can act on are counted with examples; blank blocks under
++  Private content are counted only; every other blank-looking block (value blocks, typed blocks,
++  headings, tagged blocks) is left out. An apply needs block-ids and isn't built yet (501).
++  Graphs sit on a real SQLite store (better-sqlite3) and every call goes through handle-http, on a
++  graph created on the server and on one that arrived through the app's snapshot upload."
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is testing]]
++            [clojure.set :as set]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db.common.order :as db-order]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.presence :as presence]
++            [logseq.db.frontend.schema :as db-schema]
++            [logseq.db.sqlite.create-graph :as sqlite-create-graph]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++;; The spec's allow-list (section 3.4 step 2): the attributes a plain blank block may hold.
++(def ^:private plain-block-attributes
++  #{:block/uuid :block/parent :block/page :block/order :block/title :block/created-at :block/updated-at
++    :block/tx-id :logseq.property/created-by-ref :user.property/claude-editedBy :user.property/claude-editedAt})
++
++(def ^:private user-a {:user-id "0b7c2f4e-1d3a-4c5b-8e6f-7a9b0c1d2e3f" :email "user-a@example.com" :username "user-a"})
++
++(def ^:private actor
++  (js/encodeURIComponent
++   (js/JSON.stringify #js {"sub" (:user-id user-a) "cognito:username" (:username user-a) "email" (:email user-a)})))
++
++(defn- memory-sql []
++  (let [db (new sqlite3 ":memory:" nil)]
++    #js {:transaction (fn [f] ((.transaction db f)))
++         :exec (fn [sql-str & args]
++                 (let [stmt (.prepare db sql-str)]
++                   (if (string/starts-with? (-> sql-str string/trim string/lower-case) "select")
++                     (.apply (.-all stmt) stmt (to-array args))
++                     (do (.apply (.-run stmt) stmt (to-array args)) nil))))}))
++
++(defn- request!
++  "One semantic API request through the real handler, as user A; returns {:status :body :text}.
++  `headers` adds headers (e.g. Claude's stamp); `e2ee?` marks the graph E2EE as the index does."
++  [self method path body & {:keys [headers e2ee? raw]}]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1"
++                   (when e2ee? "&graph-e2ee=true"))
++          h (js/Headers. #js {"content-type" "application/json" "x-logseq-sync-actor" actor})
++          _ (doseq [[k v] headers] (.set h k v))
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method :headers h}
++                                                raw (assoc :body raw)
++                                                (and body (not raw)) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :text text
++     :body (when (seq text) (try (js->clj (js/JSON.parse text) :keywordize-keys true) (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- blank! [self body & opts]
++  (apply request! self "POST" "/semantic/blank-blocks/delete" body opts))
++
++(defn- dry-run! [self page-ids & opts]
++  (apply blank! self {:page-ids page-ids :dry-run true} opts))
++
++(defn- run [done f]
++  (-> (p/do (f))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++;; ---------------------------------------------------------------------------------------------
++;; Graphs
++
++(defn- server-graph
++  "A graph created on the server itself (never uploaded), not yet opened."
++  []
++  (let [sql (memory-sql)
++        conn (storage/open-conn sql)]
++    (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
++    {:sql sql :self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}}))
++
++(defn- upload-rows
++  "The kvs rows the app uploads for `client`, as <prepare-upload-temp-sqlite! makes them."
++  [client]
++  (let [sql (memory-sql)
++        _ (storage/init-schema! sql)
++        temp (d/conn-from-datoms [] (d/schema @client) {:storage (storage/new-sqlite-storage sql)})]
++    (d/transact! temp (mapv (fn [datom] [:db/add (:e datom) (:a datom) (:v datom)]) (d/datoms @client :eavt))
++                 {:initial-db? true})
++    (mapv (fn [row] [(aget row "addr") (aget row "content") (aget row "addresses")])
++          (.exec sql "select addr, content, addresses from kvs order by addr"))))
++
++(def ^:private app-page "App Notes")
++
++(defn- uploaded-graph
++  "A graph that arrived through the snapshot upload of an app graph, imported by the real handler.
++  Before the upload the app's own outliner made page App Notes with an empty leaf and an empty
++  parent holding a child, as pressing Enter in the app makes them. Returns the uuids it made."
++  []
++  (let [client (d/create-conn db-schema/schema)
++        _ (d/transact! client (sqlite-create-graph/build-db-initial-data "{}"))
++        [_ page-id] (outliner-page/create! client app-page {})
++        [leaf parent child] (repeatedly 3 random-uuid)
++        page (d/entity @client [:block/uuid page-id])
++        _ (outliner-core/insert-blocks! client [{:block/uuid leaf :block/title ""}
++                                                {:block/uuid parent :block/title ""}]
++                                        page {:sibling? false :keep-uuid? true :bottom? true})
++        _ (outliner-core/insert-blocks! client [{:block/uuid child :block/title "an app child"}]
++                                        (d/entity @client [:block/uuid parent]) {:sibling? false :keep-uuid? true})
++        sql (memory-sql)
++        self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}]
++    (#'sync-handler/import-snapshot! self (upload-rows client) true)
++    {:sql sql :self self :app {:page (str page-id) :leaf (str leaf) :parent (str parent) :child (str child)}}))
++
++(defn- opened!
++  "Opens the graph through a read, as any request does, and returns its conn."
++  [self]
++  (p/let [_ (ok! (request! self "GET" "/semantic/pages" nil) 200)]
++    (.-conn self)))
++
++(defn- tx-log-count [sql]
++  (aget (first (.exec sql "select count(*) as n from tx_log")) "n"))
++
++(defn- written-state
++  "What a write would change: t, the tx_log rows and the graph's datoms."
++  [sql self]
++  [(storage/get-t sql) (tx-log-count sql) (count (d/datoms @(.-conn self) :eavt))])
++
++;; ---------------------------------------------------------------------------------------------
++;; Writes used to build fixtures
++
++(defn- page! [self title]
++  (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)]
++    (get-in r [:body :uuid])))
++
++(defn- insert! [self target blocks & opts]
++  (p/let [r (ok! (apply request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks} opts) 201)]
++    (get-in r [:body :blocks])))
++
++(defn- set-property! [self id ident value]
++  (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent ident)) {:value value}) 200))
++
++(defn- outliner-insert!
++  "Blocks made by the real outliner on the server's conn, as an app's synced insert lands: this is
++  how a block with an empty title, a pre-block, a ((ref)) or an embed reaches the graph (the API
++  refuses an empty title and doesn't extract refs; the app's editor gives the outliner its refs).
++  replace-empty-target? is off: inserting several blocks after a blank last block would otherwise
++  put the first one in that block's place, as the app's paste does."
++  [self parent blocks]
++  (let [conn (.-conn self)]
++    (outliner-core/insert-blocks! conn blocks (d/entity @conn [:block/uuid (uuid (str parent))])
++                                  {:sibling? false :keep-uuid? true :bottom? true :replace-empty-target? false})))
++
++(defn- set-attr!
++  "Sets a datom directly on the opened graph (deleted-at, hide?, a tag no write route adds this way)."
++  [self id attr value]
++  (d/transact! (.-conn self) [[:db/add [:block/uuid (uuid (str id))] attr value]]))
++
++(defn- ids [n] (vec (repeatedly n #(str (random-uuid)))))
++
++;; Presence: a socket whose attachment round-trips as the runtime's does.
++(defn- socket []
++  (let [stored (atom nil)]
++    #js {:readyState 1
++         :serializeAttachment (fn [value] (reset! stored (js/structuredClone value)))
++         :deserializeAttachment (fn [] (some-> @stored js/structuredClone))}))
++
++(defn- editing!
++  "A connected client of user A reporting `block` (a uuid string) as the block being edited."
++  [self block]
++  (let [s (socket)]
++    (presence/add-presence! self s user-a)
++    (presence/update-presence! self s {:editing-block-uuid block})
++    s))
++
++(defn- attributes [db id]
++  (set (map :a (d/datoms db :eavt (:db/id (d/entity db [:block/uuid (uuid (str id))]))))))
++
++(defn- referrers [db id]
++  (let [eid (:db/id (d/entity db [:block/uuid (uuid (str id))]))]
++    (set (concat (map :e (d/datoms db :avet :block/refs eid)) (map :e (d/datoms db :avet :block/link eid))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The allow-list pin (spec section 7, risk 2): every way a plain blank block is made
++
++(deftest plain-block-attributes-test
++  ;; Before patch 0056 there is no such route: the dry runs answer 404.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (server-graph)
++                page (page! self "Example")
++                [by-api stamped by-outliner] (ids 3)
++                _ (insert! self page [{:uuid by-api :title " "}])
++                _ (insert! self page [{:uuid stamped :title " "}] :headers [["x-logseq-edit-stamp" "claude"]])
++                _ (outliner-insert! self page [{:block/uuid (uuid by-outliner) :block/title ""}])
++                server-db @(.-conn self)
++                server (dry-run! self [page])
++                {uploaded :self app :app} (uploaded-graph)
++                conn (opened! uploaded)
++                upload (dry-run! uploaded [app-page])]
++          (doseq [[label db id] [["made through the API" server-db by-api]
++                                 ["made through the API with Claude's stamp" server-db stamped]
++                                 ["made by the outliner on the server" server-db by-outliner]
++                                 ["made by the app and uploaded" @conn (:leaf app)]]]
++            (testing label
++              (is (seq (attributes db id)))
++              (is (empty? (set/difference (attributes db id) plain-block-attributes))
++                  (str "attributes outside the allow-list: " (pr-str (set/difference (attributes db id) plain-block-attributes))))))
++          (is (contains? (attributes server-db stamped) :user.property/claude-editedBy) "the stamp is on the block")
++          (is (= 200 (:status server)) (pr-str server))
++          (is (= #{by-api stamped by-outliner} (set (map :uuid (get-in server [:body :pages 0 :would-delete])))))
++          (is (= 200 (:status upload)) (pr-str upload))
++          (is (= [(:leaf app)] (map :uuid (get-in upload [:body :pages 0 :would-delete])))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The predicate, on one fixture page
++
++(defn- predicate-fixture!
++  "Builds page Example on an opened graph: each case of the spec's decision table. Returns the uuids
++  by role: :delete (would-delete), :has-children, :referenced, :being-edited, :private (counted in
++  skipped-private) and :silent (blank-looking blocks that appear nowhere in the answer)."
++  [self]
++  (p/let [_ (ok! (request! self "POST" "/semantic/tags" {:title "Private"}) 201)
++          rating (ok! (request! self "POST" "/semantic/properties" {:title "Rating" :type "default"}) 201)
++          related (ok! (request! self "POST" "/semantic/properties" {:title "Related" :type "node"}) 201)
++          rating-ident (get-in rating [:body :ident])
++          related-ident (get-in related [:body :ident])
++          page (page! self "Example")
++          [ws nbsp tab zwsp parent child task rated heading code math quote refd embedded linked holder
++           private-block under-private recycled recycled-parent under-recycled edited valued stamped
++           nested-parent nested untitled]
++          (ids 27)
++          _ (insert! self page
++                     [{:uuid ws :title "   "}
++                      {:uuid nbsp :title " "}
++                      {:uuid tab :title "\t"}
++                      {:uuid zwsp :title "​"}
++                      {:uuid parent :title " " :children [{:uuid child :title "a child"}]}
++                      {:uuid task :title " "}
++                      {:uuid rated :title " "}
++                      {:uuid heading :title " "}
++                      {:uuid code :title " " :display-type "code"}
++                      {:uuid math :title " " :display-type "math"}
++                      {:uuid quote :title " " :display-type "quote"}
++                      {:uuid refd :title " "}
++                      {:uuid embedded :title " "}
++                      {:uuid linked :title " "}
++                      {:uuid holder :title "holds a related block"}
++                      {:uuid private-block :title "a private block" :children [{:uuid under-private :title " "}]}
++                      {:uuid recycled :title " "}
++                      {:uuid recycled-parent :title "a recycled block" :children [{:uuid under-recycled :title " "}]}
++                      {:uuid edited :title " "}
++                      {:uuid valued :title "a valued block"}
++                      {:uuid nested-parent :title "a parent block" :children [{:uuid nested :title " "}]}])
++          _ (insert! self page [{:uuid stamped :title " "}] :headers [["x-logseq-edit-stamp" "claude"]])
++          [empty-leaf pre ref-block embed-block] (map uuid (ids 4))
++          _ (outliner-insert! self page [{:block/uuid empty-leaf :block/title ""}
++                                         {:block/uuid pre :block/title "" :block/pre-block? true}
++                                         {:block/uuid ref-block :block/title (str "see ((" refd "))")
++                                          :block/refs [[:block/uuid (uuid refd)]]}
++                                         {:block/uuid embed-block :block/title ""
++                                          :block/link [:block/uuid (uuid embedded)]}])
++          _ (set-property! self task "block/tags" ["Task"])
++          _ (set-property! self private-block "block/tags" ["Private"])
++          _ (set-property! self rated rating-ident "four stars")
++          _ (set-property! self heading "logseq.property/heading" 2)
++          _ (set-property! self holder related-ident linked)
++          _ (set-property! self valued rating-ident "a value")
++          conn (.-conn self)
++          value-block (:v (first (d/datoms @conn :eavt (:db/id (d/entity @conn [:block/uuid (uuid valued)]))
++                                           (keyword rating-ident))))
++          value-uuid (str (:block/uuid (d/entity @conn value-block)))
++          ;; A blank value block: no write route blanks one, so its title is cleared directly.
++          _ (set-attr! self value-uuid :block/title "")
++          ;; A blank choice on the page: made directly, as a closed value is never made by the API here.
++          choice (str (random-uuid))
++          page-eid (:db/id (d/entity @conn [:block/uuid (uuid page)]))
++          _ (d/transact! conn [{:block/uuid (uuid choice) :block/title "" :block/parent page-eid :block/page page-eid
++                                :block/order (db-order/gen-key) :block/created-at 1 :block/updated-at 1
++                                :block/closed-value-property [:db/ident (keyword rating-ident)]}])
++          ;; A block with no title datom at all (made directly: every write route gives one).
++          _ (d/transact! conn [{:block/uuid (uuid untitled) :block/parent page-eid :block/page page-eid
++                                :block/order (db-order/gen-key) :block/created-at 1 :block/updated-at 1}])
++          _ (set-attr! self recycled :logseq.property/deleted-at 1)
++          _ (set-attr! self recycled-parent :logseq.property/deleted-at 1)
++          _ (editing! self edited)]
++    (let [db @conn]
++      ;; The fixture is what it says: each referrer is in place, each typed block is typed.
++      (assert (seq (referrers db refd)) "the ((ref)) is a :block/refs datom")
++      (assert (seq (referrers db embedded)) "the embed is a :block/link datom")
++      (assert (contains? (attributes db code) :logseq.property.node/display-type))
++      (assert (contains? (attributes db pre) :block/pre-block?))
++      (assert (contains? (attributes db value-uuid) :logseq.property/created-from-property))
++      (assert (= "" (:block/title (d/entity db [:block/uuid (uuid value-uuid)])))))
++    {:page page
++     :delete #{ws nbsp tab stamped (str empty-leaf) nested untitled}
++     :parents {nested nested-parent}
++     :has-children #{parent}
++     :referenced #{refd embedded linked}
++     :being-edited #{edited}
++     :private #{under-private}
++     :silent #{zwsp task rated heading code math quote (str pre) (str embed-block) value-uuid choice
++               recycled under-recycled}
++     :untouched #{child}}))
++
++(defn- check-predicate! [response {:keys [page delete parents has-children referenced being-edited private silent untouched]}]
++  (let [answer (:body response)
++        [entry] (:pages answer)
++        examples (get-in entry [:kept :examples])]
++    (is (= 200 (:status response)) (pr-str response))
++    (is (= page (:uuid entry)))
++    (is (= "Example" (:page entry)))
++    (testing "would-delete: empty, untitled, whitespace (spaces, U+00A0 no-break space, U+0009 tab), nested and Claude-stamped leaves"
++      (is (= delete (set (map :uuid (:would-delete entry)))))
++      (is (= (into {} (map (fn [id] [id (get parents id page)])) delete)
++             (into {} (map (juxt :uuid :parent)) (:would-delete entry)))
++          "each names its parent: the page, or the block it is under"))
++    (testing "kept and listed: a blank parent, referenced blanks (a ((ref)), an embed, a node property value) and the block being edited"
++      (is (= {:has-children 1 :referenced 3 :being-edited 1} (dissoc (:kept entry) :examples)))
++      (is (= (set (concat (map #(hash-map :uuid % :reason "has children") has-children)
++                          (map #(hash-map :uuid % :reason "referenced") referenced)
++                          (map #(hash-map :uuid % :reason "being edited") being-edited)))
++             (set examples))))
++    (testing "a blank leaf under a Private block is counted, never named"
++      (is (= (count private) (:skipped-private entry))))
++    (testing "silent keeps (U+200B zero-width space, an empty Task, a block with a property, a heading, Code, Math, Quote, a value block, a choice, a pre-block, an embed holder, recycled blocks) appear nowhere"
++      (doseq [id (concat private silent untouched)]
++        (is (not (string/includes? (:text response) id)) (str id " is in the answer"))))
++    (is (= (count delete) (:total answer)))
++    (is (= (count delete) (:listed answer)))))
++
++(deftest predicate-on-a-server-graph-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                _ (opened! self)
++                fixture (predicate-fixture! self)
++                before (written-state sql self)
++                response (dry-run! self [(:page fixture)])]
++          (check-predicate! response fixture)
++          (is (= before (written-state sql self)) "the dry run wrote nothing"))))))
++
++(deftest predicate-on-an-uploaded-graph-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql app]} (uploaded-graph)
++                _ (opened! self)
++                fixture (predicate-fixture! self)
++                before (written-state sql self)
++                response (dry-run! self [(:page fixture) app-page])
++                [_ app-entry] (get-in response [:body :pages])]
++          (check-predicate! (update response :body (fn [body] (-> body (update :pages (comp vec butlast))
++                                                                  (update :total dec) (update :listed dec))))
++                            fixture)
++          (testing "the app's own blank blocks, uploaded"
++            (is (= [{:uuid (:leaf app) :parent (:page app)}] (:would-delete app-entry)))
++            (is (= [{:uuid (:parent app) :reason "has children"}] (get-in app-entry [:kept :examples])))
++            (is (not (string/includes? (:text response) (:child app)))))
++          (is (= before (written-state sql self)) "the dry run wrote nothing"))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The dry run's shape and caps
++
++(deftest dry-run-writes-nothing-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                page (page! self "Example")
++                quiet (page! self "Projects")
++                _ (insert! self quiet [{:title "nothing blank here"}])
++                ;; One insert: several blocks inserted after a blank last block would replace it.
++                inserted (insert! self page (vec (concat (for [i (range 25)] {:title " " :children [{:title (str "child " i)}]})
++                                                         (repeat 3 {:title " "}))))
++                leaves (drop 25 inserted)
++                before (written-state sql self)
++                first-run (ok! (dry-run! self [page quiet]) 200)
++                again (ok! (dry-run! self [page quiet]) 200)
++                body (:body first-run)
++                [entry quiet-entry] (:pages body)]
++          (is (= before (written-state sql self)) "t, the tx_log and the graph are unchanged")
++          (is (= (:body first-run) (:body again)) "a re-sent dry run answers the same")
++          (is (= #{:dry-run :t :total :listed :pages :note} (set (keys body))))
++          (is (true? (:dry-run body)))
++          (is (= (first before) (:t body)) "t is the graph's t")
++          (is (= #{:page :uuid :would-delete :kept :skipped-private} (set (keys entry))))
++          (is (= #{:has-children :referenced :being-edited :examples} (set (keys (:kept entry)))))
++          (is (= 25 (get-in entry [:kept :has-children])) "the count is complete")
++          (is (= 20 (count (get-in entry [:kept :examples]))) "examples stop at 20 per page")
++          (is (= (set (map :uuid leaves)) (set (map :uuid (:would-delete entry)))))
++          (is (= 3 (:total body)))
++          (is (= "pass these block-ids with dry-run false to delete them" (:note body)))
++          (testing "a page with nothing blank"
++            (is (= {:page "Projects" :uuid quiet :would-delete []
++                    :kept {:has-children 0 :referenced 0 :being-edited 0 :examples []} :skipped-private 0}
++                   quiet-entry)))
++          (p/let [nothing (ok! (dry-run! self [quiet]) 200)]
++            (is (= [0 0] [(get-in nothing [:body :total]) (get-in nothing [:body :listed])]))
++            (is (= "no blank blocks to delete on these pages" (get-in nothing [:body :note])))))))))
++
++(deftest dry-run-listing-cap-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (server-graph)
++                hundred (page! self "Hundred")
++                _ (insert! self hundred (vec (repeat 100 {:title " "})))
++                a (page! self "First Half")
++                b (page! self "Second Half")
++                a-blocks (insert! self a (vec (repeat 60 {:title " "})))
++                b-blocks (insert! self b (vec (repeat 41 {:title " "})))
++                exact (ok! (dry-run! self [hundred]) 200)
++                over (ok! (dry-run! self [a b]) 200)
++                reversed (ok! (dry-run! self [b a]) 200)]
++          (testing "exactly 100: all listed, no second run needed"
++            (is (= [100 100] [(get-in exact [:body :total]) (get-in exact [:body :listed])]))
++            (is (= 100 (count (get-in exact [:body :pages 0 :would-delete]))))
++            (is (= "pass these block-ids with dry-run false to delete them" (get-in exact [:body :note]))))
++          (testing "101 across two pages: 100 listed, filled page by page in request order"
++            (is (= [101 100] [(get-in over [:body :total]) (get-in over [:body :listed])]))
++            (is (= [60 40] (map (comp count :would-delete) (get-in over [:body :pages]))))
++            (is (= (set (map :uuid a-blocks)) (set (map :uuid (get-in over [:body :pages 0 :would-delete])))))
++            (is (string/includes? (get-in over [:body :note]) "1 more"))
++            (is (string/includes? (get-in over [:body :note]) "dry run again after the apply")))
++          (testing "the same pages in reverse order fill the other way"
++            (is (= [101 100] [(get-in reversed [:body :total]) (get-in reversed [:body :listed])]))
++            (is (= [41 59] (map (comp count :would-delete) (get-in reversed [:body :pages]))))
++            (is (= (set (map :uuid b-blocks)) (set (map :uuid (get-in reversed [:body :pages 0 :would-delete])))))
++            (is (= ["Second Half" "First Half"] (map :page (get-in reversed [:body :pages]))))))))))
++
++(defn- today-iso []
++  (subs (.toISOString (js/Date.)) 0 10))
++
++(deftest todays-journal-test
++  ;; Journals are allowed, today's included (spec section 12, answer 4): a blank leaf that is the
++  ;; journal's only block is a candidate unless a client reports it as being edited.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (server-graph)
++                capture (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title " "}]}) 201)
++                journal (get-in capture [:body :page-id])
++                title (get-in capture [:body :page-title])
++                block (get-in capture [:body :blocks 0 :uuid])
++                by-date (ok! (dry-run! self [(today-iso)]) 200)
++                by-uuid (ok! (dry-run! self [journal]) 200)
++                by-title (ok! (dry-run! self [title]) 200)
++                _ (editing! self block)
++                edited (ok! (dry-run! self [(today-iso)]) 200)]
++          (doseq [[label response] [["by date" by-date] ["by uuid" by-uuid] ["by title" by-title]]]
++            (testing label
++              (is (= journal (get-in response [:body :pages 0 :uuid])))
++              (is (= [{:uuid block :parent journal}] (get-in response [:body :pages 0 :would-delete])))))
++          (testing "the block being typed in is kept"
++            (is (= [] (get-in edited [:body :pages 0 :would-delete])))
++            (is (= [{:uuid block :reason "being edited"}] (get-in edited [:body :pages 0 :kept :examples])))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Refusals
++
++(defn- refused? [response status prefix]
++  (and (= status (:status response))
++       (string/starts-with? (str (get-in response [:body :error])) prefix)))
++
++(defn- bulk-blocks!
++  "`n` plain blocks on `page`, transacted directly in the outliner's block shape (a fixture shortcut
++  for size; the API inserts the same blocks one request at a time)."
++  [self page n]
++  (let [conn (.-conn self)
++        page-eid (:db/id (d/entity @conn [:block/uuid (uuid page)]))]
++    (d/transact! conn (vec (for [[i order] (map-indexed vector (db-order/gen-n-keys n nil nil))]
++                             {:block/uuid (random-uuid) :block/title (if (even? i) " " (str "block " i))
++                              :block/parent page-eid :block/page page-eid :block/order order
++                              :block/created-at 1 :block/updated-at 1})))))
++
++(deftest page-refusals-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                example (page! self "Example")
++                _ (insert! self example [{:title " "}])
++                hidden (page! self "Hidden")
++                recycled (page! self "Recycled")
++                private-page (page! self "Private Plans")
++                secret-page (page! self "Secret Plans")
++                board (page! self "Board")
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "Private"}) 201)
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "Secret" :extends ["Private"]}) 201)
++                topic (ok! (request! self "POST" "/semantic/tags" {:title "Topic"}) 201)
++                rating (ok! (request! self "POST" "/semantic/properties" {:title "Rating" :type "default"}) 201)
++                [block] (insert! self example [{:title "a block"}])
++                capture (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "today"}]}) 201)
++                journal (get-in capture [:body :page-id])
++                ;; Two pages sharing a name (made directly: createPage refuses a name in use) make the
++                ;; title ambiguous; a title given as a date names today's journal (createPage of today's
++                ;; date answers the journal itself).
++                plans (page! self "Plans")
++                other-plans (page! self "Other Plans")
++                _ (set-attr! self other-plans :block/title "PLANS")
++                _ (set-attr! self other-plans :block/name "plans")
++                dated (page! self "2001-02-04")
++                _ (set-property! self private-page "block/tags" ["Private"])
++                _ (set-property! self secret-page "block/tags" ["Secret"])
++                _ (set-attr! self hidden :logseq.property/hide? true)
++                _ (set-attr! self recycled :logseq.property/deleted-at 1)
++                _ (set-attr! self board :block/tags :logseq.class/Whiteboard)
++                big (page! self "Big")
++                _ (bulk-blocks! self big 2001)
++                fulls (p/all (map #(page! self (str "Full " %)) (range 6)))
++                _ (doseq [page (take 5 fulls)] (bulk-blocks! self page 2000))
++                _ (bulk-blocks! self (last fulls) 1)
++                before (written-state sql self)
++                cases [["unknown uuid" [example (str (random-uuid))] 404 "page-ids[1]: page not found"]
++                       ["unknown title" [example "Nowhere"] 404 "page-ids[1]: page not found"]
++                       ["a date with no journal" [example "2001-02-03"] 404 "page-ids[1]: page not found"]
++                       ["hidden, by uuid" [hidden] 404 "page-ids[0]: page not found"]
++                       ["hidden, by title" [example "Hidden"] 404 "page-ids[1]: page not found"]
++                       ["recycled, by uuid" [recycled] 404 "page-ids[0]: page not found"]
++                       ["recycled, by title" ["Recycled"] 404 "page-ids[0]: page not found"]
++                       ["a title two pages share" ["plans"] 409 "page-ids[0]: ambiguous title"]
++                       ["the same page by uuid and title" [example "Example"] 400 "page-ids[1]: same page as page-ids[0]"]
++                       ["the same page by title in another case" ["Example" "example"] 400 "page-ids[1]: same page as page-ids[0]"]
++                       ["the same journal by uuid and its title" [journal (get-in capture [:body :page-title])] 400
++                        "page-ids[1]: same page as page-ids[0]"]
++                       ["the same journal by date and uuid" [(today-iso) journal] 400 "page-ids[1]: same page as page-ids[0]"]
++                       ["the same page third" [example dated example] 400 "page-ids[2]: same page as page-ids[0]"]
++                       ["a whiteboard" [example board] 400 "page-ids[1]: is a whiteboard"]
++                       ["a tag" [(get-in topic [:body :uuid])] 400 "page-ids[0]: is a tag"]
++                       ["a property" [(get-in rating [:body :uuid])] 400 "page-ids[0]: is a property"]
++                       ["a block" [(:uuid block)] 400 "page-ids[0]: is not a page"]
++                       ["Private, by uuid" [example private-page] 400 "page-ids[1]: is Private"]
++                       ["Private, by title" ["Private Plans"] 400 "page-ids[0]: is Private"]
++                       ["a tag extending Private" [secret-page] 400 "page-ids[0]: is Private"]
++                       ["no pages" [] 400 "page-ids: 1 to 20 pages"]
++                       ["21 pages" (vec (repeat 21 example)) 400 "page-ids: 1 to 20 pages"]
++                       ["a page over 2000 blocks" [example big] 422 "page-ids[1]: over 2000 blocks"]
++                       ["a call over 10000 blocks" fulls 422 "page-ids[5]: the call is over 10000 blocks"]]
++                responses (p/all (map (fn [[_ page-ids]] (dry-run! self page-ids)) cases))
++                applies (p/all (map (fn [[_ page-ids]] (blank! self {:page-ids page-ids :block-ids [(str (random-uuid))]})) cases))
++                ambiguous (nth responses 7)
++                e2ee (p/all (map #(dry-run! self % :e2ee? true) [[example] ["Example"] [(str (random-uuid))]]))
++                at-caps (dry-run! self (vec (take 5 fulls)))]
++          (doseq [[[label _ status prefix] response apply] (map vector cases responses applies)]
++            (testing label
++              (is (refused? response status prefix) (pr-str response))
++              (is (refused? apply status prefix) (str "the apply refuses the same way: " (pr-str apply)))))
++          (testing "an ambiguous selector names its candidates"
++            (is (= #{plans other-plans} (set (map :uuid (get-in ambiguous [:body :candidates]))))))
++          (testing "E2EE graphs: refused before any page is read"
++            (doseq [response e2ee]
++              (is (refused? response 409 "blank blocks can't be judged on E2EE graphs: titles are ciphertext")
++                  (pr-str response))))
++          (testing "five pages of 2000 blocks, 10000 in all, is within both bounds"
++            (is (= 200 (:status at-caps)) (pr-str (:body at-caps)))
++            (is (= 5000 (get-in at-caps [:body :total])))
++            (is (= 100 (get-in at-caps [:body :listed]))))
++          (is (= before (written-state sql self)) "no refusal wrote anything"))))))
++
++(deftest body-refusals-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                example (page! self "Example")
++                [leaf] (insert! self example [{:title " "}])
++                before (written-state sql self)
++                cases [["an unknown field" {:page-ids [example] :dry-run true :pages [example]}
++                        "pages: not a field; the body takes page-ids, dry-run and block-ids"]
++                       ["dry-run as a string" {:page-ids [example] :dry-run "true"} "dry-run: must be true or false"]
++                       ["dry-run as null" {:page-ids [example] :dry-run nil} "dry-run: must be true or false"]
++                       ["page-ids as a string" {:page-ids example :dry-run true} "page-ids: must be an array of page UUIDs, titles or YYYY-MM-DD dates"]
++                       ["page-ids missing" {:dry-run true} "page-ids: must be an array of page UUIDs, titles or YYYY-MM-DD dates"]
++                       ["a page-id that is a number" {:page-ids [example 42] :dry-run true} "page-ids[1]: must be a page UUID, title or YYYY-MM-DD date"]
++                       ["a blank page-id" {:page-ids [""] :dry-run true} "page-ids[0]: must be a page UUID, title or YYYY-MM-DD date"]
++                       ["an apply without block-ids" {:page-ids [example] :dry-run false} "block-ids is required unless dry-run is true"]
++                       ["an apply with dry-run left out" {:page-ids [example]} "block-ids is required unless dry-run is true"]
++                       ["an apply with empty block-ids" {:page-ids [example] :block-ids []} "block-ids: 1 to 100 block UUIDs"]
++                       ["an apply with 101 block-ids" {:page-ids [example] :block-ids (ids 101)} "block-ids: 1 to 100 block UUIDs"]
++                       ["block-ids as a string" {:page-ids [example] :block-ids (:uuid leaf)} "block-ids: 1 to 100 block UUIDs"]
++                       ["a dry run given block-ids" {:page-ids [example] :dry-run true :block-ids [(:uuid leaf)]}
++                        "block-ids: a dry run takes no block-ids; it lists them"]]
++                responses (p/all (map (fn [[_ body]] (blank! self body)) cases))
++                not-object (blank! self nil :raw "[1,2]")
++                malformed (blank! self nil :raw "{not json")]
++          (doseq [[[label _ error] response] (map vector cases responses)]
++            (testing label
++              (is (= 400 (:status response)) (pr-str response))
++              (is (string/includes? (str (get-in response [:body :error])) error) (pr-str response))))
++          (testing "a body that isn't an object"
++            (is (refused? not-object 400 "body: give an object with page-ids") (pr-str not-object))
++            (is (refused? malformed 400 "body: give an object with page-ids") (pr-str malformed)))
++          (is (= before (written-state sql self)) "no refusal wrote anything"))))))
++
++(deftest apply-not-built-yet-test
++  ;; Stage 3 only: an apply with block-ids answers 501 and writes nothing. Stage 4 replaces it.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                example (page! self "Example")
++                [leaf] (insert! self example [{:title " "}])
++                before (written-state sql self)
++                response (blank! self {:page-ids [example] :dry-run false :block-ids [(:uuid leaf)]})
++                after-read (ok! (dry-run! self [example]) 200)]
++          (is (= 501 (:status response)) (pr-str response))
++          (is (= "apply is not built yet: only dry-run true is answered" (get-in response [:body :error])))
++          (is (= before (written-state sql self)))
++          (is (= [(:uuid leaf)] (map :uuid (get-in after-read [:body :pages 0 :would-delete])))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Inputs the refusals must not catch
++
++(deftest accepted-inputs-test
++  ;; Each of these is a selector or page shape next to a refusal: a page tagged with a user tag (not
++  ;; a tag itself), a page holding a Private block (not a Private page), a page holding a property
++  ;; value, a title given in another case, a page titled like a date when no journal has that date,
++  ;; two different pages, and a graph the index marks as not E2EE.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (server-graph)
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "Topic"}) 201)
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "Private"}) 201)
++                rating (ok! (request! self "POST" "/semantic/properties" {:title "Rating" :type "default"}) 201)
++                tagged (page! self "Tagged Page")
++                holding (page! self "Holding Page")
++                dated (page! self "2001-02-03")
++                pages [tagged holding dated]
++                leaves (p/all (map #(insert! self % [{:title " "} {:title "a private block"}]) pages))
++                _ (set-property! self tagged "block/tags" ["Topic"])
++                _ (set-property! self holding (get-in rating [:body :ident]) "five")
++                _ (set-property! self (get-in (first leaves) [1 :uuid]) "block/tags" ["Private"])
++                cases [["a page tagged with a user tag, by title in another case" ["tagged page"] tagged]
++                       ["a page holding a property value, by uuid" [holding] holding]
++                       ["a page titled like a date that no journal has" ["2001-02-03"] dated]]
++                responses (p/all (map (fn [[_ selectors]] (dry-run! self selectors)) cases))
++                together (dry-run! self ["Tagged Page" holding "2001-02-03"])
++                not-e2ee (request! self "POST" "/semantic/blank-blocks/delete?graph-e2ee=false"
++                                   {:page-ids [tagged] :dry-run true})]
++          (doseq [[[label _ page] response] (map vector cases responses)]
++            (testing label
++              (is (= 200 (:status response)) (pr-str response))
++              (is (= page (get-in response [:body :pages 0 :uuid])))
++              (is (= 1 (count (get-in response [:body :pages 0 :would-delete]))))))
++          (is (= 200 (:status together)) (pr-str together))
++          (is (= pages (map :uuid (get-in together [:body :pages]))) "in request order")
++          (is (= 3 (get-in together [:body :total])))
++          (is (= 200 (:status not-e2ee)) (pr-str not-e2ee)))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index f06a606..7b82ba0 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -40,6 +40,7 @@
+             [logseq.db-sync.semantic-value-block-by-uuid-test]
+             [logseq.db-sync.semantic-page-title-heading-test]
+             [logseq.db-sync.semantic-sync-status-test]
++            [logseq.db-sync.semantic-delete-blank-blocks-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

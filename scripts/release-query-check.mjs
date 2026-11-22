@@ -27,7 +27,10 @@
 // each F1 shape (many function bindings over one page's blocks) and checks that it answers the
 // width-cap 422 (more than 12 function bindings, refused before it runs) within F1_MS (100 ms, the median of three warm runs); and runs a datalog_query
 // that stops at the scan cap with console.error, warn, log and info captured, failing if the
-// refusal logged anything. It prints each timing under its check. Node on a developer machine
+// refusal logged anything. Then it seeds deleteBlankBlocks' caps (blankFixture: 5 pages of 2,000
+// blocks, 10,000 in all, half of them blank leaves) and checks that a dry run over all five lists
+// 100 of the 5,000 blank leaves, in request order, within BLANK_MS (500 ms, the median of three
+// warm runs). It prints each timing under its check. Node on a developer machine
 // guides the numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
@@ -44,6 +47,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** A named query at scale must answer within this many ms, and an F1 shape's width-cap 422 within F1_MS. */
 export const NAMED_MS = 300;
 export const F1_MS = 100;
+/** A deleteBlankBlocks dry run at its caps (10,000 blocks scanned) must answer within this many ms. */
+export const BLANK_MS = 500;
 
 export const PAGE_TITLE = "Release Check Page";
 export const TAG_TITLE = "Release Check Tag";
@@ -374,6 +379,79 @@ function staleTx(fixture) {
   return txs;
 }
 
+// deleteBlankBlocks at its caps
+// =============================
+
+/** deleteBlankBlocks' bounds: 2,000 blocks a page (max-outline-blocks), 10,000 a call (max-blank-scan). */
+export const BLANK = { pages: 5, blocksPerPage: 2000 };
+
+/** The pages a dry run at the caps reads: [{title, blocks}], every block a leaf, every other one blank. */
+export function blankFixture() {
+  return Array.from({ length: BLANK.pages }, (_, p) => ({
+    title: `Release blank ${p}`,
+    blocks: Array.from({ length: BLANK.blocksPerPage }, (_, i) => ({ title: i % 2 === 0 ? " " : `Release blank ${p} text ${i}` })),
+  }));
+}
+
+/** Creates the blank-blocks pages through SyncDO.fetch, one insert per page; returns their uuids in order. */
+async function seedBlank(stub) {
+  const ids = [];
+  for (const { title, blocks } of blankFixture()) {
+    const page = await call(stub, "POST", "/semantic/pages", { title });
+    if (page.status !== 201) throw new Error(`create ${title}: HTTP ${page.status}: ${page.text.slice(0, 300)}`);
+    const insert = await call(stub, "POST", "/semantic/block-trees", { "target-id": page.json.uuid, blocks, verbose: false });
+    if (insert.status !== 201) throw new Error(`insert into ${title}: HTTP ${insert.status}: ${insert.text.slice(0, 300)}`);
+    ids.push(page.json.uuid);
+  }
+  return ids;
+}
+
+/**
+ * Sends a deleteBlankBlocks dry run over `pageIds` four times: each must answer 200 with the
+ * fixture's counts (5,000 blank leaves, 100 listed, all on the first page, the pages in request
+ * order), and the median of the last three within BLANK_MS. Returns the timings as a note.
+ */
+export async function checkBlankDryRun(stub, pageIds) {
+  const expected = (BLANK.pages * BLANK.blocksPerPage) / 2;
+  const runs = await timed(() => call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "dry-run": true }), 4);
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.total !== expected) throw new Error(`total ${body.total}, expected ${expected}`);
+    if (body.listed !== 100) throw new Error(`listed ${body.listed}, expected 100`);
+    const order = (body.pages ?? []).map((p) => p.uuid);
+    if (JSON.stringify(order) !== JSON.stringify(pageIds)) throw new Error(`pages in the order ${JSON.stringify(order)}, expected ${JSON.stringify(pageIds)}`);
+    const listed = body.pages.map((p) => p["would-delete"].length);
+    if (listed[0] !== 100 || listed.slice(1).some((n) => n !== 0)) throw new Error(`would-delete holds ${listed.join(", ")} per page, expected 100 on the first`);
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > BLANK_MS) throw new Error(`answered after ${note}, expected under ${BLANK_MS} ms`);
+  return note;
+}
+
+/** The blank-blocks checks, run after the scale checks on the same graph. */
+function blankChecks(ctx) {
+  const { stub } = ctx;
+  return [
+    [
+      "seed deleteBlankBlocks' caps: 5 pages of 2000 blocks through SyncDO.fetch",
+      async () => {
+        const start = performance.now();
+        ctx.blankPages = await seedBlank(stub);
+        return `${BLANK.pages * BLANK.blocksPerPage} blocks in ${Math.round(performance.now() - start)} ms`;
+      },
+    ],
+    [
+      `at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within ${BLANK_MS} ms`,
+      async () => {
+        if (!ctx.blankPages) throw new Error("the blank-blocks pages were not seeded");
+        return checkBlankDryRun(stub, ctx.blankPages);
+      },
+    ],
+  ];
+}
+
 /**
  * Calls `fn` with console.error, warn, log and info replaced by recorders, and puts each back when
  * it settles (or throws). Resolves to {value, calls: [{level, args}]}.
@@ -634,6 +712,7 @@ export function checks(ctx) {
       },
     ],
     ...scaleChecks(ctx),
+    ...blankChecks(ctx),
   ];
 }
 

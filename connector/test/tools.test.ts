@@ -226,6 +226,16 @@ describe("tool list", () => {
     expect((await listTools()).filter((t) => t.name === "get_sync_status")).toHaveLength(1);
     expect(committedManifest.filter((e) => e.name === "get_sync_status").map((e) => [e.method, e.path])).toEqual([[null, null]]);
   });
+
+  it("deleteBlankBlocks (patch 0056) is vendored and generates no tool until its apply is built", async () => {
+    const vendored = Object.values(spec.paths).flatMap((item) => Object.values(item).map((op) => op.operationId));
+    expect(vendored).toContain("deleteBlankBlocks");
+    expect(spec.paths["/api/v1/graphs/{graph-id}/blank-blocks/delete"]?.post?.operationId).toBe("deleteBlankBlocks");
+    expect(graphOperations(spec).map((op) => op.operationId)).not.toContain("deleteBlankBlocks");
+    const names = (await listTools()).map((t) => t.name);
+    expect(names).not.toContain("delete_blank_blocks");
+    expect(committedManifest.map((e) => e.name)).not.toContain("delete_blank_blocks");
+  });
 });
 
 const HINT_KEYS = ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const;

@@ -58,6 +58,42 @@ test("the timing bounds are the spec's: 300 ms for a named query at scale, 100 m
   assert.equal(F1_MS, 100);
 });
 
+test("the blank-blocks fixture is deleteBlankBlocks at its caps: 5 pages of 2,000 blocks, 10,000 in all, half of them blank leaves", async () => {
+  const { blankFixture, BLANK } = await import(script);
+  const pages = blankFixture();
+  assert.deepEqual(blankFixture(), pages, "the same on every build");
+  assert.equal(BLANK.pages, 5);
+  assert.equal(BLANK.blocksPerPage, 2000, "the per-page bound (max-outline-blocks)");
+  assert.equal(pages.length, BLANK.pages);
+  assert.equal(pages.reduce((n, p) => n + p.blocks.length, 0), 10_000, "the per-call bound (max-blank-scan)");
+  for (const p of pages) {
+    assert.equal(p.blocks.length, BLANK.blocksPerPage);
+    assert.ok(p.blocks.every((b) => !b.children), "every block is a leaf");
+    assert.equal(p.blocks.filter((b) => b.title.trim() === "").length, BLANK.blocksPerPage / 2, `${p.title}: half blank`);
+    assert.ok(p.blocks.filter((b) => b.title.trim() !== "").every((b) => /^Release blank \d+ text \d+$/.test(b.title)));
+  }
+  assert.equal(new Set(pages.map((p) => p.title)).size, BLANK.pages, "each page once");
+});
+
+test("the dry-run bound at the caps is 500 ms", async () => {
+  const { BLANK_MS } = await import(script);
+  assert.equal(BLANK_MS, 500);
+});
+
+test("checkBlankDryRun passes a quick answer listing 100 of 5,000 across 5 pages, and fails a refusal, a wrong count or a slow answer", async () => {
+  const { checkBlankDryRun, BLANK_MS } = await import(script);
+  const ids = ["p1", "p2", "p3", "p4", "p5"];
+  const entry = (uuid, n) => ({ page: uuid, uuid, "would-delete": Array.from({ length: n }, (_, i) => ({ uuid: `${uuid}-${i}`, parent: uuid })), kept: { "has-children": 0, referenced: 0, "being-edited": 0, examples: [] }, "skipped-private": 0 });
+  const good = { "dry-run": true, t: 9, total: 5000, listed: 100, pages: [entry("p1", 100), ...ids.slice(1).map((u) => entry(u, 0))], note: "…" };
+  assert.match(await checkBlankDryRun(fakeStub({ status: 200, body: good }), ids), /median \d+ ms/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 422, body: { error: "page-ids[4]: the call is over 10000 blocks" } }), ids), /HTTP 422/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: { ...good, total: 4999 } }), ids), /total 4999, expected 5000/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: { ...good, listed: 99 } }), ids), /listed 99, expected 100/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: { ...good, pages: [entry("p1", 101), ...good.pages.slice(1)] } }), ids), /would-delete holds 101/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: { ...good, pages: [...good.pages].reverse() } }), ids), /pages in the order/);
+  await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: good, delay: BLANK_MS + 20 }), ids), /expected under 500 ms/);
+});
+
 test("the scale fixture is about 20,000 blocks of meetings, decisions, tasks, tagged pages and stale projects, the same on every build", async () => {
   const { scaleFixture, SCALE } = await import(script);
   const now = 1_762_646_400_000;
@@ -231,6 +267,8 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "at scale: F1 99 identity clauses over 200 blocks answers the width-cap 422 within 100 ms",
     "at scale: F1 20 bound includes? over 500 blocks answers the width-cap 422 within 100 ms",
     "at scale: a datalog_query scan-cap 422 logs nothing to the console",
+    "seed deleteBlankBlocks' caps: 5 pages of 2000 blocks through SyncDO.fetch",
+    "at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within 500 ms",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }
