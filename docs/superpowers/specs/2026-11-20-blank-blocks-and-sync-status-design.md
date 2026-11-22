@@ -312,3 +312,16 @@ Each PR:
 5. **Caps.** 20 pages and 100 deletions per call, with a 2,000-block bound per page. Are these right for how you'll use it?
 6. **`own` versus `others` clients.** Is it useful to separate your own connections from other members', and is it acceptable that `others` shows that someone else is connected to a shared graph, as a count only?
 7. **Counts on E2EE graphs** include Private content, flagged with `counts-include-private`. Is that acceptable, or should the counts be omitted there?
+
+## 12. Owner answers (2026-11-22)
+
+Approved for build with these answers to section 11:
+
+1. **Delivery:** one PR built in stages, `get_sync_status` first, then `delete_blank_blocks`. Each stage leaves the gate green and could ship alone.
+2. **Apply needs block ids:** keep the dry-run-then-ids handshake. No one-step mode.
+3. **What counts as blank:** as designed. Empty Code, Math or Quote blocks, empty headings and empty blocks carrying a property are kept.
+4. **Today's journal:** allowed, with the block being edited protected, as designed.
+5. **Caps:** 20 pages and 100 deletions per call, 2,000 blocks per page, as designed.
+6. **Own versus others:** keep the split, with others as a count only.
+7. **Counts on E2EE graphs:** keep them, flagged with `counts-include-private`.
+8. **Patch numbers:** 0055 (sync status) and 0056 (blank blocks). PRs 72 and 73 are being built in another session (0050 to 0053) and PR 74 takes 0054; renumber at merge if they land differently.
