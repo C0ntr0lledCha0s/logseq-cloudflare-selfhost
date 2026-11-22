@@ -1,3 +1,5 @@
+import { FAVICON_PATH } from "./favicon";
+
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
@@ -183,7 +185,7 @@ export function htmlPage(
 ): Response {
   headers.set("Content-Type", "text/html; charset=utf-8");
   // No form-action: the consent form's response redirects to GitHub or the client, which it would block.
-  headers.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
+  headers.set("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'");
   headers.set("X-Frame-Options", "DENY");
   headers.set("Referrer-Policy", "no-referrer");
   if (!headers.has("Cache-Control")) headers.set("Cache-Control", "no-store");
@@ -193,6 +195,7 @@ export function htmlPage(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" type="image/png" href="${FAVICON_PATH}">
 ${STYLE}
 <body>
 <header class="masthead"><span class="wordmark">Logseq connector</span>${nav}</header>

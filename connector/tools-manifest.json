@@ -8,7 +8,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Remove property values from many blocks in one call; prefer it to repeated single deletes."
   },
   {
     "name": "batch_insert_block_trees",
@@ -19,7 +20,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Build or fill several pages in one call, creating missing ones; best for multi-page writes."
   },
   {
     "name": "batch_move_blocks",
@@ -30,7 +32,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Move many blocks to different places in one call; move_blocks suits a single destination."
   },
   {
     "name": "batch_set_block_property",
@@ -41,7 +44,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Set tags and properties on many blocks or pages in one call; prefer it for more than one value."
   },
   {
     "name": "capture_to_today",
@@ -52,7 +56,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Append notes to today's journal; use insert_block_tree for any other page or day."
   },
   {
     "name": "connector_help",
@@ -63,7 +68,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "The connector's writing rules: read once before the first write in a conversation."
   },
   {
     "name": "create_page",
@@ -74,7 +80,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Create a page by title; a title already in use is refused, naming the existing page."
   },
   {
     "name": "create_property",
@@ -85,7 +92,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Define a new property with its type, choices or classes; check list_properties first."
   },
   {
     "name": "create_tag",
@@ -96,7 +104,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Create a tag (class) with what it extends and its properties; check list_tags first."
   },
   {
     "name": "create_task",
@@ -107,7 +116,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Create a task with status, priority and dates; use it for every action item, never TODO text."
   },
   {
     "name": "datalog_query",
@@ -118,7 +128,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Read-only Datalog for questions no other tool answers; try run_named_query first."
   },
   {
     "name": "delete_block",
@@ -129,7 +140,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Delete one block and its children; use delete_blocks for several."
   },
   {
     "name": "delete_block_property",
@@ -140,7 +152,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Remove one property value from a block or page."
   },
   {
     "name": "delete_blocks",
@@ -151,7 +164,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Delete up to 100 blocks in one call; dry-run first and show the user what goes."
   },
   {
     "name": "delete_page",
@@ -162,7 +176,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Move a page and its blocks to the Recycle bin; dry-run first to see its references."
   },
   {
     "name": "delete_property",
@@ -173,7 +188,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Delete a property definition and its values; dry-run first to see what is lost."
   },
   {
     "name": "delete_tag",
@@ -184,7 +200,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Delete a tag, which its holders lose; dry-run first to see the counts."
   },
   {
     "name": "get_activity_log",
@@ -195,7 +212,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "What the connector changed in a graph, newest first: the answer to 'what did you change?'"
   },
   {
     "name": "get_block",
@@ -206,7 +224,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "One block or page by UUID with its tags and properties, without its children."
   },
   {
     "name": "get_blocks",
@@ -217,7 +236,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Up to 100 blocks or pages by UUID in one call, optionally with their outlines."
   },
   {
     "name": "get_graph_health",
@@ -228,7 +248,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "A tidy-up report: unused tags and properties, duplicate titles, pages with no summary or tag."
   },
   {
     "name": "get_page",
@@ -239,7 +260,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "One page's tags and properties by UUID, title or date; get_page_outline reads its content."
   },
   {
     "name": "get_page_backlinks",
@@ -250,7 +272,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "How a page is used: links, tagged objects and property values pointing at it, with counts."
   },
   {
     "name": "get_page_outline",
@@ -261,7 +284,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Read a whole page as markdown with tags, properties and links resolved; the usual way to read."
   },
   {
     "name": "get_property",
@@ -272,7 +296,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "A property's type, choices and classes; check it before setting a choice or node value."
   },
   {
     "name": "get_tag",
@@ -283,7 +308,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "A tag's properties, the tags it extends and the tags that extend it."
   },
   {
     "name": "insert_block_children",
@@ -294,7 +320,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Add block trees under an existing block; insert_block_tree also takes a page as target."
   },
   {
     "name": "insert_block_tree",
@@ -305,7 +332,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Write a whole note as one nested block tree on a page or under a block; the usual way to write."
   },
   {
     "name": "kb_index",
@@ -316,7 +344,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Start here for broad questions: every page grouped by class, with its summary and UUID."
   },
   {
     "name": "list_assets",
@@ -327,7 +356,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "The graph's files and images, with the asset UUIDs read_file takes."
   },
   {
     "name": "list_favorites",
@@ -338,7 +368,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "The pages in the sidebar's Favorites list, in order."
   },
   {
     "name": "list_graphs",
@@ -349,7 +380,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Call first: the connected graphs and the alias every other tool's graph argument takes."
   },
   {
     "name": "list_page_blocks",
@@ -360,7 +392,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "A page's top-level blocks, paginated; get_page_outline reads the whole tree at once."
   },
   {
     "name": "list_page_references",
@@ -371,7 +404,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Blocks and pages that link to a page, paginated; get_page_backlinks gives grouped counts."
   },
   {
     "name": "list_pages",
@@ -382,7 +416,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "All pages, paginated, filterable by created or updated date; kb_index suits an overview."
   },
   {
     "name": "list_properties",
@@ -393,7 +428,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Every property with its type; check here before creating a property."
   },
   {
     "name": "list_tag_objects",
@@ -404,7 +440,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Every page or block with a given tag, paginated, such as all Person pages."
   },
   {
     "name": "list_tags",
@@ -415,7 +452,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Every tag in the graph; check here before creating or applying a tag."
   },
   {
     "name": "list_tasks",
@@ -426,7 +464,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Tasks filtered by status, priority or text: the way to answer what is outstanding."
   },
   {
     "name": "move_blocks",
@@ -437,7 +476,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Move blocks under or beside a block or page; dry-run a large move first."
   },
   {
     "name": "promote_page_to_tag",
@@ -448,7 +488,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Turn an existing page into a tag, keeping its blocks and references."
   },
   {
     "name": "read_file",
@@ -459,7 +500,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Read a saved asset back by its UUID: text as text, images as images."
   },
   {
     "name": "refresh_refs",
@@ -470,7 +512,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Re-apply link and tag handling to blocks written before it existed; dry-run unless applied."
   },
   {
     "name": "reorder_favorites",
@@ -481,7 +524,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Set the order of the sidebar favourites; pass the full list from list_favorites."
   },
   {
     "name": "run_named_query",
@@ -492,7 +536,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Four ready-made questions: stale projects, undecided meetings, open tasks, pages missing a value."
   },
   {
     "name": "save_document",
@@ -503,7 +548,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Save text or a base64 file into the graph as an asset, linked from a page or the journal."
   },
   {
     "name": "save_file_from_url",
@@ -514,7 +560,8 @@
       "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": true
-    }
+    },
+    "firstLine": "Download a public https file into the graph as an asset, linked from a page or the journal."
   },
   {
     "name": "search_graph",
@@ -525,7 +572,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Find pages, blocks, tags and properties by the exact words in their titles and text."
   },
   {
     "name": "semantic_index_status",
@@ -536,7 +584,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "How much of a graph the meaning-based search index covers."
   },
   {
     "name": "semantic_search",
@@ -547,7 +596,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Find blocks by meaning as well as title words; use it when the exact words may differ."
   },
   {
     "name": "set_block_property",
@@ -558,7 +608,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Set one tag or property on a block or page; batch_set_block_property sets several."
   },
   {
     "name": "set_page_favorite",
@@ -569,7 +620,8 @@
       "destructiveHint": true,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Add a page to the sidebar favourites, or remove it."
   },
   {
     "name": "suggest_links",
@@ -580,7 +632,8 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Before writing notes, find the words that should link to existing pages; never writes."
   },
   {
     "name": "update_block",
@@ -591,7 +644,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Replace one block's text or display type; set_block_property changes its properties."
   },
   {
     "name": "update_page",
@@ -602,7 +656,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Rename a page; set_block_property changes its tags and properties."
   },
   {
     "name": "update_property",
@@ -613,7 +668,8 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Change a property's title, choices or classes, or convert its text values to choices."
   },
   {
     "name": "update_tag",
@@ -624,6 +680,7 @@
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false
-    }
+    },
+    "firstLine": "Change a tag's title, the tags it extends or its properties."
   }
 ]

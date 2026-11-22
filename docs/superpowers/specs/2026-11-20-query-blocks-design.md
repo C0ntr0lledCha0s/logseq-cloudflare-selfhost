@@ -234,4 +234,18 @@ Run `scripts/check.sh --upstream` on the final commit and repeat in the PR what 
 4. **Editing your own queries.** With the update_block guard, Claude can't change a Query block's text unless the result passes the check, so it can't edit your simple queries or advanced ones with `:view` or rules. Fine, or should the guard apply only to Query blocks Claude created?
 5. **Caption title.** A `query` field keeps the node's title as a caption; a fence-made block gets `""`, as the app's `/query` command leaves it. Keep both?
 6. **Query tag refused as a tag.** Setting `logseq.class/Query` through the property paths is refused so tag and query can't drift. That also stops Claude tagging a block Query and leaving you to fill in the query. Agreed?
-7. **Spec file name.** The lane's driver note named this file `2026-11-20-query-blocks-design.md`; the stage that wrote it was told `2026-11-20-query-fence-makes-query-block-design.md`, which is what was used. Rename if you prefer the shorter name.
+7. **Spec file name.** The lane's driver note named this file `2026-11-20-query-blocks-design.md`; the stage that wrote it was told `2026-11-20-query-blocks-design.md`, which is what was used. Rename if you prefer the shorter name.
+
+## 12. Owner's decisions (2026-11-22)
+
+The owner answered section 11 on PR 72. These replace the open questions; the build follows them.
+
+1. **Runtime cost:** accepted. No server check-run; the static checks are the only gate.
+2. **Private content:** acceptable. A Query block may list Private blocks in the owner's app.
+3. **Simple queries:** out of scope, as proposed. They stay text under kept.
+4. **Editing Query blocks:** Claude may only update Query blocks it created. `update_block` on a Query block Claude did not create is refused, naming the block; a Query block Claude created may be updated, and its new text passes the same check. How "Claude created it" is known (for example the edit stamps, which exist only when "Mark Claude's edits" is on, or a marker the patch sets at creation) is a build-stage decision; with no way to tell, the write is refused.
+5. **Caption title:** not answered; the spec's proposal stands (a `query` field keeps the node's title as a caption, a fence-made block gets `""`).
+6. **Query tag:** refused through the property paths, so tag and query can't drift.
+7. **File name:** shortened to `2026-11-20-query-blocks-design.md`.
+
+The owner's comment numbered six answers; answers 5 ("no drift") and 6 ("shorten it") match questions 6 and 7, so question 5 is read as unanswered.
