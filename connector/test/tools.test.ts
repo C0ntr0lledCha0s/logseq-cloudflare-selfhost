@@ -1388,6 +1388,19 @@ describe("hand-written tools", () => {
     expect(JSON.parse(syncRequests[0].body)).toMatchObject({ params: { days: 14 } });
   });
 
+  // Patch 0054: a refused client reaches Claude as the server words it, naming params.client and,
+  // for a shared title, each candidate's kind and UUID.
+  it("run_named_query passes a params.client 400 through verbatim", async () => {
+    const error = 'params.client: "Acme" matches 2 entities (Acme: tag 00000000-0000-4000-8000-000000000001, Acme: block 00000000-0000-4000-8000-000000000002); give the one you mean by UUID';
+    syncHandler = () => Response.json({ error }, { status: 400 });
+    const result = await callTool("run_named_query", { graph: "work", name: "open-tasks-by-client", body: { params: { client: "Acme" } } });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain(error);
+    expect(syncRequests.map((r) => [new URL(r.url).pathname, JSON.parse(r.body).params])).toEqual([
+      [`/api/v1/graphs/${WORK_ID}/named-queries/open-tasks-by-client`, { client: "Acme" }],
+    ]);
+  });
+
   it("run_named_query passes an unknown name through to the server's 404, which lists the names", async () => {
     const error = "no named query projects_untouched (names: projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property)";
     syncHandler = () => Response.json({ error }, { status: 404 });
@@ -2738,6 +2751,8 @@ describe("queries help", () => {
     ["how to stay under the width cap", "return extra attributes with (pull ?b [...]) in :find, which runs only on the kept rows, bind fewer values with functions or narrow the rows first"],
     ["the Recycle bin", "and so is anything in the Recycle bin"],
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
+    ["the client param", "open-tasks-by-client takes params.client, a client's title or UUID, to list only that client's tasks"],
+    ["a shared client title", "a title several entities share is refused naming each, unless exactly one is a page"],
     ["the 422", "is refused with 422, never answered in part"],
     ["how to narrow", "narrow it with a tag, page or attribute value"],
     ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
@@ -2811,7 +2826,7 @@ describe("queries help", () => {
   // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
   it.each([
     ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
-    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
+    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "client is a client's title or UUID, and lists only that client's tasks", "a page wins when exactly one of them is a page", "params.client echoes the client used", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
   ])("%s's generated description carries the openapi text", async (name, phrases) => {
     const tool = (await listTools()).find((t) => t.name === name);
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);

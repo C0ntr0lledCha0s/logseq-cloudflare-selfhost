@@ -1,0 +1,669 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+index a682bda..ccbbbba 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+@@ -44,11 +44,13 @@
+             [datascript.core :as d]
+             [datascript.pull-parser :as pull-parser]
+             [datascript.query :as dq]
++            [logseq.common.util :as common-util]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.worker.graph-insights :as graph-insights]
+             [logseq.db-sync.worker.http :as http]
+             [logseq.db-sync.worker.named-queries :as named-queries]
+             [logseq.db.frontend.class :as db-class]
++            [logseq.db.frontend.entity-util :as entity-util]
+             [promesa.core :as p]))
+ 
+ (def scan-cap
+@@ -1268,32 +1270,108 @@
+       {:input (- now (* value day-ms)) :echo value}
+       {:error (str "params." param-name ": must be " lo "-" hi)})))
+ 
++(defn- client-candidates
++  "The visible entities `value` names as a client title: those titled exactly `value`, else the
++  pages and tags whose name is its lower case (the lookup order title-candidates uses), oldest
++  first. A property's choice or value block is never one, nor is a hidden, private or recycled
++  entity (`private?`, as the walk judges it), so a private title is never named."
++  [db value private?]
++  (let [visible (fn [datoms]
++                  (->> datoms
++                       (map #(d/entity db (:e %)))
++                       (remove :block/closed-value-property)
++                       (remove :logseq.property/created-from-property)
++                       (remove entity-util/hidden?)
++                       (remove #(private? (:db/id %)))
++                       (sort-by :db/id)))
++        exact (visible (d/datoms db :avet :block/title value))]
++    (if (seq exact) exact (visible (d/datoms db :avet :block/name (string/lower-case value))))))
++
++(defn- client-kind [e]
++  (cond (entity-util/class? e) "tag"
++        (entity-util/property? e) "property"
++        (or (entity-util/internal-page? e) (entity-util/journal? e)) "page"
++        :else "block"))
++
++(defn- resolve-client-param
++  "A :client param's value (patch 0054): the db id of the one visible entity `value` names, by UUID
++  (any case) or by title (client-candidates), echoed as {:title :uuid}. Several candidates resolve
++  only when exactly one is a page, which wins; otherwise each is named with its kind and UUID,
++  oldest first. Refused, naming params.<name>: a value that isn't a non-empty string (null
++  included), a client_property (`of`, its resolution) that is a default or url property, whose
++  values are per-block text, an unknown, hidden, private or recycled UUID, and a title with no
++  candidate. When client_property itself didn't resolve, its own error names it."
++  [db private? of {param-name :name} value]
++  (let [field (str "params." param-name)
++        found (fn [e] {:input (:db/id e) :echo {:title (or (:block/title e) "") :uuid (str (:block/uuid e))}})
++        of-type (get-in of [:echo :type])]
++    (cond
++      (or (not (string? value)) (= "" value))
++      {:error (str field ": must be a client title or UUID (a string)")}
++
++      (nil? (:input of)) {}
++
++      (contains? #{"default" "url"} of-type)
++      {:error (str field ": " (get-in of [:echo :title]) " is a " of-type " property, whose values are per-block text;"
++                   " give client_property as a node or date property, or list one client's tasks with datalog_query")}
++
++      (common-util/uuid-string? value)
++      (let [e (d/entity db [:block/uuid (uuid (string/lower-case value))])]
++        (if (and e (not (entity-util/hidden? e)) (not (private? (:db/id e))))
++          (found e)
++          {:error (str field ": no client with UUID " value)}))
++
++      :else
++      (let [candidates (client-candidates db value private?)
++            pages (filter #(= "page" (client-kind %)) candidates)]
++        (cond
++          (empty? candidates) {:error (str field ": no page, tag or block titled " (pr-str value))}
++          (empty? (next candidates)) (found (first candidates))
++          (= 1 (count pages)) (found (first pages))
++          :else {:error (str field ": " (pr-str value) " matches " (count candidates) " entities ("
++                             (string/join ", " (map #(str (:block/title %) ": " (client-kind %) " " (:block/uuid %)) candidates))
++                             "); give the one you mean by UUID")})))))
++
+ (defn resolve-params
+   "The inputs of named query `entry` from the `given` params (keyword keys) and the defaults:
+   {:inputs [one per param, in order] :params {name echo}} or {:errors [message …]}, each message
+   naming params.<name>. Tags resolve with `resolve-tag` and properties with `resolve-property`
+-  (the semantic API's own resolvers); a default that no longer resolves is an error like any other."
++  (the semantic API's own resolvers); a default that no longer resolves is an error like any other.
++  Params resolve in order, each seeing the ones before it by name, so a :client param reads the
++  :property param its :of names. An optional param without a default (:client) that isn't given
++  has a nil input and no echo; one given as null is given, and refused."
+   [db {:keys [resolve-tag resolve-property now]} query-name entry given]
+   (let [params (:params entry)
+         known (set (map (comp keyword :name) params))
+         unknown (for [k (keys given) :when (not (contains? known k))]
+                   (str "params." (name k) ": not a param of " query-name " (params: "
+                        (string/join ", " (map :name params)) ")"))
+-        resolved (for [{:keys [type required] param-name :name :as param} params
+-                       :let [k (keyword param-name)
+-                             value (get given k (:default param))]]
+-                   (cond
+-                     (and required (not (contains? given k)))
+-                     {:error (str "params." param-name ": required; give a "
+-                                  (if (= :tag type) "tag" "property") " title, UUID or ident")}
+-                     (= :tag type) (resolve-tag-param db resolve-tag param value)
+-                     (= :property type) (resolve-property-param db resolve-property param value)
+-                     (= :days type) (resolve-days-param now param value)))
++        ;; Client resolution reads are uncounted, as the tag and property resolvers' are; private?
++        ;; is the walk's (named-queries/private-fn), built only when a client is given.
++        private? (delay (named-queries/private-fn {:db db :query query-name :work (volatile! {})
++                                                   :bounds {:reads js/Number.MAX_SAFE_INTEGER}}))
++        by-name (reduce (fn [acc {:keys [type required] param-name :name :as param}]
++                          (let [k (keyword param-name)
++                                value (get given k (:default param))]
++                            (assoc acc param-name
++                                   (cond
++                                     (and required (not (contains? given k)))
++                                     {:error (str "params." param-name ": required; give a "
++                                                  (if (= :tag type) "tag" "property") " title, UUID or ident")}
++                                     (= :tag type) (resolve-tag-param db resolve-tag param value)
++                                     (= :property type) (resolve-property-param db resolve-property param value)
++                                     (= :days type) (resolve-days-param now param value)
++                                     (= :client type) (if (contains? given k)
++                                                        (resolve-client-param db @private? (get acc (:of param)) param value)
++                                                        {:absent true})))))
++                        {} params)
++        resolved (map #(get by-name (:name %)) params)
+         errors (concat unknown (keep :error resolved))]
+     (if (seq errors)
+       {:errors (vec errors)}
+       {:inputs (mapv :input resolved)
+-       :params (into {} (map (fn [{param-name :name} {:keys [echo]}] [param-name echo]) params resolved))})))
++       :params (into {} (keep (fn [[{param-name :name} {:keys [echo absent]}]] (when-not absent [param-name echo])))
++                     (map vector params resolved))})))
+ 
+ (def ^:private named-body-fields #{:params :limit :dry-run})
+ 
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+index 7cac252..e7df7e9 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+@@ -6,7 +6,10 @@
+ 
+   - :tag resolves by UUID, ident or title (case-insensitive) to the tag and every tag extending it;
+   - :property resolves by UUID, ident or title to the property's ident (:types limits its type);
+-  - :days is an integer within :bounds and becomes a cutoff in ms (now less that many days).
++  - :days is an integer within :bounds and becomes a cutoff in ms (now less that many days);
++  - :client (patch 0054, optional, no default) resolves by UUID or title to one visible entity's
++    db id, read with the :property param named by :of (a default or url property is refused);
++    absent, the query runs for every client.
+ 
+   What each walk reads, and the bound that stops it (default-bounds, set by the bench):
+ 
+@@ -19,7 +22,8 @@
+     and any page above it, so a decision at any depth costs one step per ancestor no other walk has
+     reached;
+   - open-tasks-by-client reads the entities tagged Task (:tasks), and for each open one (:open-tasks)
+-    its client_property values, else its page's;
++    its client_property values, else its page's; with client, it keeps only the tasks whose clients
++    include that entity;
+   - pages-missing-property reads the entities tagged tag (:tagged) and each page's property values.
+ 
+   Every datom read goes through datoms* or first-value* and counts toward :reads (the backstop over
+@@ -251,8 +255,9 @@
+   not Done or Canceled and that aren't private, each charged to :open-tasks. A task's clients are
+   its visible values of client_property, else its page's, else none (\"\"); a client is its
+   value's :block/title, \"\" without one. Rows [client task], one per distinct pair, so two
+-  clients with one title give one row."
+-  [ctx {:keys [client_property]}]
++  clients with one title give one row. With `client` (a db id, patch 0054), only the tasks whose
++  clients include that entity, compared by id, so another client with its title stays out."
++  [ctx {:keys [client_property client]}]
+   (let [{:keys [db]} ctx
+         private? (private-fn ctx)
+         task-class (d/entid db :logseq.class/Task)
+@@ -273,9 +278,10 @@
+                                  clients (cond (seq own) own
+                                                page (visible-values ctx private? page client_property)
+                                                :else [])]
+-                             (if (seq clients)
+-                               (map (fn [c] [(title c) t]) clients)
+-                               [["" t]]))))))
++                             (cond
++                               client (when (some #(= client %) clients) [[(title client) t]])
++                               (seq clients) (map (fn [c] [(title c) t]) clients)
++                               :else [["" t]]))))))
+              (distinct))
+             (datoms* ctx :avet :block/tags task-class)))))
+ 
+@@ -362,7 +368,10 @@
+       (str "1. Read the blocks tagged Task, each counted " (b :tasks) "."
+            " 2. Keep those whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
+            " 3. Read each one's " (get-in params ["client_property" :title]) " values, else its page's, leaving out private ones;"
+-           " each value's title is a client (empty when there is none). 4. One row per client and task, by client title." reads)
++           " each value's title is a client (empty when there is none)."
++           (when-let [{:keys [title]} (get params "client")]
++             (str " Keep only the tasks whose clients include " title " (the entity params.client names)."))
++           " 4. One row per client and task, by client title." reads)
+       "pages-missing-property"
+       (str "1. Read the pages and blocks tagged " (tag-text (get params "tag")) ", each counted " (b :tagged) "."
+            " 2. Keep the pages that aren't private and have no value for " (get-in params ["property" :title])
+@@ -403,7 +412,9 @@
+     ;; The client is read as the value's :block/title, so the property's values must be entities
+     ;; with a title: not a number (its value is :logseq.property/value) and not a raw value.
+     :params [{:name "client_property" :type :property :default "forClient"
+-              :types #{:default :url :date :node :asset :entity :class :page :property}}]}
++              :types #{:default :url :date :node :asset :entity :class :page :property}}
++             ;; Patch 0054: optional, a client's title or UUID; resolved after client_property.
++             {:name "client" :type :client :of "client_property"}]}
+ 
+    "pages-missing-property"
+    {:title "Pages missing a property"
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 39eccae..b488570 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -215,7 +215,9 @@
+                     (str "Runs one of four read-only queries as server code, not Datalog, by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
+                          " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. It reads each stale page's blocks, and stops with 422 after 2,500 tagged pages and blocks (its tagged bound) or after reading 10,000 blocks on pages not updated within days (its page-blocks bound): give a narrower tag or a larger days."
+                          " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block or page below them tagged decision_tag, a decision at any depth, on a page nested under the meeting page included; columns created-at (ms) and meeting. It walks up once from each decision_tag block or page that isn't private, through its blocks, its page and any page that page sits under (a namespace child sits under its parent page), sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
+-                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
++                         " open-tasks-by-client (params client_property, default forClient, and client, optional): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused."
++                         " client is a client's title or UUID, and lists only that client's tasks: those whose own client_property values, else their page's, include it. A title matches exactly, else a page or tag name ignoring case; when several pages, tags or blocks share it, a page wins when exactly one of them is a page, and otherwise the call is refused with 400 naming each one's kind and UUID, oldest first, so give the UUID you mean. A client that is null, empty or not a string, an unknown title or UUID (a private or recycled one reads as unknown), or a client_property that is a default or url property (its values are per-block text) is refused with 400 naming params.client, never all clients. params.client echoes the client used, as title and uuid."
++                         " It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
+                          " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
+                          " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
+                          " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
+@@ -719,7 +721,7 @@
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
+            "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
+-           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
++           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name> (params.client: a client that isn't a string, is unknown, or whose title several entities share with no single page among them), an unknown param, or a body field the call doesn't take"}
+                             "404" {:description "No named query has that name; the error lists the names"}
+                             "409" {:description "The graph is E2EE"}
+                             "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound)"}}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+index 047acfc..2973db9 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+@@ -2028,6 +2028,26 @@
+     :rules nil
+     :params [{:name "client_property" :type :property :default "forClient"
+               :types #{:default :url :date :node :asset :entity :class :page :property}}]}
++   ;; Patch 0054: open-tasks-by-client with the client bound (?c, the client's eid), for
++   ;; named-client-parity-test. A task matches when its own visible values hold ?c, or it has none
++   ;; and its page's hold ?c, as the code path's client filter keeps it.
++   "open-tasks-by-client (client)"
++   {:query '{:find [?client (pull ?t [:block/uuid :block/title])]
++             :keys [client task]
++             :in [$ ?prop ?c]
++             :where [[?t :block/tags :logseq.class/Task]
++                     [(get-else $ ?t :block/page 0) ?page]
++                     (or-join [?t ?page ?prop ?c]
++                              [?t ?prop ?c]
++                              (and [?page ?prop ?c] [(missing? $ ?t ?prop)]))
++                     [(get-else $ ?t :logseq.property/status 0) ?status]
++                     (not [?status :db/ident :logseq.property/status.done])
++                     (not [?status :db/ident :logseq.property/status.canceled])
++                     [(get-else $ ?c :block/title "") ?client]]}
++    :rules nil
++    :params [{:name "client_property" :type :property :default "forClient"
++              :types #{:default :url :date :node :asset :entity :class :page :property}}
++             {:name "client" :type :client :of "client_property"}]}
+    "pages-missing-property"
+    {:query '{:find [(pull ?p [:block/uuid :block/title])]
+              :keys [page]
+@@ -2461,7 +2481,13 @@
+   (doseq [[query-name entry] named-queries/named-queries]
+     (is (fn? (:run entry)) query-name)
+     (is (not-any? #(contains? entry %) [:query :rules]) query-name)
+-    (is (= (mapv :name (:params entry)) (mapv :name (:params (get legacy-named-queries query-name)))) query-name)
++    ;; open-tasks-by-client's params (client_property, then the optional client, patch 0054) are
++    ;; its client-bound legacy form's; the form without a client takes client_property alone.
++    (is (= (mapv :name (:params entry))
++           (mapv :name (:params (get legacy-named-queries (if (= "open-tasks-by-client" query-name)
++                                                            "open-tasks-by-client (client)"
++                                                            query-name)))))
++        query-name)
+     (is (= (:columns entry) (mapv str (get-in legacy-named-queries [query-name :query :keys]))) query-name))
+   (doseq [[query-name {:keys [query rules params]}] legacy-named-queries]
+     (let [normalised (datalog/normalise-query query)
+@@ -2469,7 +2495,8 @@
+                          (case type
+                            :tag (if (= :set binding) #{1} [1])
+                            :days 0
+-                           :property :block/title))
++                           :property :block/title
++                           :client 1))
+                        params)]
+       (is (:ok normalised) (str query-name ": " (:error normalised)))
+       (if rules
+@@ -4070,3 +4097,374 @@
+           (is (identical? own after-answered) "restored after an answered query")
+           (is (identical? own after-refused) "restored after a refused query")
+           (is (pos? direct) "a query outside run-query runs uncharged"))))))
++
++;; Patch 0054: open-tasks-by-client's client param
++;; ===============================================
++;; params.client is a client's title or UUID. It resolves to one visible entity (a page wins when
++;; exactly one candidate is a page) or answers 400 naming params.client, and the run keeps only the
++;; rows of that entity. The API refuses a second page or tag with a title already in use (409) and
++;; a case-only copy of a page's title, so the fixtures that share a title are made by retitling an
++;; entity the API wrote with d/transact!, the way a graph synced from the app can hold them.
++
++(defn- client-run!
++  "open-tasks-by-client with `params` (limit 200) and any other body fields in `more`."
++  ([self params] (client-run! self params nil))
++  ([self params more] (named! self "open-tasks-by-client" (merge {:params params :limit 200} more))))
++
++(defn- pairs-of [response] (mapv (fn [[c t]] [c (:block/title t)]) (get-in response [:body :rows])))
++
++(defn- uuid-titled
++  "The uuid (a string) of the one entity titled `title`."
++  [conn title]
++  (let [found (d/q '[:find [?u ...] :in $ ?t :where [?e :block/title ?t] [?e :block/uuid ?u]] @conn title)]
++    (assert (= 1 (count found)) (str title ": " (pr-str found)))
++    (str (first found))))
++
++(defn- retitle!
++  "Fixture: gives the entity `id` the title `title` (and a page or tag the lower-case name)."
++  [conn id title]
++  (let [e (d/entity @conn [:block/uuid (uuid (str id))])]
++    (d/transact! conn [(cond-> {:db/id (:db/id e) :block/title title}
++                         (:block/name e) (assoc :block/name (string/lower-case title)))])))
++
++(defn- tag-id! [self title]
++  (p/let [r (ok! (request! self "POST" "/semantic/tags" {:title title}) 201)] (uuid-of r)))
++
++(defn- block-id! [self page title]
++  (p/let [[b] (insert! self page [{:title title}])] (:uuid b)))
++
++(defn- for-client!
++  "Sets forClient (the seed-named node property) of `id` to `value`."
++  [self for-client id value]
++  (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent for-client)) {:value value}) 200))
++
++(defn- client-message [title kinds]
++  (str "params.client: " (pr-str title) " matches " (count kinds) " entities ("
++       (string/join ", " (map (fn [[t kind id]] (str t ": " kind " " id)) kinds))
++       "); give the one you mean by UUID"))
++
++(defn- refused-exactly?
++  "A 400 whose error is exactly `message`, with no rows."
++  [response message]
++  (and (= 400 (:status response)) (= message (get-in response [:body :error]))
++       (not (contains? (:body response) :rows))))
++
++(deftest named-client-narrowing-test
++  ;; Spec §8 test 1: with a client, only that client's open tasks come back; a task whose own client
++  ;; is zq Beta, on zq Acme's page, is zq Beta's alone. A client resolves by exact title, else by page
++  ;; name ignoring case, and by UUID in either case.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self]}]
++        (p/let [beta (uuid-titled conn "zq Beta")
++                acme (client-run! self {:client "zq Acme"})
++                beta-title (client-run! self {:client "zq Beta"})
++                beta-uuid (client-run! self {:client beta})
++                beta-upper (client-run! self {:client (string/upper-case beta)})
++                by-name (client-run! self {:client "ZQ ACME"})
++                full (client-run! self {})]
++          (is (= [200 200 200 200 200 200] (map :status [acme beta-title beta-uuid beta-upper by-name full]))
++              (pr-str (map head-of [acme beta-title beta-uuid beta-upper by-name])))
++          (testing "zq Acme's rows are the task on its page that has no client of its own"
++            (is (= [["zq Acme" "zq task page client"]] (pairs-of acme)) (pr-str (:body acme))))
++          (testing "zq Beta by title, by UUID and by an upper-case UUID: its own task only"
++            (doseq [r [beta-title beta-uuid beta-upper]]
++              (is (= [["zq Beta" "zq task own client"]] (pairs-of r)) (pr-str (:body r)))))
++          (testing "a title in another case finds the page by name"
++            (is (= (pairs-of acme) (pairs-of by-name))))
++          (testing "each client's rows are the full run's rows of that client"
++            (is (= (pairs-of acme) (filterv #(= "zq Acme" (first %)) (pairs-of full))))
++            (is (= (pairs-of beta-title) (filterv #(= "zq Beta" (first %)) (pairs-of full))))))))))
++
++(deftest named-client-property-kinds-sweep-test
++  ;; Class sweep over client_property: a node property (forClient, above), a many node property and
++  ;; a date property resolve the client and filter to it; a default or url property is refused
++  ;; (named-client-refusals-test). A date property's clients are journal pages, named by title or UUID.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self other-work]}]
++        (p/let [date-prop (ok! (request! self "POST" "/semantic/properties" {:title "zq client date" :type "date"}) 201)
++                many-prop (ok! (request! self "POST" "/semantic/properties" {:title "zq clients" :type "node" :cardinality "db.cardinality/many"}) 201)
++                _ (request! self "POST" "/semantic/capture" {:blocks [{:title "zq journal note"}]})
++                journal (uuid-titled conn "zq journal note")
++                journal-page (str (:block/uuid (:block/page (d/entity @conn [:block/uuid (uuid journal)]))))
++                journal-title (:block/title (d/entity @conn [:block/uuid (uuid journal-page)]))
++                no-client (uuid-titled conn "zq task no client")
++                own (uuid-titled conn "zq task own client")
++                put! (fn [id prop value]
++                       (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent (get-in prop [:body :ident])))
++                                      {:value value}) 200))
++                _ (put! no-client date-prop journal-page)
++                _ (put! own many-prop ["zq Acme" "zq Beta"])
++                _ (put! other-work many-prop ["zq Beta"])
++                date-title (client-run! self {:client_property "zq client date" :client journal-title})
++                date-uuid (client-run! self {:client_property "zq client date" :client journal-page})
++                many-acme (client-run! self {:client_property "zq clients" :client "zq Acme"})
++                many-beta (client-run! self {:client_property "zq clients" :client "zq Beta"})]
++          (is (every? #(= 200 (:status %)) [date-title date-uuid many-acme many-beta])
++              (pr-str (map head-of [date-title date-uuid many-acme many-beta])))
++          (testing "a date property: the journal by title and by UUID"
++            (is (= [[journal-title "zq task no client"]] (pairs-of date-title)) (pr-str (:body date-title)))
++            (is (= (pairs-of date-title) (pairs-of date-uuid))))
++          (testing "a many node property: a task with two clients is a row under the one given only"
++            (is (= [["zq Acme" "zq task own client"]] (pairs-of many-acme)) (pr-str (:body many-acme)))
++            (is (= #{["zq Beta" "zq task own client"] ["zq Beta" "zq task no client"]} (set (pairs-of many-beta)))
++                (pr-str (:body many-beta)))))))))
++
++(defn- client-parity!
++  "For each value of `prop` (an ident) in the graph: the client run by UUID equals the legacy
++  client-bound Datalog over the private filter, and the full run's rows whose client title is the
++  client's; a private or recycled value is refused as an unknown UUID. Returns how many clients had
++  rows."
++  [conn self label prop-title prop]
++  (let [db @conn
++        clients (distinct (map :v (d/datoms db :aevt prop)))]
++    (p/let [full (client-run! self {:client_property prop-title})]
++      (reduce (fn [acc c]
++                (p/let [n acc
++                        id (str (:block/uuid (d/entity db c)))
++                        r (client-run! self {:client_property prop-title :client id})
++                        private? (contains? (datalog/private-ids db) c)]
++                  (testing (str label ", client " (:block/title (d/entity db c)))
++                    (if private?
++                      (is (refused-exactly? r (str "params.client: no client with UUID " id)) (head-of r))
++                      (let [legacy (legacy-rows db "open-tasks-by-client (client)" {:client_property prop-title :client id})
++                            title (or (:block/title (d/entity db c)) "")]
++                        (is (= 200 (:status r)) (head-of r))
++                        (is (= legacy (code-rows r)) (pr-str {:legacy legacy :code (code-rows r)}))
++                        ;; A client without a title shares "" with the tasks that have none, so
++                        ;; only the legacy Datalog (bound by eid) stands for it.
++                        (when (seq title)
++                          (is (= (filterv #(= title (first %)) (code-rows full)) (code-rows r)))))))
++                  (if (seq (get-in r [:body :rows])) (inc n) n)))
++              (p/resolved 0) clients))))
++
++(deftest named-client-parity-test
++  ;; Client rows = the full run's rows of that client = the legacy client-bound Datalog, on
++  ;; seed-named, on its review-focus additions (two clients with one title, private clients, a client
++  ;; without a title) and on seeded random graphs.
++  (async done
++    (-> (p/let [graph (seed-named)
++                {:keys [conn self for-client]} graph
++                a (client-parity! conn self "seed-named" "forClient" (keyword for-client))
++                {:keys [clients]} (seed-review-focus! graph)
++                b (client-parity! conn self "review focus" "zq clients" (keyword clients))
++                seeded (reduce (fn [acc seed]
++                                 (p/let [n acc
++                                         g (seed-random-graph seed)
++                                         _ (extend-for-named! g seed)
++                                         prop (:db/ident (d/entity @(:conn g) (d/q '[:find ?e . :where [?e :block/title "zq client"] [?e :logseq.property/type _]] @(:conn g))))
++                                         m (client-parity! (:conn g) (:self g) (str "seed " seed) "zq client" prop)]
++                                   (+ n m)))
++                               (p/resolved 0) (range 1 11))]
++          (is (pos? a)) (is (pos? b))
++          (is (<= 10 seeded) (str "clients with rows across the seeded graphs: " seeded)))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest named-client-refusals-test
++  ;; Spec §8 test 2 with §12: each a 400 naming params.client, with the exact message and no rows;
++  ;; never all clients.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self other-work for-client]}]
++        (p/let [before (snapshot conn)
++                ;; A tag and a block share a title, with no page.
++                tb-tag (tag-id! self "zq Tb")
++                tb-block (block-id! self other-work "zq Tb")
++                ;; The same, beside a private page with that title: the page is never named.
++                tb2-tag (tag-id! self "zq Tb2")
++                tb2-block (block-id! self other-work "zq Tb2")
++                tb2-page (page-id! self "zq Tb2 private")
++                _ (set-tags! self tb2-page ["Private"])
++                _ (retitle! conn tb2-page "zq Tb2")
++                ;; Two pages that match only by name, ignoring case.
++                dup-a (page-id! self "zq Dup One")
++                dup-b (page-id! self "zq Dup Two")
++                _ (retitle! conn dup-a "Zq Dup")
++                _ (retitle! conn dup-b "ZQ DUP")
++                ;; A namespace child page sharing its title with another page.
++                leaf (page-id! self "zq Leaf")
++                ns-parent (page-id! self "zq Ns")
++                leaf-child (page-id! self "zq Leaf Child")
++                _ (retitle! conn leaf-child "zq Leaf")
++                _ (d/transact! conn [[:db/add [:block/uuid leaf-child] :block/parent [:block/uuid ns-parent]]])
++                ;; A private client, and a recycled one.
++                secret (page-id! self "zq Secret Client")
++                _ (set-tags! self secret ["Private"])
++                gone (page-id! self "zq Gone Client")
++                _ (ok! (request! self "DELETE" (str "/semantic/pages/" gone) nil) 200)
++                ;; Text client properties, a value block and a choice titled like a client.
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq client text" :type "default"}) 201)
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq client url" :type "url"}) 201)
++                text-ident (d/q '[:find ?i . :where [?e :block/title "zq client text"] [?e :db/ident ?i]] @conn)
++                _ (ok! (request! self "PUT" (str "/semantic/blocks/" other-work "/properties/" (js/encodeURIComponent (subs (str text-ident) 1)))
++                                 {:value "zq Value Only"}) 200)
++                kind (outliner-property/upsert-property! conn nil {:logseq.property/type :default} {:property-name "zq kind"})
++                _ (outliner-property/upsert-closed-value! conn (:db/ident kind) {:value "zq Choice"})
++                _ (assert (some? (d/q '[:find ?e . :where [?e :block/title "zq Choice"] [?e :block/closed-value-property _]] @conn)))
++                unknown (str (random-uuid))
++                before (snapshot conn)
++                type-message "params.client: must be a client title or UUID (a string)"
++                no-title #(str "params.client: no page, tag or block titled " (pr-str %))
++                no-uuid #(str "params.client: no client with UUID " %)
++                text-message #(str "params.client: " % " is a " %2 " property, whose values are per-block text;"
++                                   " give client_property as a node or date property, or list one client's tasks with datalog_query")
++                cases [["null" {:client nil} type-message]
++                       ["empty" {:client ""} type-message]
++                       ["a number" {:client 3} type-message]
++                       ["zero" {:client 0} type-message]
++                       ["an array" {:client ["zq Acme"]} type-message]
++                       ["an object" {:client {:title "zq Acme"}} type-message]
++                       ["false" {:client false} type-message]
++                       ["whitespace" {:client "   "} (no-title "   ")]
++                       ["an unknown title" {:client "zq Nobody"} (no-title "zq Nobody")]
++                       ["an unknown UUID" {:client unknown} (no-uuid unknown)]
++                       ["a malformed UUID" {:client "6650aaaa-zzzz-4000-8000-000000000000"} (no-title "6650aaaa-zzzz-4000-8000-000000000000")]
++                       ["the property's ident" {:client (subs (str for-client) 0)} (no-title (subs (str for-client) 0))]
++                       ["a tag and a block, no page" {:client "zq Tb"}
++                        (client-message "zq Tb" (sort-by #(:db/id (d/entity @conn [:block/uuid (uuid (nth % 2))]))
++                                                         [["zq Tb" "tag" (str tb-tag)] ["zq Tb" "block" (str tb-block)]]))]
++                       ["a private page beside them is never named" {:client "zq Tb2"}
++                        (client-message "zq Tb2" [["zq Tb2" "tag" (str tb2-tag)] ["zq Tb2" "block" (str tb2-block)]])]
++                       ["two pages by name only" {:client "zq dup"}
++                        (client-message "zq dup" [["Zq Dup" "page" (str dup-a)] ["ZQ DUP" "page" (str dup-b)]])]
++                       ["a namespace child and another page" {:client "zq Leaf"}
++                        (client-message "zq Leaf" [["zq Leaf" "page" (str leaf)] ["zq Leaf" "page" (str leaf-child)]])]
++                       ["a private client by UUID" {:client (str secret)} (no-uuid (str secret))]
++                       ["a private client by title" {:client "zq Secret Client"} (no-title "zq Secret Client")]
++                       ["a recycled client by UUID" {:client (str gone)} (no-uuid (str gone))]
++                       ["a recycled client by title" {:client "zq Gone Client"} (no-title "zq Gone Client")]
++                       ["a value block" {:client "zq Value Only"} (no-title "zq Value Only")]
++                       ["a choice" {:client "zq Choice"} (no-title "zq Choice")]
++                       ["a default client_property" {:client_property "zq client text" :client "zq Acme"} (text-message "zq client text" "default")]
++                       ["a url client_property" {:client_property "zq client url" :client "zq Acme"} (text-message "zq client url" "url")]
++                       ["client before a default client_property" (array-map :client "zq Acme" :client_property "zq client text")
++                        (text-message "zq client text" "default")]]
++                responses (p/all (map (fn [[_ params]] (client-run! self params)) cases))
++                dry (p/all (map (fn [[_ params]] (client-run! self params {:dry-run true})) cases))]
++          (doseq [[[label _ message] r d] (map vector cases responses dry)]
++            (is (refused-exactly? r message) (str label ": " (head-of r)))
++            (is (refused-exactly? d message) (str label ", dry run: " (head-of d))))
++          (testing "no message names the private page"
++            (is (not-any? #(string/includes? (:text %) (str tb2-page)) responses)))
++          (is (= before (snapshot conn))))))))
++
++(deftest named-client-page-wins-test
++  ;; Spec §12 answer 2: a page wins when exactly one candidate is a page. A private candidate is
++  ;; never one, and an exact title is the only tier when it matches (§12 answer 4).
++  (async done
++    (with-named done
++      (fn [{:keys [conn self other-work for-client]}]
++        (p/let [acme (uuid-titled conn "zq Acme")
++                beta (uuid-titled conn "zq Beta")
++                ;; A tag titled like the page zq Acme, and a block titled like the page zq Beta.
++                acme-tag (tag-id! self "zq Acme Tag")
++                _ (retitle! conn acme-tag "zq Acme")
++                _ (block-id! self other-work "zq Beta")
++                ;; A public tag and a private page titled zq Decoy; a task holds the tag.
++                decoy-tag (tag-id! self "zq Decoy")
++                decoy-page (page-id! self "zq Decoy Page")
++                _ (set-tags! self decoy-page ["Private"])
++                _ (retitle! conn decoy-page "zq Decoy")
++                _ (for-client! self for-client (uuid-titled conn "zq task no client") (str decoy-tag))
++                ;; A block titled exactly zq Exacto, and a page titled ZQ EXACTO.
++                exact-block (block-id! self other-work "zq Exacto")
++                exact-page (page-id! self "zq Exacto Page")
++                _ (retitle! conn exact-page "ZQ EXACTO")
++                acme-r (client-run! self {:client "zq Acme"})
++                beta-r (client-run! self {:client "zq Beta"})
++                decoy-r (client-run! self {:client "zq Decoy"})
++                exact-r (client-run! self {:client "zq Exacto"})
++                name-r (client-run! self {:client "zq exacto"})
++                tag-r (client-run! self {:client (str acme-tag)})]
++          (is (every? #(= 200 (:status %)) [acme-r beta-r decoy-r exact-r name-r tag-r])
++              (pr-str (map head-of [acme-r beta-r decoy-r exact-r name-r tag-r])))
++          (testing "a page and a tag: the page wins"
++            (is (= {:title "zq Acme" :uuid acme} (get-in acme-r [:body :params :client])))
++            (is (= [["zq Acme" "zq task page client"]] (pairs-of acme-r))))
++          (testing "a page and a block: the page wins"
++            (is (= {:title "zq Beta" :uuid beta} (get-in beta-r [:body :params :client])))
++            (is (= [["zq Beta" "zq task own client"]] (pairs-of beta-r))))
++          (testing "the tag by UUID is the tag, with no tasks"
++            (is (= {:title "zq Acme" :uuid (str acme-tag)} (get-in tag-r [:body :params :client])))
++            (is (= [] (pairs-of tag-r))))
++          (testing "a public tag and a private page: the tag is the only candidate, and the page is never named"
++            (is (= {:title "zq Decoy" :uuid (str decoy-tag)} (get-in decoy-r [:body :params :client])))
++            (is (= [["zq Decoy" "zq task no client"]] (pairs-of decoy-r)))
++            (is (not (string/includes? (:text decoy-r) (str decoy-page)))))
++          (testing "an exact title on a block is the only tier; the case-only page is not considered"
++            (is (= {:title "zq Exacto" :uuid (str exact-block)} (get-in exact-r [:body :params :client]))))
++          (testing "with no exact title, the page by name"
++            (is (= {:title "ZQ EXACTO" :uuid (str exact-page)} (get-in name-r [:body :params :client])))))))))
++
++(deftest named-client-echo-test
++  ;; params.client echoes {title, uuid} of the entity used; without a client the response's params
++  ;; are what they were. dry-run resolves and echoes the client and reads nothing.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self]}]
++        (p/let [acme (uuid-titled conn "zq Acme")
++                given (client-run! self {:client "zq Acme"})
++                absent (client-run! self {})
++                dry (client-run! self {:client "zq Acme"} {:dry-run true})
++                dry-work (:named-work @datalog/last-run)]
++          (is (= [200 200 200] (map :status [given absent dry])) (pr-str (map head-of [given absent dry])))
++          (is (= {:title "zq Acme" :uuid acme} (get-in given [:body :params :client])))
++          (is (= [:client_property] (keys (get-in absent [:body :params]))) "no client key without a client")
++          (is (= (get-in absent [:body :params :client_property]) (get-in given [:body :params :client_property])))
++          (testing "dry run: the client echoed, nothing read"
++            (is (true? (get-in dry [:body :dry-run])))
++            (is (= {:title "zq Acme" :uuid acme} (get-in dry [:body :params :client])))
++            (is (not-any? #(contains? (:body dry) %) [:rows :work]))
++            (is (= {} dry-work))))))))
++
++(deftest named-client-absent-still-works-test
++  ;; The calls that worked before params.client still answer as they did: no params, empty params,
++  ;; client_property alone (node and text), a dry run, and a client re-sent gives the same answer.
++  ;; Key order in params doesn't matter.
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (p/let [_ (ok! (request! self "POST" "/semantic/properties" {:title "zq client text" :type "default"}) 201)
++                bodies [nil {} {:params {}} {:params {:client_property "forClient"}}
++                        {:params {:client_property "zq client text"}} {:dry-run true}]
++                answers (p/all (map #(named! self "open-tasks-by-client" %) bodies))
++                once (client-run! self (array-map :client_property "forClient" :client "zq Acme"))
++                again (client-run! self (array-map :client "zq Acme" :client_property "forClient"))]
++          (doseq [[b r] (map vector bodies answers)]
++            (is (= 200 (:status r)) (str (pr-str b) " " (head-of r)))
++            (is (not (contains? (get-in r [:body :params]) :client)) (pr-str b)))
++          (is (= (:text (first answers)) (:text (nth answers 1)) (:text (nth answers 2)) (:text (nth answers 3))))
++          (is (= [200 200] (map :status [once again])))
++          (is (= (:body once) (:body again)) "a re-send, keys in either order"))))))
++
++(deftest named-client-read-only-test
++  ;; max-tx and the datom count are unchanged after a client run answered, refused at a bound, and
++  ;; refused with a 400.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self]}]
++        (p/let [before (snapshot conn)
++                answered (client-run! self {:client "zq Acme"})
++                _ (set-bounds! self {:reads 1})
++                bounded (client-run! self {:client "zq Acme"})
++                _ (set-bounds! self nil)
++                refused (client-run! self {:client "zq Nobody"})]
++          (is (= [200 422 400] (map :status [answered bounded refused])) (pr-str (map head-of [answered bounded refused])))
++          (is (= before (snapshot conn))))))))
++
++(deftest named-client-documented-test
++  ;; runNamedQuery's description and its 400 name params.client, how it resolves and what it refuses.
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        post (get-in document [:paths "/api/v1/graphs/{graph-id}/named-queries/{name}" :post])]
++    (doseq [phrase ["open-tasks-by-client (params client_property, default forClient, and client, optional)"
++                    "client is a client's title or UUID, and lists only that client's tasks"
++                    "a page wins when exactly one of them is a page"
++                    "naming each one's kind and UUID, oldest first"
++                    "a private or recycled one reads as unknown"
++                    "a client_property that is a default or url property"
++                    "never all clients"
++                    "params.client echoes the client used, as title and uuid"]]
++      (is (string/includes? (:description post) phrase) phrase))
++    (is (string/includes? (get-in post [:responses "400" :description]) "params.client"))))
