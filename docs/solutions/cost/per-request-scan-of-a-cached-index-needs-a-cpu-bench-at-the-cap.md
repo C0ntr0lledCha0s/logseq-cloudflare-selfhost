@@ -5,6 +5,7 @@ tags: [cpu, 10ms, worker, cold-start, kb-index, suggest_links, bench, json-parse
 seen:
   - 2026-11-08 – item 22 (suggest_links), review rounds 1 and 2 (r1-light-1, still open at the end, left to the backlog)
   - 2026-11-09 – item 40 (datalog_query), stages 3 and 4: the bench at 5,000 pages showed a join-fan-out shape (7,034 datoms scanned) costing more than one that scanned the full 20,000, and a named query hit the scan cap only with thousands of filler blocks; see api/a-scan-cap-alone-does-not-bound-a-caller-supplied-query.md
+  - 2026-11-22 – item 52, patch 0054: the bench was part of the acceptance, and a narrowed walk was measured at its caps. Release bundle through SyncDO.fetch, cold/warm median ms: full 88/67 (open-tasks bound), client-page of 10,500 blocks 29/27 (tasks bound), client-tasks of 2,500 open tasks 75/73 (open-tasks bound), all within 0039's 90 to 120 ms. The dev build runs about 2.5 times slower, so only the release bundle counts
 promoted_to: ["REVIEW.md"]
 ---
 
