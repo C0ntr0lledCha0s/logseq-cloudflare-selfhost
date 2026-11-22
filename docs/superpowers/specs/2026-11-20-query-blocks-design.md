@@ -249,3 +249,15 @@ The owner answered section 11 on PR 72. These replace the open questions; the bu
 7. **File name:** shortened to `2026-11-20-query-blocks-design.md`.
 
 The owner's comment numbered six answers; answers 5 ("no drift") and 6 ("shorten it") match questions 6 and 7, so question 5 is read as unanswered.
+
+## 13. As built
+
+Built as patch 0050 (plan: `docs/superpowers/plans/2026-11-22-query-blocks-fence-and-field.md`). The design held except for the points below.
+
+- **How "created by Claude" is known (decision 4).** A hidden checkbox property, `claudeQueryBlock` (ident `user.property/claude-queryBlock`), set to `true` on the Query block (not its value block) by `set-query-block!` on insert. It is created in the owner's graph on first use, so this adds a schema entity. The edit stamps were rejected: they mean "Claude edited", exist only when "Mark Claude's edits" is on, and `created-by-ref` names the owner for both the app and the connector. A property in the marker's way refuses the insert with a 409. The Activity page's blocks are not marked. Known limit: a copy of a marked block keeps the marker, and the owner can set it by hand; both only widen what Claude may edit to blocks the owner chose.
+- **`update_block` guard (changes section 3.5).** The refusal is a 409, not a 400: `update_block changes only Query blocks Claude created` for an unmarked block, and `can't tell whether Claude created this Query block, so it isn't changed` when the marker or the holder can't be found. The guard covers the Query block's caption as well as its query. On a marked block, a new query text must pass `check-query-block` (`title: query: …`, 400), with no `display-type` or `lang`.
+- **Property paths (extends section 3.5).** Besides `logseq.property/query` and the Query tag, the paths refuse the marker (`claudeQueryBlock is set by the server and can't be written`) and refuse `display-type` and `lang` on a Query block's value block, because either one stops the app reading the query as advanced code. The delete paths refuse removing the Query tag or the query (`delete the block instead`). Sending the tag a Query block already holds, or a reset tag list, keeps the tag instead of refusing.
+- **Cost (section 5).** Each Query block adds about five outliner property sets (tag, query, display type, lang, marker), not four, plus the marker property's creation once per graph.
+- **Measured CPU (section 9, item 4).** `scripts/bench-datalog-query.mjs --query-block`, warm median of 5 runs, Node v22.23.5 on a developer machine, release bundle: a batch of 100 Query nodes of 4,000 characters stores in about 2.3 s (2.6 s cold); parsing and checking alone take about 0.6 s of that, and the writes about 1.6 s. This guides the cost but is not a Durable Object measurement on Cloudflare.
+- **Release bundle.** `scripts/release-query-check.mjs` now inserts the Book query as a fence and as a field through the release bundle and reads both back, and checks that a `:rules` query is refused.
+- **Not yet done.** The owner's manual check in the app (section 9, items 2 and 3) waits for the deploy. Record its result here.
