@@ -207,3 +207,25 @@ Approved for build with these answers to section 11:
 3. **Inherited clients:** no. A task matches its own client, else its page's, as the full listing does.
 4. **Case-only matches:** keep exact title first, then page name ignoring case.
 5. **Patch number:** 0054. PRs 72 and 73 are being built in another session and take 0050 to 0053; renumber at merge if they land differently.
+
+## 13. As built
+
+Built as patch `0054-semantic-open-tasks-client-param.patch` on `feat/open-tasks-client-build`, in four stages (resolve the param, walk from the client, the 422 advice, the release check and bench). The design held except for these points.
+
+- **A page wins among shared titles.** Section 3.2's "no ranking" and test 2's class-plus-page case follow the owner's answer 2 in section 12 instead. When exactly one candidate is a page (a journal counts as a page), it wins and the call answers 200 echoing it. With no page, or with several, the call is refused naming each candidate's kind and UUID, oldest first. A private decoy with the same title is neither listed nor counted.
+- **Hidden entities are never candidates.** The built-in Recycle, `$$$favorites` and `$$$views` pages carry `hide?` but no `deleted-at` and no Private tag, so the privacy check doesn't cover them. The resolver drops them by title and by UUID, and the review added tests for each.
+- **A failed `client_property` hides the client error.** When `client_property` itself doesn't resolve (an unknown title or UUID, or a checkbox property), only that param's message is returned, since the client can't be checked against it.
+- **UUIDs match in any case.**
+- **Patch numbering.** The patch is 0054 as planned, so `patches/` runs 0049 then 0054 until the patches for items 49 and 50 land. Renumber at merge if they land differently.
+- **Contract text.** `tools-manifest.json` did not change (names and shapes are the same). `connector/vendor/` is gitignored, so the vendored `openapi.json` text is checked locally and in CI, not committed. The README changes are §11.8 (named queries), the `400` and `422` troubleshooting rows, and backlog 24, where only the `client` half was removed.
+- **Upload path (risk 1).** Tested on a graph uploaded in the app's shape, with the property made by `upsert-property!`: the `:avet` holders equal the `:aevt` scan (3 and 3), on the opened connection and on one whose schema still drifts. The risk does not hold.
+- **Bench (section 9, step 5).** Release bundle through `SyncDO.fetch`, Node v22 on a developer machine, cold then warm median of 5:
+
+  | run | cold ms | warm ms | outcome |
+  |---|---|---|---|
+  | full | 88 | 67 | `open-tasks` bound |
+  | client-page (one page of 10,500 blocks) | 29 | 27 | `tasks` bound |
+  | client-tasks (2,500 open tasks holding the client) | 75 | 73 | `open-tasks` bound |
+
+  Both client runs are under 0039's 90 to 120 ms. In the dev build, which runs about 2.5 times slower, each client run is faster than the full run at the same size. These are a guide, not the Durable Object on Cloudflare.
+- **Cost.** Unchanged per call: 2 Worker requests, about 1 D1 row read, 2 rows written, no neurons, no Vectorize.
