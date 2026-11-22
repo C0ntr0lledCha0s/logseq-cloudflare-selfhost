@@ -277,4 +277,16 @@ Run `scripts/check.sh --upstream` on the final commit, name that commit in the P
 4. **Private in old checks.** The new checks leave out Private and Recycle bin content; the old ones don't. Send that to the backlog as proposed, or fix it in this PR?
 5. **`since` in ms.** Keep ms to match `created-after`, or also accept an ISO date (`2026-11-16`) read in the Worker's `TIMEZONE`?
 6. **Patch numbers.** These are 0051 to 0053 on the assumption that item 49 takes 0050. If you drop or reorder PR 72, they become 0050 to 0052.
-7. **Spec file name.** The brief named this file `2026-11-20-changes-schema-health-design.md`; the stage that wrote it was told `2026-11-20-changes-schema-health-checks-design.md`, which is what was used. Rename if you prefer the shorter name.
+7. **Spec file name.** The brief named this file `2026-11-20-changes-schema-health-design.md`; the stage that wrote it was told `2026-11-20-changes-schema-health-design.md`, which is what was used. Rename if you prefer the shorter name.
+
+## 12. Owner's decisions (2026-11-22)
+
+The owner answered section 11 on PR 73. These replace the open questions; the build follows them.
+
+1. **Scope:** all three parts in one PR (0051 health checks, 0052 `list_changes_since`, 0053 `get_graph_schema`).
+2. **`missing-tag-properties`:** tags often have optional fields, so the check must not report every listed property. It looks only at a common set of tag-property pairs, the pairs the owner expects to be filled. The build decides where that set lives (a `pairs` input on the check, a stored default the owner can edit, or both) and refuses a pair whose tag or property doesn't exist, naming it. With no pairs given and none stored, the check reports nothing and says why, rather than listing everything.
+3. **What counts as a change:** a move shown as `page-changed` with no block is enough for the digest. No tx-log reading.
+4. **Private and Recycle bin in the old checks:** fixed in this PR. Every `get_graph_health` check, old and new, leaves out Private and Recycle-bin content.
+5. **`since`:** accepts epoch milliseconds and also an ISO date (`2026-11-16`) or datetime, a date read in the Worker's `TIMEZONE`. An unreadable value is refused, naming `since`.
+6. **Patch numbers:** 0051 to 0053, assuming item 49 (PR 72) takes 0050; renumber if that changes.
+7. **File name:** shortened to `2026-11-20-changes-schema-health-design.md`.
