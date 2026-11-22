@@ -26,7 +26,7 @@ One file per lesson, under a folder for its area: `api/`, `sync/`, `connector/`,
 | [api/read-hid-built-in-properties](api/read-hid-built-in-properties.md) | "The write dropped it" was the read hiding it; check the read path first |
 | [api/one-error-for-every-failure](api/one-error-for-every-failure.md) | One generic error for many causes makes a malformed call look like a server bug |
 | [cost/d1-reads-from-indexer-scans](cost/d1-reads-from-indexer-scans.md) | Cron jobs that scan or never finish burn the Free plan's D1 reads |
-| [api/title-resolves-outside-allowed-values](api/title-resolves-outside-allowed-values.md) | A title must resolve only among the property's allowed values; the outliner won't check |
+| [api/title-resolves-outside-allowed-values](api/title-resolves-outside-allowed-values.md) | A title must resolve only among the property's allowed values; the outliner won't check; the split-out `:block/tags` branch kept the `first` until patch 0046 |
 | [testing/untested-rules-survive-mutation](testing/untested-rules-survive-mutation.md) | Each rule a fix adds needs a case where that rule decides the outcome |
 | [api/mixed-type-sort-key-500-on-read](api/mixed-type-sort-key-500-on-read.md) | A sort key mixing order strings and db ids made valid node values unreadable (500) |
 | [api/outliner-save-and-insert-disagree-on-heading](api/outliner-save-and-insert-disagree-on-heading.md) | `save-block!` strips a `## ` prefix without setting the heading and `insert-blocks!` keeps it; convert the prefix on every write, except for display-type blocks (and exempt every title-rewriting step, not only the heading) |
