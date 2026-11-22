@@ -242,6 +242,13 @@ async function request(access: GraphAccess, req: UpstreamRequest, routes: Delete
 }
 
 /**
+ * Tools whose unknown top-level arguments are refused rather than stripped: a delete_block_property
+ * value given beside body instead of in it would otherwise be dropped, and the call would delete the
+ * whole property (patch 0042).
+ */
+const STRICT_ARGUMENTS: ReadonlySet<string> = new Set(["delete_block_property", "batch_delete_block_property"]);
+
+/**
  * Builds one tool per graph operation of the sync server's OpenAPI `spec`. Nothing request-scoped is
  * captured: each call resolves its graph from the alias in its own path.
  */
@@ -271,7 +278,7 @@ export function buildGraphTools(spec: OpenApiSpec, access: GraphAccess): GraphTo
         name: op.name,
         config: {
           description: description(op),
-          inputSchema: z.object(shape),
+          inputSchema: STRICT_ARGUMENTS.has(op.name) ? z.object(shape).strict() : z.object(shape),
           annotations,
         },
         handler,
