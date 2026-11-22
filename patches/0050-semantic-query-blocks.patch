@@ -85,7 +85,7 @@ index a682bda..f98b81a 100644
    "The body's query and inputs parsed, normalised and validated: {:query :inputs :given} or a
    refusal. A body with rules never gets here (`body-errors`)."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 3704114..b8af24e 100644
+index 3704114..d22c921 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1027,7 +1027,9 @@
@@ -460,7 +460,7 @@ index 3704114..b8af24e 100644
            (ldb/transact! conn [[:db/add id :logseq.property.table/sorting
                                  [{:id :user.property/claude-editedAt :asc? false}]]]))))))
  
-@@ -2168,10 +2356,85 @@
+@@ -2168,10 +2356,103 @@
    (when-let [tool (get class-schema-tools property-ident)]
      (str (subs (str property-ident) 1) " can't be set here; use " tool)))
  
@@ -472,14 +472,33 @@ index 3704114..b8af24e 100644
 +  (when (= :logseq.property/query property-ident)
 +    "logseq.property/query can't be set here; use the query field on an insert node"))
 +
++(defn- query-value-block?
++  "Whether the block with db id `id` is the value block holding a block's logseq.property/query, read
++  from datoms (an uploaded graph may keep the app's schema)."
++  [db id]
++  (= :logseq.property/query
++     (some->> (first (d/datoms db :eavt id :logseq.property/created-from-property)) :v (d/entity db) :db/ident)))
++
++(defn- query-value-refusal
++  "Why setting or removing `property-ident` on `block` is refused: a query's value block stays Clojure
++  code, so its display-type and lang are written only by set-query-block! (patch 0050). nil for any
++  other property or block."
++  [db block property-ident]
++  (when (and block (contains? #{display-type-ident lang-ident} property-ident)
++             (query-value-block? db (:db/id block)))
++    (str (subs (str property-ident) 1) ": a Query block's query stays Clojure code")))
++
 +(defn- query-delete-refusal
 +  "{:error reason} when deleting `property-ident` from `block` would remove the query of a block
-+  that holds one (patch 0050), else nil. Deleting it from a block without a query stays the no-op
-+  it was."
++  that holds one, or the display-type or lang of a query's value block (patch 0050), else nil.
++  Deleting the query from a block without one stays the no-op it was."
 +  [db block property-ident]
-+  (when (and (= :logseq.property/query property-ident)
-+             (seq (d/datoms db :eavt (:db/id block) :logseq.property/query)))
-+    {:error "logseq.property/query can't be removed from a Query block; delete the block instead"}))
++  (cond
++    (and (= :logseq.property/query property-ident)
++         (seq (d/datoms db :eavt (:db/id block) :logseq.property/query)))
++    {:error "logseq.property/query can't be removed from a Query block; delete the block instead"}
++    (query-value-refusal db block property-ident)
++    {:error (query-value-refusal db block property-ident)}))
 +
 +(defn- query-marker-refusal
 +  "Why a block-property set naming the created-by-Claude marker is refused: only set-query-block!
@@ -521,10 +540,9 @@ index 3704114..b8af24e 100644
 +  logseq.property/query (holder nil when it can't be told), {:holder id :value? false} for a block
 +  tagged Query, else nil."
 +  [db block]
-+  (let [id (:db/id block)
-+        from (some->> (first (d/datoms db :eavt id :logseq.property/created-from-property)) :v (d/entity db) :db/ident)]
++  (let [id (:db/id block)]
 +    (cond
-+      (= :logseq.property/query from) {:holder (query-holder db id) :value? true}
++      (query-value-block? db id) {:holder (query-holder db id) :value? true}
 +      (some #(= :logseq.class/Query (:db/ident (d/entity db (:v %)))) (d/datoms db :eavt id :block/tags))
 +      {:holder id :value? false})))
 +
@@ -547,7 +565,7 @@ index 3704114..b8af24e 100644
  
  (defn- request-creator [request e2ee?]
    (when-let [encoded (.get (.-headers request) "x-logseq-sync-actor")]
-@@ -3022,6 +3285,8 @@
+@@ -3022,6 +3303,8 @@
              fence (when (and (true? convert?) (not e2ee?) (= "block" (some-> block block-kind))
                               (nil? (display-type-ident block)))
                      (fence-display-block (:title body)))
@@ -556,7 +574,7 @@ index 3704114..b8af24e 100644
              converted (when (:type fence) fence)
              fence-error (when converted
                            (fence-refusal converted (get explicit display-type-ident) (get explicit lang-ident)))
-@@ -3029,10 +3294,15 @@
+@@ -3029,10 +3312,15 @@
              lang (or (get explicit lang-ident) (:lang converted))
              given (cond-> {} type (assoc display-type-ident type) lang (assoc lang-ident lang))
              title (if converted (:title converted) (:title body))
@@ -573,7 +591,7 @@ index 3704114..b8af24e 100644
            (= ::invalid convert?) (http/bad-request convert-fences-refusal)
            (some (comp :error second) fields) (http/bad-request (some (comp :error second) fields))
            fence-error (http/bad-request fence-error)
-@@ -3057,7 +3327,11 @@
+@@ -3057,7 +3345,11 @@
                                                               (assoc @prepared :block/uuid (:block/uuid block))
                                                               :encrypted-title? e2ee? :encrypted-name (:name body))
                                    (unverified! (keep (fn [[ident value]] (read-back-display @tx-conn (:db/id block) ident value))
@@ -586,7 +604,16 @@ index 3704114..b8af24e 100644
                   (broadcast-change! self)
                   (let [stored (d/entity @conn [:block/uuid (:block/uuid block)])]
                     (http/json-response nil (with-context-or-unavailable
-@@ -3231,8 +3505,10 @@
+@@ -3209,6 +3501,8 @@
+         (nil? property-ident) (http/bad-request "property not found")
+         (set-property-refusal property-ident)
+         (http/bad-request (str "entry 0: " (set-property-refusal property-ident)))
++        (query-value-refusal db block property-ident)
++        (http/bad-request (str "entry 0: " (query-value-refusal db block property-ident)))
+         (not (contains? body :value)) (http/bad-request "missing property value")
+         (:error prepared) (http/bad-request (cond->> (:error prepared) (::entry? prepared) (str "entry 0: ")))
+         (lang-error writes) (http/bad-request (lang-error writes))
+@@ -3231,8 +3525,10 @@
              block (find-entity db (:block-id path-params))
              property-ident (resolve-property-ident db (:property-id path-params))
              ;; An optional value removes only that value (patch 0042).
@@ -599,7 +626,18 @@ index 3704114..b8af24e 100644
        (cond
          (or (nil? block) (nil? property-ident))
          (http/bad-request "invalid block or property")
-@@ -3328,8 +3604,10 @@
+@@ -3289,7 +3585,9 @@
+                                                 (scope-with-tags db {:db/id (:db/id block)} added-ids)
+                                                 (scope-with-tags db block added-ids))
+                                         prepared (when (and block property-ident)
+-                                                   (prepare-property-value db property-ident value e2ee? scope))
++                                                   (if-let [refused (query-value-refusal db block property-ident)]
++                                                     {:error refused}
++                                                     (prepare-property-value db property-ident value e2ee? scope)))
+                                         replace? (and reset? (coll? (:value prepared)))]
+                                     (cond-> (update result :entries conj {:block block
+                                                                           :property-ident property-ident
+@@ -3328,8 +3626,10 @@
                                   {:block block
                                    :property-ident property-ident
                                    ;; An optional value removes only that value (patch 0042).
@@ -612,7 +650,7 @@ index 3704114..b8af24e 100644
                               entries))]
        (if-let [error (or (batch-delete-fields-error body) (labels-error entries) (batch-entries-error entries resolved))]
          (http/bad-request error)
-@@ -3482,6 +3760,8 @@
+@@ -3482,6 +3782,8 @@
          (http/bad-request "missing blocks")
          ;; Before today's journal is made, so a refused call writes nothing.
          (= ::invalid (convert-fences-option url)) (http/bad-request convert-fences-refusal)
@@ -621,11 +659,30 @@ index 3704114..b8af24e 100644
          :else
          (if-let [time-zone (owner-time-zone self)]
            (let [today (authored-write! conn creator ensure-today-page! time-zone)]
+@@ -4922,7 +5224,9 @@
+                     (and (contains? entry :blocks)
+                          (not (valid-tree-identities? db (or target existing-page) (:blocks entry))))
+                     "invalid blocks"
+-                    (:error properties) (:error properties)))
++                    (:error properties) (:error properties)
++                    (some #(query-value-refusal db target (first %)) (:properties properties))
++                    (some #(query-value-refusal db target (first %)) (:properties properties))))
+         tree (when (and (nil? error) (contains? entry :blocks))
+                (prepare-tree db (:blocks entry) e2ee? convert? (str prefix ".blocks")))]
+     (cond
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..eaa3e05 100644
+index 39eccae..cbf0844 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -148,7 +148,15 @@
+@@ -132,6 +132,7 @@
+        " logseq.property.code/lang is a code block's language (1 to 40 characters with no spaces, such as python or mermaid; case kept) and needs the block's type to be code once the call has applied."
+        " Both apply to blocks only: a page, tag, property or asset is refused."
+        " Code, Math and Quote can't be set as tags (use display-type); a block that holds one keeps it, and re-sending it is a no-op."
++       " A Query block's query (the block holding logseq.property/query's text) stays Clojure code: display-type and lang on it are refused, naming the entry (entry 0: logseq.property.node/display-type: a Query block's query stays Clojure code)."
+        " A text block whose stored title holds \\# escapes from earlier writes keeps them when it becomes code or math, and the response carries a warning: to store the title verbatim, call updateBlock with the title and display-type together."
+        " Every write is read back in its transaction; one that didn't store what was asked fails the whole call."))
+ 
+@@ -148,7 +149,15 @@
    "How the tree and update operations write a code, math or quote block (patch 0037)."
    (str "display-type (code, math or quote) and lang (a code block's language) can be given on each block, or as the same properties (logseq.property.node/display-type or \"Node Display Type\", logseq.property.code/lang); given in both, the values must agree. An unknown value, lang without display-type code, or two different values is refused before anything is written, naming the node's path on the tree operations. A child doesn't take its parent's type."
         " A code or math title is stored exactly as sent, judged on the block's type after the write (the call's display-type, else the stored one): no # is escaped and no inline #tag or [[link]] is resolved, so it adds no tags, refs or pages. A quote title keeps tag and link handling."
@@ -642,12 +699,12 @@ index 39eccae..eaa3e05 100644
  
  (def ^:private operation-docs
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
-@@ -166,22 +174,24 @@
+@@ -166,22 +175,24 @@
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
 -   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
-+   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
++   "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are refused on a Query block's query (the block holding its text), which stays Clojure code, and are otherwise judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
     "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped, and code and math blocks keep their titles as stored). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
     "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note
@@ -669,14 +726,14 @@ index 39eccae..eaa3e05 100644
 +   "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
 +   "insertBlockTree" ["Insert block trees" (str "Inserts one or more recursive block trees relative to an explicit target block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
 +   "setBlockProperty" ["Set a block property" (str "Idempotently adds or replaces one typed property value on one block in a DB graph. The property path value may be its UUID or ident. Never write legacy file-graph key:: value syntax into the block title. A list of tags replaces the block's tags; the built-in type tags it holds (Page, Tag, Journal, Property and the like), its Code, Math or Quote tag and a Query block's Query tag are kept. logseq.property/query and the Query tag are refused (entry 0: logseq.property/query can't be set here; …): a Query block is made with the query field on an insert node; a Query block re-sent its own Query tag is a no-op. " value-notes " " display-type-note)]
-+   "deleteBlockProperty" ["Delete a block property" "Removes one property from one block; repeating a whole-property delete changes nothing more. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class and a Query block's Query tag. Removing the Query tag or logseq.property/query from a Query block is refused, naming the entry: delete the block instead. With value in the body, removes only that value of a many-valued property (one tag, one node, text, URL, number or date value) and keeps the others; it answers 400, naming the entry and writing nothing, when the property doesn't hold several values, the block holds no such value (or more than one, when it is named by title), the value is a built-in tag or display class, or the property is internal to Logseq (such as Node references, block/refs, which follow the block's text). Once a value is gone, repeating its delete answers 400 the same way, so read the block before reporting that a repeated delete failed. The body takes value alone: any other field (a misspelt values, a target-label, which goes in the query) or malformed JSON is refused with 400, never read as a whole-property delete. Answers the block's page, breadcrumb and snippet (target)."]
++   "deleteBlockProperty" ["Delete a block property" "Removes one property from one block; repeating a whole-property delete changes nothing more. The property definition itself is not deleted. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class and a Query block's Query tag. Removing the Query tag or logseq.property/query from a Query block is refused, naming the entry: delete the block instead. Removing display-type or lang from a Query block's query (the block holding its text) is refused too: it stays Clojure code. With value in the body, removes only that value of a many-valued property (one tag, one node, text, URL, number or date value) and keeps the others; it answers 400, naming the entry and writing nothing, when the property doesn't hold several values, the block holds no such value (or more than one, when it is named by title), the value is a built-in tag or display class, or the property is internal to Logseq (such as Node references, block/refs, which follow the block's text). Once a value is gone, repeating its delete answers 400 the same way, so read the block before reporting that a repeated delete failed. The body takes value alone: any other field (a misspelt values, a target-label, which goes in the query) or malformed JSON is refused with 400, never read as a whole-property delete. Answers the block's page, breadcrumb and snippet (target)."]
 +   "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them; the built-in type tags it holds (Page, Tag, Journal, Property and the like) its Code, Math or Quote tag and a Query block's Query tag are kept, so a page given [\"Food\"] stays a page. logseq.property/query and the Query tag are refused, naming the entry: a Query block is made with the query field on an insert node; a Query block re-sent its own Query tag is a no-op. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link. " display-type-note " lang is judged on each block's type once every entry has applied, so lang may come before display-type for the same block; warnings name their entry. A display-type entry swaps the block's Code, Math or Quote tag, so a property limited to one of those tags judges the block by the type the batch leaves it with, in any entry order.")]
-+   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class and a Query block's Query tag. Removing the Query tag or logseq.property/query from a Query block is refused, naming the entry: delete the block instead. An entry with value removes only that value of a many-valued property and keeps the others; once it is gone, repeating that entry answers 400. An entry takes block-id, property-id, value and target-label, and the body takes entries alone: any other field is refused with 400, never read as a whole-property delete. A failing entry refuses the whole batch with 400, naming the entry (entry 1: ...), and nothing is written."]
++   "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry. Removing logseq.property.node/display-type makes the block a text block again: its Code, Math or Quote tag and its lang go too. Removing Tags removes the block's own tags and keeps the built-in tags Logseq sets (Page, Journal, Tag, Property, Whiteboard, Asset) and a code, math or quote block's display class and a Query block's Query tag. Removing the Query tag or logseq.property/query from a Query block is refused, naming the entry: delete the block instead. Removing display-type or lang from a Query block's query (the block holding its text) is refused too: it stays Clojure code. An entry with value removes only that value of a many-valued property and keeps the others; once it is gone, repeating that entry answers 400. An entry takes block-id, property-id, value and target-label, and the body takes entries alone: any other field is refused with 400, never read as a whole-property delete. A failing entry refuses the whole batch with 400, naming the entry (entry 1: ...), and nothing is written."]
 +   "captureToToday" ["Capture to today's journal" (str "Creates today's journal page when necessary and appends the supplied recursive block trees, with each new block's properties, to its end. " today-note " The response names the journal with page-id and page-title. " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
     "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by page-id (its UUID or title), into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
-@@ -345,7 +355,7 @@
+@@ -345,7 +356,7 @@
  
  (def ^:private convert-fences-parameter
    {:name "convert-fences" :in "query" :schema {:type "boolean" :default true}
@@ -685,7 +742,7 @@ index 39eccae..eaa3e05 100644
  
  (def ^:private summary-prefix-parameter
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
-@@ -379,6 +389,11 @@
+@@ -379,6 +390,11 @@
    {:type "string" :minLength 1 :maxLength 40
     :description "A code block's language, such as python or mermaid (1 to 40 characters, no spaces, case kept); needs display-type code. Also accepted in properties as logseq.property.code/lang."})
  
@@ -697,7 +754,7 @@ index 39eccae..eaa3e05 100644
  (def ^:private dry-run-schema
    {:type "boolean" :default false
     :description "Check the request and apply it to a throwaway copy of the graph, reporting the result without changing the graph."})
-@@ -888,7 +903,7 @@
+@@ -888,7 +904,7 @@
                      :description "Property values to set on the new block or target, keyed by property UUID, ident or exact title, e.g. {\"Tags\": [\"Person\"], \"Description\": \"text\"}. Values take the same forms as in setBlockProperty; many-valued properties add to the block's values. A block reused by its uuid keeps its properties."
                      :additionalProperties {:$ref "#/components/schemas/PropertyValue"}}
     :KeptFences {:type "array"
@@ -706,7 +763,7 @@ index 39eccae..eaa3e05 100644
                  :items {:type "object" :required ["path" "reason"]
                          :properties {:path {:type "string"} :reason {:type "string"}}}}
     :InsertedBlock {:type "object" :required ["uuid"]
-@@ -897,8 +912,10 @@
+@@ -897,8 +913,10 @@
                                  :display-type {:type "string" :enum ["code" "math" "quote"]
                                                 :description "The block's type, when it has one. Omitted when verbose is false."}
                                  :lang {:type "string" :description "A code block's language, when set. Omitted when verbose is false."}
@@ -719,7 +776,7 @@ index 39eccae..eaa3e05 100644
                                  :children {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}
     :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
                              :properties {:target {:$ref "#/components/schemas/BlockContext"}
-@@ -971,6 +988,7 @@
+@@ -971,6 +989,7 @@
                                          :title {:type "string"}
                                          :display-type display-type-schema
                                          :lang lang-schema
@@ -814,10 +871,10 @@ index cf2d9a7..fad4718 100644
            (str path ": dry-run")))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
 new file mode 100644
-index 0000000..1e554db
+index 0000000..275fe13
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
-@@ -0,0 +1,1671 @@
+@@ -0,0 +1,1757 @@
 +(ns logseq.db-sync.semantic-query-block-test
 +  "Query blocks (patch 0050), stage 1: the static check a stored query passes and the one write of a
 +  Query block. `check-query-block` takes the text Claude gives as a Query block's query and answers
@@ -2489,6 +2546,92 @@ index 0000000..1e554db
 +    (doseq [path ["/api/v1/graphs/{graph-id}/block-trees" "/api/v1/graphs/{graph-id}/blocks/{block-id}/children"
 +                  "/api/v1/graphs/{graph-id}/block-trees/batch" "/api/v1/graphs/{graph-id}/capture"]]
 +      (is (string/includes? (description path :post) "hidden claudeQueryBlock") path))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Review round 2 (r2-correctness-1): a query's value block stays Clojure code. Only set-query-block!
++;; writes its display-type and lang, so set_block_property, batch_set_block_property, their deletes and
++;; a batch insert entry's properties on that block refuse display-type and lang (by ident, title or
++;; UUID, any value), naming the entry, on a Claude-made, a fence-made and an app-made Query block.
++;; A plain block's display-type and lang still write.
++;; Before the fix (Stage 4 tree + round 1) each answered 200, and the next update_block answered 500:
++;;   FAIL in (query-value-block-keeps-code-test) Claude field: logseq.property.node/display-type =
++;;   "quote": set: {:updated true, ...}  expected: (= 400 (:status response))  actual: (not (= 400 200))
++
++(defn- query-value-reason [ident] (str ident ": a Query block's query stays Clojure code"))
++
++(deftest query-value-block-keeps-code-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes a]}]
++        (p/let [_ (request! self "PATCH" (str "/semantic/blocks/" a) {:title "zq A edited"} :headers stamped)
++                field (query-block! self notes "zq Books")
++                fence-id (random-uuid)
++                fence (tree! self notes [{:uuid (str fence-id) :title book-fence}])
++                _ (is (= 201 (:status fence)) (pr-str (:body fence)))
++                app (app-query-block! conn notes book-query true "a9")
++                display (d/entity @conn :logseq.property.node/display-type)
++                lang (d/entity @conn :logseq.property.code/lang)
++                selectors (fn [entity ident]
++                            [ident (:block/title entity) (str (:block/uuid entity))])
++                writes (concat (for [s (selectors display "logseq.property.node/display-type")
++                                     v ["quote" "math" "code"]]
++                                 ["logseq.property.node/display-type" s v])
++                               (for [s (selectors lang "logseq.property.code/lang")
++                                     v ["sql" "clojure"]]
++                                 ["logseq.property.code/lang" s v]))]
++          (p/doseq [[label qb] [["Claude field" field] ["Claude fence" fence-id] ["app-made" app]]]
++            (p/let [vb (value-uuid conn qb)
++                    held-before (held conn qb)]
++              (p/doseq [[ident selector value] writes]
++                (p/let [what (str label ": " selector " = " (pr-str value))
++                        reason (query-value-reason ident)
++                        before (snapshot conn)
++                        single (put! self vb selector value)
++                        batch (batch-set! self [[a "logseq.property.node/display-type" "code"] [vb selector value]])
++                        reversed (batch-set! self [[vb selector value] [a "logseq.property.node/display-type" "code"]])
++                        entry (batch! self [{:target-id (str vb) :properties {selector value}}])
++                        deleted (delete-property! self vb selector)
++                        deleted-value (delete-property! self vb selector value)
++                        batch-deleted (batch-delete! self [[a "logseq.property.node/display-type"] [vb selector]])
++                        batch-reversed (batch-delete! self [[vb selector] [a "logseq.property.node/display-type"]])]
++                  (refused-unchanged conn before single (str "entry 0: " reason) (str what ": set"))
++                  (refused-unchanged conn before batch (str "entry 1: " reason) (str what ": batch"))
++                  (refused-unchanged conn before reversed (str "entry 0: " reason) (str what ": batch reversed"))
++                  (refused-unchanged conn before entry (str "entries[0]: " reason) (str what ": batch insert entry"))
++                  (refused-unchanged conn before deleted (str "entry 0: " reason) (str what ": delete"))
++                  (refused-unchanged conn before deleted-value (str "entry 0: " reason) (str what ": delete a value"))
++                  (refused-unchanged conn before batch-deleted (str "entry 1: " reason) (str what ": batch delete"))
++                  (refused-unchanged conn before batch-reversed (str "entry 0: " reason)
++                                     (str what ": batch delete reversed"))))
++              (is (= held-before (held conn qb)) (str label ": the query is still Clojure code"))))
++          (testing "a Claude-made value block still updates after every refused write"
++            (p/let [vb (value-uuid conn field)
++                    response (update! self vb {:title other-query})]
++              (ok-200 response "update_block")
++              (is (= (query-block "zq Books" other-query) (held conn field)))))
++          (testing "a plain block's display-type and lang still write and delete"
++            (p/let [set-type (put! self a "logseq.property.node/display-type" "code")
++                    _ (ok-200 set-type "set display-type")
++                    set-lang (batch-set! self [[a "logseq.property.code/lang" "sql"]])
++                    _ (ok-200 set-lang "batch-set lang")
++                    entry (batch! self [{:target-id (str a) :properties {"logseq.property.code/lang" "clojure"}}])
++                    _ (is (= 201 (:status entry)) (pr-str (:body entry)))
++                    del-lang (delete-property! self a "logseq.property.code/lang")
++                    _ (ok-200 del-lang "delete lang")
++                    del-type (batch-delete! self [[a "logseq.property.node/display-type"]])]
++              (ok-200 del-type "batch-delete display-type"))))))))
++
++;; The contract for r2-correctness-1: each property tool that reaches a value block says its query
++;; stays Clojure code.
++(deftest openapi-query-value-block-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        description (fn [path method] (get-in document [:paths path method :description]))]
++    (doseq [[path method] [["/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}" :put]
++                           ["/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}" :delete]
++                           ["/api/v1/graphs/{graph-id}/block-properties/batch-set" :post]
++                           ["/api/v1/graphs/{graph-id}/block-properties/batch-delete" :post]
++                           ["/api/v1/graphs/{graph-id}/block-trees/batch" :post]]]
++      (is (string/includes? (str (description path method)) "Query block's query") (str path " " method)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 1a146f3..90c1ced 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

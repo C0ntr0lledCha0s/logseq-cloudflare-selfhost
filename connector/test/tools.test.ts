@@ -2657,6 +2657,7 @@ describe("code, math and quote blocks", () => {
     ["the query property refused on the property paths", "refuse logseq.property/query, naming the entry"],
     ["a reset keeps Query", "a reset tag list keeps a Query block's Query tag"],
     ["the delete paths keep Query", "refuse removing the Query tag or the query from a Query block"],
+    ["a query stays Clojure code", "A Query block's query (the block holding its text) stays Clojure code"],
   ])("the section names %s", (_point, phrase) => {
     expect(CODE_BLOCKS_HELP).toContain(phrase);
   });
@@ -2691,7 +2692,12 @@ describe("code, math and quote blocks", () => {
     }
     for (const name of ["delete_block_property", "batch_delete_block_property"]) {
       expect(description(name), name).toContain("Removing the Query tag or logseq.property/query from a Query block is refused");
+      expect(description(name), name).toContain("Removing display-type or lang from a Query block's query");
     }
+    for (const name of ["set_block_property", "batch_set_block_property"]) {
+      expect(description(name), name).toContain("A Query block's query (the block holding logseq.property/query's text) stays Clojure code");
+    }
+    expect(description("batch_insert_block_trees")).toContain("refused on a Query block's query");
   });
 
   it("the heading sentence agrees with the section: no heading for a code, math or quote block, and quote keeps tag handling", () => {
