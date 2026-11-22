@@ -27,7 +27,11 @@
 // each F1 shape (many function bindings over one page's blocks) and checks that it answers the
 // width-cap 422 (more than 12 function bindings, refused before it runs) within F1_MS (100 ms, the median of three warm runs); and runs a datalog_query
 // that stops at the scan cap with console.error, warn, log and info captured, failing if the
-// refusal logged anything. It prints each timing under its check. Node on a developer machine
+// refusal logged anything. It runs open-tasks-by-client with params.client (patch 0054): by title
+// and by UUID it must answer exactly the full run's rows of that client and echo {title, uuid}; a
+// title a tag and a block share must answer the 400 naming each; and with each of its bounds
+// lowered (namedQueryBounds on the Durable Object) the 422 must name the client, which it can only
+// do if the bundle kept the :client ex-data key. It prints each timing under its check. Node on a developer machine
 // guides the numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
@@ -177,6 +181,11 @@ export const SCALE = {
 };
 const STATUSES = ["Todo", "Doing", "Done", "Canceled"];
 
+/** The client the params.client checks name: held by some task pages and, on others, by tasks themselves. */
+export const CLIENT = SCALE.clients[0];
+/** A title a tag and a block share, with no page of that title, so params.client can't resolve it. */
+export const SHARED_CLIENT = "Release Shared Client";
+
 /** The F1 shapes of the width cap, over the scale fixture's width pages: [{label, page, blocks, query}]. */
 export function f1Queries() {
   const labels = ["175 identity clauses over 100 blocks", "99 identity clauses over 200 blocks", "20 bound includes? over 500 blocks"];
@@ -325,6 +334,7 @@ export function scaleFixture(now) {
   }
   // By client title, then creation order (each task is created after the one before it).
   taskRows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[2] - b[2]));
+  const clientRows = taskRows.filter(([c]) => c === CLIENT).map(([c, t]) => [c, t]);
 
   // Fresh projects, and a block appended to some stale ones.
   for (let i = 0; i < SCALE.freshProjects; i++) {
@@ -349,7 +359,11 @@ export function scaleFixture(now) {
     expected: {
       "projects-untouched": expectedStale,
       "meetings-without-decision": meetingRows,
-      "open-tasks-by-client": { rows: taskRows.slice(0, 200).map(([c, t]) => [c, t]), total: taskRows.length },
+      "open-tasks-by-client": {
+        rows: taskRows.slice(0, 200).map(([c, t]) => [c, t]),
+        total: taskRows.length,
+        client: { title: CLIENT, rows: clientRows },
+      },
       "pages-missing-property": missing,
     },
   };
@@ -457,6 +471,7 @@ function scaleChecks(ctx) {
       },
     ],
     ...Object.entries(NAMED_AT_SCALE).map(([query, { params, expect }]) => namedCheck(query, params, expect)),
+    ...clientChecks(ctx, seeded),
     ...f1Queries().map(({ label, query: q }) => [
       `at scale: F1 ${label} answers the width-cap 422 within ${F1_MS} ms`,
       async () => {
@@ -505,6 +520,138 @@ export const NAMED_AT_SCALE = {
     expect: (body, expected) => assertRows(body.rows.map((r) => cells(r)[0]), expected),
   },
 };
+
+// open-tasks-by-client with params.client (patch 0054)
+// =====================================================
+
+const CLIENT_ADVICE = {
+  tasks: ["stopped after", (c) => `blocks holding ${c} or on its pages (its tasks bound)`, "blocks tagged Task (its tasks bound)"],
+  "open-tasks": ["found more than", (c) => `open tasks of ${c} (its open-tasks bound)`, "open tasks (its open-tasks bound)"],
+  reads: ["stopped after", () => "reads (its reads bound, the backstop over every read)", "reads (its reads bound, the backstop over every read)"],
+};
+
+/**
+ * open-tasks-by-client's 422 at `bound` (tasks, open-tasks or reads) of `value`: worded for
+ * `client` (its name) when given, else the advice to give one.
+ */
+export function clientBoundMessage(bound, value, client) {
+  const words = CLIENT_ADVICE[bound];
+  if (!words) throw new Error(`open-tasks-by-client has no bound ${bound}`);
+  const [verb, counted, plain] = words;
+  const n = value.toLocaleString("en-NZ");
+  return client
+    ? `open-tasks-by-client ${verb} ${n} ${counted(client)}; mark ${client}'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query`
+    : `open-tasks-by-client ${verb} ${n} ${plain}; give a client (params.client), or mark finished tasks Done or Canceled`;
+}
+
+/** The 400 for a params.client title that `matches` ([{kind, uuid}], oldest first) name. */
+export function sharedTitleMessage(title, matches) {
+  const each = matches.map(({ kind, uuid }) => `${title}: ${kind} ${uuid}`).join(", ");
+  return `params.client: ${JSON.stringify(title)} matches ${matches.length} entities (${each}); give the one you mean by UUID`;
+}
+
+/**
+ * Throws unless `body` is a client run's answer: exactly `rows` ([client title, task title], cell
+ * for cell, in order) with total-rows to match, params.client echoed as {title, uuid}, and a plan
+ * and work naming each of its bounds.
+ */
+export function expectClientRun(body, { title, uuid, rows }) {
+  const echo = body.params?.client;
+  if (JSON.stringify(echo) !== JSON.stringify({ title, uuid })) {
+    throw new Error(`params.client echo ${JSON.stringify(echo)}, expected ${JSON.stringify({ title, uuid })}`);
+  }
+  assertRows(body.rows.map(cells), rows);
+  if (body["total-rows"] !== rows.length) throw new Error(`total-rows ${body["total-rows"]}, expected ${rows.length}`);
+  assertPlanAndWork(body, ["tasks", "open-tasks", "reads"]);
+}
+
+/** Throws unless `res` is a refusal of exactly `status` and `message`, with no rows. */
+export function expectRefusal(res, status, message) {
+  if (res.status !== status) throw new Error(`HTTP ${res.status}, expected ${status}: ${res.text.slice(0, 300)}`);
+  if (res.json?.error !== message) throw new Error(`error ${JSON.stringify(res.json?.error)}, expected ${JSON.stringify(message)}`);
+  if (res.json && "rows" in res.json) throw new Error("the refusal carries rows");
+}
+
+/**
+ * Lowers each of open-tasks-by-client's bounds on the Durable Object in turn (namedQueryBounds, as
+ * the upstream tests do) and checks the 422: first the tasks bound without a client (the advice to
+ * give one), then tasks, open-tasks and reads with `client`, each naming it. Puts the defaults back,
+ * even after a failure.
+ */
+export async function checkClientBounds(stub, clientProperty, client) {
+  const cases = [
+    ["tasks", 3, undefined],
+    ["tasks", 3, client],
+    ["open-tasks", 1, client],
+    ["reads", 5, client],
+  ];
+  try {
+    for (const [bound, value, given] of cases) {
+      stub.namedQueryBounds = { [bound]: value };
+      const params = { client_property: clientProperty, ...(given ? { client: given } : {}) };
+      const res = await call(stub, "POST", "/semantic/named-queries/open-tasks-by-client", { params, limit: 200 });
+      try {
+        expectRefusal(res, 422, clientBoundMessage(bound, value, given));
+      } catch (error) {
+        throw new Error(`${bound} bound ${given ? "with" : "without"} params.client: ${error.message}`);
+      }
+    }
+  } finally {
+    delete stub.namedQueryBounds;
+  }
+}
+
+/** The params.client checks on the scale fixture (patch 0054). */
+function clientChecks(ctx, seeded) {
+  const { stub } = ctx;
+  const named = (params) => call(stub, "POST", "/semantic/named-queries/open-tasks-by-client", { params, limit: 200 });
+  const ok = (step, res) => {
+    if (res.status < 200 || res.status > 299) throw new Error(`${step}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json;
+  };
+  const clientUuid = async () => {
+    const q = `[:find ?u :where [?e :block/name ${JSON.stringify(CLIENT.toLowerCase())}] [?e :block/uuid ?u]]`;
+    const rows = ok("the client's uuid", await call(stub, "POST", "/semantic/query", { query: q })).rows;
+    if (rows?.length !== 1) throw new Error(`the client's uuid: rows ${JSON.stringify(rows)}`);
+    return rows[0][0];
+  };
+  const byClient = (how) => [
+    `at scale: open-tasks-by-client with params.client by ${how} answers that client's rows of the full run and echoes it`,
+    async () => {
+      const { client } = seeded().expected["open-tasks-by-client"];
+      const uuid = await clientUuid();
+      const runs = await timed(() => named({ client_property: SCALE.titles.client, client: how === "title" ? CLIENT : uuid.toUpperCase() }));
+      for (const { res } of runs) if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+      const body = runs[1].res.json;
+      expectClientRun(body, { title: CLIENT, uuid, rows: client.rows });
+      return `${runs[0].ms} ms, then ${runs[1].ms} ms; ${body["total-rows"]} rows; work ${JSON.stringify(body.work)}`;
+    },
+  ];
+  return [
+    byClient("title"),
+    byClient("UUID"),
+    [
+      "at scale: open-tasks-by-client refuses a client title a tag and a block share, naming each",
+      async () => {
+        seeded();
+        const tag = ok("create the tag", await call(stub, "POST", "/semantic/tags", { title: SHARED_CLIENT }));
+        const [block] = ok(
+          "insert the block",
+          await call(stub, "POST", "/semantic/block-trees", { "target-id": ctx.pageUuid, blocks: [{ title: SHARED_CLIENT }] }),
+        ).blocks;
+        const message = sharedTitleMessage(SHARED_CLIENT, [{ kind: "tag", uuid: tag.uuid }, { kind: "block", uuid: block.uuid }]);
+        expectRefusal(await named({ client_property: SCALE.titles.client, client: SHARED_CLIENT }), 400, message);
+      },
+    ],
+    [
+      "at scale: open-tasks-by-client with params.client names the client in each bound's 422",
+      async () => {
+        seeded();
+        await checkClientBounds(stub, SCALE.titles.client, CLIENT);
+      },
+    ],
+  ];
+}
 
 /**
  * The width cap's two 422s: a query of more than 12 function bindings, refused before it runs (as

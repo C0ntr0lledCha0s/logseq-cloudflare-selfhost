@@ -199,6 +199,113 @@ test("checkScanCapQuiet passes a silent scan-cap 422 and fails one that logs, at
   await assert.rejects(checkScanCapQuiet(fakeStub({ status: 200, body: { rows: [] } })), /expected the scan-cap 422, got HTTP 200/);
 });
 
+// Patch 0054: open-tasks-by-client with params.client
+// ====================================================
+
+test("the scale fixture's client rows are the full run's rows of one client: its own tasks and its pages', not a task whose own client is another", async () => {
+  const { scaleFixture, CLIENT, SCALE } = await import(script);
+  assert.equal(CLIENT, SCALE.clients[0]);
+  const { expected } = scaleFixture(1_762_646_400_000);
+  const { client } = expected["open-tasks-by-client"];
+  assert.equal(client.title, CLIENT);
+  assert.ok(client.rows.length >= 20, `${client.rows.length} rows`);
+  assert.ok(client.rows.every(([c]) => c === CLIENT), "every row is the client's");
+  assert.deepEqual(scaleFixture(0).expected["open-tasks-by-client"].client, client, "the same on every build");
+  const titles = client.rows.map(([, t]) => t);
+  // Release tasks 0 is held by Release Client A (its page's client); its task 0 has its own client B.
+  assert.ok(titles.includes("Release task 0.1"), "a task that takes its page's client");
+  assert.ok(!titles.includes("Release task 0.0"), "a task whose own client is another stays out");
+  assert.ok(titles.some((t) => Number(t.split(" ")[2].split(".")[0]) % 2 === 1), "a task that holds the client itself");
+  const order = titles.map((t) => t.split(" ")[2].split(".").map(Number));
+  assert.deepEqual(order, [...order].sort((a, b) => a[0] - b[0] || a[1] - b[1]), "in creation order, as the handler sorts one client's rows");
+  // The first 200 of the full run hold rows of other clients too, so the client case is no slice of them.
+  assert.ok(expected["open-tasks-by-client"].rows.some(([c]) => c !== CLIENT));
+});
+
+test("clientBoundMessage gives the client-worded 422 of each bound, and the advice to give a client without one", async () => {
+  const { clientBoundMessage } = await import(script);
+  const advice = "mark zq Acme's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query";
+  assert.equal(clientBoundMessage("tasks", 10_000, "zq Acme"), `open-tasks-by-client stopped after 10,000 blocks holding zq Acme or on its pages (its tasks bound); ${advice}`);
+  assert.equal(clientBoundMessage("open-tasks", 1, "zq Acme"), `open-tasks-by-client found more than 1 open tasks of zq Acme (its open-tasks bound); ${advice}`);
+  assert.equal(clientBoundMessage("reads", 30_000, "zq Acme"), `open-tasks-by-client stopped after 30,000 reads (its reads bound, the backstop over every read); ${advice}`);
+  assert.equal(clientBoundMessage("tasks", 3), "open-tasks-by-client stopped after 3 blocks tagged Task (its tasks bound); give a client (params.client), or mark finished tasks Done or Canceled");
+  assert.throws(() => clientBoundMessage("meetings", 3, "zq Acme"), /no bound meetings/);
+});
+
+test("sharedTitleMessage names each entity a shared title matches, with its kind and UUID, in the order given", async () => {
+  const { sharedTitleMessage } = await import(script);
+  const a = "00000000-0000-4000-8000-00000000000a";
+  const b = "00000000-0000-4000-8000-00000000000b";
+  assert.equal(
+    sharedTitleMessage("zq Shared", [{ kind: "tag", uuid: a }, { kind: "block", uuid: b }]),
+    `params.client: "zq Shared" matches 2 entities (zq Shared: tag ${a}, zq Shared: block ${b}); give the one you mean by UUID`,
+  );
+});
+
+const clientUuid = "00000000-0000-4000-8000-0000000000c1";
+const taskEntity = (title) => ({ "block/uuid": "00000000-0000-4000-8000-000000000001", "block/title": title });
+const clientBody = (rows, extra = {}) => ({
+  name: "open-tasks-by-client",
+  params: { client_property: { title: "releaseClient", type: "node" }, client: { title: "zq Acme", uuid: clientUuid } },
+  "total-rows": rows.length,
+  plan: "1. … (tasks bound 10,000) … (open-tasks bound 2,000) … (reads bound 30,000)",
+  work: { tasks: 9, "open-tasks": 3, reads: 40 },
+  rows: rows.map(([c, t]) => [c, taskEntity(t)]),
+  ...extra,
+});
+
+test("expectClientRun passes the client's rows and echo, and fails a wrong echo, the right count of wrong rows, a total off by one or a missing bound", async () => {
+  const { expectClientRun } = await import(script);
+  const rows = [["zq Acme", "t1"], ["zq Acme", "t2"]];
+  const want = { title: "zq Acme", uuid: clientUuid, rows };
+  assert.doesNotThrow(() => expectClientRun(clientBody(rows), want));
+  const echo = (client) => clientBody(rows, { params: { ...clientBody(rows).params, client } });
+  assert.throws(() => expectClientRun(echo(undefined), want), /params\.client echo undefined, expected/);
+  assert.throws(() => expectClientRun(echo({ title: "zq Acme" }), want), /params\.client echo \{"title":"zq Acme"\}, expected/);
+  assert.throws(() => expectClientRun(echo({ title: "zq Beta", uuid: clientUuid }), want), /params\.client echo/);
+  assert.throws(() => expectClientRun(echo({ title: "zq Acme", uuid: "00000000-0000-4000-8000-0000000000c2" }), want), /params\.client echo/);
+  assert.throws(() => expectClientRun(clientBody([["zq Acme", "t1"], ["zq Acme", "t3"]]), want), /rows .*expected/);
+  assert.throws(() => expectClientRun(clientBody([["zq Acme", "t2"], ["zq Acme", "t1"]]), want), /rows .*expected/);
+  assert.throws(() => expectClientRun(clientBody(rows, { "total-rows": 3 }), want), /total-rows 3, expected 2/);
+  assert.throws(() => expectClientRun(clientBody(rows, { work: { tasks: 9, reads: 40 } }), want), /work has no open-tasks count/);
+});
+
+test("expectRefusal passes the exact status and message with no rows, and fails another status, another message or a body with rows", async () => {
+  const { expectRefusal } = await import(script);
+  const res = (status, json) => ({ status, json, text: JSON.stringify(json) });
+  assert.doesNotThrow(() => expectRefusal(res(400, { error: "params.client: x" }), 400, "params.client: x"));
+  assert.throws(() => expectRefusal(res(200, { rows: [] }), 400, "params.client: x"), /HTTP 200, expected 400/);
+  assert.throws(() => expectRefusal(res(422, { error: "params.client: x" }), 400, "params.client: x"), /HTTP 422, expected 400/);
+  assert.throws(() => expectRefusal(res(400, { error: "params.client: y" }), 400, "params.client: x"), /error "params\.client: y", expected "params\.client: x"/);
+  assert.throws(() => expectRefusal(res(400, { error: "params.client: x", rows: [] }), 400, "params.client: x"), /the refusal carries rows/);
+});
+
+// A stand-in for the SyncDO's named-query route: answers open-tasks-by-client's lowered bounds with
+// `message(bound, value, client)`, as the release bundle would, reading namedQueryBounds off itself.
+const boundStub = (message) => ({
+  seen: [],
+  async fetch(request) {
+    const { params } = await request.json();
+    const bounds = this.namedQueryBounds ?? {};
+    this.seen.push({ ...bounds });
+    const [bound, value] = Object.entries(bounds)[0] ?? [];
+    if (!bound) return new Response(JSON.stringify({ rows: [] }), { status: 200 });
+    return new Response(JSON.stringify({ error: message(bound, value, params.client) }), { status: 422 });
+  },
+});
+
+test("checkClientBounds passes the client-worded 422 at each lowered bound, fails a bundle that drops the client's name, and restores the bounds", async () => {
+  const { checkClientBounds, clientBoundMessage } = await import(script);
+  const good = boundStub((bound, value, client) => clientBoundMessage(bound, value, client));
+  await checkClientBounds(good, "releaseClient", "zq Acme");
+  assert.deepEqual(good.seen.map((b) => Object.keys(b)), [["tasks"], ["tasks"], ["open-tasks"], ["reads"]], "the control without a client, then each bound with one");
+  assert.equal(good.namedQueryBounds, undefined, "the defaults are back");
+  // A release bundle that renamed or lost :client in the ex-data gives the generic advice.
+  const renamed = boundStub((bound, value) => clientBoundMessage(bound, value));
+  await assert.rejects(checkClientBounds(renamed, "releaseClient", "zq Acme"), /tasks bound with params\.client: error "open-tasks-by-client stopped after 3 blocks tagged Task/);
+  assert.equal(renamed.namedQueryBounds, undefined, "the defaults are back after a failure");
+});
+
 test("exits 2 naming the missing bundle", () => {
   const dir = mkdtempSync(join(tmpdir(), "rqc-test-"));
   try {
@@ -227,6 +334,10 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "at scale: run_named_query meetings-without-decision answers its exact rows within 300 ms",
     "at scale: run_named_query open-tasks-by-client answers its exact rows within 300 ms",
     "at scale: run_named_query pages-missing-property answers its exact rows within 300 ms",
+    "at scale: open-tasks-by-client with params.client by title answers that client's rows of the full run and echoes it",
+    "at scale: open-tasks-by-client with params.client by UUID answers that client's rows of the full run and echoes it",
+    "at scale: open-tasks-by-client refuses a client title a tag and a block share, naming each",
+    "at scale: open-tasks-by-client with params.client names the client in each bound's 422",
     "at scale: F1 175 identity clauses over 100 blocks answers the width-cap 422 within 100 ms",
     "at scale: F1 99 identity clauses over 200 blocks answers the width-cap 422 within 100 ms",
     "at scale: F1 20 bound includes? over 500 blocks answers the width-cap 422 within 100 ms",
