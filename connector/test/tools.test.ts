@@ -2899,9 +2899,7 @@ describe("get_graph_health and broken refs", () => {
   });
 
   it("get_graph_health's first line names broken refs", () => {
-    expect(FIRST_LINES.get_graph_health).toBe(
-      "A tidy-up report: unused tags and properties, duplicate titles, page gaps, broken refs.",
-    );
+    expect(FIRST_LINES.get_graph_health).toContain("broken refs");
   });
 
   it("get_graph_health's vendored description and checks parameter carry broken-refs", async () => {
@@ -2910,6 +2908,46 @@ describe("get_graph_health and broken refs", () => {
     for (const phrase of ["broken-refs (blocks and pages whose title refers", "reason missing", "reason in-recycle-bin", "target-uuid"]) {
       expect(tool.description, phrase).toContain(phrase);
     }
-    expect(JSON.stringify(tool.inputSchema)).toContain("orphan-choices, broken-refs. Defaults to all");
+    expect(JSON.stringify(tool.inputSchema)).toContain("orphan-choices, broken-refs");
+  });
+});
+
+// Patch 0051 stage 3: get_graph_health reports missing expected tag properties.
+describe("get_graph_health and missing tag properties", () => {
+  it("connector_help names the check, tag-properties, the stored default and the no-pairs note", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    for (const phrase of [
+      "missing tag properties (missing-tag-properties: objects tagged with a tag, or with a tag extending it, that hold no value, or only the empty placeholder, for one of that tag's expected properties)",
+      'pass tag-properties, a JSON array of {"tag": …, "property": …}',
+      "config/settings.json health.expectedTagProperties",
+      "with no pairs it lists nothing and its note says so",
+      "is refused naming the entry",
+    ]) {
+      expect(help, phrase).toContain(phrase);
+    }
+  });
+
+  it("get_graph_health's first line names missing tag values", () => {
+    expect(FIRST_LINES.get_graph_health).toBe(
+      "Tidy-up report: unused tags and properties, duplicates, page gaps, broken refs, missing tag values.",
+    );
+  });
+
+  it("get_graph_health's vendored description, checks and tag-properties parameter carry the check", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_health)).toBe(true);
+    for (const phrase of [
+      "missing-tag-properties (objects tagged with a tag, or with a tag that extends it",
+      "HEALTH_TAG_PROPERTIES",
+      "health.expectedTagProperties",
+      "pairs-from: input, settings or none",
+      "tag-properties without the missing-tag-properties check is refused",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to all");
+    const param = tool.inputSchema.properties["tag-properties"];
+    expect(param?.type).toBe("string");
+    expect(param.description).toContain("JSON array of 1 to 50 pairs");
   });
 });

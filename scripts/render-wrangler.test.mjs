@@ -90,8 +90,9 @@ test("timeZone becomes the TIMEZONE var that sets 'today'", () => {
   assert.equal(render().vars.TIMEZONE, "Pacific/Auckland", "the owner's zone, from config/settings.json");
   const { timeZone: _omit, ...withoutZone } = settings;
   assert.equal("TIMEZONE" in render({ settings: withoutZone }).vars, false, "unset: the server uses UTC");
+  const { health: _health, ...withoutZoneOrHealth } = withoutZone;
   assert.equal(
-    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings: withoutZone }).vars,
+    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings: withoutZoneOrHealth }).vars,
     undefined,
     "unset adds no [vars] table",
   );
@@ -107,6 +108,62 @@ test("an unknown or blank timeZone throws", () => {
   for (const timeZone of ["Mars/Olympus", "", "  ", 13]) {
     assert.throws(() => render({ settings: { ...settings, timeZone } }), /settings\.timeZone/);
   }
+});
+
+test("health.expectedTagProperties becomes the HEALTH_TAG_PROPERTIES var, JSON-encoded", () => {
+  assert.equal(render().vars.HEALTH_TAG_PROPERTIES, "[]", "the committed default: no pairs");
+  const pairs = [{ tag: "zz Book", property: "zz author" }, { tag: "zz Book", property: "user.property/rating" }];
+  const rendered = render({ settings: { ...settings, health: { expectedTagProperties: pairs } } }).vars;
+  assert.deepEqual(JSON.parse(rendered.HEALTH_TAG_PROPERTIES), pairs);
+  assert.equal(rendered.TIMEZONE, "Pacific/Auckland", "the other vars are kept");
+  const fifty = Array.from({ length: 50 }, (_, i) => ({ tag: "zz Book", property: `zz p${i}` }));
+  assert.equal(
+    JSON.parse(render({ settings: { ...settings, health: { expectedTagProperties: fifty } } }).vars.HEALTH_TAG_PROPERTIES).length,
+    50,
+    "50 pairs is the cap, and allowed",
+  );
+  assert.equal(
+    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings }).vars.HEALTH_TAG_PROPERTIES,
+    "[]",
+    "upstream with no [vars] table still gets it",
+  );
+});
+
+test("an absent health.expectedTagProperties writes no HEALTH_TAG_PROPERTIES var", () => {
+  const { health: _omit, ...withoutHealth } = settings;
+  assert.equal("HEALTH_TAG_PROPERTIES" in render({ settings: withoutHealth }).vars, false, "no health key");
+  assert.equal("HEALTH_TAG_PROPERTIES" in render({ settings: { ...withoutHealth, health: {} } }).vars, false,
+    "health without expectedTagProperties");
+  const { timeZone: _zone, ...bare } = withoutHealth;
+  assert.equal(
+    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings: bare }).vars,
+    undefined,
+    "absent adds no [vars] table",
+  );
+});
+
+test("a malformed health.expectedTagProperties throws naming the entry", () => {
+  const key = "settings.health.expectedTagProperties";
+  const cases = [
+    [{ tag: "zz Book", property: "zz author" }, `${key} must be an array`],
+    ["[]", `${key} must be an array`],
+    [Array.from({ length: 51 }, () => ({ tag: "zz Book", property: "zz author" })), `${key} must hold at most 50 pairs (got 51)`],
+    [[{ tag: "zz Book", property: "zz author" }, "zz Book/zz author"], `${key}[1] must be an object with tag and property`],
+    [[null], `${key}[0] must be an object with tag and property`],
+    [[["zz Book", "zz author"]], `${key}[0] must be an object with tag and property`],
+    [[{ tag: "zz Book", property: "zz author" }, { property: "zz author" }], `${key}[1].tag must be a non-empty string`],
+    [[{ tag: "zz Book", property: "" }], `${key}[0].property must be a non-empty string`],
+    [[{ tag: "  ", property: "zz author" }], `${key}[0].tag must be a non-empty string`],
+    [[{ tag: "zz Book", property: 7 }], `${key}[0].property must be a non-empty string`],
+  ];
+  for (const [expectedTagProperties, message] of cases) {
+    assert.throws(
+      () => render({ settings: { ...settings, health: { expectedTagProperties } } }),
+      (error) => error.message === message,
+      `${JSON.stringify(expectedTagProperties).slice(0, 60)} -> ${message}`,
+    );
+  }
+  assert.throws(() => render({ settings: { ...settings, health: [] } }), /settings\.health must be an object/);
 });
 
 test("unknown plan throws", () => {

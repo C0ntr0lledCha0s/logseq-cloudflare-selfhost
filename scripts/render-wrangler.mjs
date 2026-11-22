@@ -98,6 +98,13 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
     cfg.vars = { ...(cfg.vars ?? {}), TIMEZONE: timeZone(settings.timeZone) };
   }
 
+  // The tag-property pairs getGraphHealth's missing-tag-properties check uses when a call gives
+  // none (patch 0051). The server resolves each pair and refuses the check naming a bad one.
+  const pairs = expectedTagProperties(settings.health);
+  if (pairs !== undefined) {
+    cfg.vars = { ...(cfg.vars ?? {}), HEALTH_TAG_PROPERTIES: JSON.stringify(pairs) };
+  }
+
   return stringify(cfg);
 }
 
@@ -108,6 +115,34 @@ function timeZone(value) {
     throw new Error(`settings.timeZone is not an IANA time zone: ${JSON.stringify(value)}`);
   }
   return value;
+}
+
+// The handler's own cap (max-tag-property-pairs in patch 0051).
+const MAX_TAG_PROPERTY_PAIRS = 50;
+
+function expectedTagProperties(health) {
+  if (health === undefined) return undefined;
+  if (health === null || typeof health !== "object" || Array.isArray(health)) {
+    throw new Error("settings.health must be an object");
+  }
+  const pairs = health.expectedTagProperties;
+  if (pairs === undefined) return undefined;
+  const key = "settings.health.expectedTagProperties";
+  if (!Array.isArray(pairs)) throw new Error(`${key} must be an array`);
+  if (pairs.length > MAX_TAG_PROPERTY_PAIRS) {
+    throw new Error(`${key} must hold at most ${MAX_TAG_PROPERTY_PAIRS} pairs (got ${pairs.length})`);
+  }
+  return pairs.map((pair, i) => {
+    if (pair === null || typeof pair !== "object" || Array.isArray(pair)) {
+      throw new Error(`${key}[${i}] must be an object with tag and property`);
+    }
+    for (const field of ["tag", "property"]) {
+      if (typeof pair[field] !== "string" || pair[field].trim() === "") {
+        throw new Error(`${key}[${i}].${field} must be a non-empty string`);
+      }
+    }
+    return { tag: pair.tag, property: pair.property };
+  });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

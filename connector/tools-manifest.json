@@ -249,7 +249,7 @@
       "idempotentHint": true,
       "openWorldHint": false
     },
-    "firstLine": "A tidy-up report: unused tags and properties, duplicate titles, page gaps, broken refs."
+    "firstLine": "Tidy-up report: unused tags and properties, duplicates, page gaps, broken refs, missing tag values."
   },
   {
     "name": "get_page",
