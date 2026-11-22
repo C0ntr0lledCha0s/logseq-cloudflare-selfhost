@@ -9,7 +9,9 @@ import { RESULT_CHAR_LIMIT, capResult } from "../src/tools/common";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
-import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP, SERVER_INSTRUCTIONS } from "../src/tools/handwritten";
+import { BLANK_BLOCKS_HELP, CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP, SERVER_INSTRUCTIONS } from "../src/tools/handwritten";
+import { SYNC_STATUS_DESCRIPTION, SYNC_STATUS_HELP } from "../src/tools/sync-status";
+import { thousands } from "../src/tools/suggest-links";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, describeWrite, toAffectedTargets } from "../src/tools/readable";
 import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
@@ -17,6 +19,7 @@ import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
 import {
   ANNOTATIONS,
+  BLANK_BLOCK_CAPS,
   FIRST_LINES,
   type OpenApiSpec,
   SEMANTIC_TOOLS,
@@ -350,6 +353,128 @@ describe("get_sync_status (plan 2026-11-22 stage 2)", () => {
       expect(first.length).toBeLessThanOrEqual(100);
     }
     expect(CONNECTOR_HELP).toContain("get_sync_status");
+  });
+});
+
+/** Every number a text states, commas removed, leaving out digits inside words and dates (E2EE, 0056, block-ids[2], 2026-11-05). */
+function numbersIn(text: string): number[] {
+  return (text.match(/[\w.,[\]-]+/g) ?? [])
+    .map((token) => token.replace(/[.,]+$/, ""))
+    .filter((token) => /^(?:[1-9]\d{0,2}(?:,\d{3})+|0|[1-9]\d*)$/.test(token))
+    .map((token) => Number(token.replaceAll(",", "")));
+}
+
+/** Every number a vendored schema states as a bound (minItems, maxItems, minimum, maximum), at any depth. */
+function schemaBounds(node: unknown, out = new Set<number>()): Set<number> {
+  if (Array.isArray(node)) for (const item of node) schemaBounds(item, out);
+  else if (node && typeof node === "object") {
+    for (const [key, value] of Object.entries(node)) {
+      if (["minItems", "maxItems", "minimum", "maximum"].includes(key) && typeof value === "number") out.add(value);
+      else schemaBounds(value, out);
+    }
+  }
+  return out;
+}
+
+/** The numbers a tool's text may state: the vendored operation's bounds and status codes, and its response schemas' bounds. */
+function vendoredNumbers(path: string, method: "get" | "post", schemas: string[]): Set<number> {
+  const op = (spec.paths as any)[path][method];
+  const out = schemaBounds(op.requestBody ?? {});
+  for (const code of Object.keys(op.responses)) out.add(Number(code));
+  for (const name of schemas) schemaBounds((openapi as any).components.schemas[name], out);
+  return out;
+}
+
+const BLANK_PATH = "/api/v1/graphs/{graph-id}/blank-blocks/delete";
+const BLANK_SCHEMAS = ["BlankBlocksDryRunResponse", "BlankBlocksDeletedResponse"];
+
+describe("delete_blank_blocks and get_sync_status contract (plan 2026-11-22 stage 5)", () => {
+  it("the caps the connector states equal the vendored schema's bounds", () => {
+    const op = (spec.paths as any)[BLANK_PATH].post;
+    const body = op.requestBody.content["application/json"].schema.properties;
+    const dry = (openapi as any).components.schemas.BlankBlocksDryRunResponse.properties;
+    const deleted = (openapi as any).components.schemas.BlankBlocksDeletedResponse.properties;
+    expect(BLANK_BLOCK_CAPS.pages).toBe(body["page-ids"].maxItems);
+    expect(BLANK_BLOCK_CAPS.blockIds).toBe(body["block-ids"].maxItems);
+    expect(BLANK_BLOCK_CAPS.blockIds).toBe(dry.listed.maximum);
+    expect(BLANK_BLOCK_CAPS.blockIds).toBe(deleted.deleted.maximum);
+    expect(BLANK_BLOCK_CAPS.keptExamples).toBe(dry.pages.items.properties.kept.properties.examples.maxItems);
+  });
+
+  it("the caps equal the numbers the route's description and 422 answer state", () => {
+    const op = (spec.paths as any)[BLANK_PATH].post;
+    const text: string = op.description;
+    const capture = (re: RegExp, s = text) => Number(s.match(re)?.[1]);
+    expect(capture(/on 1 to (\d+) pages/)).toBe(BLANK_BLOCK_CAPS.pages);
+    expect(capture(/lists at most (\d+) blocks across the call/)).toBe(BLANK_BLOCK_CAPS.blockIds);
+    expect(capture(/An apply takes 1 to (\d+) block-ids/)).toBe(BLANK_BLOCK_CAPS.blockIds);
+    expect(capture(/with up to (\d+) examples per page/)).toBe(BLANK_BLOCK_CAPS.keptExamples);
+    expect(capture(/A page with more than (\d+) blocks/)).toBe(BLANK_BLOCK_CAPS.pageBlocks);
+    expect(capture(/pages with more than (\d+) together/)).toBe(BLANK_BLOCK_CAPS.callBlocks);
+    expect(capture(/has more than (\d+) blocks/, op.responses["422"].description)).toBe(BLANK_BLOCK_CAPS.pageBlocks);
+    expect(capture(/more than (\d+); nothing/, op.responses["422"].description)).toBe(BLANK_BLOCK_CAPS.callBlocks);
+  });
+
+  it("connector_help's deletes paragraph describes delete_blank_blocks as built, one assertion per phrase", () => {
+    expect(CONNECTOR_HELP).toContain(BLANK_BLOCKS_HELP);
+    const phrases = [
+      // the handshake
+      "call delete_blank_blocks with dry-run: true first",
+      "show the user its summary",
+      "then call it again without dry-run, passing the block-ids it listed under would-delete",
+      // what is a candidate, and what is kept
+      "Only plain blank leaves are deleted",
+      "an empty Task or tagged block, a heading, a block with a property, a Code, Math or Quote block, a property value block, a choice and a pre-block are kept and not reported",
+      "A blank block with children is kept, its children never lifted",
+      "listed under kept with its reason (has children, referenced or being edited)",
+      `up to ${BLANK_BLOCK_CAPS.keptExamples} examples per page`,
+      // Private and E2EE
+      "Blank blocks on or under Private content are only counted, per page in skipped-private",
+      "E2EE graphs are refused",
+      // the caps
+      `1 to ${BLANK_BLOCK_CAPS.pages} pages`,
+      `at most ${BLANK_BLOCK_CAPS.blockIds} block-ids per apply`,
+      "when total is above listed, dry-run again after the apply",
+      `A page over ${thousands(BLANK_BLOCK_CAPS.pageBlocks)} blocks, or pages over ${thousands(BLANK_BLOCK_CAPS.callBlocks)} together, are refused`,
+      // the apply's re-check and its outcome
+      "A listed block that changed since the dry run refuses the whole apply, naming block-ids[i], and nothing is deleted",
+      "the app may add an empty block when it is opened",
+      // tokens
+      "A write-no-delete token can dry-run it but not apply it",
+    ];
+    for (const phrase of phrases) expect(BLANK_BLOCKS_HELP, phrase).toContain(phrase);
+  });
+
+  it("the write-no-delete list names delete_blank_blocks: the apply refused, the dry run allowed", () => {
+    expect(CONNECTOR_HELP).toContain("and delete_blank_blocks without dry-run: true (an apply, which deletes the blank blocks it names)");
+    expect(CONNECTOR_HELP).toContain("in the body for delete_blocks, set_page_favorite and delete_blank_blocks");
+  });
+
+  it("count claims: every number in delete_blank_blocks' text comes from a cap or the vendored schema", async () => {
+    // The caps are pinned to the vendored schema and the route's description by the two tests above.
+    const allowed = new Set([...vendoredNumbers(BLANK_PATH, "post", BLANK_SCHEMAS), ...Object.values(BLANK_BLOCK_CAPS)]);
+    const tool = (await listTools()).find((t) => t.name === "delete_blank_blocks");
+    const texts = { firstLine: FIRST_LINES.delete_blank_blocks, description: tool.description as string, help: BLANK_BLOCKS_HELP };
+    for (const [where, text] of Object.entries(texts)) {
+      for (const n of numbersIn(text)) expect([...allowed], `${where} states ${n}`).toContain(n);
+    }
+    // The help states every cap and page-ids' minItems (1 to 20 pages), so a cap it dropped is caught.
+    const minPages = (spec.paths as any)[BLANK_PATH].post.requestBody.content["application/json"].schema.properties["page-ids"].minItems;
+    expect(new Set(numbersIn(BLANK_BLOCKS_HELP))).toEqual(new Set([minPages, ...Object.values(BLANK_BLOCK_CAPS)]));
+    expect(numbersIn(FIRST_LINES.delete_blank_blocks)).toEqual([BLANK_BLOCK_CAPS.pages]);
+  });
+
+  it("count claims: every number in get_sync_status' text comes from the vendored schema", async () => {
+    const allowed = vendoredNumbers("/api/v1/graphs/{graph-id}/sync-status", "get", ["SyncStatusResponse"]);
+    const tool = (await listTools()).find((t) => t.name === "get_sync_status");
+    const texts = { firstLine: FIRST_LINES.get_sync_status, description: tool.description as string, constant: SYNC_STATUS_DESCRIPTION, help: SYNC_STATUS_HELP };
+    for (const [where, text] of Object.entries(texts)) {
+      for (const n of numbersIn(text)) expect([...allowed], `${where} states ${n}`).toContain(n);
+    }
+  });
+
+  it("numbersIn reads the numbers a text states and skips digits inside words", () => {
+    expect(numbersIn("1 to 20 pages, 2,000 blocks, 10,000 in all; E2EE, patch 0056, block-ids[2], 2026-11-05, 422.")).toEqual([1, 20, 2000, 10000, 422]);
   });
 });
 
