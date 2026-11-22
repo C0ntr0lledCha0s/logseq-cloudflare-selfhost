@@ -131,10 +131,19 @@ export function annotationsFor(name) {
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
 /**
- * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), or, for listBlockChanges,
- * the semantic indexer's feed rather than something Claude needs. `/e2ee/` paths are dropped too.
+ * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), kept for one
+ * (getSyncStatus: a hand-written get_sync_status is to fold it with the semantic index's state, spec
+ * 2026-11-20 §3.3), or, for listBlockChanges, the semantic indexer's feed rather than something
+ * Claude needs. `/e2ee/` paths are dropped too.
  */
-const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs", "listKnowledgeIndex", "listBlockChanges"]);
+const EXCLUDED_OPERATIONS = new Set([
+  "createAsset",
+  "getAsset",
+  "listGraphs",
+  "listKnowledgeIndex",
+  "listBlockChanges",
+  "getSyncStatus",
+]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
 /**

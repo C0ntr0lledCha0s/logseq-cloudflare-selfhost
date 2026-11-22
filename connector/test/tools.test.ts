@@ -24,6 +24,7 @@ import {
   buildManifest,
   checkManifest,
   firstLineFor,
+  graphOperations,
 } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
@@ -214,6 +215,15 @@ describe("tool list", () => {
   it("matches the committed tools-manifest.json, less the semantic search tools while those are off", async () => {
     const names = (await listTools()).map((t) => t.name).sort();
     expect(names).toEqual(committedManifest.map((e) => e.name).filter((n) => !SEMANTIC_TOOLS.includes(n)));
+  });
+
+  it("getSyncStatus (patch 0055) is vendored and generates no tool, so no get_sync_status is generated", async () => {
+    const vendored = Object.values(spec.paths).flatMap((item) => Object.values(item).map((op) => op.operationId));
+    expect(vendored).toContain("getSyncStatus");
+    expect(spec.paths["/api/v1/graphs/{graph-id}/sync-status"]?.get?.operationId).toBe("getSyncStatus");
+    expect(graphOperations(spec).map((op) => op.operationId)).not.toContain("getSyncStatus");
+    expect((await listTools()).map((t) => t.name)).not.toContain("get_sync_status");
+    expect(committedManifest.map((e) => e.name)).not.toContain("get_sync_status");
   });
 });
 
