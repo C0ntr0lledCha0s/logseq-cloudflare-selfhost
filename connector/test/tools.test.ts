@@ -2753,6 +2753,7 @@ describe("queries help", () => {
     ["a task with two clients", "open-tasks-by-client lists a task with two clients under each"],
     ["the client param", "open-tasks-by-client takes params.client, a client's title or UUID, to list only that client's tasks"],
     ["a shared client title", "a title several entities share is refused naming each, unless exactly one is a page"],
+    ["the client walk's tasks bound", "with a client, its tasks bound counts the blocks holding the client or on its pages, not every Task"],
     ["the 422", "is refused with 422, never answered in part"],
     ["how to narrow", "narrow it with a tag, page or attribute value"],
     ["aggregates fold rows", "count with an aggregate such as (count ?b)"],
@@ -2826,7 +2827,7 @@ describe("queries help", () => {
   // These carry the openapi text vendored in Stages 1 to 4, so they passed before this stage.
   it.each([
     ["datalog_query", ["20,000 datoms (the scan cap", "2,500 rows (the row cap)", "limit (1 to 200, default 50)", "100,000 characters of JSON (the byte cap)", "Private content is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
-    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "client is a client's title or UUID, and lists only that client's tasks", "a page wins when exactly one of them is a page", "params.client echoes the client used", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
+    ["run_named_query", ["as server code, not Datalog", "a decision at any depth", "client is a client's title or UUID, and lists only that client's tasks", "a page wins when exactly one of them is a page", "params.client echoes the client used", "With client, it reads only the blocks holding the client and the blocks on those that are pages", "blocks holding the client or on its pages (its tasks bound)", "plan (the steps the query took, each with its bound and number)", "422 naming the bound and what to narrow", "limit (1 to 200, default 50)", "the byte cap", "anything tagged Private, on a private page or under a private block is left out", "Unavailable for E2EE graphs (409)", "dry-run=true"]],
   ])("%s's generated description carries the openapi text", async (name, phrases) => {
     const tool = (await listTools()).find((t) => t.name === name);
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);

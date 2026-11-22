@@ -138,7 +138,7 @@ index a682bda..ccbbbba 100644
  (def ^:private named-body-fields #{:params :limit :dry-run})
  
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-index 7cac252..e7df7e9 100644
+index 7cac252..c3d3b4b 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 @@ -6,7 +6,10 @@
@@ -153,55 +153,174 @@ index 7cac252..e7df7e9 100644
  
    What each walk reads, and the bound that stops it (default-bounds, set by the bench):
  
-@@ -19,7 +22,8 @@
+@@ -19,7 +22,9 @@
      and any page above it, so a decision at any depth costs one step per ancestor no other walk has
      reached;
    - open-tasks-by-client reads the entities tagged Task (:tasks), and for each open one (:open-tasks)
 -    its client_property values, else its page's;
-+    its client_property values, else its page's; with client, it keeps only the tasks whose clients
-+    include that entity;
++    its client_property values, else its page's; with client, it reads instead the client's holders
++    through AVET on client_property and the blocks on each holder that is a page, each once
++    (:tasks), and keeps the open Task blocks among them whose clients include the client;
    - pages-missing-property reads the entities tagged tag (:tagged) and each page's property values.
  
    Every datom read goes through datoms* or first-value* and counts toward :reads (the backstop over
-@@ -251,8 +255,9 @@
+@@ -73,13 +78,14 @@
+       (throw (js/Error. (str "named query: no bound " bound))))
+     (when (> counted limit)
+       (throw (ex-info (str (:query ctx) " stopped at its " (name bound) " bound")
+-                      {::bound {:query (:query ctx) :bound bound :value limit}})))))
++                      {::bound (cond-> {:query (:query ctx) :bound bound :value limit}
++                                 (:client-title ctx) (assoc :client (:client-title ctx)))})))))
+ 
+ (defn charge!
+   "Counts `n` toward `bound` only: :reads counts the datoms read (datoms*, first-value*), not the
+   candidates a query charges, so a candidate bound can stop a query before :reads does. Past the
+-  bound, throws (ex-info … {::bound {:query :bound :value}}) naming it and its value: at the bound
+-  is allowed, one past it is not."
++  bound, throws (ex-info … {::bound {:query :bound :value}}) naming it and its value, with :client
++  (the client's name) when ctx has :client-title: at the bound is allowed, one past it is not."
+   [ctx bound n]
+   (bump! ctx bound n))
+ 
+@@ -246,20 +252,65 @@
+                 (recur (first-value* ctx x :block/parent))))))
+         (into [] (remove (fn [[_ m]] (contains? @decided m))) candidates)))))
+ 
++(defn- client-candidates*
++  "The walk from client `client` (a db id, patch 0054): the entities holding it as a value of
++  `client_property` (AVET), and the blocks on each holder that is a page (AVET :block/page), in the
++  order reached, each charged to :tasks the first time only. A holder block's children are not
++  read: a task takes its own client, else its page's, never its parent's."
++  [ctx client_property client]
++  (let [seen (volatile! #{})
++        reach (fn [acc e]
++                (if (contains? @seen e)
++                  acc
++                  (do (charge! ctx :tasks 1)
++                      (vswap! seen conj e)
++                      (conj! acc e))))]
++    (persistent!
++     (reduce (fn [acc datom]
++               (let [h (:e datom)
++                     acc (reach acc h)]
++                 (if (nil? (first-value* ctx h :block/page))
++                   (reduce (fn [acc d] (reach acc (:e d))) acc (datoms* ctx :avet :block/page h))
++                   acc)))
++             (transient []) (datoms* ctx :avet client_property client)))))
++
+ (defn open-tasks-by-client
+   "Blocks tagged Task (only Task, as the Datalog matched it), each charged to :tasks, whose status is
    not Done or Canceled and that aren't private, each charged to :open-tasks. A task's clients are
    its visible values of client_property, else its page's, else none (\"\"); a client is its
    value's :block/title, \"\" without one. Rows [client task], one per distinct pair, so two
 -  clients with one title give one row."
 -  [ctx {:keys [client_property]}]
-+  clients with one title give one row. With `client` (a db id, patch 0054), only the tasks whose
-+  clients include that entity, compared by id, so another client with its title stays out."
++  clients with one title give one row. With `client` (a db id, patch 0054), the walk starts from
++  the client instead (client-candidates*, each candidate charged to :tasks), keeping the candidates
++  tagged Task that are open and not private (each charged to :open-tasks) whose clients include
++  that entity, compared by id, so another client with its title stays out: the full run's rows of
++  that client."
 +  [ctx {:keys [client_property client]}]
    (let [{:keys [db]} ctx
          private? (private-fn ctx)
          task-class (d/entid db :logseq.class/Task)
-@@ -273,9 +278,10 @@
-                                  clients (cond (seq own) own
-                                                page (visible-values ctx private? page client_property)
-                                                :else [])]
--                             (if (seq clients)
--                               (map (fn [c] [(title c) t]) clients)
--                               [["" t]]))))))
-+                             (cond
-+                               client (when (some #(= client %) clients) [[(title client) t]])
-+                               (seq clients) (map (fn [c] [(title c) t]) clients)
-+                               :else [["" t]]))))))
-              (distinct))
-             (datoms* ctx :avet :block/tags task-class)))))
+         finished (into #{} (keep #(d/entid db %)) [:logseq.property/status.done :logseq.property/status.canceled])
+         title (fn [c] (or (first-value* ctx c :block/title) ""))]
+-    (if (or (nil? task-class) (private? task-class))
++    (cond
++      (or (nil? task-class) (private? task-class))
+       []
++
++      client
++      (into []
++            (keep (fn [t]
++                    (when (and (some? (first (datoms* ctx :eavt t :block/tags task-class)))
++                               (not (contains? finished (first-value* ctx t :logseq.property/status)))
++                               (not (private? t)))
++                      (charge! ctx :open-tasks 1)
++                      (let [own (visible-values ctx private? t client_property)
++                            page (when (empty? own) (first-value* ctx t :block/page))
++                            clients (cond (seq own) own
++                                          page (visible-values ctx private? page client_property)
++                                          :else [])]
++                        (when (some #(= client %) clients)
++                          [(title client) t])))))
++            (client-candidates* ctx client_property client))
++
++      :else
+       (into []
+             (comp
+              (mapcat (fn [datom]
+@@ -317,7 +368,12 @@
+    {:advice "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
+     :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)" "list one client's tasks with datalog_query"]
+              :open-tasks ["found more than" "open tasks (its open-tasks bound)"]
+-             :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}}
++             :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}
++    ;; Patch 0054: with params.client, each bound's words, given the client's name.
++    :client {:advice #(str "mark " % "'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query")
++             :bounds {:tasks ["stopped after" #(str "blocks holding " % " or on its pages (its tasks bound)")]
++                      :open-tasks ["found more than" #(str "open tasks of " % " (its open-tasks bound)")]
++                      :reads ["stopped after" (constantly reads-counted)]}}}
+    "pages-missing-property"
+    {:advice "give a narrower tag"
+     :bounds {:tagged ["stopped after" "tagged pages and blocks (its tagged bound)"]
+@@ -325,11 +381,15 @@
  
-@@ -362,7 +368,10 @@
-       (str "1. Read the blocks tagged Task, each counted " (b :tasks) "."
-            " 2. Keep those whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
-            " 3. Read each one's " (get-in params ["client_property" :title]) " values, else its page's, leaving out private ones;"
+ (defn bound-message
+   "The 422 for a ::bound refusal: the query, what the bound counted and its value, the bound's
+-  name, and how to narrow the call."
+-  [{:keys [query bound value]}]
+-  (let [{:keys [advice bounds]} (get stops query)
+-        [verb counted own-advice] (get bounds bound)]
+-    (str query " " verb " " (format-count value) " " counted "; " (or own-advice advice))))
++  name, and how to narrow the call. With :client (open-tasks-by-client given params.client), the
++  query's :client words name the client."
++  [{:keys [query bound value client]}]
++  (if-let [{:keys [advice bounds]} (when client (get-in stops [query :client]))]
++    (let [[verb counted] (get bounds bound)]
++      (str query " " verb " " (format-count value) " " (counted client) "; " (advice client)))
++    (let [{:keys [advice bounds]} (get stops query)
++          [verb counted own-advice] (get bounds bound)]
++      (str query " " verb " " (format-count value) " " counted "; " (or own-advice advice)))))
+ 
+ (defn- tag-text [{:keys [title includes]}]
+   (if (seq includes)
+@@ -338,6 +398,13 @@
+ 
+ (defn- bound-text [bounds bound] (str "(" (name bound) " bound " (format-count (get bounds bound)) ")"))
+ 
++(defn- client-name
++  "params.client's name as the plan and the 422 give it: its title, else (a client with no title)
++  its UUID; nil without a client."
++  [params]
++  (when-let [{:keys [title uuid]} (get params "client")]
++    (if (seq title) title uuid)))
++
+ (defn plan-text
+   "The steps `query-name` takes with its resolved `params` (as the response echoes them), each with
+   the bound that stops it and its value in `bounds`."
+@@ -359,10 +426,15 @@
+            " 3. Walk up from each through its parents, its page and any page above it, each step counted " (b :ancestor-steps)
+            ", stopping at a block already reached. 4. A meeting no walk reached is a row, oldest first." reads)
+       "open-tasks-by-client"
+-      (str "1. Read the blocks tagged Task, each counted " (b :tasks) "."
+-           " 2. Keep those whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
+-           " 3. Read each one's " (get-in params ["client_property" :title]) " values, else its page's, leaving out private ones;"
 -           " each value's title is a client (empty when there is none). 4. One row per client and task, by client title." reads)
-+           " each value's title is a client (empty when there is none)."
-+           (when-let [{:keys [title]} (get params "client")]
-+             (str " Keep only the tasks whose clients include " title " (the entity params.client names)."))
-+           " 4. One row per client and task, by client title." reads)
++      (if-let [client (client-name params)]
++        (let [property (get-in params ["client_property" :title])]
++          (str "1. Read the blocks and pages whose " property " is " client ", and the blocks on each such page, each counted " (b :tasks) "."
++               " 2. Keep those tagged Task whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
++               " 3. Keep each whose own " property " values, else its page's, include " client ". 4. One row per task." reads))
++        (str "1. Read the blocks tagged Task, each counted " (b :tasks) "."
++             " 2. Keep those whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
++             " 3. Read each one's " (get-in params ["client_property" :title]) " values, else its page's, leaving out private ones;"
++             " each value's title is a client (empty when there is none). 4. One row per client and task, by client title." reads))
        "pages-missing-property"
        (str "1. Read the pages and blocks tagged " (tag-text (get params "tag")) ", each counted " (b :tagged) "."
             " 2. Keep the pages that aren't private and have no value for " (get-in params ["property" :title])
-@@ -403,7 +412,9 @@
+@@ -403,7 +475,9 @@
      ;; The client is read as the value's :block/title, so the property's values must be entities
      ;; with a title: not a number (its value is :logseq.property/value) and not a raw value.
      :params [{:name "client_property" :type :property :default "forClient"
@@ -212,8 +331,17 @@ index 7cac252..e7df7e9 100644
  
     "pages-missing-property"
     {:title "Pages missing a property"
+@@ -422,6 +496,7 @@
+   ([query-name db resolved bounds] (run-named query-name db resolved bounds (volatile! {})))
+   ([query-name db {:keys [inputs params]} bounds work]
+    (let [{:keys [run]} (get named-queries query-name)
+-         ctx {:db db :query query-name :bounds bounds :work work}
++         ctx (cond-> {:db db :query query-name :bounds bounds :work work}
++               (client-name params) (assoc :client-title (client-name params)))
+          rows (run ctx inputs)]
+      {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..b488570 100644
+index 39eccae..4c0eaf1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -215,7 +215,9 @@
@@ -222,12 +350,12 @@ index 39eccae..b488570 100644
                           " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block or page below them tagged decision_tag, a decision at any depth, on a page nested under the meeting page included; columns created-at (ms) and meeting. It walks up once from each decision_tag block or page that isn't private, through its blocks, its page and any page that page sits under (a namespace child sits under its parent page), sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
 -                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
 +                         " open-tasks-by-client (params client_property, default forClient, and client, optional): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused."
-+                         " client is a client's title or UUID, and lists only that client's tasks: those whose own client_property values, else their page's, include it. A title matches exactly, else a page or tag name ignoring case; when several pages, tags or blocks share it, a page wins when exactly one of them is a page, and otherwise the call is refused with 400 naming each one's kind and UUID, oldest first, so give the UUID you mean. A client that is null, empty or not a string, an unknown title or UUID (a private or recycled one reads as unknown), or a client_property that is a default or url property (its values are per-block text) is refused with 400 naming params.client, never all clients. params.client echoes the client used, as title and uuid."
++                         " client is a client's title or UUID, and lists only that client's tasks: those whose own client_property values, else their page's, include it. A title matches exactly, else a page or tag name ignoring case; when several pages, tags or blocks share it, a page wins when exactly one of them is a page, and otherwise the call is refused with 400 naming each one's kind and UUID, oldest first, so give the UUID you mean. A client that is null, empty or not a string, an unknown title or UUID (a private or recycled one reads as unknown), or a client_property that is a default or url property (its values are per-block text) is refused with 400 naming params.client, never all clients. params.client echoes the client used, as title and uuid. With client, it reads only the blocks holding the client and the blocks on those that are pages, not every Task, so a graph whose Task count stops the full run can still be asked about one client; it then stops with 422 after 10,000 blocks holding the client or on its pages (its tasks bound), or when it finds more than 2,000 open tasks of the client (its open-tasks bound): mark the client's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query."
 +                         " It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
                           " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
                           " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
                           " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
-@@ -719,7 +721,7 @@
+@@ -719,10 +721,10 @@
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
@@ -235,9 +363,13 @@ index 39eccae..b488570 100644
 +           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name> (params.client: a client that isn't a string, is unknown, or whose title several entities share with no single page among them), an unknown param, or a body field the call doesn't take"}
                              "404" {:description "No named query has that name; the error lists the names"}
                              "409" {:description "The graph is E2EE"}
-                             "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound)"}}
+-                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound)"}}
++                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound); with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, and the error names the client"}}
+            "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap), made more than 20,000 function calls (the call cap), did more than 200,000 rows of relation work (the work cap), had function bindings copy more than 100,000 values (the width cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
+            "createPage" {"201" (entity-response "PageResponse" "The created page")
+                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-index 047acfc..2973db9 100644
+index 047acfc..df371f9 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 @@ -2028,6 +2028,26 @@
@@ -292,7 +424,7 @@ index 047acfc..2973db9 100644
                         params)]
        (is (:ok normalised) (str query-name ": " (:error normalised)))
        (if rules
-@@ -4070,3 +4097,374 @@
+@@ -4070,3 +4097,690 @@
            (is (identical? own after-answered) "restored after an answered query")
            (is (identical? own after-refused) "restored after a refused query")
            (is (pos? direct) "a query outside run-query runs uncharged"))))))
@@ -437,29 +569,6 @@ index 047acfc..2973db9 100644
 +                          (is (= (filterv #(= title (first %)) (code-rows full)) (code-rows r)))))))
 +                  (if (seq (get-in r [:body :rows])) (inc n) n)))
 +              (p/resolved 0) clients))))
-+
-+(deftest named-client-parity-test
-+  ;; Client rows = the full run's rows of that client = the legacy client-bound Datalog, on
-+  ;; seed-named, on its review-focus additions (two clients with one title, private clients, a client
-+  ;; without a title) and on seeded random graphs.
-+  (async done
-+    (-> (p/let [graph (seed-named)
-+                {:keys [conn self for-client]} graph
-+                a (client-parity! conn self "seed-named" "forClient" (keyword for-client))
-+                {:keys [clients]} (seed-review-focus! graph)
-+                b (client-parity! conn self "review focus" "zq clients" (keyword clients))
-+                seeded (reduce (fn [acc seed]
-+                                 (p/let [n acc
-+                                         g (seed-random-graph seed)
-+                                         _ (extend-for-named! g seed)
-+                                         prop (:db/ident (d/entity @(:conn g) (d/q '[:find ?e . :where [?e :block/title "zq client"] [?e :logseq.property/type _]] @(:conn g))))
-+                                         m (client-parity! (:conn g) (:self g) (str "seed " seed) "zq client" prop)]
-+                                   (+ n m)))
-+                               (p/resolved 0) (range 1 11))]
-+          (is (pos? a)) (is (pos? b))
-+          (is (<= 10 seeded) (str "clients with rows across the seeded graphs: " seeded)))
-+        (p/catch #(is false (str % "\n" (.-stack %))))
-+        (p/finally done))))
 +
 +(deftest named-client-refusals-test
 +  ;; Spec §8 test 2 with §12: each a 400 naming params.client, with the exact message and no rows;
@@ -664,6 +773,419 @@ index 047acfc..2973db9 100644
 +                    "a private or recycled one reads as unknown"
 +                    "a client_property that is a default or url property"
 +                    "never all clients"
-+                    "params.client echoes the client used, as title and uuid"]]
++                    "params.client echoes the client used, as title and uuid"
++                    ;; Stage 2: the walk from the client, and what its bounds count.
++                    "With client, it reads only the blocks holding the client and the blocks on those that are pages, not every Task"
++                    "after 10,000 blocks holding the client or on its pages (its tasks bound)"
++                    "more than 2,000 open tasks of the client (its open-tasks bound)"
++                    "mark the client's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query"]]
 +      (is (string/includes? (:description post) phrase) phrase))
-+    (is (string/includes? (get-in post [:responses "400" :description]) "params.client"))))
++    (is (string/includes? (get-in post [:responses "400" :description]) "params.client"))
++    (is (string/includes? (get-in post [:responses "422" :description])
++                          "with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, and the error names the client"))))
++
++;; Patch 0054, stage 2: the walk from the client
++;; =============================================
++;; With params.client, open-tasks-by-client reads the client's holders (AVET on client_property)
++;; and the blocks on each holder that is a page, each charged once to :tasks, instead of every Task;
++;; it keeps the open, non-private Task candidates whose own clients, else their page's, include the
++;; client. Its 422s and plan say what they counted.
++
++(defn- walk-candidates
++  "What the client walk should reach for client `c` (an eid) through `prop` (an ident), read with
++  Datalog on the raw db: the entities holding c, and the blocks on each holder that is a page."
++  [db prop c]
++  (let [holders (set (d/q '[:find [?h ...] :in $ ?prop ?c :where [?h ?prop ?c]] db prop c))
++        pages (filterv #(nil? (:block/page (d/entity db %))) holders)
++        on-pages (if (seq pages)
++                   (set (d/q '[:find [?b ...] :in $ [?p ...] :where [?b :block/page ?p]] db pages))
++                   #{})]
++    (into holders on-pages)))
++
++(defn- eid-titled [conn title] (:db/id (d/entity @conn [:block/uuid (uuid (uuid-titled conn title))])))
++
++(defn- open-task [title] {:title title :properties {"block/tags" ["Task"] "logseq.property/status" "Todo"}})
++
++(defn- seed-client-walk
++  "60 open tasks across three clients, written through the real handler: a node property forClient;
++  client pages zq Acme, zq Beta and zq Gamma; pages zq Acme Work, zq Beta Work and zq Gamma Work,
++  each holding its client. zq Acme Work has 4 tasks with no client of their own and 2 notes; zq
++  Beta Work has zq acme held task (its own client zq Acme) and 30 tasks; zq Gamma Work has 25.
++  zq Acme's candidates: zq Acme Work, its 6 blocks and zq acme held task (8), 5 of them its tasks."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          prop (ok! (request! self "POST" "/semantic/properties" {:title "forClient" :type "node"}) 201)
++          for-client (get-in prop [:body :ident])
++          _ (page-id! self "zq Acme")
++          _ (page-id! self "zq Beta")
++          _ (page-id! self "zq Gamma")
++          acme-work (page-id! self "zq Acme Work")
++          beta-work (page-id! self "zq Beta Work")
++          gamma-work (page-id! self "zq Gamma Work")
++          _ (for-client! self for-client acme-work "zq Acme")
++          _ (for-client! self for-client beta-work "zq Beta")
++          _ (for-client! self for-client gamma-work "zq Gamma")
++          _ (insert! self acme-work (into (mapv #(open-task (str "zq acme task " %)) (range 4))
++                                          [{:title "zq acme note 0"} {:title "zq acme note 1"}]))
++          [held] (insert! self beta-work [(open-task "zq acme held task")])
++          _ (for-client! self for-client (:uuid held) "zq Acme")
++          _ (insert! self beta-work (mapv #(open-task (str "zq beta task " %)) (range 30)))
++          _ (insert! self gamma-work (mapv #(open-task (str "zq gamma task " %)) (range 25)))]
++    {:conn conn :self self :for-client for-client}))
++
++(defn- with-client-walk [done run]
++  (-> (p/let [graph (seed-client-walk)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(def ^:private acme-rows
++  #{["zq Acme" "zq acme held task"] ["zq Acme" "zq acme task 0"] ["zq Acme" "zq acme task 1"]
++    ["zq Acme" "zq acme task 2"] ["zq Acme" "zq acme task 3"]})
++
++(deftest named-client-walk-test
++  ;; Spec §8 test 3 (with-client half): with the tasks bound lowered below the Task count, the full
++  ;; run stops at it and a client run answers, its tasks bound counting the client's candidates.
++  (async done
++    (with-client-walk done
++      (fn [{:keys [conn self for-client]}]
++        (p/let [_ (set-bounds! self {:tasks 50})
++                full (client-run! self {})
++                acme (client-run! self {:client "zq Acme"})
++                beta (client-run! self {:client "zq Beta"})
++                gamma (client-run! self {:client "zq Gamma"})
++                _ (set-bounds! self nil)
++                prop (keyword for-client)
++                count-of #(count (walk-candidates @conn prop (eid-titled conn %)))]
++          (is (= 60 (count (d/datoms @conn :avet :block/tags (d/entid @conn :logseq.class/Task)))))
++          (is (= [422 "open-tasks-by-client stopped after 50 blocks tagged Task (its tasks bound); list one client's tasks with datalog_query"]
++                 (answer-of full))
++              (head-of full))
++          (is (= [200 200 200] (map :status [acme beta gamma])) (pr-str (map head-of [acme beta gamma])))
++          (testing "zq Acme: its own and its page's tasks, counted by its candidates"
++            (is (= acme-rows (set (pairs-of acme))) (pr-str (:body acme)))
++            (is (= 5 (count (pairs-of acme))))
++            (is (= {:tasks 8 :open-tasks 5} (select-keys (get-in acme [:body :work]) [:tasks :open-tasks])))
++            (is (= 8 (count-of "zq Acme"))))
++          (testing "zq Beta: the tasks on its page, not the one whose own client is zq Acme"
++            (is (= 30 (count (pairs-of beta))))
++            (is (not (contains? (set (map second (pairs-of beta))) "zq acme held task")))
++            (is (= {:tasks 32 :open-tasks 31} (select-keys (get-in beta [:body :work]) [:tasks :open-tasks])))
++            (is (= 32 (count-of "zq Beta"))))
++          (testing "zq Gamma"
++            (is (= 25 (count (pairs-of gamma))))
++            (is (= 26 (get-in gamma [:body :work :tasks])))))))))
++
++(defn- client-walk-message [bound title n]
++  (let [advice (str "mark " title "'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query")]
++    (str "open-tasks-by-client "
++         (case bound
++           :tasks (str "stopped after " (format-n n) " blocks holding " title " or on its pages (its tasks bound)")
++           :open-tasks (str "found more than " (format-n n) " open tasks of " title " (its open-tasks bound)")
++           :reads (str "stopped after " (format-n n) " reads (its reads bound, the backstop over every read)"))
++         "; " advice)))
++
++(deftest named-client-bounds-test
++  ;; Spec §8 test 3 (client half), review focus 13: each bound with a client, set to exactly what the
++  ;; run counts, answers the same rows; one lower answers the client-worded 422, last-run shows the
++  ;; bound + 1, and no rows come back. A client with no title is named by its UUID.
++  (async done
++    (with-client-walk done
++      (fn [{:keys [conn self for-client]}]
++        (p/let [untitled (page-id! self "zq Untitled")
++                [t] (insert! self (uuid-titled conn "zq Gamma Work") [(open-task "zq untitled task")])
++                _ (for-client! self for-client (:uuid t) (str untitled))
++                _ (d/transact! conn [[:db.fn/retractAttribute [:block/uuid untitled] :block/title]])
++                cases [["zq Acme" "zq Acme"] [(str untitled) (str untitled)]]]
++          (-> (reduce
++               (fn [acc [client named]]
++                 (reduce
++                  (fn [acc bound]
++                    (p/let [_ acc
++                            _ (set-bounds! self nil)
++                            free (client-run! self {:client client})
++                            counted (get-in @datalog/last-run [:named-work bound])
++                            _ (set-bounds! self {bound counted})
++                            at (client-run! self {:client client})
++                            _ (set-bounds! self {bound (dec counted)})
++                            before (snapshot conn)
++                            over (client-run! self {:client client})
++                            over-work (get-in @datalog/last-run [:named-work bound])
++                            _ (set-bounds! self nil)]
++                      (testing (str client ", its " (name bound) " bound")
++                        (is (= 200 (:status free)) (head-of free))
++                        (is (pos-int? counted) (pr-str (:named-work @datalog/last-run)))
++                        (is (= [200 (get-in free [:body :rows])] [(:status at) (get-in at [:body :rows])]) (str "at the bound: " (head-of at)))
++                        (is (= [422 (client-walk-message bound named (dec counted))] (answer-of over)) (head-of over))
++                        (is (= counted over-work) "work shows the bound + 1")
++                        (is (not (contains? (:body over) :rows)) "no rows found so far")
++                        (is (= before (snapshot conn))))))
++                  acc [:tasks :open-tasks :reads]))
++               (p/resolved nil) cases)
++              (p/finally #(set-bounds! self nil))))))))
++
++(deftest named-client-dry-run-plan-test
++  ;; Spec §8 test 4 (plan half): the plan names the client and what each bound counts, with its
++  ;; number; a dry run reads nothing, so a bound set to 0 doesn't stop it. A run's plan is the same.
++  (async done
++    (with-named done
++      (fn [{:keys [self]}]
++        (let [plan (fn [tasks]
++                     (str "1. Read the blocks and pages whose forClient is zq Acme, and the blocks on each such page,"
++                          " each counted (tasks bound " tasks ")."
++                          " 2. Keep those tagged Task whose status isn't Done or Canceled and that aren't private,"
++                          " each counted (open-tasks bound 2,000)."
++                          " 3. Keep each whose own forClient values, else its page's, include zq Acme. 4. One row per task."
++                          " Every read counts (reads bound 30,000); a bound passed answers 422 naming it, never part of the rows."))]
++          (p/let [dry (client-run! self {:client "zq Acme"} {:dry-run true})
++                  dry-work (:named-work @datalog/last-run)
++                  run (client-run! self {:client "zq Acme"})
++                  _ (set-bounds! self {:tasks 0})
++                  zero (client-run! self {:client "zq Acme"} {:dry-run true})
++                  zero-work (:named-work @datalog/last-run)
++                  zero-run (client-run! self {:client "zq Acme"})
++                  _ (set-bounds! self nil)
++                  none (client-run! self {} {:dry-run true})]
++            (is (= [200 200 200 422] (map :status [dry run zero zero-run])) (pr-str (map head-of [dry run zero zero-run])))
++            (is (= (plan "10,000") (get-in dry [:body :plan])))
++            (is (= (plan "10,000") (get-in run [:body :plan])))
++            (is (= (plan "0") (get-in zero [:body :plan])))
++            (is (= [{} {}] [dry-work zero-work]) "a dry run reads nothing")
++            (is (not-any? #(contains? (:body %) :work) [dry zero]))
++            (testing "without a client, the plan reads every Task"
++              (is (string/starts-with? (get-in none [:body :plan]) "1. Read the blocks tagged Task, each counted (tasks bound 10,000).")))))))))
++
++(deftest named-client-review-focus-test
++  ;; Plan review focus 8 to 12 and 14, each asserting rows and work (:tasks = what the walk should
++  ;; reach, read with Datalog).
++  (async done
++    (with-named done
++      (fn [{:keys [conn self other-work for-client]}]
++        (p/let [prop (keyword for-client)
++                client-work (uuid-titled conn "zq Client Work")
++                ;; 8. A task holding zq Acme on zq Acme's page.
++                [both] (insert! self client-work [(open-task "zq rf8 both")])
++                _ (for-client! self for-client (:uuid both) "zq Acme")
++                ;; 9. A block holding zq Acme on a page without a client, with a Task child; and a
++                ;;    block holding zq Beta on zq Acme's page, with a Task child.
++                [holder] (insert! self other-work [{:title "zq rf9 holder" :children [(open-task "zq rf9 child")]}])
++                _ (for-client! self for-client (:uuid holder) "zq Acme")
++                [page-holder] (insert! self client-work [{:title "zq rf9 page holder" :children [(open-task "zq rf9 page child")]}])
++                _ (for-client! self for-client (:uuid page-holder) "zq Beta")
++                ;; 10. A task with two clients, through a many node property.
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq rf clients" :type "node" :cardinality "db.cardinality/many"}) 201)
++                many (d/q '[:find ?i . :where [?e :block/title "zq rf clients"] [?e :db/ident ?i]] @conn)
++                [two] (insert! self other-work [(open-task "zq rf10 two")])
++                _ (for-client! self (subs (str many) 1) (:uuid two) ["zq Acme" "zq Beta"])
++                ;; 11. A Task block used as a client, held by another task.
++                [client-task held-by] (insert! self other-work [(open-task "zq rf11 client") (open-task "zq rf11 holder")])
++                _ (for-client! self for-client (:uuid held-by) (str (:uuid client-task)))
++                ;; 12. A client nothing holds.
++                lonely (page-id! self "zq rf12 lonely")
++                ;; 14. A date client_property: a task and a page hold a journal, with a task on the page.
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq rf date" :type "date"}) 201)
++                date (d/q '[:find ?i . :where [?e :block/title "zq rf date"] [?e :db/ident ?i]] @conn)
++                _ (request! self "POST" "/semantic/capture" {:blocks [{:title "zq rf14 journal note"}]})
++                journal (:block/page (d/entity @conn [:block/uuid (uuid (uuid-titled conn "zq rf14 journal note"))]))
++                journal-uuid (str (:block/uuid journal))
++                journal-title (:block/title journal)
++                [dated] (insert! self other-work [(open-task "zq rf14 task")])
++                _ (for-client! self (subs (str date) 1) (:uuid dated) journal-uuid)
++                dated-page (page-id! self "zq rf14 page")
++                _ (for-client! self (subs (str date) 1) dated-page journal-uuid)
++                _ (insert! self dated-page [(open-task "zq rf14 on page") {:title "zq rf14 note"}])
++                acme (client-run! self {:client "zq Acme"})
++                beta (client-run! self {:client "zq Beta"})
++                many-acme (client-run! self {:client_property "zq rf clients" :client "zq Acme"})
++                many-beta (client-run! self {:client_property "zq rf clients" :client "zq Beta"})
++                by-task (client-run! self {:client (str (:uuid client-task))})
++                lonely-r (client-run! self {:client (str lonely)})
++                dated-r (client-run! self {:client_property "zq rf date" :client journal-title})
++                walked (fn [p title] (count (walk-candidates @conn p (eid-titled conn title))))
++                tasks-of (fn [r] (get-in r [:body :work :tasks]))]
++          (is (every? #(= 200 (:status %)) [acme beta many-acme many-beta by-task lonely-r dated-r])
++              (pr-str (map head-of [acme beta many-acme many-beta by-task lonely-r dated-r])))
++          (testing "8. a task holding the client on the client's page: one row, one candidate"
++            (is (= 1 (count (filter #(= ["zq Acme" "zq rf8 both"] %) (pairs-of acme)))))
++            (is (= (walked prop "zq Acme") (tasks-of acme)) (pr-str (get-in acme [:body :work]))))
++          (testing "9. a holder block's Task children are not its client's; on the client's page they are the page's"
++            (is (= #{["zq Acme" "zq task page client"] ["zq Acme" "zq rf8 both"] ["zq Acme" "zq rf9 page child"]}
++                   (set (pairs-of acme))))
++            (is (= #{["zq Beta" "zq task own client"]} (set (pairs-of beta))))
++            (is (= (walked prop "zq Beta") (tasks-of beta))))
++          (testing "10. a task with two clients is a row under the one given only"
++            (is (= [["zq Acme" "zq rf10 two"]] (pairs-of many-acme)))
++            (is (= [["zq Beta" "zq rf10 two"]] (pairs-of many-beta)))
++            (is (= [1 1] (map tasks-of [many-acme many-beta]))))
++          (testing "11. a task as the client: its holders are candidates, and it is not a row of its own"
++            (is (= [["zq rf11 client" "zq rf11 holder"]] (pairs-of by-task)))
++            (is (= 1 (tasks-of by-task))))
++          (testing "12. a client nothing holds: no rows, nothing counted"
++            (is (= [] (pairs-of lonely-r)))
++            (is (= {:tasks 0 :open-tasks 0} (select-keys (get-in lonely-r [:body :work]) [:tasks :open-tasks]))))
++          (testing "14. a date client_property: the journal's holders and the blocks on its holder page"
++            (is (= #{[journal-title "zq rf14 task"] [journal-title "zq rf14 on page"]} (set (pairs-of dated-r))))
++            (is (= 4 (tasks-of dated-r)) "the task, the page and the page's two blocks")
++            (is (= 2 (get-in dated-r [:body :work :open-tasks])))))))))
++
++(defn- extend-for-client-walk!
++  "Adds to an extend-for-named! graph what the client walk must get right, shaped by `seed`: on each
++  live page holding a zq client value, a block holding another client with a Task child (the child
++  is the page's client's, not the block's) and a task holding that other client (its own client
++  wins over the page's)."
++  [{:keys [conn self]} seed]
++  (let [db @conn
++        prop (d/q '[:find ?i . :where [?e :block/title "zq client"] [?e :logseq.property/type _] [?e :db/ident ?i]] db)
++        path (js/encodeURIComponent (subs (str prop) 1))
++        clients (vec (sort (d/q '[:find [?u ...] :where [?e :block/title ?t] [(clojure.string/starts-with? ?t "zq cl ")] [?e :block/uuid ?u]] db)))
++        holder-pages (vec (sort (d/q '[:find [?u ...] :in $ ?prop
++                                       :where [?p ?prop _] [(missing? $ ?p :block/page)]
++                                       [(missing? $ ?p :logseq.property/deleted-at)] [?p :block/uuid ?u]]
++                                     db prop)))
++        put! (fn [id value] (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" path) {:value value}) 200))]
++    (reduce (fn [acc [i page]]
++              (p/let [n acc
++                      other (str (clients (mod (+ seed i) (count clients))))
++                      [holder own] (insert! self page [{:title (str "zq walk holder " seed " " i)
++                                                        :children [(open-task (str "zq walk child " seed " " i))]}
++                                                       (open-task (str "zq walk own " seed " " i))])
++                      _ (put! (:uuid holder) [other])
++                      _ (put! (:uuid own) [other])]
++                (inc n)))
++            (p/resolved 0) (map-indexed vector holder-pages))))
++
++(deftest named-client-parity-test
++  ;; Client rows = the full run's rows of that client = the legacy client-bound Datalog, on
++  ;; seed-named, on its review-focus additions (two clients with one title, private clients, a client
++  ;; without a title) and on seeded random graphs. Stage 2: the seeded graphs gain holder blocks over
++  ;; Task children on client pages, and tasks holding a client on another client's page
++  ;; (extend-for-client-walk!), which the walk from the client must answer as the full run does.
++  (async done
++    (-> (p/let [graph (seed-named)
++                {:keys [conn self for-client]} graph
++                a (client-parity! conn self "seed-named" "forClient" (keyword for-client))
++                {:keys [clients]} (seed-review-focus! graph)
++                b (client-parity! conn self "review focus" "zq clients" (keyword clients))
++                seeded (reduce (fn [acc seed]
++                                 (p/let [[n extended] acc
++                                         g (seed-random-graph seed)
++                                         _ (extend-for-named! g seed)
++                                         added (extend-for-client-walk! g seed)
++                                         prop (:db/ident (d/entity @(:conn g) (d/q '[:find ?e . :where [?e :block/title "zq client"] [?e :logseq.property/type _]] @(:conn g))))
++                                         m (client-parity! (:conn g) (:self g) (str "seed " seed) "zq client" prop)]
++                                   [(+ n m) (+ extended added)]))
++                               (p/resolved [0 0]) (range 1 11))]
++          (is (pos? a)) (is (pos? b))
++          (is (<= 10 (first seeded)) (str "clients with rows across the seeded graphs: " (pr-str seeded)))
++          (is (<= 5 (second seeded)) (str "client pages extended across the seeded graphs: " (pr-str seeded))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest named-client-private-candidates-test
++  ;; The walk reaches private candidates (it reads every holder and every block on a holder page),
++  ;; and must leave them out as the full run does: a task tagged Private holding the client or on
++  ;; the client's page, a task under a private block on the client's page, a task on a private page
++  ;; that holds the client, and a task on a page in the Recycle bin that holds it. Found by the
++  ;; stage 2 mutation step (dropping private? on candidates survived every other test).
++  (async done
++    (with-named done
++      (fn [{:keys [conn self other-work for-client]}]
++        (p/let [client-work (uuid-titled conn "zq Client Work")
++                private-task (fn [title] {:title title :properties {"block/tags" ["Task" "Private"] "logseq.property/status" "Todo"}})
++                [own-private] (insert! self other-work [(private-task "zq rfp own private")])
++                _ (for-client! self for-client (:uuid own-private) "zq Acme")
++                _ (insert! self client-work [(private-task "zq rfp page private")
++                                             {:title "zq rfp hidden" :properties {"block/tags" ["Private"]}
++                                              :children [(open-task "zq rfp under hidden")]}])
++                secret (page-id! self "zq rfp secret page")
++                _ (for-client! self for-client secret "zq Acme")
++                _ (insert! self secret [(open-task "zq rfp on secret")])
++                _ (set-tags! self secret ["Private"])
++                gone (page-id! self "zq rfp gone page")
++                _ (for-client! self for-client gone "zq Acme")
++                _ (insert! self gone [(open-task "zq rfp on gone")])
++                _ (ok! (request! self "DELETE" (str "/semantic/pages/" gone) nil) 200)
++                acme (client-run! self {:client "zq Acme"})
++                full (client-run! self {})]
++          (is (= [200 200] (map :status [acme full])) (pr-str (map head-of [acme full])))
++          (is (= [["zq Acme" "zq task page client"]] (pairs-of acme)) (pr-str (:body acme)))
++          (is (= (pairs-of acme) (filterv #(= "zq Acme" (first %)) (pairs-of full))))
++          (is (not (string/includes? (:text acme) "zq rfp")) "no private candidate is named")
++          (is (= (count (walk-candidates @conn (keyword for-client) (eid-titled conn "zq Acme")))
++                 (get-in acme [:body :work :tasks]))
++              "every candidate is counted, private ones included")
++          (is (= 2 (get-in acme [:body :work :open-tasks])) "only the two visible open tasks on its page are counted as open"))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
+index abfe15b..ba59349 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
+@@ -413,3 +413,69 @@
+                  (map #(select-keys % [:uuid :property :value :value-uuid :value-property :reason]) (:items check)))
+               "the misplaced choice names project-status as its owner")))
+       :stale? true)))
++
++;; ---------------------------------------------------------------------------------------------
++;; open-tasks-by-client's walk from a client (patch 0054)
++
++(def ^:private acme-uuid #uuid "8d3c1a52-0b6f-4e1d-9a71-5c2e7f0a1b01")
++(def ^:private beta-uuid #uuid "8d3c1a52-0b6f-4e1d-9a71-5c2e7f0a1b02")
++(def ^:private acme-work-uuid #uuid "8d3c1a52-0b6f-4e1d-9a71-5c2e7f0a1b03")
++(def ^:private other-uuid #uuid "8d3c1a52-0b6f-4e1d-9a71-5c2e7f0a1b04")
++
++(defn- client-graph!
++  "On the app's conn, as the app writes them: a node property forClient (upsert-property!), client
++  pages Acme and Beta, a page Acme Work holding Acme with two tasks and a note on it (one task's own
++  client is Beta), a page Other with a task holding Acme, a done task holding Acme and three tasks
++  with no client. Returns forClient's ident."
++  [client]
++  (let [ident (:db/ident (outliner-property/upsert-property!
++                          client nil {:logseq.property/type :node :db/cardinality :db.cardinality/one}
++                          {:property-name "forClient"}))
++        now 1700000000000
++        page (fn [id title] {:block/uuid id :block/title title :block/name (string/lower-case title)
++                             :block/tags #{:logseq.class/Page} :block/created-at now :block/updated-at now})
++        block (fn [page-id order title & [task?]]
++                (cond-> {:block/uuid (random-uuid) :block/title title :block/order order
++                         :block/page [:block/uuid page-id] :block/parent [:block/uuid page-id]
++                         :block/created-at now :block/updated-at now}
++                  task? (assoc :block/tags #{:logseq.class/Task} :logseq.property/status task?)))]
++    (d/transact! client [(page acme-uuid "Acme") (page beta-uuid "Beta")
++                         (assoc (page acme-work-uuid "Acme Work") ident [:block/uuid acme-uuid])
++                         (page other-uuid "Other")])
++    (d/transact! client [(block acme-work-uuid "a0" "acme page task" :logseq.property/status.todo)
++                         (assoc (block acme-work-uuid "a1" "beta own task" :logseq.property/status.doing) ident [:block/uuid beta-uuid])
++                         (block acme-work-uuid "a2" "acme note")
++                         (assoc (block other-uuid "a0" "acme own task" :logseq.property/status.todo) ident [:block/uuid acme-uuid])
++                         (assoc (block other-uuid "a1" "acme done task" :logseq.property/status.done) ident [:block/uuid acme-uuid])
++                         (block other-uuid "a2" "loose task 0" :logseq.property/status.todo)
++                         (block other-uuid "a3" "loose task 1" :logseq.property/status.todo)
++                         (block other-uuid "a4" "loose task 2" :logseq.property/status.todo)])
++    ident))
++
++(deftest uploaded-graph-client-walk-test
++  ;; Spec §8 test 5 and §7 risk 1: on a graph uploaded in the app's shape, with forClient made as the
++  ;; app makes it, the AVET read of a client's holders finds what the AEVT scan finds, and the client
++  ;; run walks from them: Acme's rows, counted by its candidates (Acme Work, its 3 blocks, the 2
++  ;; tasks on Other holding Acme), not by the 7 Task blocks.
++  (let [ident (volatile! nil)]
++    (async done
++      (with-uploaded done
++        (fn [{:keys [conn self]}]
++          (p/let [db @conn
++                  acme (:db/id (d/entity db [:block/uuid acme-uuid]))
++                  avet (set (map :e (d/datoms db :avet @ident acme)))
++                  aevt (set (keep #(when (= acme (:v %)) (:e %)) (d/datoms db :aevt @ident)))
++                  client (request! self "POST" "/semantic/named-queries/open-tasks-by-client"
++                                   {:params {:client "Acme"} :limit 200})
++                  full (request! self "POST" "/semantic/named-queries/open-tasks-by-client" {:limit 200})
++                  pairs (fn [r] (set (map (fn [[c t]] [c (:block/title t)]) (get-in r [:body :rows]))))]
++            (is (= 3 (count aevt)) (pr-str aevt))
++            (is (= aevt avet) "AVET holders equal the AEVT scan")
++            (is (= [200 200] [(:status client) (:status full)]) (pr-str (:body client) (:body full)))
++            (is (= #{["Acme" "acme page task"] ["Acme" "acme own task"]} (pairs client)) (pr-str (:body client)))
++            (is (= (pairs client) (set (filter #(= "Acme" (first %)) (pairs full)))))
++            (is (= {:title "Acme" :uuid (str acme-uuid)} (get-in client [:body :params :client])))
++            (is (= {:tasks 6 :open-tasks 3} (select-keys (get-in client [:body :work]) [:tasks :open-tasks]))
++                (pr-str (get-in client [:body :work])))))
++        :client-setup (fn [client] (vreset! ident (client-graph! client)))
++        :stale? true))))
