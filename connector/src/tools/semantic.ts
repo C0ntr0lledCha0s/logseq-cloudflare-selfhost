@@ -83,7 +83,7 @@ const HOLDER_STAMPING_TOOLS = new Set(["delete_block", "delete_blocks", "update_
 
 /** The pointer each tool that writes a title adds on code, math and quote blocks (patch 0037). */
 export const FENCE_HINT =
-  "Write code, math and quotes with display-type (and lang for code), not as fence text; a block whose whole title is one ``` or $$ fence is converted unless convert-fences=false, and ```query fences stay text, listed under kept. connector_help's Code, math and quote blocks section has the rules.";
+  "Write code, math and quotes with display-type (and lang for code), not as fence text; a block whose whole title is one ``` or $$ fence is converted unless convert-fences=false. On insert, an advanced ```query fence (or a node's query field) becomes a Query block, checked as datalog_query checks a query; a simple query fence stays text, listed under kept, as does any query fence on update_block. connector_help's Code, math and quote blocks section has the rules.";
 const FENCE_TOOLS = new Set(["insert_block_tree", "insert_block_children", "batch_insert_block_trees", "capture_to_today", "update_block"]);
 
 /** The pointer the property-set tools add on display-type (patch 0037). */
