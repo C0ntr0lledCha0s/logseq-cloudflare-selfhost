@@ -1,0 +1,585 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+index a682bda..f98b81a 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+@@ -1128,6 +1128,81 @@
+       (refusal 400 (string/join "; " problems))
+       {:query (:ok normalised) :given query :inputs inputs})))
+ 
++;; Query blocks (patch 0050)
++;; =========================
++;; The text Claude stores as a Query block's query runs in the owner's app, not here, so it gets
++;; only the static checks: the ones datalog_query applies before it runs a query, plus the keys the
++;; app reads (and none it runs as code) and the vector form, the only :query form the app runs.
++
++(def query-block-keys
++  "The keys a query block's map may hold, in the order refusals list them."
++  [:query :inputs :title :collapsed? :group-by-page? :remove-block-children? :breadcrumb-show?])
++
++(def query-block-flags
++  "The query block keys that take true or false."
++  [:collapsed? :group-by-page? :remove-block-children? :breadcrumb-show?])
++
++(def ^:private give-query-map "query: give an EDN map {:query [:find … :where …] :inputs […]}")
++
++(defn- query-reason
++  "`message` starting with `query: ` exactly once."
++  [message]
++  (if (string/starts-with? message "query: ") message (str "query: " message)))
++
++(defn- query-block-shape-errors
++  "Why the map `m` isn't a query block's shape: its keys, :title, the flags, :inputs and the vector
++  form of :query."
++  [m]
++  (let [{:keys [query inputs title]} m]
++    (concat
++     (for [k (sort-by str (keys m)) :when (not (some #{k} query-block-keys))]
++       (case k
++         :rules (str "query: :rules is not accepted; " no-caller-rules)
++         (:view :result-transform) (str "query: " k " is not accepted; it runs as code in the app")
++         (str "query: " (pr-str k) " is not accepted (keys: " (string/join ", " query-block-keys) ")")))
++     (when (and (contains? m :title) (not (string? title))) ["query: :title must be a string"])
++     (for [k query-block-flags :when (and (contains? m k) (not (boolean? (get m k))))]
++       (str "query: " k " must be true or false"))
++     (cond
++       (and (contains? m :inputs) (not (vector? inputs))) ["query: :inputs must be a vector"]
++       (> (count inputs) max-inputs)
++       [(str "query: :inputs takes at most " max-inputs " values (got " (count inputs) ")")])
++     (when-not (and (vector? query) (= :find (first query)))
++       ["query: give :query as a vector [:find … :where …]; the app runs only that form"]))))
++
++(defn check-query-block
++  "Checks `text`, a Query block's query, as the app will read it: {:ok text :form m} or {:error
++  message}, every reason starting with `query: ` once and joined with `; `. In order: a string of at
++  most `max-query-chars` characters (the whole text); one EDN form (`parse-edn`); a map; its shape
++  (`query-block-shape-errors`); then what datalog_query checks before it runs a query, in
++  `checked-query`'s order (write forms in the whole map, the normaliser, the validator with the
++  inputs), and its function-binding cap, answered here as a reason since nothing runs."
++  [text]
++  (cond
++    (not (string? text)) {:error give-query-map}
++
++    (> (count text) max-query-chars)
++    {:error (str "query: at most " (format-count max-query-chars) " characters (got " (format-count (count text)) ")")}
++
++    :else
++    (let [{form :ok parse-error :error} (parse-edn "query" text)]
++      (cond
++        parse-error {:error parse-error}
++        (not (map? form)) {:error give-query-map}
++        :else
++        (if-let [shape (seq (query-block-shape-errors form))]
++          {:error (string/join "; " shape)}
++          (let [normalised (normalise-query (:query form))
++                invalid (or (:error normalised)
++                            (validate-query (:ok normalised) (or (:inputs form) [])))
++                problems (cond-> (vec (write-form-errors "query" form))
++                           invalid (conj (query-reason invalid)))
++                too-wide (when (empty? problems) (fn-bindings-refusal (:ok normalised)))]
++            (cond
++              (seq problems) {:error (string/join "; " problems)}
++              too-wide {:error (query-reason (::error too-wide))}
++              :else {:ok text :form form})))))))
++
+ (defn- parse-request
+   "The body's query and inputs parsed, normalised and validated: {:query :inputs :given} or a
+   refusal. A body with rules never gets here (`body-errors`)."
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 3704114..95760b3 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -2104,6 +2104,47 @@
+ ;; one and seven days back in epoch milliseconds, which is what claudeEditedAt holds. A page, tag or
+ ;; property (anything holding the :block/name) already titled Claude Activity is left alone.
+ 
++;; Query blocks (patch 0050). One write makes a block a Query block, as the app's advanced-query
++;; command does: tagged Query, the text in :logseq.property/query's value block, shown as a Clojure
++;; code block. The Activity page uses it; the insert path (stage 2) will too.
++
++(defn- query-value-id
++  "The db id of the value block holding `block-id`'s query, read from :eavt (an uploaded graph may
++  store the attribute with the app's schema), or nil."
++  [db block-id]
++  (:v (first (d/datoms db :eavt block-id :logseq.property/query))))
++
++(defn set-query-block!
++  "Makes block `block-id` on `conn` a Query block holding `text`: tagged Query, the text in its query
++  value block, which shows as code in Clojure. `_opts` takes {:mark? bool}: :mark? asks for the created-by-Claude marker, which
++  stage 4 adds; nothing writes it yet, so `read-back-query-block` reports it missing. The caller
++  checks `text` first (`datalog/check-query-block`) and reads the write back."
++  [conn block-id text _opts]
++  (outliner-property/set-block-property! conn block-id :block/tags :logseq.class/Query)
++  (outliner-property/set-block-property! conn block-id :logseq.property/query text)
++  (when-let [query-id (query-value-id @conn block-id)]
++    (outliner-property/set-block-property! conn query-id :logseq.property.node/display-type :code)
++    (outliner-property/set-block-property! conn query-id :logseq.property.code/lang "clojure"))
++  nil)
++
++(defn read-back-query-block
++  "What `db` doesn't hold of the Query block `block-id` that `set-query-block!` wrote with `text` and
++  `mark?`, as reasons for `unverified!` (empty when it stored). Read from :eavt datoms."
++  [db block-id text mark?]
++  (let [value (fn [e a] (:v (first (d/datoms db :eavt e a))))
++        tags (set (map #(:db/ident (d/entity db (:v %))) (d/datoms db :eavt block-id :block/tags)))
++        query-id (query-value-id db block-id)]
++    (cond-> []
++      (not (contains? tags :logseq.class/Query)) (conj "the block is not tagged Query")
++      (nil? query-id) (conj "the block holds no query")
++      (and query-id (not= text (value query-id :block/title))) (conj "the query text is not what was given")
++      (and query-id (not= :code (value query-id :logseq.property.node/display-type)))
++      (conj "the query is not shown as code")
++      (and query-id (not= "clojure" (value query-id :logseq.property.code/lang)))
++      (conj "the query's lang is not clojure")
++      ;; Stage 4 writes the marker and reads it here; until then a request for it can't hold.
++      mark? (conj "claudeQueryBlock is not set"))))
++
+ (def ^:private activity-page-title "Claude Activity")
+ 
+ (defn- activity-query-text
+@@ -2138,12 +2179,8 @@
+                                     {:sibling? false :bottom? true :keep-uuid? true :keep-block-order? true})
+       (doseq [[{:keys [text]} {:block/keys [uuid]}] (map vector activity-queries blocks)]
+         (let [id (:db/id (d/entity @conn [:block/uuid uuid]))]
+-          ;; As the app's advanced-query command makes one: tagged Query, the text in a code block.
+-          (outliner-property/set-block-property! conn id :block/tags :logseq.class/Query)
+-          (outliner-property/set-block-property! conn id :logseq.property/query text)
+-          (let [query-id (:db/id (:logseq.property/query (d/entity @conn id)))]
+-            (outliner-property/set-block-property! conn query-id :logseq.property.node/display-type :code)
+-            (outliner-property/set-block-property! conn query-id :logseq.property.code/lang "clojure"))
++          ;; The server pins this text, so Claude may not edit these blocks: they are not marked.
++          (set-query-block! conn id text {:mark? false})
+           (ldb/transact! conn [[:db/add id :logseq.property.table/sorting
+                                 [{:id :user.property/claude-editedAt :asc? false}]]]))))))
+ 
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
+new file mode 100644
+index 0000000..97cee6c
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
+@@ -0,0 +1,414 @@
++(ns logseq.db-sync.semantic-query-block-test
++  "Query blocks (patch 0050), stage 1: the static check a stored query passes and the one write of a
++  Query block. `check-query-block` takes the text Claude gives as a Query block's query and answers
++  {:ok text :form m} or {:error \"query: …\"}. It reuses datalog_query's parser, write-form check,
++  normaliser, validator and function-binding cap, and adds a key allow-list (no :rules, no :view or
++  :result-transform, which run as code in the app), the vector form for :query (the only form the app
++  runs) and the 4,000-character limit over the whole text. Every refusal that is not new to query
++  blocks is also refused by datalog_query's dry run through handle-http, and every accepted query is
++  accepted by it. `set-query-block!` is the one write of a Query block, pulled out of the Claude
++  Activity page (patch 0034), whose blocks are stored exactly as before."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.common.util :as common-util]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.datalog :as datalog]
++            [logseq.db-sync.worker.handler.semantic :as semantic]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(def ^:private actor
++  (js/encodeURIComponent
++   (js/JSON.stringify #js {"sub" "6f2c1a90-5b1e-4c7a-9d3e-2a1b0c9d8e7f"
++                           "cognito:username" "Owner" "email" "owner@example.com"})))
++
++(def ^:private stamped [["x-logseq-sync-actor" actor] ["x-logseq-edit-stamp" "claude"]])
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body & {:keys [headers]}]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          js-headers (js/Headers. #js {"content-type" "application/json"})
++          _ (doseq [[k v] headers] (.append js-headers k v))
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method :headers js-headers}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- raw-page [id page-title]
++  {:block/uuid id :block/name (string/lower-case page-title) :block/title page-title
++   :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1})
++
++(defn- with-graph
++  "A graph with page Notes holding block A (\"zq A\")."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true
++                        :env #js {"TIMEZONE" "UTC"}}
++              notes (random-uuid)
++              a (random-uuid)]
++        (d/transact! conn [(raw-page notes "Notes")])
++        (d/transact! conn [{:block/uuid a :block/title "zq A" :block/order "a0"
++                            :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                            :block/created-at 1 :block/updated-at 1}])
++        (run {:conn conn :self self :notes notes :a a}))
++      (p/catch #(is false (str "unexpected error: " % (some-> % .-stack))))
++      (p/finally done)))
++
++;; ---------------------------------------------------------------------------------------------
++;; The cases. Each has the text Claude would give, the reason check-query-block answers (nil when it
++;; accepts), and the body datalog_query's dry run is sent for the same :query and :inputs, with
++;; whether it refuses it. Where the rule is new to query blocks (the key list, the vector form, the
++;; flags, a non-map, the length over the whole map), the dry run accepts the same :query: that pins the
++;; rule as the query block's own, not a copy of datalog_query's.
++
++(def ^:private book-query
++  "{:query [:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title \"Book\"]]}")
++
++(defn- activity-text [input]
++  ;; The Activity page's own text, from the namespace that writes it.
++  (#'semantic/activity-query-text input))
++
++(def ^:private allowed-keys
++  "(keys: :query, :inputs, :title, :collapsed?, :group-by-page?, :remove-block-children?, :breadcrumb-show?)")
++
++(def ^:private rules-reason
++  (str "datalog_query takes no rules, because a tree of rules expands without reading data and can run"
++       " for seconds before any cap stops it; write the query without rules, or use run_named_query when one of"
++       " its queries fits"))
++
++(def ^:private give-map "query: give an EDN map {:query [:find … :where …] :inputs […]}")
++(def ^:private give-vector "query: give :query as a vector [:find … :where …]; the app runs only that form")
++
++(defn- padded
++  "A query text of exactly `n` characters, padded inside a string literal."
++  [n]
++  (let [base "{:query [:find ?b :where [?b :block/title \"\"]]}"
++        pad (- n (count base))]
++    (str "{:query [:find ?b :where [?b :block/title \"" (apply str (repeat pad "x")) "\"]]}")))
++
++(defn- spaced
++  "A short query padded to `n` characters with whitespace, which reading drops."
++  [n]
++  (let [base "{:query [:find ?b :where [?b :block/title]]}"]
++    (str (subs base 0 (dec (count base))) (apply str (repeat (- n (count base)) " ")) "}")))
++
++(defn- input-vars [n] (string/join " " (map #(str "?i" %) (range n))))
++
++(defn- many-inputs [n]
++  (str "{:query [:find ?b :in $ " (input-vars n) " :where [?b :block/title ?i0]] :inputs ["
++       (string/join " " (range n)) "]}"))
++
++(defn- many-bindings [n]
++  (str "{:query [:find ?b :where [?b :block/title ?t] "
++       (string/join " " (map #(str "[(str ?t) ?x" % "]") (range n))) "]}"))
++
++(def ^:private accepted
++  [{:label "the Book query" :text book-query
++    :dq {:query "[:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title \"Book\"]]"}}
++   {:label "the Activity page's last-day text" :text (activity-text :-1d-ms)
++    :dq {:query (pr-str (:query (common-util/safe-read-string (activity-text :-1d-ms)))) :inputs "[:-1d-ms]"}}
++   {:label "the Activity page's last-week text" :text (activity-text :-7d-ms)
++    :dq {:query (pr-str (:query (common-util/safe-read-string (activity-text :-7d-ms)))) :inputs "[:-7d-ms]"}}
++   {:label "keyword, string and number inputs"
++    :text (str "{:query [:find ?b :in $ ?p ?s ?n :where [?b :block/page ?p] [?b :block/title ?s]"
++               " [?b :block/collapsed? ?n]] :inputs [:current-page \"x\" 3]}")
++    :dq {:query "[:find ?b :in $ ?p ?s ?n :where [?b :block/page ?p] [?b :block/title ?s] [?b :block/collapsed? ?n]]"
++         :inputs "[:current-page \"x\" 3]"}}
++   {:label "every allowed key and flag"
++    :text (str "{:query [:find ?b :where [?b :block/title]] :inputs [] :title \"zq Books\" :collapsed? true"
++               " :group-by-page? false :remove-block-children? true :breadcrumb-show? false}")
++    :dq {:query "[:find ?b :where [?b :block/title]]" :inputs "[]"}}
++   {:label "20 inputs" :text (many-inputs 20)
++    :dq {:query (str "[:find ?b :in $ " (input-vars 20) " :where [?b :block/title ?i0]]")
++         :inputs (str "[" (string/join " " (range 20)) "]")}}
++   {:label "12 function bindings" :text (many-bindings 12)
++    :dq {:query (pr-str (:query (common-util/safe-read-string (many-bindings 12))))}}
++   {:label "keys in another order, with a collection input"
++    :text "{:breadcrumb-show? true :inputs [[\"a\" \"b\"]] :query [:find ?b :in $ [?s ...] :where [?b :block/title ?s]]}"
++    :dq {:query "[:find ?b :in $ [?s ...] :where [?b :block/title ?s]]" :inputs "[[\"a\" \"b\"]]"}}
++   {:label "uuid, inst, boolean and nil inputs"
++    :text (str "{:query [:find ?b :in $ ?u ?d ?c ?n :where [?b :block/uuid ?u] [?b :block/created-at ?d]"
++               " [?b :block/collapsed? ?c] [?b :block/title ?n]]"
++               " :inputs [#uuid \"3072a652-18e8-4dcb-bb37-e1aa38c8e3e9\" #inst \"2026-01-01\" true nil]}")
++    :dq {:query (str "[:find ?b :in $ ?u ?d ?c ?n :where [?b :block/uuid ?u] [?b :block/created-at ?d]"
++                     " [?b :block/collapsed? ?c] [?b :block/title ?n]]")
++         :inputs "[#uuid \"3072a652-18e8-4dcb-bb37-e1aa38c8e3e9\" #inst \"2026-01-01\" true nil]"}}
++   {:label "exactly 4,000 characters" :text (padded 4000)
++    :dq {:query (pr-str (:query (common-util/safe-read-string (padded 4000))))}}])
++
++(defn- dq-of [text] {:query (pr-str (:query (common-util/safe-read-string text)))})
++
++(def ^:private refused
++  (let [allowed (string/join ", " (sort-by str datalog/allowed-fns))
++        rule-call "{:query [:find ?b :where [?b :block/title] (task ?b #{\"todo\"})]}"
++        percent "{:query [:find ?b :in $ % :where [?b :block/title]]}"
++        retract "{:query [:find ?b :where [?b :block/title :db/retract]]}"
++        db-id "{:query [:find ?b :where [?b :block/parent {:db/id 1}]]}"
++        re-find "{:query [:find ?b :where [?b :block/title ?t] [(re-find ?t ?t)]]}"
++        cross "{:query [:find ?a ?b :where [?a :block/title] [?b :block/title]]}"
++        mismatch "{:query [:find ?b :in $ ?x :where [?b :block/title ?x]] :inputs []}"
++        plain "[:find ?b :where [?b :block/title]]"]
++    [{:label ":rules" :new? false
++      :text (str "{:query " plain " :rules [[(r ?b) [?b :block/title]]]}")
++      :reason (str "query: :rules is not accepted; " rules-reason)
++      :dq {:query plain :rules "[[(r ?b) [?b :block/title]]]"}}
++     {:label "a rule call" :text rule-call
++      :reason (str "query: where 2: (task …) calls a rule; " rules-reason)
++      :dq (dq-of rule-call)}
++     {:label "% in :in" :text percent
++      :reason (str "query: :in: % is not accepted; " rules-reason)
++      :dq (dq-of percent)}
++     {:label ":result-transform" :new? true
++      :text (str "{:query " plain " :result-transform :sort-by-title}")
++      :reason "query: :result-transform is not accepted; it runs as code in the app"
++      :dq {:query plain}}
++     {:label ":view" :new? true
++      :text (str "{:query " plain " :view (fn [rows] [:div (count rows)])}")
++      :reason "query: :view is not accepted; it runs as code in the app"
++      :dq {:query plain}}
++     {:label "an unknown key" :new? true
++      :text (str "{:query " plain " :limit 3}")
++      :reason (str "query: :limit is not accepted " allowed-keys)
++      :dq {:query plain}}
++     {:label "a string key" :new? true
++      :text (str "{:query " plain " \"title\" \"x\"}")
++      :reason (str "query: \"title\" is not accepted " allowed-keys)
++      :dq {:query plain}}
++     {:label ":db/retract" :text retract
++      :reason "query: :db/retract is a write form; datalog_query is read-only"
++      :dq (dq-of retract)}
++     {:label "a map with :db/id" :text db-id
++      :reason "query: a map with :db/id is a write form; datalog_query is read-only"
++      :dq (dq-of db-id)}
++     {:label "a write form in :inputs"
++      :text "{:query [:find ?b :in $ ?x :where [?b :block/title ?x]] :inputs [:db/add]}"
++      :reason "query: :db/add is a write form; datalog_query is read-only"
++      :dq {:query "[:find ?b :in $ ?x :where [?b :block/title ?x]]" :inputs "[:db/add]"}}
++     {:label "re-find" :text re-find
++      :reason (str "query: where 2: function re-find is not allowed (allowed: " allowed ")")
++      :dq (dq-of re-find)}
++     {:label "a cross product" :text cross
++      :reason "query: where: clauses 1 and 2 share no variable (a cross product); join them through a shared variable"
++      :dq (dq-of cross)}
++     {:label "13 function bindings" :text (many-bindings 13)
++      :reason (str "query: query has 13 function bindings, more than the 12 the width cap allows: each function binding"
++                   " copies every column of every row bound so far; return extra attributes with (pull ?b [...]) in :find,"
++                   " which runs only on the kept rows, bind fewer values with functions, or narrow the rows first")
++      :dq (dq-of (many-bindings 13)) :status 422}
++     {:label "4,001 characters" :new? true :text (padded 4001)
++      :reason "query: at most 4,000 characters (got 4,001)"
++      :dq (dq-of (padded 4001))}
++     ;; The limit counts the text as given, whitespace included, as datalog_query counts its field.
++     {:label "4,001 characters, mostly whitespace" :new? true :text (spaced 4001)
++      :reason "query: at most 4,000 characters (got 4,001)"
++      :dq (dq-of (spaced 4001))}
++     ;; A validator reason that already starts with query: is not prefixed again.
++     {:label "a :find with no values" :text "{:query [:find :where [?b :block/title]]}"
++      :reason "query: :find has no values"
++      :dq {:query "[:find :where [?b :block/title]]"}}
++     {:label "an inputs count mismatch" :text mismatch
++      :reason "query: inputs: 0 values given, but :in binds 1 after $"
++      :dq {:query "[:find ?b :in $ ?x :where [?b :block/title ?x]]" :inputs "[]"}}
++     {:label ":inputs not a vector"
++      :text (str "{:query " plain " :inputs \"x\"}")
++      :reason "query: :inputs must be a vector"
++      :dq {:query plain :inputs "\"x\""}}
++     {:label ":inputs as a list"
++      :text "{:query [:find ?b :in $ ?x :where [?b :block/title ?x]] :inputs (\"x\")}"
++      :reason "query: :inputs must be a vector"
++      :dq {:query "[:find ?b :in $ ?x :where [?b :block/title ?x]]" :inputs "(\"x\")"}}
++     {:label "21 inputs" :text (many-inputs 21)
++      :reason "query: :inputs takes at most 20 values (got 21)"
++      :dq {:query (str "[:find ?b :in $ " (input-vars 21) " :where [?b :block/title ?i0]]")
++           :inputs (str "[" (string/join " " (range 21)) "]")}}
++     {:label "a vector, not a map" :new? true :text plain :reason give-map :dq {:query plain}}
++     {:label "a string, not a map" :new? true :text "\"(task todo)\"" :reason give-map :dq {:query plain}}
++     {:label "map-form :query" :new? true
++      :text "{:query {:find [?b] :where [[?b :block/title]]}}"
++      :reason give-vector
++      :dq {:query "{:find [?b] :where [[?b :block/title]]}"}}
++     {:label "no :query" :new? true :text "{:title \"zq x\"}" :reason give-vector :dq {:query plain}}
++     {:label ":query not starting with :find" :new? true
++      :text "{:query [:where [?b :block/title] :find ?b]}"
++      :reason give-vector
++      :dq {:query "[:where [?b :block/title] :find ?b]"}}
++     {:label "a #js reader tag"
++      :text "{:query [:find ?b :where [?b :block/title #js \"x\"]]}"
++      :reason "query: reader tag #js is not allowed (only #uuid and #inst)"
++      :dq {:query "[:find ?b :where [?b :block/title #js \"x\"]]"}}
++     {:label "two forms"
++      :text (str "{:query " plain "} {:query " plain "}")
++      ;; parse-edn reports where the reader stopped: after the second form.
++      :reason (str "query: unexpected text after the form at line 1, column "
++                   (inc (count (str "{:query " plain "} {:query " plain "}"))) "; give one EDN form")
++      :dq {:query (str plain " " plain)}}
++     {:label "an empty text" :text ""
++      :reason "query: empty; give an EDN form"
++      :dq {:query ""}}
++     {:label ":title 3" :new? true :text (str "{:query " plain " :title 3}")
++      :reason "query: :title must be a string" :dq {:query plain}}
++     {:label ":collapsed? \"yes\"" :new? true :text (str "{:query " plain " :collapsed? \"yes\"}")
++      :reason "query: :collapsed? must be true or false" :dq {:query plain}}
++     {:label ":group-by-page? nil" :new? true :text (str "{:query " plain " :group-by-page? nil}")
++      :reason "query: :group-by-page? must be true or false" :dq {:query plain}}
++     {:label ":remove-block-children? 1" :new? true :text (str "{:query " plain " :remove-block-children? 1}")
++      :reason "query: :remove-block-children? must be true or false" :dq {:query plain}}
++     {:label ":breadcrumb-show? :yes" :new? true :text (str "{:query " plain " :breadcrumb-show? :yes}")
++      :reason "query: :breadcrumb-show? must be true or false" :dq {:query plain}}]))
++
++(defn- once-prefixed? [reason]
++  (and (string/starts-with? reason "query: ")
++       (not (string/starts-with? reason "query: query: "))))
++
++;; Before the fix (the function did not exist):
++;;   ERROR in (check-query-block-accepts-test) ... TypeError: ... check_query_block is not a function
++(deftest check-query-block-accepts-test
++  (doseq [{:keys [label text]} accepted]
++    (let [result (datalog/check-query-block text)]
++      (is (= text (:ok result)) (str label ": " (pr-str (:error result))))
++      (is (= (common-util/safe-read-string text) (:form result)) (str label ": the parsed map"))
++      (is (nil? (:error result)) label)))
++  (testing "the length counts the whole text, before parsing"
++    (is (= 4000 (count (padded 4000))))
++    (is (= 4001 (count (padded 4001))))))
++
++;; Before the fix (the function did not exist):
++;;   ERROR in (check-query-block-refuses-test) ... TypeError: ... check_query_block is not a function
++(deftest check-query-block-refuses-test
++  (doseq [{:keys [label text reason]} refused]
++    (let [result (datalog/check-query-block text)]
++      (is (= reason (:error result)) label)
++      (is (once-prefixed? (str (:error result))) (str label ": starts with query: once"))
++      (is (nil? (:ok result)) label)))
++  (testing "a text that isn't a string"
++    (doseq [x [nil 3 {:query []} ["[:find ?b]"]]]
++      (is (= {:error give-map} (datalog/check-query-block x)) (pr-str x))))
++  (testing "every reason for one text, joined with ; as datalog_query joins them"
++    (is (= {:error (str "query: :limit is not accepted " allowed-keys "; "
++                        "query: :view is not accepted; it runs as code in the app; "
++                        "query: :title must be a string; query: :collapsed? must be true or false; "
++                        "query: :inputs must be a vector; " give-vector)}
++           (datalog/check-query-block
++            "{:query {:find [?b]} :view 1 :limit 2 :title 3 :collapsed? 4 :inputs 5}")))
++    (is (= {:error (str "query: :db/retract is a write form; datalog_query is read-only; "
++                        "query: where 2: function re-find is not allowed (allowed: "
++                        (string/join ", " (sort-by str datalog/allowed-fns)) ")")}
++           (datalog/check-query-block
++            "{:query [:find ?b :where [?b :block/title :db/retract] [(re-find ?b ?b)]]}")))))
++
++(defn- dry-run! [self {:keys [query inputs rules]}]
++  (request! self "POST" "/semantic/query"
++            (cond-> {:query query :dry-run true}
++              (some? inputs) (assoc :inputs inputs)
++              (some? rules) (assoc :rules rules))))
++
++;; Before the fix (the function did not exist):
++;;   ERROR in (check-query-block-agrees-with-datalog-query-test) ... check_query_block is not a function
++(deftest check-query-block-agrees-with-datalog-query-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/do
++          (p/doseq [{:keys [label text dq]} accepted]
++            (p/let [response (dry-run! self dq)]
++              (is (some? (:ok (datalog/check-query-block text))) label)
++              (is (= 200 (:status response)) (str label ": datalog_query accepts it too: " (pr-str (:body response))))))
++          (p/doseq [{:keys [label text dq new? status]} refused]
++            (p/let [response (dry-run! self dq)]
++              (is (some? (:error (datalog/check-query-block text))) label)
++              (if new?
++                (is (= 200 (:status response))
++                    (str label ": a rule of the query block's own; datalog_query accepts the same :query: "
++                         (pr-str (:body response))))
++                (is (= (or status 400) (:status response))
++                    (str label ": datalog_query refuses it too: " (pr-str (:body response))))))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; The Claude Activity page, after the write moved into set-query-block!. A pin: the extraction
++;; changes only where the code lives, so this can't fail first; the mutation check (dropping the
++;; lang set, the display type or the tag) shows it decides.
++
++(defn- datom-v [db e a] (:v (first (d/datoms db :eavt e a))))
++
++(defn- activity-blocks
++  "The Activity page's top-level blocks, read from :eavt and :avet, in page order."
++  [db]
++  (let [page (:e (first (d/datoms db :avet :block/name "claude activity")))]
++    (->> (d/datoms db :avet :block/parent page)
++         (map :e)
++         (sort-by #(datom-v db % :block/order)))))
++
++(defn- stored-query-block
++  "What `block` holds as a Query block, from :eavt: its tags' idents, its query value blocks' text,
++  display type and lang, and its table sorting."
++  [db block]
++  (let [values (map :v (d/datoms db :eavt block :logseq.property/query))]
++    {:title (datom-v db block :block/title)
++     :tags (set (map #(:db/ident (d/entity db (:v %))) (d/datoms db :eavt block :block/tags)))
++     :values (mapv (fn [v] {:text (datom-v db v :block/title)
++                            :display-type (datom-v db v :logseq.property.node/display-type)
++                            :lang (datom-v db v :logseq.property.code/lang)
++                            :from (:db/ident (d/entity db (datom-v db v :logseq.property/created-from-property)))})
++                   values)
++     :sorting (datom-v db block :logseq.property.table/sorting)}))
++
++(deftest activity-page-unchanged-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a]}]
++        (p/let [response (request! self "PATCH" (str "/semantic/blocks/" a) {:title "zq A edited"} :headers stamped)
++                db @conn
++                blocks (activity-blocks db)
++                write-tx (:tx (first (d/datoms db :eavt (:db/id (d/entity db [:block/uuid a])) :block/title)))]
++          (is (= 200 (:status response)) (pr-str (:body response)))
++          (is (= [{:title "Edited by Claude since yesterday"
++                   :tags #{:logseq.class/Query}
++                   :values [{:text (activity-text :-1d-ms) :display-type :code :lang "clojure"
++                             :from :logseq.property/query}]
++                   :sorting [{:id :user.property/claude-editedAt :asc? false}]}
++                  {:title "Edited by Claude in the last 7 days"
++                   :tags #{:logseq.class/Query}
++                   :values [{:text (activity-text :-7d-ms) :display-type :code :lang "clojure"
++                             :from :logseq.property/query}]
++                   :sorting [{:id :user.property/claude-editedAt :asc? false}]}]
++                 (map #(stored-query-block db %) blocks)))
++          (testing "in the write's own transaction"
++            (is (= #{write-tx} (set (map :tx (mapcat #(d/datoms db :eavt %) blocks))))))
++          (testing "the read-back finds each block stored"
++            (doseq [[block input] (map vector blocks [:-1d-ms :-7d-ms])]
++              (is (= [] (semantic/read-back-query-block db block (activity-text input) false))))))))))
++
++;; Before the fix (the function did not exist):
++;;   ERROR in (read-back-query-block-names-each-gap-test) ... read_back_query_block is not a function
++(deftest read-back-query-block-names-each-gap-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self a]}]
++        (p/let [_ (request! self "PATCH" (str "/semantic/blocks/" a) {:title "zq A edited"} :headers stamped)
++                [block] (activity-blocks @conn)
++                text (activity-text :-1d-ms)
++                value (datom-v @conn block :logseq.property/query)
++                without (fn [e a]
++                          (d/db-with @conn (map (fn [datom] [:db/retract e a (:v datom)]) (d/datoms @conn :eavt e a))))]
++          (is (= [] (semantic/read-back-query-block @conn block text false)))
++          (is (= ["the query text is not what was given"]
++                 (semantic/read-back-query-block @conn block (str text " ") false)))
++          (is (= ["the block is not tagged Query"]
++                 (semantic/read-back-query-block (without block :block/tags) block text false)))
++          (is (= ["the block holds no query"]
++                 (semantic/read-back-query-block (without block :logseq.property/query) block text false)))
++          (is (= ["the query is not shown as code"]
++                 (semantic/read-back-query-block (without value :logseq.property.node/display-type) block text false)))
++          (is (= ["the query's lang is not clojure"]
++                 (semantic/read-back-query-block (without value :logseq.property.code/lang) block text false)))
++          (testing "the marker is not written before stage 4, so asking for it reads back as missing"
++            (is (= ["claudeQueryBlock is not set"]
++                   (semantic/read-back-query-block @conn block text true)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 1a146f3..90c1ced 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -39,6 +39,7 @@
+             [logseq.db-sync.semantic-tags-title-scoped-test]
+             [logseq.db-sync.semantic-value-block-by-uuid-test]
+             [logseq.db-sync.semantic-page-title-heading-test]
++            [logseq.db-sync.semantic-query-block-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]
