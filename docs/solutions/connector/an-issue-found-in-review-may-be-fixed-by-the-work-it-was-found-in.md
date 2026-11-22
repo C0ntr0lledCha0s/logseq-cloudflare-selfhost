@@ -4,7 +4,7 @@ area: connector
 tags: [not-a-bug, stale-issue, already-fixed, annotations, destructiveHint, tools-manifest, tracker]
 seen:
   - 2026-11-19 – item 46 (batch_insert_block_trees annotated additive; already DESTRUCTIVE at HEAD, lane found no bug)
-promoted_to: []
+promoted_to: ["CLAUDE.md Gotchas"]
 ---
 
 ## Symptom

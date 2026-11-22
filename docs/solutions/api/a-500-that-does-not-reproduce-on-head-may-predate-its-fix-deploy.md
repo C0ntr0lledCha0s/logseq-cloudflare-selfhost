@@ -4,7 +4,7 @@ area: api
 tags: [does-not-reproduce, not-a-bug, stale-deploy, tags, private-tags, reset, 500, deploy-history, regression-test]
 seen:
   - 2026-11-19 – item 38 (Tags reset answered 500; fixed by patch 0027 and deployed 2026-11-07, lane found no bug on HEAD)
-promoted_to: []
+promoted_to: ["CLAUDE.md Gotchas"]
 ---
 
 ## Symptom
