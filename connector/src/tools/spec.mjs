@@ -261,7 +261,7 @@ export const FIRST_LINES = Object.freeze({
   get_activity_log: "What the connector changed in a graph, newest first: the answer to 'what did you change?'",
   get_block: "One block or page by UUID with its tags and properties, without its children.",
   get_blocks: "Up to 100 blocks or pages by UUID in one call, optionally with their outlines.",
-  get_graph_health: "A tidy-up report: unused tags and properties, duplicate titles, pages with no summary or tag.",
+  get_graph_health: "A tidy-up report: unused tags and properties, duplicate titles, page gaps, broken refs.",
   get_page: "One page's tags and properties by UUID, title or date; get_page_outline reads its content.",
   get_page_backlinks: "How a page is used: links, tagged objects and property values pointing at it, with counts.",
   get_page_outline: "Read a whole page as markdown with tags, properties and links resolved; the usual way to read.",

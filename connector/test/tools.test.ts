@@ -2888,3 +2888,28 @@ describe("get_graph_health and Private content", () => {
     expect(tool.description).toContain("a tag or property used only by Private objects is in use");
   });
 });
+
+// Patch 0051 stage 2: get_graph_health reports broken refs.
+describe("get_graph_health and broken refs", () => {
+  it("connector_help names the broken-refs check, its reasons and the Private-target rule", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "broken refs (broken-refs: a block or page whose text links, as [[uuid]] or ((uuid)), a uuid with no entity, reason missing, or one in the Recycle bin, reason in-recycle-bin; a property value's link is reported as the block holding it, and a link to Private content isn't listed)",
+    );
+  });
+
+  it("get_graph_health's first line names broken refs", () => {
+    expect(FIRST_LINES.get_graph_health).toBe(
+      "A tidy-up report: unused tags and properties, duplicate titles, page gaps, broken refs.",
+    );
+  });
+
+  it("get_graph_health's vendored description and checks parameter carry broken-refs", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_health)).toBe(true);
+    for (const phrase of ["broken-refs (blocks and pages whose title refers", "reason missing", "reason in-recycle-bin", "target-uuid"]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(JSON.stringify(tool.inputSchema)).toContain("orphan-choices, broken-refs. Defaults to all");
+  });
+});

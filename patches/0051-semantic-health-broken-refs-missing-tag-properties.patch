@@ -1,7 +1,74 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+index 7ed17ad..a6e34ec 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
+@@ -9,6 +9,7 @@
+   pages and their blocks."
+   (:require [clojure.string :as string]
+             [datascript.core :as d]
++            [logseq.common.util :as common-util]
+             [logseq.db.frontend.class :as db-class]
+             [logseq.db.frontend.entity-util :as entity-util]
+             [logseq.db.frontend.property :as db-property]))
+@@ -280,3 +281,45 @@
+                                        :property (d/entity db property-id)
+                                        :value (d/entity db (:v datom))
+                                        :reason reason})))))))))))
++
++(def ^:private ref-pattern
++  "A ref in a stored title: [[uuid]] (db-content/id-ref-pattern's form, which a #[[uuid]] tag also
++  holds) or ((uuid)) (a block ref, stored as typed), in any case. Group 1 or 2 is the uuid."
++  (re-pattern (str "(?i)\\[\\[(" common-util/uuid-pattern ")\\]\\]"
++                   "|\\(\\((" common-util/uuid-pattern ")\\)\\)")))
++
++(defn- recycled-id?
++  "The entity or one of its parents is in the Recycle bin."
++  [db e]
++  (loop [e e
++         seen #{}]
++    (cond
++      (or (nil? e) (contains? seen e)) false
++      (attr-value db e :logseq.property/deleted-at) true
++      :else (recur (attr-value db e :block/parent) (conj seen e)))))
++
++(defn broken-refs
++  "Refs in stored titles whose target has no entity (:reason \"missing\") or is in the Recycle bin,
++  itself or through a parent (\"in-recycle-bin\"), as {:holder :target-uuid :reason}, one per holder
++  and target. A property value block's ref belongs to its owner. Holders in `private`
++  (datalog/private-ids), hidden or built-in are not scanned, and a target in `private` that isn't in
++  the bin is not listed: it exists, so it isn't missing. Titles are matched first, so only titles that
++  hold a ref cost an entity walk."
++  [db private]
++  (->> (d/datoms db :aevt :block/title)
++       (mapcat (fn [{:keys [e v]}]
++                 (when (string? v)
++                   (when-let [targets (seq (re-seq ref-pattern v))]
++                     (let [holder (if (value-block-property db e) (attr-value db e :block/parent) e)]
++                       (when-not (or (nil? holder) (contains? private holder)
++                                     (built-in-id? db holder) (hidden-id? db holder))
++                         (for [[_ page-form block-form] targets]
++                           [holder (string/lower-case (or page-form block-form))])))))))
++       (distinct)
++       (keep (fn [[holder target]]
++               (let [target-id (:e (first (d/datoms db :avet :block/uuid (uuid target))))
++                     reason (cond
++                              (nil? target-id) "missing"
++                              (recycled-id? db target-id) "in-recycle-bin")]
++                 (when reason
++                   {:holder (d/entity db holder) :target-uuid target :reason reason}))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d22c921..32d475e 100644
+index d22c921..1c9cfb1 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -5504,7 +5504,7 @@
+ 
+ (def ^:private health-checks
+   ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"
+-   "mismatched-choice-values" "orphan-choices"])
++   "mismatched-choice-values" "orphan-choices" "broken-refs"])
+ 
+ (defn- orphan-choices
+   "Every choice whose owners are all gone or nameless (stranded-choice?)."
 @@ -5536,16 +5536,25 @@
    (let [raw (.get (.-searchParams url) param)]
      (when (seq raw) (vec (distinct (string/split raw #","))))))
@@ -34,7 +101,7 @@ index d22c921..32d475e 100644
                                   :items #(mapv (fn [group]
                                                   {:title (:block/title (first group))
                                                    :entities (mapv page-ref-response group)})
-@@ -5556,11 +5565,13 @@
+@@ -5556,12 +5565,20 @@
        (update (paginate-by (fn [{:keys [holder property value]}]
                               [(uuid-string (:block/uuid holder))
                                (str (entity-ident property) " " (uuid-string (:block/uuid value)))])
@@ -46,11 +113,19 @@ index d22c921..32d475e 100644
        "orphan-choices"
        (update (paginate-by (fn [choice] [(string/lower-case (choice-content choice)) (uuid-string (:block/uuid choice))])
 -                           (orphan-choices db) limit cursor)
+-              :items #(mapv orphan-choice-response %)))))
 +                           (visible (orphan-choices db)) limit cursor)
-               :items #(mapv orphan-choice-response %)))))
++              :items #(mapv orphan-choice-response %))
++      "broken-refs"
++      (update (paginate-by (fn [{:keys [holder target-uuid]}] [(uuid-string (:block/uuid holder)) target-uuid])
++                           (graph-insights/broken-refs db private) limit cursor)
++              :items #(mapv (fn [{:keys [holder target-uuid reason]}]
++                              (assoc (holder-response holder) :target-uuid target-uuid :reason reason))
++                            %)))))
  
  (defn- knowledge-index-aliases
-@@ -5611,7 +5622,8 @@
+   "Titles of the page's :block/alias targets, sorted: none hidden or in the Recycle bin (itself or
+@@ -5611,7 +5628,8 @@
              (and cursor (not= 1 (count checks))) (http/bad-request "cursor needs exactly one check")
              (:invalid? time-filters) (http/bad-request "invalid time filter")
              :else
@@ -61,7 +136,7 @@ index d22c921..32d475e 100644
                                                       checks)}))))
  
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index cbf0844..70336d5 100644
+index cbf0844..0f692af 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -167,7 +167,7 @@
@@ -69,13 +144,63 @@ index cbf0844..70336d5 100644
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
 -   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
-+   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists). Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
+@@ -598,7 +598,7 @@
+             :description "Most items listed per relation. Counts are always complete."}])
+     (= "getGraphHealth" operation-id)
+     (into (concat [{:name "checks" :in "query" :schema {:type "string"}
+-                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags, mismatched-choice-values, orphan-choices. Defaults to all; any other value is rejected."}
++                    :description "Comma-separated checks to run: orphan-tags, orphan-properties, duplicate-titles, pages-without-summary, pages-without-tags, mismatched-choice-values, orphan-choices, broken-refs. Defaults to all; any other value is rejected."}
+                    {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
+                     :description "Most items listed per check. Counts are always complete."}
+                    {:name "cursor" :in "query" :schema {:type "string"}
+@@ -1055,7 +1055,7 @@
+                :HealthCheckResult {:type "object" :required ["count" "items"]
+                                    :properties {:count {:type "integer"}
+                                                 :items {:type "array"
+-                                                        :description "Tags for orphan-tags, property definitions for orphan-properties, {title, entities} groups for duplicate-titles, pages for the page checks, and {uuid, value, reason} choices for orphan-choices."
++                                                        :description "Tags for orphan-tags, property definitions for orphan-properties, {title, entities} groups for duplicate-titles, pages for the page checks, {uuid, value, reason} choices for orphan-choices, and {uuid, kind, title, page-id, page-title, target-uuid, reason} holders for broken-refs."
+                                                         :items {}}
+                                                 :next-cursor {:type "string"}}}
+                :GraphHealthResponse {:type "object" :required ["checks"]
+diff --git a/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs b/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
+index 7c3f300..c707986 100644
+--- a/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/e2ee_semantic_test.cljs
+@@ -272,3 +272,27 @@
+                (is (not-any? #(contains? (get-in stored-body [:blocks 0]) %) [:query :converted])))
+              (p/catch #(is false (str %)))
+              (p/finally done))))
++
++;; getGraphHealth's broken-refs check (patch 0051) reads titles, which are ciphertext on an E2EE
++;; graph, so the call answers the insights 409 before reading any parameter, and writes nothing.
++(deftest broken-refs-refused-on-e2ee-test
++  (async done
++         (-> (p/let [conn (sqlite-export/create-conn)
++                     [_ page-id] (outliner-page/create! conn "Disposable" {})
++                     ctx (self conn)
++                     before [(:max-tx @conn) (count (d/datoms @conn :eavt))]
++                     responses (p/all (map (fn [query]
++                                             (p/let [response (sync/handle-http
++                                                               ctx
++                                                               (js/Request. (str "http://localhost/semantic/health?graph-id=graph-1&graph-e2ee=true" query)
++                                                                            #js {:method "GET"}))
++                                                     body (.json response)]
++                                               [(.-status response) (aget body "error")]))
++                                           ["&checks=broken-refs" "&checks=broken-refs&limit=0" ""]))
++                     after [(:max-tx @conn) (count (d/datoms @conn :eavt))]]
++               (is (some? page-id))
++               (is (= (repeat 3 [409 "graph insights are unavailable for E2EE graphs"]) responses)
++                   "broken-refs alone, with a bad limit, and in the default set")
++               (is (= before after) "nothing written"))
++             (p/catch #(is false (str %)))
++             (p/finally done))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs
 new file mode 100644
-index 0000000..8d2204f
+index 0000000..6be8397
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_private_test.cljs
 @@ -0,0 +1,338 @@
@@ -376,7 +501,7 @@ index 0000000..8d2204f
 +                checks (get-in response [:body :checks])]
 +          (println "default health call on the private fixture:" elapsed "ms")
 +          (is (= 200 (:status response)) (pr-str response))
-+          (is (= 7 (count checks)))
++          (is (= 8 (count checks)))
 +          (doseq [[check result] checks]
 +            (testing (name check)
 +              (is (= [] (leaked private result)))
@@ -417,15 +542,344 @@ index 0000000..8d2204f
 +            (is (contains? page-uuids (str plain)) "an untagged visible page still is"))
 +          (p/catch #(is false (str % "\n" (.-stack %))))
 +          (p/finally done)))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
+new file mode 100644
+index 0000000..53276e3
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
+@@ -0,0 +1,307 @@
++(ns logseq.db-sync.semantic-graph-health-refs-test
++  "getGraphHealth's broken-refs check (patch 0051): every visible block or page whose stored title
++  refers to a uuid, as [[uuid]] (which a #[[uuid]] tag holds) or ((uuid)), that has no entity
++  (reason missing) or whose entity is in the Recycle bin, itself or through a parent (reason
++  in-recycle-bin). A property value block is reported as its owner. A holder that is Private, in the
++  Recycle bin or built-in is not scanned, and a ref to a Private target that isn't in the bin is not
++  listed: the target exists, so missing would be false. One item per holder and target.
++
++  The graph is written through the real handler (tags, pages, blocks, property values, deleteBlock and
++  deletePage, which recycle) and transacted directly for what the API can't store: an uppercase uuid,
++  a built-in holder, and a page whose own title holds a ref. Every fixture title holds zz."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test :as uploaded]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- uuid-of [response] (uuid (get-in response [:body :uuid])))
++
++(defn- eid [conn id] (:db/id (d/entity @conn [:block/uuid id])))
++
++(defn- writer
++  "Write helpers on `self`, each through the real handler."
++  [self]
++  {:tag! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/tags" {:title title}) 201)] (uuid-of r)))
++   :page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++   :set-tags! (fn [id titles]
++                (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent "block/tags"))
++                               {:value titles})
++                     200))
++   :insert! (fn [target blocks]
++              (p/let [r (ok! (request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks}) 201)]
++                (mapv #(uuid (:uuid %)) (get-in r [:body :blocks]))))
++   :delete-block! (fn [id] (ok! (request! self "DELETE" (str "/semantic/blocks/" id "?acknowledge-references=true") nil) 200))
++   :delete-page! (fn [id] (ok! (request! self "DELETE" (str "/semantic/pages/" id "?acknowledge-references=true") nil) 200))})
++
++(defn- ref [id] (str "[[" id "]]"))
++(defn- block-ref [id] (str "((" id "))"))
++
++(defn- seed-graph
++  "The graph the namespace docstring describes. Returns the conn, the handler context, the uuids by
++  name and :expected, the set of [holder target reason] items the check must list."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++          {:keys [tag! page! set-tags! insert! delete-block! delete-page!]} (writer self)
++          _private-tag (tag! "Private")
++          book (tag! "zz Book")
++          notes (page! "zz Notes")
++          valid-page (page! "zz Valid Page")
++          private-page (page! "zz Private Page")
++          binned-page (page! "zz Binned Page")
++          journal-ish (page! "zz Other")
++          _ (set-tags! private-page ["Private"])
++          [ghost ghost-2 ghost-3 ghost-4 ghost-5 ghost-6 page-holder] (repeatedly 7 random-uuid)
++          [doomed-block valid-block private-block binned-block]
++          (insert! journal-ish [{:title "zz doomed block"} {:title "zz valid block"} {:title "zz private block"}
++                                {:title "zz binned block"}])
++          _ (set-tags! private-block ["Private"])
++          [on-private-page] (insert! private-page [{:title "zz block on a private page"}])
++          [on-binned-page on-bin-holder] (insert! binned-page [{:title "zz block on a binned page"}
++                                                               {:title (str "zz on bin holder " (ref ghost-5))}])
++          [missing-holder deleted-holder bin-block-holder on-bin-page-holder
++           forms-holder upper-holder valid-holder private-target-holder value-owner
++           private-holder bin-holder built-in-holder hidden-holder]
++          (insert! notes [{:title (str "zz see " (ref ghost))}
++                          {:title (str "zz deleted block ref " (block-ref doomed-block))}
++                          {:title (str "zz binned block ref " (block-ref binned-block))}
++                          {:title (str "zz ref to a block on a binned page " (block-ref on-binned-page))}
++                          {:title (str "zz forms " (ref ghost-2) " " (block-ref ghost-2) " " (ref ghost-2)
++                                       " #" (ref ghost-3))}
++                          {:title "zz upper placeholder"}
++                          {:title (str "zz valid " (ref valid-page) " " (block-ref valid-block) " " (ref book))}
++                          {:title (str "zz private targets " (ref private-page) " " (block-ref private-block)
++                                       " " (block-ref on-private-page))}
++                          {:title (str "zz value owner " (ref ghost-4))}
++                          {:title (str "zz private holder " (ref ghost-5))}
++                          {:title (str "zz bin holder " (ref ghost-5))}
++                          {:title (str "zz built-in holder " (ref ghost-5))}
++                          {:title (str "zz hidden holder " (ref ghost-5))}])
++          ;; A text property value that links a missing uuid, held by a block whose own title links
++          ;; the same uuid (one item), and one held by a block whose title doesn't (the owner listed).
++          notes-prop (:db/ident (outliner-property/upsert-property!
++                                 conn nil {:logseq.property/type :default :db/cardinality :db.cardinality/one}
++                                 {:property-name "zz notes"}))
++          prop-path (js/encodeURIComponent (subs (str notes-prop) 1))
++          [value-only-owner] (insert! notes [{:title "zz value only owner"}])
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" value-owner "/properties/" prop-path)
++                           {:value (str "zz about " (ref ghost-4))})
++                 200)
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" value-only-owner "/properties/" prop-path)
++                           {:value (str "zz about " (ref ghost-6))})
++                 200)
++          _ (set-tags! private-holder ["Private"])
++          ;; deleteBlock retracts the block; deletePage recycles the page with its blocks (and turns
++          ;; [[uuid]] links to it in other titles into its title, so the page ref is written after).
++          ;; A block in the bin by itself is marked as the app's recycle leaves it (deleted-at).
++          _ (delete-block! doomed-block)
++          _ (delete-page! binned-page)
++          [bin-page-holder] (insert! notes [{:title (str "zz page ref " (ref binned-page))}])
++          _ (d/transact! conn [[:db/add (eid conn binned-block) :logseq.property/deleted-at 1]
++                               [:db/add (eid conn bin-holder) :logseq.property/deleted-at 1]])
++          ;; What the API can't store: an uppercase uuid (to a missing and to an existing entity), a
++          ;; built-in holder, and a page whose own title holds a ref.
++          _ (d/transact! conn [[:db/add (eid conn upper-holder) :block/title
++                                (str "zz upper " (ref (string/upper-case (str ghost))) " "
++                                     (ref (string/upper-case (str valid-page))))]
++                               [:db/add (eid conn built-in-holder) :logseq.property/built-in? true]
++                               [:db/add (eid conn hidden-holder) :logseq.property/hide? true]
++                               {:block/uuid page-holder :block/name "zz page holder" :block/title (str "zz page holder " (ref ghost))
++                                :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}])]
++    {:conn conn :self self
++     :ids {:ghost ghost :ghost-2 ghost-2 :ghost-3 ghost-3 :ghost-4 ghost-4 :ghost-5 ghost-5 :ghost-6 ghost-6
++           :notes notes :missing-holder missing-holder :value-owner value-owner :value-only-owner value-only-owner
++           :private-holder private-holder :bin-holder bin-holder :on-bin-holder on-bin-holder
++           :built-in-holder built-in-holder :hidden-holder hidden-holder
++           :valid-holder valid-holder :private-target-holder private-target-holder :page-holder page-holder
++           :forms-holder forms-holder :upper-holder upper-holder
++           :deleted-holder deleted-holder :doomed-block doomed-block}
++     :expected #{[missing-holder ghost "missing"]
++                 [deleted-holder doomed-block "missing"]
++                 [bin-block-holder binned-block "in-recycle-bin"]
++                 [bin-page-holder binned-page "in-recycle-bin"]
++                 [on-bin-page-holder on-binned-page "in-recycle-bin"]
++                 [forms-holder ghost-2 "missing"]
++                 [forms-holder ghost-3 "missing"]
++                 [upper-holder ghost "missing"]
++                 [value-owner ghost-4 "missing"]
++                 [value-only-owner ghost-6 "missing"]
++                 [page-holder ghost "missing"]}}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(defn- check! [self & [query]]
++  (p/let [response (request! self "GET" (str "/semantic/health?checks=broken-refs" (or query "&limit=200")) nil)]
++    (assert (= 200 (:status response)) (pr-str response))
++    (get-in response [:body :checks :broken-refs])))
++
++(defn- triples [check]
++  (set (map (fn [item] [(uuid (:uuid item)) (uuid (:target-uuid item)) (:reason item)]) (:items check))))
++
++(defn- holders [check] (set (map :uuid (:items check))))
++
++;; Before the fix (Stage 1 tree) every broken-refs call answered 400:
++;;   AssertionError: Assert failed: {:status 400, :body {:error "invalid checks"}}
++(deftest broken-refs-missing-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self ids]}]
++        (p/let [{:keys [ghost missing-holder notes]} ids
++                check (check! self)
++                item (first (filter #(and (= (str missing-holder) (:uuid %)) (= (str ghost) (:target-uuid %)))
++                                    (:items check)))]
++          (is (= {:uuid (str missing-holder) :kind "block" :title (str "zz see " (ref ghost))
++                  :page-id (str notes) :page-title "zz Notes" :target-uuid (str ghost) :reason "missing"}
++                 item)
++              "the spec's repro: a [[uuid]] with no entity, with the spec section 4 item shape"))))))
++
++(deftest broken-refs-in-recycle-bin-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self expected ids]}]
++        (p/let [check (check! self)
++                bin (set (filter #(= "in-recycle-bin" (nth % 2)) expected))]
++          (is (= 3 (count bin)))
++          (is (every? (triples check) bin)
++              "a ((uuid)) to a block in the bin, a [[uuid]] to a page deletePage recycled, and a ((uuid)) to a block on that page")
++          (is (contains? (triples check) [(:deleted-holder ids) (:doomed-block ids) "missing"])
++              "a ((uuid)) to a block deleteBlock retracted is missing"))))))
++
++(deftest broken-refs-skips-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self ids]}]
++        (p/let [{:keys [valid-holder private-holder bin-holder on-bin-holder built-in-holder hidden-holder ghost-5]} ids
++                check (check! self)]
++          (is (not (contains? (holders check) (str valid-holder)))
++              "refs to a live page, block and tag (and an uppercase ref to a live page) are not listed")
++          (is (not (contains? (holders check) (str private-holder))) "a Private holder is not scanned")
++          (is (not (contains? (holders check) (str bin-holder))) "a holder in the Recycle bin is not scanned")
++          (is (not (contains? (holders check) (str on-bin-holder))) "nor is a holder on a recycled page")
++          (is (not (contains? (holders check) (str built-in-holder))) "a built-in holder is not scanned")
++          (is (not (contains? (holders check) (str hidden-holder))) "a hidden holder is not scanned")
++          (is (not-any? #(= (str ghost-5) (:target-uuid %)) (:items check))))))))
++
++(deftest broken-refs-forms-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self expected ids]}]
++        (p/let [{:keys [private-target-holder value-owner ghost-4]} ids
++                check (check! self)
++                found (triples check)
++                value-block-ids (set (map str (keep :block/uuid (:block/_parent (d/entity @(.-conn self) [:block/uuid value-owner])))))]
++          (testing "[[uuid]], ((uuid)), #[[uuid]] and a repeated target in one title"
++            (is (= #{[(:forms-holder ids) (:ghost-2 ids) "missing"] [(:forms-holder ids) (:ghost-3 ids) "missing"]}
++                   (set (filter #(= (:forms-holder ids) (first %)) found)))
++                "one item per target, though the title holds one three times in two forms and one as a tag"))
++          (is (contains? found [(:value-owner ids) ghost-4 "missing"])
++              "a ref in a property value block's title and in its owner's title is one item, for the owner")
++          (is (contains? found [(:value-only-owner ids) (:ghost-6 ids) "missing"])
++              "a ref only in a property value block's title is reported as its owner block")
++          (is (not-any? #(contains? value-block-ids (:uuid %)) (:items check)) "no value block is an item")
++          (is (= #{[(:upper-holder ids) (:ghost ids) "missing"]} (set (filter #(= (:upper-holder ids) (first %)) found)))
++              "an uppercase uuid matches (a live one isn't listed), and target-uuid is lower case")
++          (is (some #(and (= (str (:upper-holder ids)) (:uuid %)) (= (str (:ghost ids)) (:target-uuid %))) (:items check)))
++          (is (not (contains? (holders check) (str private-target-holder)))
++              "refs to a Private page, a Private block and a block on a Private page are not listed")
++          (is (some #(and (= (str (:page-holder ids)) (:uuid %)) (= "page" (:kind %))) (:items check))
++              "a page whose own title holds a ref is listed as a page")
++          (is (= expected found) "exactly the expected items")
++          (is (= (count expected) (:count check) (count (:items check)))))))))
++
++(deftest broken-refs-paging-test
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                {:keys [page! insert!]} (writer self)
++                page (page! "zz Paging")
++                _ (insert! page (mapv (fn [i] {:title (str "zz broken " i " " (ref (random-uuid)))}) (range 3)))
++                first-page (check! self "&limit=2")
++                cursor (:next-cursor first-page)
++                second-page (check! self (str "&limit=2&cursor=" (js/encodeURIComponent cursor)))
++                mixed (request! self "GET" (str "/semantic/health?checks=broken-refs,orphan-tags&cursor="
++                                                (js/encodeURIComponent cursor)) nil)]
++          (is (= 2 (count (:items first-page))))
++          (is (string? cursor))
++          (is (= 1 (count (:items second-page))) "the cursor returns the third")
++          (is (nil? (:next-cursor second-page)))
++          (is (= [3 3] [(:count first-page) (:count second-page)]) "the count is complete on both pages")
++          (is (= 3 (count (into (holders first-page) (holders second-page)))) "no holder twice, none skipped")
++          (is (= {:status 400 :body {:error "cursor needs exactly one check"}} mixed)))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest broken-refs-default-set-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self expected]}]
++        (p/let [all (request! self "GET" "/semantic/health?limit=200" nil)
++                typo (request! self "GET" "/semantic/health?checks=broken-ref" nil)]
++          (is (= 200 (:status all)))
++          (is (= 8 (count (get-in all [:body :checks]))))
++          (is (= (count expected) (get-in all [:body :checks :broken-refs :count]))
++              "the default call runs broken-refs")
++          (is (= {:status 400 :body {:error "invalid checks"}} typo)))))))
++
++(deftest broken-refs-upload-path-test
++  ;; The same check on a graph that arrived through the app's snapshot upload.
++  (async done
++    (let [request! #'uploaded/request!
++          signed @#'uploaded/signed]
++      (-> (p/let [{:keys [self]} (#'uploaded/uploaded-graph)
++                  _conn (#'uploaded/open! self)
++                  created (fn [r] (assert (= 201 (:status r)) (pr-str r)) r)
++                  page (p/let [r (request! self "POST" "/semantic/pages" {:title "zz Notes"} signed)] (uuid-of (created r)))
++                  target (p/let [r (request! self "POST" "/semantic/pages" {:title "zz Target"} signed)] (uuid-of (created r)))
++                  [ghost] [(random-uuid)]
++                  _ (p/let [r (request! self "DELETE" (str "/semantic/pages/" target) nil signed)]
++                      (assert (= 200 (:status r)) (pr-str r)))
++                  inserted (p/let [r (request! self "POST" "/semantic/block-trees"
++                                               {:target-id (str page)
++                                                :blocks [{:title (str "zz see " (ref ghost))}
++                                                         {:title (str "zz target " (ref target))}]}
++                                               signed)]
++                             (mapv #(uuid (:uuid %)) (get-in (created r) [:body :blocks])))
++                  response (request! self "GET" "/semantic/health?checks=broken-refs" nil signed)]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= #{[(first inserted) ghost "missing"] [(second inserted) target "in-recycle-bin"]}
++                   (triples (get-in response [:body :checks :broken-refs])))))
++          (p/catch #(is false (str % "\n" (.-stack %))))
++          (p/finally done)))))
++
++(deftest broken-refs-documented-test
++  (let [operation (get-in (semantic-routes/openapi-document "https://issuer.example")
++                          [:paths "/api/v1/graphs/{graph-id}/health" :get])
++        checks (first (filter #(= "checks" (:name %)) (:parameters operation)))]
++    (is (string/includes? (:description operation) "broken-refs (blocks and pages whose title refers"))
++    (is (every? #(string/includes? (:description operation) %) ["reason missing" "reason in-recycle-bin" "target-uuid"]))
++    (is (string/includes? (:description checks) "orphan-choices, broken-refs. Defaults to all"))))
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+index f285538..f6fe65b 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
+@@ -167,8 +167,9 @@
+                            checks (get-in all [:body :checks])]
+                      (is (= 200 (:status all)))
+                      (is (= #{:orphan-tags :orphan-properties :duplicate-titles :pages-without-summary :pages-without-tags
+-                            :mismatched-choice-values :orphan-choices}
++                            :mismatched-choice-values :orphan-choices :broken-refs}
+                             (set (keys checks))))
++                     (is (= {:count 0 :items []} (:broken-refs checks)) "every [[uuid]] in the fixture resolves")
+                      (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))
+                          "classes with holders or subclasses are not orphans; built-in classes are left out")
+                      (is (= ["user.property/unused"] (map :ident (get-in checks [:orphan-properties :items]))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 90c1ced..c4bda03 100644
+index 90c1ced..0248a10 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -15,6 +15,7 @@
+@@ -15,6 +15,8 @@
              [logseq.db-sync.normalize-test]
              [logseq.db-sync.semantic-write-guards-test]
              [logseq.db-sync.semantic-index-health-test]
 +            [logseq.db-sync.semantic-graph-health-private-test]
++            [logseq.db-sync.semantic-graph-health-refs-test]
              [logseq.db-sync.semantic-block-changes-test]
              [logseq.db-sync.semantic-choice-values-test]
              [logseq.db-sync.semantic-headings-test]
