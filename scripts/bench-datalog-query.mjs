@@ -14,6 +14,7 @@
 //                                        [--shapes a,b] [--upstream .upstream] [--json]
 //   node scripts/bench-datalog-query.mjs --named [--bounds reads=N,tagged=N…] [--pages …] [--runs …]
 //   node scripts/bench-datalog-query.mjs --width [--width-cap N] [--pages …] [--runs …]
+//   node scripts/bench-datalog-query.mjs --query-block [--runs …]
 //
 // --named runs the four named queries as code (named-queries/run-named on the restored db, as the
 // handler does after resolving params) under default-bounds, or the values --bounds gives, and
@@ -24,13 +25,23 @@
 // before they run) and the 3-binding query over 2,500 blocks through run-query under the width
 // cap, or --width-cap, and reports the width charged.
 //
+// --query-block times Query blocks (patch 0050) at the cap: check-query-block alone on one
+// 4,000-character query in the dev build (check-1), and through the release bundle's SyncDO.fetch
+// (what deploy ships, loaded as release-query-check.mjs loads it) a batch_insert_block_trees of 100
+// Query nodes of 4,000 characters each. parse-100 is that batch with its last node refused by
+// check-query-block's last check (13 function bindings), so every node is read and checked and
+// nothing is written; insert-100 is the batch stored; write-100 is insert less parse, run for run.
+// Cold runs each start on a freshly loaded bundle; warm runs alternate parse and insert on the one
+// the cold insert used, each insert on a new page.
+//
 // Warm times are medians over --runs runs on the conn the cold run warmed. The numbers are a guide:
 // Node on a developer machine is not a Durable Object on Cloudflare's hardware.
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import vm from "node:vm";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -537,6 +548,149 @@ export async function benchWidth({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, w
   return { mode: "width", width_cap: cap, runs, node: process.version, records };
 }
 
+// Query blocks
+// ============
+
+/** The length of each query in --query-block (datalog.cljs's max-query-chars) and the nodes in its batch. */
+export const QUERY_BLOCK_CHARS = 4000;
+export const QUERY_BLOCK_NODES = 100;
+
+/**
+ * Node `i`'s query for --query-block: an advanced query of exactly QUERY_BLOCK_CHARS characters,
+ * heavy in clauses (refs, titles and not clauses) so the validator walks as many as fit, with its
+ * :title padded to the length. With `refused`, it also holds 13 function bindings, one more than the
+ * cap allows, which check-query-block refuses last, after the parse and the validator.
+ */
+export function queryBlockText(i, { refused = false } = {}) {
+  const head = '{:query [:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title "Book"]';
+  const tail = (title) => `] :title ${JSON.stringify(title)} :collapsed? false}`;
+  const clauses = refused ? Array.from({ length: 13 }, (_, k) => `[(identity ?t) ?f${k}]`) : [];
+  const text = (title) => `${head} ${clauses.join(" ")}${tail(title)}`;
+  for (let n = 0; text(`zq bench ${i}`).length < QUERY_BLOCK_CHARS - 100; n++) {
+    const r = n - (n % 3);
+    clauses.push(n % 3 === 0 ? `[?b :block/refs ?r${r}]` : n % 3 === 1 ? `[?r${r} :block/title ?n${n}]` : `(not [?r${r} :block/tags ?t])`);
+  }
+  const short = QUERY_BLOCK_CHARS - text(`zq bench ${i} `).length;
+  return text(`zq bench ${i} ${"x".repeat(short)}`);
+}
+
+/**
+ * The --query-block batch runs on one freshly loaded release SyncDO (call it in a process that has
+ * imported no release bundle): the `first` batch ("parse", the last node refused, or "insert") cold,
+ * then `runs` warm pairs of parse and insert, each on a new page. Each run is {ms, status, error?,
+ * stored?}; throws when a parse is not a 400 or an insert not a 201.
+ */
+export async function queryBlockBatchRuns({ upstream, bundle, first, runs }) {
+  const { loadReleaseSyncDO, call } = await import("./release-query-check.mjs");
+  const texts = Array.from({ length: QUERY_BLOCK_NODES }, (_, i) => queryBlockText(i));
+  const refusedText = queryBlockText(QUERY_BLOCK_NODES - 1, { refused: true });
+  let page = 0;
+  const run = async (stub, step) => {
+    const refused = step === "parse";
+    const blocks = texts.map((query, i) => ({ title: `zq bench node ${i}`, query: refused && i === QUERY_BLOCK_NODES - 1 ? refusedText : query }));
+    const body = { entries: [{ page: `Bench Query Page ${page++}`, blocks }] };
+    const t0 = performance.now();
+    const res = await call(stub, "POST", "/semantic/block-trees/batch", body);
+    const ms = performance.now() - t0;
+    if (refused && res.status !== 400) throw new Error(`parse-100: HTTP ${res.status}, expected 400: ${res.text.slice(0, 300)}`);
+    if (!refused && res.status !== 201) throw new Error(`insert-100: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    // Each stored node answers its query (patch 0050 answers query on every Query block an insert makes).
+    const stored = refused ? undefined : (res.json?.entries?.[0]?.blocks ?? []).filter((b, i) => b.query === texts[i]).length;
+    return { ms, status: res.status, ...(refused ? { error: res.json?.error } : { stored }) };
+  };
+  const { stub, close } = await loadReleaseSyncDO(upstream, bundle);
+  try {
+    const cold = await run(stub, first);
+    const parse = [];
+    const insert = [];
+    for (let i = 0; i < runs; i++) {
+      parse.push(await run(stub, "parse"));
+      insert.push(await run(stub, "insert"));
+    }
+    return { cold, parse, insert };
+  } finally {
+    close();
+  }
+}
+
+/**
+ * --query-block: check-query-block alone (dev build) and the 100-node batch through the release
+ * bundle, cold and warm, with parse and write apart. Records: check-1, parse-100, insert-100, write-100.
+ */
+export async function benchQueryBlock({ runs = DEFAULT_RUNS, upstream = join(root, ".upstream") } = {}) {
+  const build = findBuild(upstream);
+  if (build.missing) return { skipped: build.missing };
+  const { bundlePath } = await import("./release-query-check.mjs");
+  const bundle = bundlePath(upstream);
+  if (!existsSync(bundle)) return { skipped: `${relative(root, bundle) || bundle} is missing: build the release bundle with scripts/build.sh` };
+  const ns = loadBuild(build);
+  const datalog = ns.logseq.db_sync.worker.handler.datalog;
+  const kw = ns.cljs.keyword;
+
+  // check-1: one query, cold then warm, in the dev build.
+  const one = queryBlockText(0);
+  const check = () => {
+    const t0 = performance.now();
+    const result = datalog.check_query_block(one);
+    const ms = performance.now() - t0;
+    const error = ns.cljs.get.cljs$core$IFn$_invoke$arity$2(result, kw("error"));
+    if (error != null) throw new Error(`check-query-block refused the bench query: ${error}`);
+    return ms;
+  };
+  const checkCold = check();
+  const checkWarm = Array.from({ length: runs }, check);
+
+  // The batch, through the release bundle, in child processes: the dev build that seeds a release
+  // SyncDO stops working in a process once a release bundle has been imported after it, so each
+  // freshly loaded bundle gets a process of its own (and this one never imports one).
+  const child = (first, n) => {
+    const code = `import { queryBlockBatchRuns } from ${JSON.stringify(pathToFileURL(fileURLToPath(import.meta.url)).href)};
+      console.log(JSON.stringify(await queryBlockBatchRuns(${JSON.stringify({ upstream, bundle, first, runs: n })})));`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    if (r.status !== 0) throw new Error(`the ${first} run failed: ${r.stderr.slice(-2000)}`);
+    return JSON.parse(r.stdout.trim().split("\n").pop());
+  };
+  const parseCold = child("parse", 0).cold;
+  const { cold: insertCold, parse: parseRuns, insert: insertRuns } = child("insert", runs);
+  const parseWarm = parseRuns.map((x) => x.ms);
+  const insertWarm = insertRuns.map((x) => x.ms);
+  const lastParse = parseRuns.at(-1) ?? parseCold;
+  const lastInsert = insertRuns.at(-1) ?? insertCold;
+  const writeWarm = insertWarm.map((ms, i) => ms - parseWarm[i]);
+  const records = [
+    { step: "check-1", build: "dev", nodes: 1, cold_ms: round(checkCold), warm_ms: round(median(checkWarm)), outcome: "ok" },
+    {
+      step: "parse-100",
+      build: "release",
+      nodes: QUERY_BLOCK_NODES,
+      cold_ms: round(parseCold.ms),
+      warm_ms: round(median(parseWarm)),
+      outcome: "refused",
+      status: lastParse.status,
+      error: lastParse.error,
+    },
+    {
+      step: "insert-100",
+      build: "release",
+      nodes: QUERY_BLOCK_NODES,
+      cold_ms: round(insertCold.ms),
+      warm_ms: round(median(insertWarm)),
+      outcome: "stored",
+      status: lastInsert.status,
+      stored: lastInsert.stored,
+    },
+    {
+      step: "write-100",
+      build: "release",
+      nodes: QUERY_BLOCK_NODES,
+      cold_ms: round(insertCold.ms - parseCold.ms),
+      warm_ms: round(median(writeWarm)),
+      outcome: "insert less parse",
+    },
+  ];
+  return { mode: "query-block", runs, query_chars: QUERY_BLOCK_CHARS, nodes: QUERY_BLOCK_NODES, node: process.version, records };
+}
+
 export async function bench({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, scanCap, shapes = SHAPES, upstream = join(root, ".upstream"), seed = 1 } = {}) {
   const build = findBuild(upstream);
   if (build.missing) return { skipped: build.missing };
@@ -590,7 +744,7 @@ function parseArgs(argv) {
     else if (a === "--runs") opts.runs = whole(a, argv[++i]);
     else if (a === "--scan-cap") opts.scanCap = whole(a, argv[++i]);
     else if (a === "--upstream") opts.upstream = resolve(argv[++i] ?? "");
-    else if (a === "--named" || a === "--width") modes.push(a.slice(2));
+    else if (a === "--named" || a === "--width" || a === "--query-block") modes.push(a.slice(2));
     else if (a === "--width-cap") opts.widthCap = whole(a, argv[++i]);
     else if (a === "--bounds") {
       opts.bounds = {};
@@ -606,16 +760,18 @@ function parseArgs(argv) {
       opts.shapes = String(argv[++i]).split(",");
       for (const s of opts.shapes) if (!SHAPES.includes(s)) throw new Error(`--shapes: unknown shape ${s} (shapes: ${SHAPES.join(", ")})`);
     }
-    else throw new Error(`unknown argument ${a}; usage: bench-datalog-query.mjs [--named [--bounds NAME=N[,…]] | --width [--width-cap N]] [--pages N[,N…]] [--runs N] [--scan-cap N] [--shapes NAME[,NAME…]] [--upstream DIR] [--json]`);
+    else throw new Error(`unknown argument ${a}; usage: bench-datalog-query.mjs [--named [--bounds NAME=N[,…]] | --width [--width-cap N] | --query-block] [--pages N[,N…]] [--runs N] [--scan-cap N] [--shapes NAME[,NAME…]] [--upstream DIR] [--json]`);
   }
-  if (modes.length > 1) throw new Error("give one of --named or --width");
+  if (modes.length > 1) throw new Error("give one of --named, --width or --query-block");
   opts.mode = modes[0] ?? "shapes";
   return opts;
 }
 
 const fmt = (n) => n.toLocaleString("en-NZ");
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// No top-level await: --query-block imports release-query-check.mjs, which imports this module, and
+// that import would wait on this module's evaluation for ever.
+async function main() {
   let opts;
   try {
     opts = parseArgs(process.argv.slice(2));
@@ -623,7 +779,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.error(e.message);
     process.exit(2);
   }
-  const r = opts.mode === "named" ? await benchNamed(opts) : opts.mode === "width" ? await benchWidth(opts) : await bench(opts);
+  const r =
+    opts.mode === "named" ? await benchNamed(opts)
+    : opts.mode === "width" ? await benchWidth(opts)
+    : opts.mode === "query-block" ? await benchQueryBlock(opts)
+    : await bench(opts);
   if (opts.json) console.log(JSON.stringify(r, null, 2));
   else if (r.skipped) console.log(`skipped: ${r.skipped}`);
   else if (r.mode === "named") {
@@ -640,6 +800,21 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
           (x.bound ? `${x.bound}!` : x.outcome).padEnd(8),
           String(x.rows).padStart(6),
           Object.entries(x.work).map(([k, v]) => `${k} ${v}`).join(", "),
+        ].join(" "),
+      );
+    }
+  } else if (r.mode === "query-block") {
+    console.log(`query-block bench: ${r.nodes} nodes of ${fmt(r.query_chars)} characters, warm median of ${r.runs} run${r.runs === 1 ? "" : "s"}, Node ${r.node}`);
+    console.log("step         build    nodes  cold_ms  warm_ms  outcome");
+    for (const x of r.records) {
+      console.log(
+        [
+          x.step.padEnd(12),
+          x.build.padEnd(8),
+          String(x.nodes).padStart(5),
+          x.cold_ms.toFixed(1).padStart(8),
+          x.warm_ms.toFixed(1).padStart(8),
+          x.outcome + (x.status ? ` (HTTP ${x.status})` : ""),
         ].join(" "),
       );
     }
@@ -678,4 +853,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       );
     }
   }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error?.stack ?? error);
+    process.exit(1);
+  });
 }

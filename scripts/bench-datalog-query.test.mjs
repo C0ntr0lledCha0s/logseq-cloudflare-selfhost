@@ -280,7 +280,7 @@ test("--named and --width skip naming the missing build, and refuse being given 
     }
     const both = spawnSync(process.execPath, [script, "--named", "--width"], { encoding: "utf8" });
     assert.equal(both.status, 2);
-    assert.match(both.stderr, /give one of --named or --width/);
+    assert.match(both.stderr, /give one of --named, --width or --query-block/);
   } finally {
     rmSync(empty, { recursive: true, force: true });
   }
@@ -295,4 +295,83 @@ test("text output in --named and --width prints a row per query or shape", { ski
   assert.equal(width.status, 0, width.stderr);
   for (const s of WIDTH) assert.match(width.stdout, new RegExp(`^${s}\\s+150\\s`, "m"));
   assert.match(width.stdout, /width cap 100,000/);
+});
+
+// Query-block mode (patch 0050 stage 5, spec 2026-11-20 §5 and §9 item 4)
+// ========================================================================
+
+// The batch runs through the release bundle's SyncDO.fetch (what deploy ships); check-query-block
+// alone runs in the dev test build, which the release bundle's renamed names can't be called from.
+const releaseBundle = join(root, ".upstream", "deps", "db-sync", "worker", "dist", "worker", "main.js");
+const skipQueryBlock = skip || (existsSync(releaseBundle) ? false : ".upstream release bundle missing: scripts/build.sh .upstream");
+const QUERY_STEPS = ["check-1", "parse-100", "insert-100", "write-100"];
+
+test("queryBlockText makes 4,000-character advanced queries, distinct per node, and a refused one that only the function-binding cap stops", async () => {
+  const { queryBlockText, QUERY_BLOCK_CHARS, QUERY_BLOCK_NODES } = await import(script);
+  assert.equal(QUERY_BLOCK_CHARS, 4000);
+  assert.equal(QUERY_BLOCK_NODES, 100);
+  const texts = Array.from({ length: 100 }, (_, i) => queryBlockText(i));
+  for (const t of texts) {
+    assert.equal(t.length, 4000);
+    assert.match(t, /^\{:query \[:find \(pull \?b \[\*\]\) :where \[\?b :block\/tags \?t\] \[\?t :block\/title "Book"\] /);
+    assert.doesNotMatch(t, /\[\(identity/, "no function binding in a stored query");
+    assert.ok((t.match(/\[\?b :block\/refs \?r\d+\]/g) ?? []).length >= 50, "clause-heavy: the validator walks many clauses");
+    assert.match(t, /\(not \[/, "a not clause");
+  }
+  assert.equal(new Set(texts).size, 100);
+  const refused = queryBlockText(99, { refused: true });
+  assert.equal(refused.length, 4000);
+  assert.equal((refused.match(/\[\(identity \?t\) \?f\d+\]/g) ?? []).length, 13, "one more function binding than the 12 allowed");
+});
+
+test("--query-block --json times check-query-block and a 100-node batch of 4,000-character queries, cold and warm, with parse and write apart", { skip: skipQueryBlock, timeout: 600_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--query-block", "--runs", "1", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.mode, "query-block");
+  assert.equal(out.runs, 1);
+  assert.equal(out.query_chars, 4000);
+  assert.equal(out.nodes, 100);
+  assert.equal(typeof out.node, "string");
+  assert.deepEqual(out.records.map((r) => r.step), QUERY_STEPS);
+  for (const r of out.records) {
+    for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${r.step}: ${k} ${r[k]}`);
+    assert.equal(typeof r.build, "string", `${r.step}: build`);
+  }
+  const at = (step) => out.records.find((r) => r.step === step);
+  assert.deepEqual([at("check-1").nodes, at("parse-100").nodes, at("insert-100").nodes, at("write-100").nodes], [1, 100, 100, 100]);
+  assert.equal(at("check-1").build, "dev");
+  assert.equal(at("check-1").outcome, "ok");
+  assert.equal(at("parse-100").build, "release");
+  assert.equal(at("parse-100").status, 400, "every node parsed and checked, the last refused, nothing written");
+  assert.match(at("parse-100").error, /^entries\[0\]\.blocks\[99\]: query: query has 13 function bindings, more than the 12 the width cap allows/);
+  assert.equal(at("insert-100").status, 201);
+  assert.equal(at("insert-100").stored, 100, "all 100 Query blocks stored");
+  // write = insert − parse, for the cold pair and for the warm runs.
+  assert.ok(Math.abs(at("write-100").cold_ms - (at("insert-100").cold_ms - at("parse-100").cold_ms)) <= 0.02);
+  assert.equal(at("write-100").build, "release");
+});
+
+test("--query-block text output prints a row per step with cold and warm ms", { skip: skipQueryBlock, timeout: 600_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--query-block", "--runs", "1"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /^query-block bench: 100 nodes of 4,000 characters, warm median of 1 run/m);
+  assert.match(run.stdout, /^step\s+build\s+nodes\s+cold_ms\s+warm_ms\s+outcome/m);
+  for (const step of QUERY_STEPS) assert.match(run.stdout, new RegExp(`^${step}\\s+(dev|release)\\s+\\d+\\s+\\d+\\.\\d\\s+\\d+\\.\\d\\s`, "m"));
+});
+
+test("--query-block skips naming a missing build, and is refused beside --named or --width", () => {
+  const empty = mkdtempSync(join(tmpdir(), "bench-datalog-empty-"));
+  try {
+    const run = spawnSync(process.execPath, [script, "--query-block", "--upstream", empty, "--json"], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(JSON.parse(run.stdout).skipped, /worker-test\.js|worker\/main\.js/);
+    for (const other of ["--named", "--width"]) {
+      const both = spawnSync(process.execPath, [script, "--query-block", other], { encoding: "utf8" });
+      assert.equal(both.status, 2);
+      assert.match(both.stderr, /give one of --named, --width or --query-block/);
+    }
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
 });
