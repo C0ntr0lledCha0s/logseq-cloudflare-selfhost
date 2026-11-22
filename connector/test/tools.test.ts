@@ -2951,3 +2951,39 @@ describe("get_graph_health and missing tag properties", () => {
     expect(param.description).toContain("JSON array of 1 to 50 pairs");
   });
 });
+// Patch 0052: list_changes_since lists what changed in a window, grouped by page.
+describe("list_changes_since", () => {
+  it("is offered read-only, under exactly that name", async () => {
+    const tool = (await listTools()).find((t) => t.name === "list_changes_since");
+    expect(tool, "list_changes_since is listed").toBeDefined();
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(committedManifest).toHaveLength(58);
+  });
+
+  it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
+    expect(FIRST_LINES.list_changes_since).toBe("What changed in the graph since a time, grouped by page; for digests and reviews.");
+    const tool = (await listTools()).find((t) => t.name === "list_changes_since");
+    expect(tool.description.startsWith(FIRST_LINES.list_changes_since)).toBe(true);
+    for (const phrase of [
+      "an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE",
+      "store this call's until and pass it as the next since",
+      "next-cursor pages through them and is null on the last page",
+      "A move shows as page-changed on both pages",
+      "of the connector's write tools, set_page_favorite",
+      "Permanent deletes leave nothing to read",
+      "Unavailable for E2EE graphs",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(tool.inputSchema.required).toContain("since");
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(expect.arrayContaining(["since", "until", "limit", "blocks-per-page", "cursor"]));
+  });
+
+  it("connector_help says when to use it and how to chain runs", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "For what changed since a time (a daily digest or weekly review), call list_changes_since with since set to the previous run's until (an ISO date such as 2026-11-16 works for a first run) and keep this call's until for the next; a move shows only as page-changed on both pages.",
+    );
+  });
+});
+

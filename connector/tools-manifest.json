@@ -360,6 +360,18 @@
     "firstLine": "The graph's files and images, with the asset UUIDs read_file takes."
   },
   {
+    "name": "list_changes_since",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/changes",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "What changed in the graph since a time, grouped by page; for digests and reviews."
+  },
+  {
     "name": "list_favorites",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/favorites",

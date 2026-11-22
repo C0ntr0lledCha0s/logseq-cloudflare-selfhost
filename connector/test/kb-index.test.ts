@@ -630,6 +630,8 @@ describe("tool list", () => {
     for (const name of ["kb_index", "get_page_backlinks", "get_graph_health"]) expect(names).toContain(name);
     expect(names).not.toContain("list_knowledge_index");
     expect(tools.find((t) => t.name === "kb_index")?.annotations.readOnlyHint).toBe(true);
+    // Patch 0052: the change feed for a digest is offered, read-only.
+    expect(tools.find((t) => t.name === "list_changes_since")?.annotations.readOnlyHint).toBe(true);
   });
 });
 
