@@ -18,6 +18,7 @@ import { type SemanticBindings, semanticBindings } from "./semantic/config";
 import { SemanticStore } from "./semantic/store";
 import { registerSemanticTools } from "./tools/semantic-search";
 import { registerSuggestLinksTool } from "./tools/suggest-links";
+import { registerSyncStatusTool } from "./tools/sync-status";
 import type { OpenApiSpec } from "./tools/spec.mjs";
 import { connectorHostname } from "./config";
 import { FAVICON_PATH, FAVICON_SIZE } from "./favicon";
@@ -161,6 +162,7 @@ export function mcpHandler(
       registerAssetTools(server, access, onSuccess, audit);
       registerKbIndexTool(server, access, onSuccess);
       registerSuggestLinksTool(server, access, semantic, onSuccess);
+      registerSyncStatusTool(server, access, semantic, onSuccess, audit);
       if (semantic) registerSemanticTools(server, { access, ...semantic }, onSuccess);
       return server;
     },

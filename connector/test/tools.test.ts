@@ -217,13 +217,14 @@ describe("tool list", () => {
     expect(names).toEqual(committedManifest.map((e) => e.name).filter((n) => !SEMANTIC_TOOLS.includes(n)));
   });
 
-  it("getSyncStatus (patch 0055) is vendored and generates no tool, so no get_sync_status is generated", async () => {
+  it("getSyncStatus (patch 0055) is vendored and generates no tool: the one get_sync_status is hand-written", async () => {
     const vendored = Object.values(spec.paths).flatMap((item) => Object.values(item).map((op) => op.operationId));
     expect(vendored).toContain("getSyncStatus");
     expect(spec.paths["/api/v1/graphs/{graph-id}/sync-status"]?.get?.operationId).toBe("getSyncStatus");
     expect(graphOperations(spec).map((op) => op.operationId)).not.toContain("getSyncStatus");
-    expect((await listTools()).map((t) => t.name)).not.toContain("get_sync_status");
-    expect(committedManifest.map((e) => e.name)).not.toContain("get_sync_status");
+    // Stage 2 adds the hand-written tool; it is listed once, with no method or path of its own.
+    expect((await listTools()).filter((t) => t.name === "get_sync_status")).toHaveLength(1);
+    expect(committedManifest.filter((e) => e.name === "get_sync_status").map((e) => [e.method, e.path])).toEqual([[null, null]]);
   });
 });
 
@@ -248,7 +249,7 @@ function specWithFakeOperation(): OpenApiSpec {
 }
 
 /** Spec section 4's classes, from the tool's name and method, independent of the table under test. */
-const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file", "suggest_links"];
+const READ_HANDWRITTEN = ["get_activity_log", "connector_help", "list_graphs", "kb_index", "semantic_search", "semantic_index_status", "read_file", "suggest_links", "get_sync_status"];
 // Reads sent as POST because their input can be long (patch 0039).
 const READ_NOT_GET = ["datalog_query", "run_named_query"];
 const DESTRUCTIVE_NAMED = [
@@ -313,6 +314,21 @@ describe("server instructions", () => {
     expect(named.length).toBeGreaterThan(5);
     expect(named.filter((n) => !names.has(n))).toEqual([]);
     expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1500);
+  });
+});
+
+describe("get_sync_status (plan 2026-11-22 stage 2)", () => {
+  it("is listed with and without semantic search, READ, its first line at most 100 characters, and connector_help names it", async () => {
+    for (const e of [undefined, semanticOnEnv()]) {
+      const tools = (await rpc(connector(e), "tools/list", {}, e)).tools as { name: string; description: string; annotations: unknown }[];
+      const tool = tools.find((t) => t.name === "get_sync_status");
+      expect(tool, "listed").toBeDefined();
+      expect(tool!.annotations).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+      const first = tool!.description.split("\n")[0];
+      expect(first).toBe(FIRST_LINES.get_sync_status);
+      expect(first.length).toBeLessThanOrEqual(100);
+    }
+    expect(CONNECTOR_HELP).toContain("get_sync_status");
   });
 });
 

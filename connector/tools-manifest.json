@@ -300,6 +300,18 @@
     "firstLine": "A property's type, choices and classes; check it before setting a choice or node value."
   },
   {
+    "name": "get_sync_status",
+    "method": null,
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "A graph's sync state: latest t, last write, block and page counts, clients online, index status."
+  },
+  {
     "name": "get_tag",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/tags/{tag-id}",

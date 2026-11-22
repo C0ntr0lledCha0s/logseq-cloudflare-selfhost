@@ -890,6 +890,17 @@ describe("scope", () => {
     expect(await auditKinds()).toEqual([{ tool: "run_named_query", kind: "read", status: "ok" }]);
   });
 
+  it("read-only scope reads the sync status: get_sync_status reaches the sync server with one GET and leaves one read row", async () => {
+    const result = await call("get_sync_status", { graph: "work" }, READ_CI);
+    expect(result.isError, result.text).toBe(false);
+    expect(syncCalls.map((c) => [c.method, new URL(c.url).pathname])).toEqual([["GET", `/api/v1/graphs/${WORK}/sync-status`]]);
+    expect(await auditKinds()).toEqual([{ tool: "get_sync_status", kind: "read", status: "ok" }]);
+    // Outside the token's graphs it is refused like any read, before a sync request.
+    syncCalls = [];
+    expect((await call("get_sync_status", { graph: "notes" }, READ_CI)).text).toBe("graph 'notes' is outside service token 'ci''s scope (it covers: work)");
+    expect(syncCalls).toEqual([]);
+  });
+
   it("out of scope: a read and a write tool are refused listing the covered aliases; the write's audit row is refused", async () => {
     const message = "graph 'notes' is outside service token 'ci''s scope (it covers: work)";
     expect(await call("get_page", { graph: "notes", "page-id": PAGE }, READ_CI)).toEqual({ isError: true, text: message });

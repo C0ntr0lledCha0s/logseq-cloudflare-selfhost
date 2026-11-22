@@ -19,6 +19,7 @@ export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 export const HANDWRITTEN_TOOLS = [
   "connector_help",
   "get_activity_log",
+  "get_sync_status",
   "kb_index",
   "list_graphs",
   "read_file",
@@ -81,6 +82,7 @@ export const ANNOTATIONS = Object.freeze({
   get_page_backlinks: READ,
   get_page_outline: READ,
   get_property: READ,
+  get_sync_status: READ,
   get_tag: READ,
   insert_block_children: ADDITIVE,
   insert_block_tree: ADDITIVE,
@@ -275,6 +277,7 @@ export const FIRST_LINES = Object.freeze({
   get_page_backlinks: "How a page is used: links, tagged objects and property values pointing at it, with counts.",
   get_page_outline: "Read a whole page as markdown with tags, properties and links resolved; the usual way to read.",
   get_property: "A property's type, choices and classes; check it before setting a choice or node value.",
+  get_sync_status: "A graph's sync state: latest t, last write, block and page counts, clients online, index status.",
   get_tag: "A tag's properties, the tags it extends and the tags that extend it.",
   insert_block_children: "Add block trees under an existing block; insert_block_tree also takes a page as target.",
   insert_block_tree: "Write a whole note as one nested block tree on a page or under a block; the usual way to write.",

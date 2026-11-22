@@ -389,6 +389,13 @@ describe("context classes", () => {
     for (const reason of Object.values(NO_CONTEXT_TOOLS)) expect(reason.length).toBeGreaterThan(10);
   });
 
+  it("get_sync_status is a read: READ in the manifest, so in neither write table", () => {
+    const entry = (manifest as { name: string; annotations: { readOnlyHint: boolean } }[]).find((t) => t.name === "get_sync_status");
+    expect(entry?.annotations.readOnlyHint).toBe(true);
+    expect(Object.hasOwn(CONTEXT_TOOLS, "get_sync_status")).toBe(false);
+    expect(Object.hasOwn(NO_CONTEXT_TOOLS, "get_sync_status")).toBe(false);
+  });
+
   it("set_page_favorite is no-context: its response names the page and returns the whole list (patch 0038)", () => {
     expect(contextClassFor("set_page_favorite")).toBe("no-context");
     expect(NO_CONTEXT_TOOLS.set_page_favorite).toBe("the response names the page and returns the whole list");
