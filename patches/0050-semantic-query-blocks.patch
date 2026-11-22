@@ -814,10 +814,10 @@ index cf2d9a7..fad4718 100644
            (str path ": dry-run")))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
 new file mode 100644
-index 0000000..109622f
+index 0000000..1e554db
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
-@@ -0,0 +1,1663 @@
+@@ -0,0 +1,1671 @@
 +(ns logseq.db-sync.semantic-query-block-test
 +  "Query blocks (patch 0050), stage 1: the static check a stored query passes and the one write of a
 +  Query block. `check-query-block` takes the text Claude gives as a Query block's query and answers
@@ -1444,6 +1444,14 @@ index 0000000..109622f
 +     ["insert_block_children" (fn [self _ a] (children! self a (node {:query rules-text})))
 +      (str "blocks[0]: " rules-reason*)]
 +     ["capture" (fn [self _ _] (capture! self (node {:query rules-text}))) (str "blocks[0]: " rules-reason*)]
++     ;; capture_to_today makes today's journal before prepare-tree runs, so only
++     ;; query-tree-refusal's recursion into children keeps these from writing it.
++     ["capture, nested" (fn [self _ _] (capture! self [{:title "p" :children [{:title "zq c" :query rules-text}]}]))
++      (str "blocks[0].children[0]: " rules-reason*)]
++     ["capture, a grandchild after a sibling"
++      (fn [self _ _] (capture! self [{:title "p" :children [{:title "a"}
++                                                            {:title "b" :children [{:title "zq c" :query rules-text}]}]}]))
++      (str "blocks[0].children[1].children[0]: " rules-reason*)]
 +     ["a field and an advanced fence" (tree [{:title book-fence :query q}]) "blocks[0]: query: given both as a field and as a fence"]
 +     ["a field and a simple fence" (tree [{:title "```query\n(task todo)\n```" :query q}])
 +      "blocks[0]: query: given both as a field and as a fence"]
