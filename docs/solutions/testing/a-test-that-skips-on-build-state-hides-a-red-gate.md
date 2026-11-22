@@ -4,6 +4,7 @@ area: testing
 tags: [skip, release-bundle, bench, build.sh, gate, stale-bundle, scripts-test]
 seen:
   - 2026-11-17 – item 40, patch 0039, stage 2 (s-2-1, s-2-2)
+  - 2026-11-22 – blank-blocks-sync-status, stage 1 (s-stage-1-2)
 promoted_to: []
 ---
 
@@ -18,6 +19,8 @@ Some checks depend on build artefacts in the working tree (the dev build versus 
 ## Fix
 
 The stage's shapes were updated and the gate re-run; the stage was not reported done until both checks ran on the committed HEAD (closed in review round 2).
+
+It recurred on 2026-11-22: after `scripts/build.sh`, `scripts/check.sh --upstream` ran the scripts tests first, while `worker-test.js` was missing, and nine bench and release-bundle tests skipped. The upstream suite then rebuilt the file, too late. `check.sh` now runs the upstream suite and the release bundle query before the scripts tests when `--upstream` is set (`scripts/check.test.mjs` pins the order).
 
 ## How to catch it next time
 
