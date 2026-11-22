@@ -138,7 +138,7 @@ index a682bda..ccbbbba 100644
  (def ^:private named-body-fields #{:params :limit :dry-run})
  
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
-index 7cac252..c3d3b4b 100644
+index 7cac252..2592ce6 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
 @@ -6,7 +6,10 @@
@@ -164,13 +164,14 @@ index 7cac252..c3d3b4b 100644
    - pages-missing-property reads the entities tagged tag (:tagged) and each page's property values.
  
    Every datom read goes through datoms* or first-value* and counts toward :reads (the backstop over
-@@ -73,13 +78,14 @@
+@@ -73,13 +78,16 @@
        (throw (js/Error. (str "named query: no bound " bound))))
      (when (> counted limit)
        (throw (ex-info (str (:query ctx) " stopped at its " (name bound) " bound")
 -                      {::bound {:query (:query ctx) :bound bound :value limit}})))))
 +                      {::bound (cond-> {:query (:query ctx) :bound bound :value limit}
-+                                 (:client-title ctx) (assoc :client (:client-title ctx)))})))))
++                                 (:client-title ctx) (assoc :client (:client-title ctx))
++                                 (:text-client ctx) (assoc :text-client true))})))))
  
  (defn charge!
    "Counts `n` toward `bound` only: :reads counts the datoms read (datoms*, first-value*), not the
@@ -178,11 +179,12 @@ index 7cac252..c3d3b4b 100644
 -  bound, throws (ex-info … {::bound {:query :bound :value}}) naming it and its value: at the bound
 -  is allowed, one past it is not."
 +  bound, throws (ex-info … {::bound {:query :bound :value}}) naming it and its value, with :client
-+  (the client's name) when ctx has :client-title: at the bound is allowed, one past it is not."
++  (the client's name) when ctx has :client-title and :text-client when ctx has it: at the bound is
++  allowed, one past it is not."
    [ctx bound n]
    (bump! ctx bound n))
  
-@@ -246,20 +252,65 @@
+@@ -246,20 +254,65 @@
                  (recur (first-value* ctx x :block/parent))))))
          (into [] (remove (fn [[_ m]] (contains? @decided m))) candidates)))))
  
@@ -251,12 +253,23 @@ index 7cac252..c3d3b4b 100644
        (into []
              (comp
               (mapcat (fn [datom]
-@@ -317,7 +368,12 @@
-    {:advice "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
-     :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)" "list one client's tasks with datalog_query"]
+@@ -314,10 +367,21 @@
+              :ancestor-steps ["stopped after" "steps up from blocks tagged decision_tag (its ancestor-steps bound)"]
+              :reads ["stopped after" reads-counted]}}
+    "open-tasks-by-client"
+-   {:advice "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
+-    :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)" "list one client's tasks with datalog_query"]
++   ;; Patch 0054: without a client, give one; :text, a default or url client_property, can't take
++   ;; a client, so its advice stays datalog_query.
++   {:advice "give a client (params.client), or mark finished tasks Done or Canceled"
++    :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)"]
               :open-tasks ["found more than" "open tasks (its open-tasks bound)"]
 -             :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}}
-+             :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}
++             :reads ["stopped after" reads-counted]}
++    :text {:advice "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
++           :bounds {:tasks ["stopped after" "blocks tagged Task (its tasks bound)" "list one client's tasks with datalog_query"]
++                    :open-tasks ["found more than" "open tasks (its open-tasks bound)"]
++                    :reads ["stopped after" reads-counted "list one client's tasks with datalog_query"]}}
 +    ;; Patch 0054: with params.client, each bound's words, given the client's name.
 +    :client {:advice #(str "mark " % "'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query")
 +             :bounds {:tasks ["stopped after" #(str "blocks holding " % " or on its pages (its tasks bound)")]
@@ -265,7 +278,7 @@ index 7cac252..c3d3b4b 100644
     "pages-missing-property"
     {:advice "give a narrower tag"
      :bounds {:tagged ["stopped after" "tagged pages and blocks (its tagged bound)"]
-@@ -325,11 +381,15 @@
+@@ -325,11 +389,16 @@
  
  (defn bound-message
    "The 422 for a ::bound refusal: the query, what the bound counted and its value, the bound's
@@ -275,18 +288,19 @@ index 7cac252..c3d3b4b 100644
 -        [verb counted own-advice] (get bounds bound)]
 -    (str query " " verb " " (format-count value) " " counted "; " (or own-advice advice))))
 +  name, and how to narrow the call. With :client (open-tasks-by-client given params.client), the
-+  query's :client words name the client."
-+  [{:keys [query bound value client]}]
++  query's :client words name the client; with :text-client (a default or url client_property, which
++  can't take a client), the query's :text words."
++  [{:keys [query bound value client text-client]}]
 +  (if-let [{:keys [advice bounds]} (when client (get-in stops [query :client]))]
 +    (let [[verb counted] (get bounds bound)]
 +      (str query " " verb " " (format-count value) " " (counted client) "; " (advice client)))
-+    (let [{:keys [advice bounds]} (get stops query)
++    (let [{:keys [advice bounds]} (or (when text-client (get-in stops [query :text])) (get stops query))
 +          [verb counted own-advice] (get bounds bound)]
 +      (str query " " verb " " (format-count value) " " counted "; " (or own-advice advice)))))
  
  (defn- tag-text [{:keys [title includes]}]
    (if (seq includes)
-@@ -338,6 +398,13 @@
+@@ -338,6 +407,13 @@
  
  (defn- bound-text [bounds bound] (str "(" (name bound) " bound " (format-count (get bounds bound)) ")"))
  
@@ -300,7 +314,7 @@ index 7cac252..c3d3b4b 100644
  (defn plan-text
    "The steps `query-name` takes with its resolved `params` (as the response echoes them), each with
    the bound that stops it and its value in `bounds`."
-@@ -359,10 +426,15 @@
+@@ -359,10 +435,15 @@
             " 3. Walk up from each through its parents, its page and any page above it, each step counted " (b :ancestor-steps)
             ", stopping at a block already reached. 4. A meeting no walk reached is a row, oldest first." reads)
        "open-tasks-by-client"
@@ -320,7 +334,7 @@ index 7cac252..c3d3b4b 100644
        "pages-missing-property"
        (str "1. Read the pages and blocks tagged " (tag-text (get params "tag")) ", each counted " (b :tagged) "."
             " 2. Keep the pages that aren't private and have no value for " (get-in params ["property" :title])
-@@ -403,7 +475,9 @@
+@@ -403,7 +484,9 @@
      ;; The client is read as the value's :block/title, so the property's values must be entities
      ;; with a title: not a number (its value is :logseq.property/value) and not a raw value.
      :params [{:name "client_property" :type :property :default "forClient"
@@ -331,17 +345,18 @@ index 7cac252..c3d3b4b 100644
  
     "pages-missing-property"
     {:title "Pages missing a property"
-@@ -422,6 +496,7 @@
+@@ -422,6 +505,8 @@
    ([query-name db resolved bounds] (run-named query-name db resolved bounds (volatile! {})))
    ([query-name db {:keys [inputs params]} bounds work]
     (let [{:keys [run]} (get named-queries query-name)
 -         ctx {:db db :query query-name :bounds bounds :work work}
 +         ctx (cond-> {:db db :query query-name :bounds bounds :work work}
-+               (client-name params) (assoc :client-title (client-name params)))
++               (client-name params) (assoc :client-title (client-name params))
++               (contains? #{"default" "url"} (get-in params ["client_property" :type])) (assoc :text-client true))
           rows (run ctx inputs)]
       {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..4c0eaf1 100644
+index 39eccae..4ddedc9 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -215,7 +215,9 @@
@@ -351,7 +366,7 @@ index 39eccae..4c0eaf1 100644
 -                         " open-tasks-by-client (param client_property, default forClient): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused. It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
 +                         " open-tasks-by-client (params client_property, default forClient, and client, optional): blocks tagged Task whose status is not Done or Canceled, with each client from the task's own client_property, else each from its page's, else empty, sorted by client title, so a task with two clients is a row under each (two clients with one title are one row); columns client and task. client_property must be a node, default (text), url or date property (its values have titles); a number, checkbox or datetime property is refused."
 +                         " client is a client's title or UUID, and lists only that client's tasks: those whose own client_property values, else their page's, include it. A title matches exactly, else a page or tag name ignoring case; when several pages, tags or blocks share it, a page wins when exactly one of them is a page, and otherwise the call is refused with 400 naming each one's kind and UUID, oldest first, so give the UUID you mean. A client that is null, empty or not a string, an unknown title or UUID (a private or recycled one reads as unknown), or a client_property that is a default or url property (its values are per-block text) is refused with 400 naming params.client, never all clients. params.client echoes the client used, as title and uuid. With client, it reads only the blocks holding the client and the blocks on those that are pages, not every Task, so a graph whose Task count stops the full run can still be asked about one client; it then stops with 422 after 10,000 blocks holding the client or on its pages (its tasks bound), or when it finds more than 2,000 open tasks of the client (its open-tasks bound): mark the client's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query."
-+                         " It stops with 422 after 10,000 blocks tagged Task (its tasks bound): list one client's tasks with datalog_query; or when it finds more than 2,000 open tasks (its open-tasks bound): mark finished tasks Done or Canceled, or list one client's tasks with datalog_query."
++                         " Without client, it stops with 422 after 10,000 blocks tagged Task (its tasks bound) or when it finds more than 2,000 open tasks (its open-tasks bound): give a client (params.client), or mark finished tasks Done or Canceled; with a default or url client_property, which can't take a client, list one client's tasks with datalog_query instead."
                           " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
                           " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
                           " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
@@ -364,12 +379,12 @@ index 39eccae..4c0eaf1 100644
                              "404" {:description "No named query has that name; the error lists the names"}
                              "409" {:description "The graph is E2EE"}
 -                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound)"}}
-+                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound); with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, and the error names the client"}}
++                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound); with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, and the error names the client; without params.client, open-tasks-by-client's error advises giving one (params.client), except for a default or url client_property, where it advises datalog_query"}}
             "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap), made more than 20,000 function calls (the call cap), did more than 200,000 rows of relation work (the work cap), had function bindings copy more than 100,000 values (the width cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-index 047acfc..df371f9 100644
+index 047acfc..f3517aa 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 @@ -2028,6 +2028,26 @@
@@ -424,7 +439,29 @@ index 047acfc..df371f9 100644
                         params)]
        (is (:ok normalised) (str query-name ": " (:error normalised)))
        (if rules
-@@ -4070,3 +4097,690 @@
+@@ -3413,9 +3440,9 @@
+      :ancestor-steps "meetings-without-decision stopped after %s steps up from blocks tagged decision_tag (its ancestor-steps bound); give a smaller days or a narrower meeting_tag or decision_tag"
+      :reads "meetings-without-decision stopped after %s reads (its reads bound, the backstop over every read); give a smaller days or a narrower meeting_tag or decision_tag"}]
+    ["open-tasks-by-client" nil
+-    {:tasks "open-tasks-by-client stopped after %s blocks tagged Task (its tasks bound); list one client's tasks with datalog_query"
+-     :open-tasks "open-tasks-by-client found more than %s open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
+-     :reads "open-tasks-by-client stopped after %s reads (its reads bound, the backstop over every read); list one client's tasks with datalog_query"}]
++    {:tasks "open-tasks-by-client stopped after %s blocks tagged Task (its tasks bound); give a client (params.client), or mark finished tasks Done or Canceled"
++     :open-tasks "open-tasks-by-client found more than %s open tasks (its open-tasks bound); give a client (params.client), or mark finished tasks Done or Canceled"
++     :reads "open-tasks-by-client stopped after %s reads (its reads bound, the backstop over every read); give a client (params.client), or mark finished tasks Done or Canceled"}]
+    ["pages-missing-property" {:params {:tag "Project" :property "forClient"}}
+     {:tagged "pages-missing-property stopped after %s tagged pages and blocks (its tagged bound); give a narrower tag"
+      :reads "pages-missing-property stopped after %s reads (its reads bound, the backstop over every read); give a narrower tag"}]])
+@@ -3428,7 +3455,7 @@
+   (doseq [[query-name bound text]
+           [["meetings-without-decision" :meetings "meetings-without-decision stopped after 2,000 meetings created within days (its meetings bound); give a smaller days or a narrower meeting_tag"]
+            ["projects-untouched" :page-blocks "projects-untouched stopped after reading 10,000 blocks on pages not updated within days (its page-blocks bound); give a narrower tag or a larger days"]
+-           ["open-tasks-by-client" :open-tasks "open-tasks-by-client found more than 2,000 open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"]
++           ["open-tasks-by-client" :open-tasks "open-tasks-by-client found more than 2,000 open tasks (its open-tasks bound); give a client (params.client), or mark finished tasks Done or Canceled"]
+            ["pages-missing-property" :tagged "pages-missing-property stopped after 2,500 tagged pages and blocks (its tagged bound); give a narrower tag"]]]
+     (is (= text (named-queries/bound-message {:query query-name :bound bound :value (get named-queries/default-bounds bound)})))))
+ 
+@@ -4070,3 +4097,767 @@
            (is (identical? own after-answered) "restored after an answered query")
            (is (identical? own after-refused) "restored after a refused query")
            (is (pos? direct) "a query outside run-query runs uncharged"))))))
@@ -858,7 +895,7 @@ index 047acfc..df371f9 100644
 +                prop (keyword for-client)
 +                count-of #(count (walk-candidates @conn prop (eid-titled conn %)))]
 +          (is (= 60 (count (d/datoms @conn :avet :block/tags (d/entid @conn :logseq.class/Task)))))
-+          (is (= [422 "open-tasks-by-client stopped after 50 blocks tagged Task (its tasks bound); list one client's tasks with datalog_query"]
++          (is (= [422 "open-tasks-by-client stopped after 50 blocks tagged Task (its tasks bound); give a client (params.client), or mark finished tasks Done or Canceled"]
 +                 (answer-of full))
 +              (head-of full))
 +          (is (= [200 200 200] (map :status [acme beta gamma])) (pr-str (map head-of [acme beta gamma])))
@@ -1115,6 +1152,83 @@ index 047acfc..df371f9 100644
 +                 (get-in acme [:body :work :tasks]))
 +              "every candidate is counted, private ones included")
 +          (is (= 2 (get-in acme [:body :work :open-tasks])) "only the two visible open tasks on its page are counted as open"))))))
++
++;; Patch 0054 stage 3: without a client, the 422 advises giving one
++;; -----------------------------------------------------------------
++
++(def ^:private client-advice "give a client (params.client), or mark finished tasks Done or Canceled")
++
++(defn- no-client-message
++  "open-tasks-by-client's 422 without a client at `bound` 0: with a client_property that can take a
++  client (`text?` false) the advice is to give one; with a text one (default or url), whose values
++  are per-block text, it stays the datalog_query advice."
++  [bound text?]
++  (str "open-tasks-by-client "
++       (case bound
++         :tasks "stopped after 0 blocks tagged Task (its tasks bound)"
++         :open-tasks "found more than 0 open tasks (its open-tasks bound)"
++         :reads "stopped after 0 reads (its reads bound, the backstop over every read)")
++       "; "
++       (if text?
++         (case bound
++           :open-tasks "mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
++           "list one client's tasks with datalog_query")
++         client-advice)))
++
++(deftest named-client-advice-test
++  ;; Spec §3.4 (without a client), review focus 15: each of the three bounds, reached without a
++  ;; client, advises params.client for every client_property kind that can take a client (node and
++  ;; date; the default forClient is node), and keeps the datalog_query advice for a default or url
++  ;; property, where a client is refused. No rows come back with any 422.
++  (async done
++    (with-named done
++      (fn [{:keys [conn self]}]
++        (p/let [_ (p/all (map (fn [[t ty]] (ok! (request! self "POST" "/semantic/properties" {:title t :type ty}) 201))
++                              [["zq advice text" "default"] ["zq advice url" "url"] ["zq advice date" "date"]]))
++                before (snapshot conn)
++                runs (reduce
++                      (fn [acc [prop text?]]
++                        (reduce (fn [acc bound]
++                                  (p/let [acc acc
++                                          _ (set-bounds! self {bound 0})
++                                          r (named! self "open-tasks-by-client" {:params {:client_property prop}})
++                                          _ (set-bounds! self nil)]
++                                    (conj acc [prop text? bound r])))
++                                acc [:tasks :open-tasks :reads]))
++                      (p/resolved [])
++                      [["forClient" false] ["zq advice date" false] ["zq advice text" true] ["zq advice url" true]])
++                _ (set-bounds! self {:open-tasks 0})
++                default-run (named! self "open-tasks-by-client" {})
++                _ (set-bounds! self nil)
++                after (snapshot conn)]
++          (doseq [[prop text? bound r] runs]
++            (testing (str prop ", its " (name bound) " bound")
++              (is (= [422 (no-client-message bound text?)] (answer-of r)) (head-of r))
++              (is (nil? (get-in r [:body :rows])) "no rows")))
++          (testing "client_property left to its default (forClient, a node property)"
++            (is (= [422 (no-client-message :open-tasks false)] (answer-of default-run)) (head-of default-run)))
++          (is (= before after) "read-only"))))))
++
++(deftest named-client-advice-message-test
++  ;; bound-message itself: the client advice without a client, the datalog_query advice for a text
++  ;; client_property, and the client's own words with a client, at the default bounds; the other
++  ;; queries' messages don't change with either key.
++  (let [msg (fn [bound & {:as extra}]
++              (named-queries/bound-message (merge {:query "open-tasks-by-client" :bound bound
++                                                   :value (get named-queries/default-bounds bound)} extra)))]
++    (is (= (str "open-tasks-by-client stopped after 10,000 blocks tagged Task (its tasks bound); " client-advice) (msg :tasks)))
++    (is (= (str "open-tasks-by-client found more than 2,000 open tasks (its open-tasks bound); " client-advice) (msg :open-tasks)))
++    (is (= (str "open-tasks-by-client stopped after 30,000 reads (its reads bound, the backstop over every read); " client-advice) (msg :reads)))
++    (is (= "open-tasks-by-client stopped after 10,000 blocks tagged Task (its tasks bound); list one client's tasks with datalog_query"
++           (msg :tasks :text-client true)))
++    (is (= "open-tasks-by-client found more than 2,000 open tasks (its open-tasks bound); mark finished tasks Done or Canceled, or list one client's tasks with datalog_query"
++           (msg :open-tasks :text-client true)))
++    (is (= "open-tasks-by-client stopped after 30,000 reads (its reads bound, the backstop over every read); list one client's tasks with datalog_query"
++           (msg :reads :text-client true)))
++    (is (= "open-tasks-by-client found more than 2,000 open tasks of zq Acme (its open-tasks bound); mark zq Acme's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query"
++           (msg :open-tasks :client "zq Acme")))
++    (is (= "pages-missing-property stopped after 2,500 tagged pages and blocks (its tagged bound); give a narrower tag"
++           (named-queries/bound-message {:query "pages-missing-property" :bound :tagged :value 2500 :text-client true})))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs
 index abfe15b..ba59349 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_uploaded_graph_schema_test.cljs

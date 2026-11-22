@@ -2808,6 +2808,18 @@ describe("queries help", () => {
     expect(QUERIES_HELP.match(pattern)?.[1]).toBe(server);
   });
 
+  // Patch 0054 stage 3: without a client, open-tasks-by-client's 422 advises giving one, except for
+  // a default or url client_property, which can't take a client and keeps the datalog_query advice.
+  it("the help, the description and the vendored 422 say an open-tasks refusal without a client advises giving one", async () => {
+    const advice = "give a client (params.client), or mark finished tasks Done or Canceled";
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    expect(named.description).toContain(`(its open-tasks bound): ${advice}; with a default or url client_property, which can't take a client, list one client's tasks with datalog_query instead`);
+    expect(named.description).not.toContain("(its tasks bound): list one client's tasks with datalog_query");
+    const refusal = (openapi as unknown as { paths: Record<string, { post: { responses: Record<string, { description: string }> } }> }).paths["/api/v1/graphs/{graph-id}/named-queries/{name}"].post.responses["422"].description;
+    expect(refusal).toContain("without params.client, open-tasks-by-client's error advises giving one (params.client), except for a default or url client_property, where it advises datalog_query");
+    expect(QUERIES_HELP).toContain(`Without a client, open-tasks-by-client's 422 says to ${advice}; with a default or url client_property, which can't take a client, it says to list one client's tasks with datalog_query.`);
+  });
+
   it("neither the help nor run_named_query's description names a cap or a depth limit for the named queries", async () => {
     const named = (await listTools()).find((t) => t.name === "run_named_query");
     for (const gone of ["rule cap", "levels deep", "scan cap", "as EDN"]) expect(named.description, gone).not.toContain(gone);
