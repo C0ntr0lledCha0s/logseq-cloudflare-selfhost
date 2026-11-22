@@ -532,16 +532,22 @@ const CLIENT_ADVICE = {
 
 /**
  * open-tasks-by-client's 422 at `bound` (tasks, open-tasks or reads) of `value`: worded for
- * `client` (its name) when given, else the advice to give one.
+ * `client` (its name) when given, else the advice to give one. The tasks bound counts candidates
+ * before their status is read, so its advice never says to mark tasks Done.
  */
 export function clientBoundMessage(bound, value, client) {
   const words = CLIENT_ADVICE[bound];
   if (!words) throw new Error(`open-tasks-by-client has no bound ${bound}`);
   const [verb, counted, plain] = words;
   const n = value.toLocaleString("en-NZ");
-  return client
-    ? `open-tasks-by-client ${verb} ${n} ${counted(client)}; mark ${client}'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query`
-    : `open-tasks-by-client ${verb} ${n} ${plain}; give a client (params.client), or mark finished tasks Done or Canceled`;
+  const advice = client
+    ? bound === "tasks"
+      ? "list one of its pages' tasks with datalog_query"
+      : `mark ${client}'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query`
+    : bound === "tasks"
+      ? "give a client (params.client)"
+      : "give a client (params.client), or mark finished tasks Done or Canceled";
+  return `open-tasks-by-client ${verb} ${n} ${client ? counted(client) : plain}; ${advice}`;
 }
 
 /** The 400 for a params.client title that `matches` ([{kind, uuid}], oldest first) name. */

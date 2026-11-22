@@ -222,13 +222,14 @@ test("the scale fixture's client rows are the full run's rows of one client: its
   assert.ok(expected["open-tasks-by-client"].rows.some(([c]) => c !== CLIENT));
 });
 
-test("clientBoundMessage gives the client-worded 422 of each bound, and the advice to give a client without one", async () => {
+test("clientBoundMessage gives the client-worded 422 of each bound, and the advice to give a client without one, the tasks bound's advice its own", async () => {
   const { clientBoundMessage } = await import(script);
   const advice = "mark zq Acme's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query";
-  assert.equal(clientBoundMessage("tasks", 10_000, "zq Acme"), `open-tasks-by-client stopped after 10,000 blocks holding zq Acme or on its pages (its tasks bound); ${advice}`);
+  assert.equal(clientBoundMessage("tasks", 10_000, "zq Acme"), "open-tasks-by-client stopped after 10,000 blocks holding zq Acme or on its pages (its tasks bound); list one of its pages' tasks with datalog_query");
   assert.equal(clientBoundMessage("open-tasks", 1, "zq Acme"), `open-tasks-by-client found more than 1 open tasks of zq Acme (its open-tasks bound); ${advice}`);
   assert.equal(clientBoundMessage("reads", 30_000, "zq Acme"), `open-tasks-by-client stopped after 30,000 reads (its reads bound, the backstop over every read); ${advice}`);
-  assert.equal(clientBoundMessage("tasks", 3), "open-tasks-by-client stopped after 3 blocks tagged Task (its tasks bound); give a client (params.client), or mark finished tasks Done or Canceled");
+  assert.equal(clientBoundMessage("tasks", 3), "open-tasks-by-client stopped after 3 blocks tagged Task (its tasks bound); give a client (params.client)");
+  assert.equal(clientBoundMessage("open-tasks", 3), "open-tasks-by-client found more than 3 open tasks (its open-tasks bound); give a client (params.client), or mark finished tasks Done or Canceled");
   assert.throws(() => clientBoundMessage("meetings", 3, "zq Acme"), /no bound meetings/);
 });
 

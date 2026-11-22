@@ -2817,7 +2817,19 @@ describe("queries help", () => {
     expect(named.description).not.toContain("(its tasks bound): list one client's tasks with datalog_query");
     const refusal = (openapi as unknown as { paths: Record<string, { post: { responses: Record<string, { description: string }> } }> }).paths["/api/v1/graphs/{graph-id}/named-queries/{name}"].post.responses["422"].description;
     expect(refusal).toContain("without params.client, open-tasks-by-client's error advises giving one (params.client), except for a default or url client_property, where it advises datalog_query");
-    expect(QUERIES_HELP).toContain(`Without a client, open-tasks-by-client's 422 says to ${advice}; with a default or url client_property, which can't take a client, it says to list one client's tasks with datalog_query.`);
+    expect(QUERIES_HELP).toContain("Without a client, open-tasks-by-client's 422 says to give a client (params.client), and for its open-tasks and reads bounds also to mark finished tasks Done or Canceled; with a default or url client_property, which can't take a client, it says to list one client's tasks with datalog_query.");
+  });
+
+  // Review r1-light-1: the tasks bound counts Task blocks (or, with a client, its candidates) before
+  // the status check, so marking tasks Done can't clear it; its advice is its own. Review
+  // r2-correctness-1: with a client, the open-tasks bound counts only the client's open tasks.
+  it("the help and the description give the tasks bound advice that can clear it, and say the client's open-tasks bound counts its own tasks", async () => {
+    const named = (await listTools()).find((t) => t.name === "run_named_query");
+    expect(named.description).toContain("after 10,000 blocks tagged Task (its tasks bound): give a client (params.client);");
+    expect(named.description).toContain("after 10,000 blocks holding the client or on its pages (its tasks bound): list one of its pages' tasks with datalog_query;");
+    expect(named.description).toContain("more than 2,000 open tasks of the client, counted once a task is found to be the client's (its open-tasks bound): mark the client's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query");
+    expect(named.description).not.toMatch(/\(its tasks bound\)[^;.]*mark [^;.]*Done or Canceled/);
+    expect(QUERIES_HELP).toContain("with a client, its tasks bound counts the blocks holding the client or on its pages, not every Task, and its 422 says to list one of its pages' tasks with datalog_query; its open-tasks bound counts only the open tasks that are the client's.");
   });
 
   it("neither the help nor run_named_query's description names a cap or a depth limit for the named queries", async () => {

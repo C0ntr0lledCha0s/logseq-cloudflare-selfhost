@@ -279,7 +279,7 @@ test("--named runs open-tasks-by-client with params.client at the cap: a client 
   }
   assert.equal(onPage.bound, "tasks");
   assert.equal(onPage.work.tasks, out.bounds.tasks + 1, "stopped one past the tasks bound");
-  assert.equal(onPage.error, `open-tasks-by-client stopped after 10,000 blocks holding ${onPage.client} or on its pages (its tasks bound); mark ${onPage.client}'s finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query`);
+  assert.equal(onPage.error, `open-tasks-by-client stopped after 10,000 blocks holding ${onPage.client} or on its pages (its tasks bound); list one of its pages' tasks with datalog_query`);
   assert.ok(["open-tasks", "reads"].includes(held.bound), held.bound);
   assert.ok(held.work[held.bound] === out.bounds[held.bound] + 1, `stopped one past the ${held.bound} bound: ${JSON.stringify(held.work)}`);
   assert.match(held.error, new RegExp(`^open-tasks-by-client (found more than 2,000 open tasks of ${held.client} \\(its open-tasks bound\\)|stopped after 30,000 reads \\(its reads bound, the backstop over every read\\)); mark ${held.client}'s finished tasks`));
