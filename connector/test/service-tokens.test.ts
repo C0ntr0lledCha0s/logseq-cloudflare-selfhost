@@ -1734,6 +1734,19 @@ const REFUSED: [string, string, Record<string, unknown>, string][] = [
     { "page-id": PAGE, body: { favorite: false } },
     `${by} set_page_favorite on graph 'notes' removes the page from the favourites list. ${DRY}`,
   ],
+  // Patch 0056: an apply deletes blank leaves; dry-run false and dry-run left out are both applies.
+  [
+    "delete_blank_blocks",
+    "dry-run: false",
+    { body: { "page-ids": [PAGE], "dry-run": false, "block-ids": [B1] } },
+    `${by} delete_blank_blocks on graph 'notes' deletes blank blocks. ${DRY}`,
+  ],
+  [
+    "delete_blank_blocks",
+    "dry-run missing",
+    { body: { "page-ids": [PAGE], "block-ids": [B1] } },
+    `${by} delete_blank_blocks on graph 'notes' deletes blank blocks. ${DRY}`,
+  ],
 ];
 
 /** A batch_set entry: an empty one, or one holding a value. */
@@ -1865,8 +1878,11 @@ describe("write-no-delete", () => {
 
   it("every never-rule tool, with the smallest arguments its schema takes, is not refused as a delete", async () => {
     const listed = (await tools(WORKER)).filter((t) => t.annotations?.readOnlyHint !== true);
-    const never = listed.filter((t) => !["delete_page", "delete_block", "delete_blocks", "delete_tag", "delete_property", "delete_block_property", "batch_delete_block_property"].includes(t.name));
-    expect(never.length).toBe(WRITES_IN_MANIFEST.length - 7);
+    // delete_blank_blocks' smallest arguments (page-ids, no dry-run) are an apply: a delete by design.
+    const never = listed.filter(
+      (t) => !["delete_page", "delete_block", "delete_blocks", "delete_tag", "delete_property", "delete_block_property", "batch_delete_block_property", "delete_blank_blocks"].includes(t.name),
+    );
+    expect(never.length).toBe(WRITES_IN_MANIFEST.length - 8);
     for (const tool of never) {
       const result = await ndCall(tool.name, argsFor(tool, "notes"), WORKER);
       expect(result.text, tool.name).not.toContain("may not delete");
@@ -1883,6 +1899,7 @@ describe("write-no-delete", () => {
     ["update_property", { "property-id": "Venue", "dry-run": true, body: { convert_values: true } }, "PATCH", "query"],
     ["update_property", { "property-id": "Venue", "dry-run": true, body: { choices: { retire: ["Old hall"] } } }, "PATCH", "query"],
     ["set_page_favorite", { "page-id": PAGE, body: { favorite: false, "dry-run": true } }, "PUT", "body"],
+    ["delete_blank_blocks", { body: { "page-ids": [PAGE, "Notes"], "dry-run": true } }, "POST", "body"],
   ] as const)("a declared dry run of %s passes: it reaches sync with dry-run=true and is audited dry_run = 1", async (tool, args, method, where) => {
     const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
     expect(result.text).not.toContain("may not delete");
@@ -1902,6 +1919,7 @@ describe("write-no-delete", () => {
     ["delete_page with dry-run false", "delete_page", { "page-id": PAGE, "dry-run": false }],
     ["set_page_favorite with dry-run outside the body", "set_page_favorite", { "page-id": PAGE, "dry-run": true, body: { favorite: false } }],
     ["set_page_favorite with dry-run false", "set_page_favorite", { "page-id": PAGE, body: { favorite: false, "dry-run": false } }],
+    ["delete_blank_blocks with dry-run outside the body", "delete_blank_blocks", { "dry-run": true, body: { "page-ids": [PAGE], "block-ids": [B1] } }],
   ] as const)("an undeclared dry run is refused: %s", async (_label, tool, args) => {
     const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
     expect(result.isError).toBe(true);
@@ -1913,11 +1931,25 @@ describe("write-no-delete", () => {
     for (const [tool, args] of [
       ["delete_page", { "page-id": PAGE, "dry-run": "true" }],
       ["delete_blocks", { body: { "block-ids": [B1], "dry-run": "true" } }],
+      // delete_blank_blocks' schema types dry-run as a boolean, so the string is refused as input.
+      ["delete_blank_blocks", { body: { "page-ids": [PAGE], "dry-run": "true" } }],
     ] as const) {
       const result = await ndCall(tool, { graph: "notes", ...args }, WORKER);
       expect(result.isError, tool).toBe(true);
     }
     expect(ndSync).toEqual([]);
+  });
+
+  it("delete_blank_blocks: a read token is refused the dry run and the apply as read-only, with 0 sync calls and refused rows", async () => {
+    const message = "graph 'notes' is read-only (service token 'ci' is read-only)";
+    for (const body of [{ "page-ids": [PAGE], "dry-run": true }, { "page-ids": [PAGE], "block-ids": [B1] }]) {
+      expect(await ndCall("delete_blank_blocks", { graph: "notes", body }, READ_NOTES), JSON.stringify(body)).toEqual({ isError: true, text: message });
+    }
+    expect(ndSync).toEqual([]);
+    expect((await ndAuditRows()).map((r) => [r.tool, r.status, r.error])).toEqual([
+      ["delete_blank_blocks", "refused", message],
+      ["delete_blank_blocks", "refused", message],
+    ]);
   });
 
   it("set_page_favorite: a read token is refused both add and remove as read-only, with 0 sync calls and refused rows", async () => {
@@ -2083,7 +2115,9 @@ describe("write-no-delete", () => {
     expect(help).toContain("Don't retry a refused delete: report what it would delete and leave the delete to the owner.");
     // Patch 0038: removing a favourite is a delete, and its dry run is in the body.
     expect(help).toContain("set_page_favorite with favorite: false");
-    expect(help).toContain("in the body for delete_blocks and set_page_favorite");
+    expect(help).toContain("in the body for delete_blocks, set_page_favorite and delete_blank_blocks");
+    // Patch 0056: an apply of delete_blank_blocks is a delete; its dry run lists and is allowed.
+    expect(help).toContain("and delete_blank_blocks without dry-run: true (an apply, which deletes the blank blocks it names)");
     const listGraphs = (await tools(WORKER)).find((t) => t.name === "list_graphs");
     expect(listGraphs.description).toContain("read, write-no-delete or write");
   });

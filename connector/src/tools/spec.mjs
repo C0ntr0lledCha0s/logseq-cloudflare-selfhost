@@ -68,6 +68,8 @@ export const ANNOTATIONS = Object.freeze({
   create_task: ADDITIVE,
   // Patch 0039: a POST only because the query can be long; it runs on a read-only view of the graph.
   datalog_query: READ,
+  // Patch 0056: an apply deletes only the listed blank leaves; a re-sent apply finds them gone (404).
+  delete_blank_blocks: DESTRUCTIVE_IDEMPOTENT,
   delete_block: DESTRUCTIVE_IDEMPOTENT,
   delete_block_property: DESTRUCTIVE_IDEMPOTENT,
   delete_blocks: DESTRUCTIVE_IDEMPOTENT,
@@ -136,8 +138,7 @@ const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
  * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), kept for one
  * (getSyncStatus: a hand-written get_sync_status is to fold it with the semantic index's state, spec
  * 2026-11-20 §3.3), or, for listBlockChanges, the semantic indexer's feed rather than something
- * Claude needs. deleteBlankBlocks is held back until its apply is built (plan 2026-11-22, Stage 4
- * removes it here), so no half-built delete_blank_blocks reaches Claude. `/e2ee/` paths are dropped too.
+ * Claude needs. `/e2ee/` paths are dropped too.
  */
 const EXCLUDED_OPERATIONS = new Set([
   "createAsset",
@@ -146,7 +147,6 @@ const EXCLUDED_OPERATIONS = new Set([
   "listKnowledgeIndex",
   "listBlockChanges",
   "getSyncStatus",
-  "deleteBlankBlocks",
 ]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
@@ -265,6 +265,7 @@ export const FIRST_LINES = Object.freeze({
   create_tag: "Create a tag (class) with what it extends and its properties; check list_tags first.",
   create_task: "Create a task with status, priority and dates; use it for every action item, never TODO text.",
   datalog_query: "Read-only Datalog for questions no other tool answers; try run_named_query first.",
+  delete_blank_blocks: "Delete empty leaf blocks from up to 20 pages: dry-run first, then pass the block ids it listed.",
   delete_block: "Delete one block and its children; use delete_blocks for several.",
   delete_block_property: "Remove one property value from a block or page.",
   delete_blocks: "Delete up to 100 blocks in one call; dry-run first and show the user what goes.",

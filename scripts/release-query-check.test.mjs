@@ -94,6 +94,78 @@ test("checkBlankDryRun passes a quick answer listing 100 of 5,000 across 5 pages
   await assert.rejects(checkBlankDryRun(fakeStub({ status: 200, body: good, delay: BLANK_MS + 20 }), ids), /expected under 500 ms/);
 });
 
+test("the apply bound at the caps is 15 s, half the Durable Object's 30 s CPU limit", async () => {
+  const { BLANK_APPLY_MS } = await import(script);
+  assert.equal(BLANK_APPLY_MS, 15000);
+});
+
+/**
+ * A fake SyncDO for deleteBlankBlocks at the caps: a dry run lists the next 100 blank leaves of the
+ * first page, an apply answers `apply(round, ids)` (by default what the real apply answers for them).
+ */
+function blankStub({ apply, delay = 0, listed = 100 } = {}) {
+  const ids = ["p1", "p2", "p3", "p4", "p5"];
+  let round = 0;
+  const sent = [];
+  const entry = (uuid, n, from = 0) => ({ page: uuid, uuid, "would-delete": Array.from({ length: n }, (_, i) => ({ uuid: `${uuid}-${from + i}`, parent: uuid })), kept: { "has-children": 0, referenced: 0, "being-edited": 0, examples: [] }, "skipped-private": 0 });
+  const real = (r, blockIds) => ({
+    deleted: blockIds.length,
+    t: 9 + r,
+    pages: ids.map((uuid, i) => ({ page: uuid, uuid, deleted: i === 0 ? blockIds.length : 0, "remaining-blocks": i === 0 ? 2000 - 100 * r : 2000 })),
+  });
+  return {
+    ids,
+    sent,
+    stub: {
+      async fetch(request) {
+        const body = await request.json();
+        sent.push(body);
+        if (body["dry-run"] === true) {
+          const total = 5000 - 100 * round;
+          return Response.json({ "dry-run": true, t: 9 + round, total, listed, pages: [entry("p1", listed, 100 * round), ...ids.slice(1).map((u) => entry(u, 0))], note: "…" });
+        }
+        round += 1;
+        if (delay) await new Promise((r) => setTimeout(r, delay));
+        const answer = (apply ?? ((r, b) => ({ status: 200, body: real(r, b) })))(round, body["block-ids"], real);
+        return new Response(JSON.stringify(answer.body), { status: answer.status });
+      },
+    },
+  };
+}
+
+test("checkBlankApply passes three applies of the 100 ids each dry run listed, and fails a refusal, a wrong count, a short listing or a slow answer", async () => {
+  const { checkBlankApply, BLANK_APPLY_MS } = await import(script);
+  const good = blankStub();
+  assert.match(await checkBlankApply(good.stub, good.ids), /median \d+ ms/);
+  const applies = good.sent.filter((b) => b["dry-run"] !== true);
+  assert.equal(applies.length, 3, "three applies");
+  for (const [i, body] of applies.entries()) {
+    assert.deepEqual(body["page-ids"], good.ids);
+    assert.equal(body["block-ids"].length, 100);
+    assert.deepEqual(body["block-ids"], Array.from({ length: 100 }, (_, j) => `p1-${100 * i + 99 - j}`), "the listed ids, in reverse order");
+  }
+  assert.equal(good.sent.at(-1)["dry-run"], true, "a dry run after the last apply");
+  const failing = [
+    [{ apply: () => ({ status: 409, body: { error: "block-ids[3]: referenced" } }) }, /apply 1: HTTP 409: .*block-ids\[3\]: referenced/],
+    [{ apply: (r, b, real) => ({ status: 200, body: { ...real(r, b), deleted: 99 } }) }, /apply 1: deleted 99, expected 100/],
+    [{ apply: (r, b, real) => ({ status: 200, body: { ...real(r, b), pages: real(r, b).pages.reverse() } }) }, /apply 1: pages in the order/],
+    [{ apply: (r, b, real) => ({ status: 200, body: { ...real(r, b), pages: real(r, b).pages.map((p, i) => (i === 1 ? { ...p, deleted: 1 } : p)) } }) }, /apply 1: deleted 100, 1, 0, 0, 0 per page/],
+    [{ apply: (r, b, real) => ({ status: 200, body: { ...real(r, b), pages: real(r, b).pages.map((p, i) => (i === 0 ? { ...p, "remaining-blocks": 2000 } : p)) } }) }, /apply 1: remaining-blocks 2000, 2000, 2000, 2000, 2000, expected 1900, 2000/],
+    [{ listed: 99 }, /dry run 1: listed 99, expected 100/],
+    [{ apply: (r, b, real) => ({ status: 500, body: { error: "1 of 100 deleted blocks were not removed: x", "not-removed": ["x"] } }) }, /apply 1: HTTP 500/],
+  ];
+  for (const [opts, error] of failing) {
+    const { stub, ids } = blankStub(opts);
+    await assert.rejects(checkBlankApply(stub, ids), error);
+  }
+  // A slow answer, against a 50 ms bound so the test doesn't wait BLANK_APPLY_MS three times.
+  const slow = blankStub({ delay: 70 });
+  await assert.rejects(checkBlankApply(slow.stub, slow.ids, 50), /expected under 50 ms/);
+  const quick = blankStub();
+  assert.match(await checkBlankApply(quick.stub, quick.ids, 50), /median \d+ ms/);
+  assert.ok(BLANK_APPLY_MS > 50);
+});
+
 test("the scale fixture is about 20,000 blocks of meetings, decisions, tasks, tagged pages and stale projects, the same on every build", async () => {
   const { scaleFixture, SCALE } = await import(script);
   const now = 1_762_646_400_000;
@@ -269,6 +341,7 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "at scale: a datalog_query scan-cap 422 logs nothing to the console",
     "seed deleteBlankBlocks' caps: 5 pages of 2000 blocks through SyncDO.fetch",
     "at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within 500 ms",
+    "at the caps: a deleteBlankBlocks apply of 100 listed ids over 10000 blocks deletes them within 15000 ms",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }

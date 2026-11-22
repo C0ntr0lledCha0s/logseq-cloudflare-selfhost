@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 2895632..e6eb930 100644
+index 2895632..471af4a 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5035,6 +5035,199 @@
+@@ -5035,6 +5035,282 @@
                       (nil? existing) (assoc :page (insert-page-title db page)))))
                 (map vector entries resolved)))
  
@@ -184,34 +184,117 @@ index 2895632..e6eb930 100644
 +                      pages)]
 +    {:dry-run true :t t :total @total :listed @listed :pages entries :note (blank-note @total @listed)}))
 +
-+(defn- delete-blank-blocks [^js self request db e2ee?]
++(defn- blank-ids-refusal
++  "The first block-ids entry that can't name a block in `db`, as {:status :error} naming
++  block-ids[i]: not a UUID or a duplicate (400, ignoring case), or no visible block (404); else nil.
++  The apply re-reads each inside its transaction: this only answers a malformed list up front."
++  [db block-ids]
++  (let [result (reduce (fn [seen [i id]]
++                         (let [field (str "block-ids[" i "]")
++                               id (when (and (string? id) (parse-uuid id)) (string/lower-case id))]
++                           (cond
++                             (nil? id) (reduced {:status 400 :error (str field ": not a UUID")})
++                             (contains? seen id) (reduced {:status 400 :error (str field ": duplicate of block-ids[" (get seen id) "]")})
++                             (nil? (find-visible-entity db id)) (reduced {:status 404 :error (str field ": block not found")})
++                             :else (assoc seen id i))))
++                       {}
++                       (map-indexed vector block-ids))]
++    (when (:error result) result)))
++
++(def ^:private apply-refusal-reasons
++  "Why an apply refuses a block-ids entry, by blank-candidate's reason or the apply's own checks."
++  {:missing "block not found" :hidden "block not found" :not-plain "not a plain block"
++   :off-page "not on a listed page" :has-text "no longer blank (it has text)" :private "is Private"
++   :has-children "has children" :referenced "referenced" :being-edited "being edited in the app"})
++
++(defn- apply-refusal
++  "Why block-ids[i] (`id`) can't be deleted now, judged on `db` (the transaction's), as
++  {:status :error}, or nil. Its :block/page is read from datoms, as blank-candidate reads, and must
++  be one of `page-eids`."
++  [db page-eids context i id]
++  (let [block (d/entity db [:block/uuid (uuid id)])
++        reason (cond
++                 (nil? (:db/id block)) :missing
++                 (not= "block" (block-kind block)) :not-plain
++                 (not (contains? page-eids (:v (first (d/datoms db :eavt (:db/id block) :block/page))))) :off-page
++                 :else (blank-candidate db block context))]
++    (when reason
++      {:status (if (#{:missing :hidden} reason) 404 409)
++       :error (str "block-ids[" i "]: " (apply-refusal-reasons reason))})))
++
++(defn- remaining-blocks
++  "The blocks `page` still holds that aren't in the Recycle bin."
++  [db page]
++  (count (remove #(some? (:v (first (d/datoms db :eavt (:e %) :logseq.property/deleted-at))))
++                 (d/datoms db :avet :block/page (:db/id page)))))
++
++(defn- apply-blank-deletes!
++  "Deletes the blocks `ids` name (lower-case UUIDs, each found) on `pages`, and answers how many went
++  from each page and what each still holds. Inside one transaction each block is re-read and
++  re-judged on the transaction's db, so text typed, a child added, a move or a reference made since
++  the dry run (or since this request read the graph) refuses the whole call naming block-ids[i]
++  (check-labels!'s refusal shape, which `rejecting` answers); then one delete-blocks! call deletes
++  them all (one tx id, :delete-blocks), and confirm-removed! reads back that they are gone."
++  [^js self conn creator pages ids]
++  (let [page-eids (set (map :db/id pages))
++        deleted (atomic-write! conn creator false :delete-blocks
++                               (fn [tx-conn]
++                                 (let [db @tx-conn
++                                       context {:private (datalog/private-ids db)
++                                                :editing (presence/editing-block-uuids self)
++                                                :attributes (blank-reference-attributes db)}
++                                       blocks (mapv #(d/entity db [:block/uuid (uuid %)]) ids)]
++                                   (when-let [refusal (some (fn [[i id]] (apply-refusal db page-eids context i id))
++                                                            (map-indexed vector ids))]
++                                     (throw (ex-info (:error refusal) {::label-refusal refusal})))
++                                   (outliner-core/delete-blocks! tx-conn blocks {})
++                                   (frequencies (map #(:v (first (d/datoms db :eavt (:db/id %) :block/page))) blocks)))))]
++    (broadcast-change! self)
++    (confirm-removed! @conn (map uuid ids))
++    (let [db @conn]
++      {:deleted (count ids)
++       :t (storage/get-t (.-sql self))
++       :pages (mapv (fn [page] {:page (:block/title page)
++                                :uuid (uuid-string (:block/uuid page))
++                                :deleted (get deleted (:db/id page) 0)
++                                :remaining-blocks (remaining-blocks db page)})
++                    pages)})))
++
++(defn- delete-blank-blocks [^js self request conn db e2ee? creator]
 +  (p/let [body (body-clj request)]
 +    (if-let [error (blank-body-error body)]
 +      (http/bad-request error)
 +      (let [private (when-not e2ee? (datalog/private-ids db))
 +            resolved (resolve-blank-pages db e2ee? private (:page-ids body))
-+            refusal (or (when (:error resolved) resolved) (blank-scan-refusal db (:pages resolved)))]
++            refusal (or (when (:error resolved) resolved)
++                        (blank-scan-refusal db (:pages resolved))
++                        (when-not (true? (:dry-run body))
++                          (blank-ids-refusal db (:block-ids body))))]
 +        (cond
 +          refusal (selector-refusal refusal)
-+          (not (true? (:dry-run body))) (http/error-response "apply is not built yet: only dry-run true is answered" 501)
-+          :else (http/json-response nil (blank-dry-run db (storage/get-t (.-sql self)) (:pages resolved)
-+                                                       {:private private
-+                                                        :editing (presence/editing-block-uuids self)
-+                                                        :attributes (blank-reference-attributes db)})))))))
++          (true? (:dry-run body))
++          (http/json-response nil (blank-dry-run db (storage/get-t (.-sql self)) (:pages resolved)
++                                                 {:private private
++                                                  :editing (presence/editing-block-uuids self)
++                                                  :attributes (blank-reference-attributes db)}))
++          :else
++          (rejecting
++           #(http/json-response nil (apply-blank-deletes! self conn creator (:pages resolved)
++                                                          (mapv string/lower-case (:block-ids body))))))))))
 +
  (defn- bulk-write-response
    "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
    [body dry-run? status]
-@@ -5044,6 +5237,8 @@
+@@ -5044,6 +5320,8 @@
  
  (defn- handle-bulk [{:keys [^js self request ^js url conn db handler e2ee? creator]}]
    (case handler
-+    :semantic/blank-blocks-delete (delete-blank-blocks self request db e2ee?)
++    :semantic/blank-blocks-delete (delete-blank-blocks self request conn db e2ee? creator)
 +
      :semantic/blocks-get-many
      (let [ids (parse-ids (.get (.-searchParams url) "ids"))
            view (or (.get (.-searchParams url) "view") "summary")
-@@ -5852,7 +6047,7 @@
+@@ -5852,7 +6130,7 @@
  
  (def ^:private bulk-handlers
    #{:semantic/blocks-get-many :semantic/blocks-delete-many :semantic/blocks-batch-move
@@ -221,7 +304,7 @@ index 2895632..e6eb930 100644
  (def ^:private property-and-search-handlers
    #{:semantic/properties-list :semantic/properties-create :semantic/properties-get
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 88a506e..be8c63e 100644
+index 88a506e..44fb408 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -42,6 +42,8 @@
@@ -233,7 +316,7 @@ index 88a506e..be8c63e 100644
     {:method "POST" :path "/api/v1/graphs/:graph-id/refresh-refs" :internal-path "/semantic/refresh-refs"
      :handler :semantic/refresh-refs :operation-id "refreshRefs" :scope "logseq/write" :rate-class :write}
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
-@@ -168,6 +170,14 @@
+@@ -168,6 +170,15 @@
     "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
@@ -244,11 +327,12 @@ index 88a506e..be8c63e 100644
 +                             " A blank block is kept and counted under kept, with up to 20 examples per page, when it has children (they are never lifted), when something references it (a link, an embed, a property value) or when a connected app reports it as the block being edited. Blank blocks on or under Private content are counted per page in skipped-private and never named."
 +                             " The dry run writes nothing and lists at most 100 blocks across the call, page by page in request order, under would-delete with each one's parent; total counts them all, listed counts those listed, and note says to run the dry run again after the apply when some weren't listed."
 +                             " A page with more than 2000 blocks, or pages with more than 10000 together, are refused with 422 naming the page where the bound was passed. A page may end with no blocks; the app may add an empty block back when it is opened."
-+                             " Apply is not built yet: an apply with block-ids answers 501.")]
++                             " An apply takes 1 to 100 block-ids (UUIDs, each once, ignoring case) and refuses the whole call, naming block-ids[i] and writing nothing: 400 for an entry that isn't a UUID or repeats an earlier one, 404 for one that names no block (or one in the Recycle bin), and 409 when, judged again inside the write's transaction, the block is no longer blank (it has text), has children, is referenced, is being edited in the app, is not on a listed page, is not a plain block or is Private. So only blocks that are still plain blank leaves on the named pages are deleted, never a block that changed since the dry run."
++                             " The apply deletes them all in one transaction, answers deleted, the graph's t after the write and, per page in request order, how many it deleted and how many blocks it still holds (remaining-blocks), and answers 500 naming any block still there afterwards.")]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
     "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
-@@ -416,6 +426,16 @@
+@@ -416,6 +427,16 @@
                                                              "target-label is on the single-block writes. A different length is refused "
                                                              "with 400. " target-label-description)}
                                   :dry-run dry-run-schema}}
@@ -265,28 +349,31 @@ index 88a506e..be8c63e 100644
      "batchInsertBlockTrees"
      {:required ["entries"]
       :properties {:entries {:type "array" :minItems 1 :maxItems 100
-@@ -699,6 +719,7 @@
+@@ -699,6 +720,10 @@
                     :content {"application/json" {:schema {:anyOf [{:$ref "#/components/schemas/BlocksResponse"}
                                                                    {:$ref "#/components/schemas/SignalsResponse"}]}}}}
                    "deleteBlocks" (entity-response "DeleteBlocksResponse" "How many blocks were deleted, and each one named")
-+                  "deleteBlankBlocks" (entity-response "BlankBlocksDryRunResponse" "With dry-run true: the blank blocks on each page; nothing was deleted")
++                  "deleteBlankBlocks"
++                  {:description "With dry-run true, the blank blocks on each page (nothing was deleted); otherwise what the apply deleted"
++                   :content {"application/json" {:schema {:anyOf [{:$ref "#/components/schemas/BlankBlocksDryRunResponse"}
++                                                                  {:$ref "#/components/schemas/BlankBlocksDeletedResponse"}]}}}}
                    "deleteBlock" (entity-response "DeleteBlocksResponse" "The deleted block, named")
                    "moveBlocks" (entity-response "MovedBlocksResponse" "The moved blocks, with where each was and is")
                    "batchMoveBlocks" (entity-response "MoveBlocksResponse" "How many blocks were moved, with where each was and is")
-@@ -755,6 +776,12 @@
+@@ -755,6 +780,12 @@
              "500" (entity-response "NotRemoved" "The page is still in the graph after the delete")}
             ("deleteBlock" "deleteBlocks")
             {"500" (entity-response "NotRemoved" "Blocks still in the graph after the delete")}
 +           "deleteBlankBlocks"
-+           {"400" {:description "A malformed body (an unknown field, a non-boolean dry-run, page-ids not 1 to 20 strings, block-ids missing on an apply or given on a dry run), or page-ids[i] naming the same page as an earlier entry, a whiteboard, a tag, a property, something that isn't a page, or a Private page; nothing was written"}
-+            "404" {:description "page-ids[i] names no visible page; nothing was written"}
-+            "409" {:description "page-ids[i] names several pages (candidates names each one's uuid and title), or the graph is E2EE; nothing was written"}
++           {"400" {:description "A malformed body (an unknown field, a non-boolean dry-run, page-ids not 1 to 20 strings, block-ids missing or not 1 to 100 on an apply, or given on a dry run), page-ids[i] naming the same page as an earlier entry, a whiteboard, a tag, a property, something that isn't a page, or a Private page, or block-ids[i] not a UUID or a duplicate of an earlier entry; nothing was written"}
++            "404" {:description "page-ids[i] names no visible page, or block-ids[i] no block outside the Recycle bin; nothing was written"}
++            "409" {:description "page-ids[i] names several pages (candidates names each one's uuid and title), the graph is E2EE, or block-ids[i] is no longer blank (it has text), has children, is referenced, is being edited in the app, is not on a listed page, is not a plain block or is Private; nothing was written"}
 +            "422" {:description "page-ids[i] has more than 2000 blocks, or the pages up to it more than 10000; nothing was written"}
-+            "501" {:description "An apply (dry-run false with block-ids) is not built yet"}}
++            "500" (entity-response "NotRemoved" "Blocks still in the graph after the apply")}
             ("deleteTag" "deleteProperty")
             {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
              "204" {:description "Deleted"}
-@@ -950,6 +977,30 @@
+@@ -950,6 +981,40 @@
                                                                  :property-values {:type ["array" "null"] :items {:type "string"}
                                                                                    :description "null without property; else the property's values as text on the entity, else on its page, else []."}}}}
                                    :missing {:type "array" :items {:type "string"}}}}
@@ -314,24 +401,36 @@ index 88a506e..be8c63e 100644
 +                                                                                                  :reason {:enum ["has children" "referenced" "being edited"]}}}}}}
 +                                              :skipped-private {:type "integer" :description "Blank blocks on or under Private content, counted and never named."}}}}
 +                 :note {:type "string"}}}
++   :BlankBlocksDeletedResponse
++   {:type "object" :required ["deleted" "t" "pages"]
++    :properties {:deleted {:type "integer" :maximum 100 :description "The blocks deleted: every entry in block-ids."}
++                 :t {:type "integer" :description "The graph's t after the delete."}
++                 :pages {:type "array"
++                         :items {:type "object" :required ["page" "uuid" "deleted" "remaining-blocks"]
++                                 :properties {:page {:type "string" :description "The page's title."}
++                                              :uuid {:type "string"}
++                                              :deleted {:type "integer" :description "The blocks deleted from this page."}
++                                              :remaining-blocks {:type "integer" :description "The blocks the page still holds, outside the Recycle bin; 0 when it is empty."}}}}}}
     :DeleteBlocksResponse {:type "object" :required ["deleted" "total-removed"]
                            :properties {:deleted {:type "integer" :description "Blocks named in block-ids."}
                                         :total-removed {:type "integer" :description "Those blocks and all their descendants."}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
 new file mode 100644
-index 0000000..72717d5
+index 0000000..4136a72
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,983 @@
 +(ns logseq.db-sync.semantic-delete-blank-blocks-test
-+  "deleteBlankBlocks (patch 0056), Stage 3: page resolution, the blank predicate and the dry run.
++  "deleteBlankBlocks (patch 0056): page resolution, the blank predicate, the dry run and the apply.
 +  A call names 1 to 20 pages; any page that doesn't resolve to one visible, plain, non-Private page
 +  refuses the whole call naming page-ids[i]. A dry run judges every block on the pages and lists the
 +  plain blank leaves (an empty or whitespace title, no children, no tags, nothing but the built-in
 +  bookkeeping and Claude's stamps, no referrer, not Private, not being edited) without writing.
 +  Blank blocks kept for a reason the caller can act on are counted with examples; blank blocks under
 +  Private content are counted only; every other blank-looking block (value blocks, typed blocks,
-+  headings, tagged blocks) is left out. An apply needs block-ids and isn't built yet (501).
++  headings, tagged blocks) is left out. An apply takes 1 to 100 block-ids, re-judges each inside one
++  transaction (refusing the whole call naming block-ids[i]), deletes them with one delete-blocks!
++  call (one tx_log row, one tx id) and reads back that they are gone.
 +  Graphs sit on a real SQLite store (better-sqlite3) and every call goes through handle-http, on a
 +  graph created on the server and on one that arrived through the app's snapshot upload."
 +  (:require ["better-sqlite3" :as sqlite3]
@@ -340,6 +439,7 @@ index 0000000..72717d5
 +            [clojure.string :as string]
 +            [datascript.core :as d]
 +            [logseq.db.common.order :as db-order]
++            [logseq.db-sync.common :as common]
 +            [logseq.db-sync.storage :as storage]
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db-sync.worker.presence :as presence]
@@ -930,21 +1030,339 @@ index 0000000..72717d5
 +            (is (refused? malformed 400 "body: give an object with page-ids") (pr-str malformed)))
 +          (is (= before (written-state sql self)) "no refusal wrote anything"))))))
 +
-+(deftest apply-not-built-yet-test
-+  ;; Stage 3 only: an apply with block-ids answers 501 and writes nothing. Stage 4 replaces it.
++;; ---------------------------------------------------------------------------------------------
++;; The apply: block-ids re-judged inside one transaction, deleted by one delete-blocks! call
++
++(defn- apply! [self page-ids block-ids & opts]
++  (apply blank! self {:page-ids page-ids :block-ids block-ids} opts))
++
++(defn- listed-ids
++  "The block-ids a dry run of `page-ids` lists, in its order."
++  [self page-ids]
++  (p/let [r (ok! (dry-run! self page-ids) 200)]
++    (vec (mapcat #(map :uuid (:would-delete %)) (get-in r [:body :pages])))))
++
++(defn- live? [db id]
++  (let [entity (d/entity db [:block/uuid (uuid (str id))])]
++    (boolean (and entity (not (:logseq.property/deleted-at entity))))))
++
++(defn- outline
++  "The live blocks on `page` (a uuid string), as {parent [children in :block/order]}, with the page
++  itself keyed :page: what a client shows, so a server and a replayed client compare."
++  [db page]
++  (let [page-eid (:db/id (d/entity db [:block/uuid (uuid page)]))]
++    (->> (d/datoms db :avet :block/page page-eid)
++         (map #(d/entity db (:e %)))
++         (remove :logseq.property/deleted-at)
++         (group-by #(str (:block/uuid (:block/parent %))))
++         (map (fn [[parent blocks]] [(if (= parent page) :page parent) (mapv #(str (:block/uuid %)) (sort-by :block/order blocks))]))
++         (into {}))))
++
++(defn- two-pages!
++  "Pages Example and Projects with blank leaves between blocks of text, none adjacent: e2 and e4 on
++  Example, e7 between two children of e5, p2 (a tab) and p4 (the last block) on Projects. `uuids` is
++  12 uuid strings, so separate graphs can hold the same blocks."
++  [self [e1 e2 e3 e4 e5 e6 e7 e8 p1 p2 p3 p4 :as uuids]]
++  (p/let [example (page! self "Example")
++          projects (page! self "Projects")
++          _ (insert! self example [{:uuid e1 :title "one"} {:uuid e2 :title " "} {:uuid e3 :title "two"} {:uuid e4 :title " "}
++                                   {:uuid e5 :title "three" :children [{:uuid e6 :title "a child"} {:uuid e7 :title " "}
++                                                                       {:uuid e8 :title "another child"}]}])
++          _ (insert! self projects [{:uuid p1 :title "four"} {:uuid p2 :title "\t"} {:uuid p3 :title "five"} {:uuid p4 :title " "}])]
++    {:example example :projects projects :ids (zipmap [:e1 :e2 :e3 :e4 :e5 :e6 :e7 :e8 :p1 :p2 :p3 :p4] uuids)}))
++
++(defn- expected-outlines
++  "Example and Projects of two-pages! once their blank leaves are gone."
++  [{:keys [e1 e3 e5 e6 e8 p1 p3]}]
++  [{:page [e1 e3 e5] e5 [e6 e8]} {:page [p1 p3]}])
++
++(deftest apply-replays-on-a-client-copy-test
++  ;; Spec section 7, risk 1: non-adjacent blank leaves on two pages, given in an order unlike the dry
++  ;; run's and with the pages named the other way round, reach the sync log as one transaction with
++  ;; one tx id, and a client replaying the log ends with the server's outline on both pages.
++  ;; Before patch 0056's apply: 501 "apply is not built yet", and no tx_log row.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                {:keys [example projects ids]} (two-pages! self (ids 12))
++                {:keys [e2 e4 e7 p2 p4]} ids
++                listed (listed-ids self [example projects])
++                conn (.-conn self)
++                client (d/conn-from-db @conn)
++                t0 (storage/get-t sql)
++                reports (atom [])
++                _ (d/listen! conn ::reports #(swap! reports conj %))
++                response (apply! self [projects example] [p4 e7 e2 p2 e4])
++                _ (d/unlisten! conn ::reports)
++                rows (storage/fetch-tx-since sql t0)
++                _ (doseq [{:keys [tx]} rows] (d/transact! client (common/read-transit tx)))]
++          (is (= [e2 e4 e7 p2 p4] listed) "the dry run lists the five blanks, page by page in outline order")
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= 5 (get-in response [:body :deleted])))
++          (testing "one transaction, one tx id, logged as delete-blocks"
++            (is (= 1 (count rows)) (pr-str (map :outliner-op rows)))
++            (is (= :delete-blocks (:outliner-op (first rows))))
++            (is (= 1 (count @reports)) "one transaction on the graph")
++            (is (= 1 (count (distinct (map :tx (:tx-data (first @reports)))))) "its datoms carry one tx id"))
++          (testing "the server's outline, and the client's replay of the log, on both pages"
++            (is (= (expected-outlines ids) [(outline @conn example) (outline @conn projects)]))
++            (is (= (expected-outlines ids) [(outline @client example) (outline @client projects)]))
++            (is (not-any? #(live? @client %) [e2 e4 e7 p2 p4]) "the blanks are gone on the client too")))))))
++
++(deftest apply-order-permutations-test
++  ;; The same five blanks in the dry run's order, reversed, with two swapped, interleaved across the
++  ;; pages, and with the pages named the other way round: each deletes exactly those blocks in one
++  ;; tx_log row and leaves the same outline.
++  (async done
++    (let [uuids (ids 12)
++          {:keys [e2 e4 e7 p2 p4]} (zipmap [:e1 :e2 :e3 :e4 :e5 :e6 :e7 :e8 :p1 :p2 :p3 :p4] uuids)
++          orders [["the dry run's order" [:example :projects] [e2 e4 e7 p2 p4]]
++                  ["reversed" [:example :projects] [p4 p2 e7 e4 e2]]
++                  ["the first two swapped" [:example :projects] [e4 e2 e7 p2 p4]]
++                  ["interleaved, pages the other way round" [:projects :example] [p2 e2 p4 e4 e7]]]]
++      (run done
++        (fn []
++          (p/doseq [[label page-order block-ids] orders]
++            (p/let [{:keys [self sql]} (server-graph)
++                    {:keys [ids] :as pages} (two-pages! self uuids)
++                    t0 (storage/get-t sql)
++                    response (apply! self (mapv pages page-order) block-ids)
++                    conn (.-conn self)]
++              (testing label
++                (is (= 200 (:status response)) (pr-str response))
++                (is (= 5 (get-in response [:body :deleted])))
++                (is (= (mapv #(get {:example "Example" :projects "Projects"} %) page-order)
++                       (map :page (get-in response [:body :pages])))
++                    "pages answer in request order")
++                (is (= 1 (count (storage/fetch-tx-since sql t0))))
++                (is (= (expected-outlines ids) [(outline @conn (:example pages)) (outline @conn (:projects pages))]))))))))))
++
++(deftest apply-deletes-dry-run-ids-test
++  ;; A dry run, then an apply of exactly the ids it listed, reached through handle (which seeds the
++  ;; max order key): the answer counts each page's deletes and the blocks it still holds, the blocks
++  ;; are gone from listPageBlocks, and a re-sent apply finds nothing to delete and writes nothing.
++  ;; Pages are named by uuid, by title and by date; one page has nothing blank; one leaf carries
++  ;; Claude's stamps; on an uploaded graph the app's own blank leaf is deleted the same way.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                {:keys [example projects ids]} (two-pages! self (ids 12))
++                [stamped] (insert! self example [{:title " "}] :headers [["x-logseq-edit-stamp" "claude"]])
++                quiet (page! self "Quiet")
++                _ (insert! self quiet [{:title "nothing blank here"}])
++                capture (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title " "}]}) 201)
++                journal (get-in capture [:body :page-id])
++                selectors [example "Projects" (today-iso) "quiet"]
++                listed (listed-ids self selectors)
++                [t0 rows0] (written-state sql self)
++                response (apply! self selectors listed)
++                [t1 rows1] (written-state sql self)
++                example-blocks (ok! (request! self "GET" (str "/semantic/pages/" example "/blocks") nil) 200)
++                again-state (written-state sql self)
++                again (apply! self selectors listed)
++                after-dry-run (ok! (dry-run! self selectors) 200)
++                {uploaded :self app :app} (uploaded-graph)
++                _ (opened! uploaded)
++                app-listed (listed-ids uploaded [app-page])
++                app-apply (apply! uploaded [app-page] app-listed)]
++          (is (= (set (concat (map ids [:e2 :e4 :e7]) [(:uuid stamped)] (map ids [:p2 :p4])
++                              [(get-in capture [:body :blocks 0 :uuid])]))
++                 (set listed)))
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= {:deleted 7
++                  :t t1
++                  :pages [{:page "Example" :uuid example :deleted 4 :remaining-blocks 5}
++                          {:page "Projects" :uuid projects :deleted 2 :remaining-blocks 2}
++                          {:page (get-in capture [:body :page-title]) :uuid journal :deleted 1 :remaining-blocks 0}
++                          {:page "Quiet" :uuid quiet :deleted 0 :remaining-blocks 1}]}
++                 (:body response)))
++          (is (= [(inc t0) (inc rows0)] [t1 rows1]) "one write")
++          (is (not-any? #(string/includes? (:text example-blocks) %) listed) "listPageBlocks no longer shows them")
++          (is (string/includes? (:text example-blocks) (:e1 ids)))
++          (testing "a re-sent apply: nothing is left to delete, and nothing is written"
++            (is (refused? again 404 "block-ids[0]: block not found") (pr-str again))
++            (is (= again-state (written-state sql self))))
++          (is (= 0 (get-in after-dry-run [:body :total])) "a dry run afterwards finds nothing blank")
++          (testing "an uploaded graph: the app's blank leaf goes, its blank parent stays"
++            (is (= [(:leaf app)] app-listed))
++            (is (= 200 (:status app-apply)) (pr-str app-apply))
++            (is (= 1 (get-in app-apply [:body :deleted])))
++            (is (not (live? @(.-conn uploaded) (:leaf app))))
++            (is (live? @(.-conn uploaded) (:parent app)))))))))
++
++(deftest apply-accepts-test
++  ;; Inputs next to a refusal that must still delete: an id in upper case (the dry run lists lower
++  ;; case), dry-run false given explicitly, a page listed with no id on it, and a blank leaf whose
++  ;; sibling and parent changed after the dry run.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (server-graph)
++                {:keys [example projects ids]} (two-pages! self (ids 12))
++                listed (listed-ids self [example])
++                _ (ok! (request! self "PATCH" (str "/semantic/blocks/" (:e5 ids)) {:title "three, edited"}) 200)
++                _ (ok! (request! self "PATCH" (str "/semantic/blocks/" (:e6 ids)) {:title "a child, edited"}) 200)
++                response (blank! self {:page-ids [example projects] :dry-run false
++                                       :block-ids (mapv string/upper-case listed)})]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= [3 0] (map :deleted (get-in response [:body :pages]))))
++          (is (not-any? #(live? @(.-conn self) %) listed)))))))
++
++(deftest apply-refusals-test
++  ;; Each refusal names block-ids[i] and writes nothing; a good blank leaf sits at index 0 of each call
++  ;; and survives it. Between the dry run and the apply, blocks are given text, a child, a move to an
++  ;; unlisted page, a referrer and a client editing them; other ids are guessed: a block with text, a
++  ;; blank parent listed with its blank child (either order), a typed, tagged or valued blank block, a
++  ;; blank leaf under Private, a recycled one, the page, a property, a tag, a journal, and malformed,
++  ;; duplicate and unknown ids.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                _ (opened! self)
++                _ (ok! (request! self "POST" "/semantic/tags" {:title "Private"}) 201)
++                rating (ok! (request! self "POST" "/semantic/properties" {:title "Rating" :type "default"}) 201)
++                rating-ident (get-in rating [:body :ident])
++                topic (ok! (request! self "POST" "/semantic/tags" {:title "Topic"}) 201)
++                capture (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "today"}]}) 201)
++                example (page! self "Example")
++                other (page! self "Other")
++                [good texted childed moved worded parent child edited refd task rated coded private-block under-private
++                 recycled valued] (ids 16)
++                _ (insert! self example [{:uuid good :title " "} {:uuid texted :title " "} {:uuid childed :title " "}
++                                         {:uuid moved :title " "} {:uuid worded :title "words"}
++                                         {:uuid parent :title " " :children [{:uuid child :title " "}]}
++                                         {:uuid edited :title " "} {:uuid refd :title " "} {:uuid task :title " "}
++                                         {:uuid rated :title " "} {:uuid coded :title " " :display-type "code"}
++                                         {:uuid private-block :title "a private block" :children [{:uuid under-private :title " "}]}
++                                         {:uuid recycled :title " "} {:uuid valued :title "a valued block"}])
++                [elsewhere] (insert! self other [{:title "on another page"}])
++                listed (listed-ids self [example])
++                ;; After the dry run:
++                _ (ok! (request! self "PATCH" (str "/semantic/blocks/" texted) {:title "now has text"}) 200)
++                _ (insert! self childed [{:title "a new child"}])
++                _ (ok! (request! self "POST" "/semantic/block-moves"
++                                 {:block-ids [moved] :target-id (:uuid elsewhere) :position "after"}) 200)
++                _ (outliner-insert! self other [{:block/uuid (random-uuid) :block/title (str "see ((" refd "))")
++                                                 :block/refs [[:block/uuid (uuid refd)]]}])
++                _ (editing! self edited)
++                _ (set-property! self task "block/tags" ["Task"])
++                _ (set-property! self rated rating-ident "four stars")
++                _ (set-property! self private-block "block/tags" ["Private"])
++                _ (set-property! self valued rating-ident "a value")
++                conn (.-conn self)
++                value-uuid (str (:block/uuid (d/entity @conn (:v (first (d/datoms @conn :eavt (:db/id (d/entity @conn [:block/uuid (uuid valued)]))
++                                                                                     (keyword rating-ident)))))))
++                _ (set-attr! self value-uuid :block/title "")
++                _ (set-attr! self recycled :logseq.property/deleted-at 1)
++                before (written-state sql self)
++                cases [["given text after the dry run" [good texted] 409 "block-ids[1]: no longer blank (it has text)"]
++                       ["given a child after the dry run" [good childed] 409 "block-ids[1]: has children"]
++                       ["moved to an unlisted page after the dry run" [good moved] 409 "block-ids[1]: not on a listed page"]
++                       ["referenced after the dry run" [good refd] 409 "block-ids[1]: referenced"]
++                       ["now being edited in the app" [good edited] 409 "block-ids[1]: being edited in the app"]
++                       ["a guessed block with text" [good worded] 409 "block-ids[1]: no longer blank (it has text)"]
++                       ["a guessed block on another page" [good (:uuid elsewhere)] 409 "block-ids[1]: not on a listed page"]
++                       ["a blank parent listed after its blank child" [good child parent] 409 "block-ids[2]: has children"]
++                       ["a blank parent listed before its blank child" [good parent child] 409 "block-ids[1]: has children"]
++                       ["an empty Task" [good task] 409 "block-ids[1]: not a plain block"]
++                       ["a blank block with a property" [good rated] 409 "block-ids[1]: not a plain block"]
++                       ["an empty Code block" [good coded] 409 "block-ids[1]: not a plain block"]
++                       ["a blank value block" [good value-uuid] 409 "block-ids[1]: not a plain block"]
++                       ["the page itself" [good example] 409 "block-ids[1]: not a plain block"]
++                       ["a property" [good (get-in rating [:body :uuid])] 409 "block-ids[1]: not a plain block"]
++                       ["a tag" [good (get-in topic [:body :uuid])] 409 "block-ids[1]: not a plain block"]
++                       ["a journal page" [good (get-in capture [:body :page-id])] 409 "block-ids[1]: not a plain block"]
++                       ["a blank leaf under a Private block" [good under-private] 409 "block-ids[1]: is Private"]
++                       ["a recycled blank leaf" [good recycled] 404 "block-ids[1]: block not found"]
++                       ["an unknown uuid" [good (str (random-uuid))] 404 "block-ids[1]: block not found"]
++                       ["a title, not a uuid" [good "Example"] 400 "block-ids[1]: not a UUID"]
++                       ["a number" [good 42] 400 "block-ids[1]: not a UUID"]
++                       ["an empty string" [good ""] 400 "block-ids[1]: not a UUID"]
++                       ["a uuid with a space" [good (str " " good)] 400 "block-ids[1]: not a UUID"]
++                       ["a duplicate" [good good] 400 "block-ids[1]: duplicate of block-ids[0]"]
++                       ["a duplicate in another case" [good (string/upper-case good)] 400 "block-ids[1]: duplicate of block-ids[0]"]
++                       ["the first failure is named" [good texted childed] 409 "block-ids[1]: no longer blank (it has text)"]
++                       ["no block-ids" [] 400 "block-ids: 1 to 100 block UUIDs"]
++                       ["101 block-ids" (vec (cons good (ids 100))) 400 "block-ids: 1 to 100 block UUIDs"]]
++                responses (p/all (map (fn [[_ block-ids]] (apply! self [example] block-ids)) cases))
++                after (written-state sql self)
++                good-alone (apply! self [example] [good])]
++          (is (= #{good texted childed moved refd edited child task rated under-private recycled} (set listed))
++              "the dry run listed every blank leaf before it changed")
++          (doseq [[[label _ status prefix] response] (map vector cases responses)]
++            (testing label
++              (is (refused? response status prefix) (pr-str response))))
++          (is (= before after) "no refusal wrote anything")
++          (is (= 200 (:status good-alone)) (str "the good leaf was deletable all along: " (pr-str good-alone))))))))
++
++(deftest apply-first-failure-refuses-all-test
++  ;; One bad id among good ones, first, in the middle or last: nothing is deleted.
 +  (async done
 +    (run done
 +      (fn []
 +        (p/let [{:keys [self sql]} (server-graph)
 +                example (page! self "Example")
-+                [leaf] (insert! self example [{:title " "}])
++                [a b c bad] (ids 4)
++                _ (insert! self example [{:uuid a :title " "} {:uuid b :title " "} {:uuid c :title " "} {:uuid bad :title "text"}])
 +                before (written-state sql self)
-+                response (blank! self {:page-ids [example] :dry-run false :block-ids [(:uuid leaf)]})
-+                after-read (ok! (dry-run! self [example]) 200)]
-+          (is (= 501 (:status response)) (pr-str response))
-+          (is (= "apply is not built yet: only dry-run true is answered" (get-in response [:body :error])))
++                responses (p/all (map #(apply! self [example] %) [[bad a b c] [a bad b c] [a b c bad]]))]
++          (is (= [409 409 409] (map :status responses)) (pr-str responses))
++          (is (= ["block-ids[0]" "block-ids[1]" "block-ids[3]"]
++                 (map #(first (string/split (get-in % [:body :error]) #":")) responses)))
 +          (is (= before (written-state sql self)))
-+          (is (= [(:uuid leaf)] (map :uuid (get-in after-read [:body :pages 0 :would-delete])))))))))
++          (is (every? #(live? @(.-conn self) %) [a b c])))))))
++
++(deftest apply-rejudges-on-the-transaction-db-test
++  ;; Text typed into a listed block while the apply's body is still arriving. The handler read the
++  ;; graph before it read the body, so only a re-judge on the transaction's db sees the text.
++  (async done
++    (run done
++      (fn []
++        (let [pending (atom nil)
++              controller (atom nil)]
++          (p/let [{:keys [self]} (server-graph)
++                  example (page! self "Example")
++                  [a b] (ids 2)
++                  _ (insert! self example [{:uuid a :title " "} {:uuid b :title " "}])
++                  stream (js/ReadableStream. #js {:start (fn [c] (reset! controller c))})
++                  _ (do (reset! pending (sync-handler/handle-http
++                                         self
++                                         (js/Request. "http://localhost/semantic/blank-blocks/delete?graph-id=graph-1"
++                                                      #js {:method "POST" :body stream :duplex "half"
++                                                           :headers (js/Headers. #js {"content-type" "application/json"
++                                                                                      "x-logseq-sync-actor" actor})})))
++                        nil)
++                  _ (p/delay 20)
++                  _ (d/transact! (.-conn self) [[:db/add [:block/uuid (uuid b)] :block/title "typed meanwhile"]])
++                  _ (do (.enqueue @controller (.encode (js/TextEncoder.)
++                                                       (js/JSON.stringify (clj->js {:page-ids [example] :block-ids [a b]}))))
++                        (.close @controller)
++                        nil)
++                  response @pending
++                  text (.text response)]
++            (is (= 409 (.-status response)) text)
++            (is (string/includes? text "block-ids[1]: no longer blank (it has text)"))
++            (is (live? @(.-conn self) a) "nothing was deleted")))))))
++
++(deftest confirm-removed-read-back-test
++  ;; STUBS A STEP (labelled): delete-blocks! is redefined to leave the last block it is given, so the
++  ;; read-back (confirm-removed!) has a survivor to find. The call answers 500 naming it.
++  (async done
++    (let [original outliner-core/delete-blocks!]
++      (run (fn [] (set! outliner-core/delete-blocks! original) (done))
++        (fn []
++          (p/let [{:keys [self]} (server-graph)
++                  example (page! self "Example")
++                  [a b] (ids 2)
++                  _ (insert! self example [{:uuid a :title " "} {:uuid b :title " "}])
++                  _ (set! outliner-core/delete-blocks! (fn [conn blocks opts] (original conn (vec (butlast blocks)) opts)))
++                  response (apply! self [example] [a b])]
++            (is (= 500 (:status response)) (pr-str response))
++            (is (= [b] (get-in response [:body :not-removed])))
++            (is (string/includes? (str (get-in response [:body :error])) b))))))))
 +
 +;; ---------------------------------------------------------------------------------------------
 +;; Inputs the refusals must not catch

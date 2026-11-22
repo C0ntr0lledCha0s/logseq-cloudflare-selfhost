@@ -374,6 +374,60 @@ describe("summarise", () => {
   });
 });
 
+describe("delete_blank_blocks (patch 0056)", () => {
+  const P1 = "6b0350ae-961c-49f0-9fac-30d57d4f072f";
+  const P2 = "6b0350ae-5095-4c61-8aac-1cc2a60ba8c4";
+  const B = (n: number) => `8d1c2b6e-4f0a-4c51-9a77-${String(n).padStart(12, "0")}`;
+  const result = (response: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(response) }] });
+
+  it("is a context tool: an apply names each page it deleted from, with the number of blocks", () => {
+    expect(contextClassFor("delete_blank_blocks")).toBe("context");
+    const apply = {
+      deleted: 3,
+      t: 12,
+      pages: [
+        { page: "Example", uuid: P1, deleted: 2, "remaining-blocks": 5 },
+        { page: "Quiet", uuid: P2, deleted: 0, "remaining-blocks": 1 },
+        { page: "Projects", uuid: P2.replace("6b", "7b"), deleted: 1, "remaining-blocks": 0 },
+      ],
+    };
+    const { targets, summary } = describeWrite("delete_blank_blocks", result(apply), "tidy empty bullets");
+    expect(summary).toBe('Deleted blank blocks from 2 pages:\n- page "Example" (2 blocks)\n- page "Projects" (1 block)\nReason: tidy empty bullets');
+    expect(targets.map((t) => [t.kind, t.pageUuid, t.pageTitle, t.blocks])).toEqual([
+      ["page", P1, "Example", 2],
+      ["page", P2.replace("6b", "7b"), "Projects", 1],
+    ]);
+  });
+
+  it("a dry run names each page with the number of block ids it lists, and says nothing changed", () => {
+    const dry = {
+      "dry-run": true,
+      t: 12,
+      total: 3,
+      listed: 3,
+      pages: [
+        { page: "Example", uuid: P1, "would-delete": [{ uuid: B(1), parent: P1 }, { uuid: B(2), parent: P1 }], kept: { "has-children": 1, referenced: 0, "being-edited": 0, examples: [{ uuid: B(3), reason: "has children" }] }, "skipped-private": 0 },
+        { page: "Projects", uuid: P2, "would-delete": [{ uuid: B(4), parent: P2 }], kept: { "has-children": 0, referenced: 0, "being-edited": 0, examples: [] }, "skipped-private": 2 },
+      ],
+      note: "pass these block-ids with dry-run false to delete them",
+    };
+    expect(describeWrite("delete_blank_blocks", result(dry), undefined).summary).toBe(
+      'Dry run, nothing changed: would delete blank blocks from 2 pages:\n- page "Example" (2 blocks)\n- page "Projects" (1 block)',
+    );
+  });
+
+  it("names nothing when nothing is or would be deleted, or the response has no pages", () => {
+    for (const response of [
+      { "dry-run": true, t: 1, total: 0, listed: 0, pages: [{ page: "Quiet", uuid: P2, "would-delete": [], kept: {}, "skipped-private": 0 }], note: "no blank blocks to delete on these pages" },
+      { deleted: 0, t: 1, pages: [] },
+      { error: "block-ids[0]: block not found" },
+      { pages: [{ page: "No uuid", deleted: 1 }, "x", null] },
+    ]) {
+      expect(describeWrite("delete_blank_blocks", result(response), "r"), JSON.stringify(response)).toEqual({ targets: [], summary: "Reason: r" });
+    }
+  });
+});
+
 describe("context classes", () => {
   it("every write tool is classified, as context or no-context, and only once", () => {
     const writes = (manifest as { name: string; annotations: { readOnlyHint: boolean } }[])

@@ -30,7 +30,9 @@
 // refusal logged anything. Then it seeds deleteBlankBlocks' caps (blankFixture: 5 pages of 2,000
 // blocks, 10,000 in all, half of them blank leaves) and checks that a dry run over all five lists
 // 100 of the 5,000 blank leaves, in request order, within BLANK_MS (500 ms, the median of three
-// warm runs). It prints each timing under its check. Node on a developer machine
+// warm runs), then that three applies, each of the 100 ids a fresh dry run listed (in reverse order,
+// none adjacent), delete exactly those from the first page within BLANK_APPLY_MS (15,000 ms, half
+// the Durable Object's CPU limit, the median). It prints each timing under its check. Node on a developer machine
 // guides the numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
@@ -49,6 +51,13 @@ export const NAMED_MS = 300;
 export const F1_MS = 100;
 /** A deleteBlankBlocks dry run at its caps (10,000 blocks scanned) must answer within this many ms. */
 export const BLANK_MS = 500;
+/**
+ * A deleteBlankBlocks apply of 100 ids on the same pages within this many ms: half the Durable
+ * Object's 30 s CPU limit. Nearly all of it is the outliner's delete-blocks! of 100 non-adjacent
+ * blocks in one call (deleteBlocks' 100-block delete costs the same): about 4.5 s on a developer
+ * machine.
+ */
+export const BLANK_APPLY_MS = 15000;
 
 export const PAGE_TITLE = "Release Check Page";
 export const TAG_TITLE = "Release Check Tag";
@@ -430,6 +439,49 @@ export async function checkBlankDryRun(stub, pageIds) {
   return note;
 }
 
+/**
+ * Three rounds over `pageIds` (after checkBlankDryRun, which leaves them whole): a dry run, which must
+ * list 100 ids, then an apply of those ids in reverse order, which must answer 200 deleting exactly
+ * 100, all from the first page, with the pages in request order and the first page 100 blocks fewer
+ * each round. A last dry run must count 300 fewer blank leaves. The median apply must answer within
+ * `limitMs` (BLANK_APPLY_MS; a test passes a smaller one). Returns the timings as a note.
+ */
+export async function checkBlankApply(stub, pageIds, limitMs = BLANK_APPLY_MS) {
+  const total = (BLANK.pages * BLANK.blocksPerPage) / 2;
+  const dryRun = async (label) => {
+    const res = await call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "dry-run": true });
+    if (res.status !== 200) throw new Error(`${label}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json;
+  };
+  const timings = [];
+  for (let round = 1; round <= 3; round++) {
+    const dry = await dryRun(`dry run ${round}`);
+    if (dry.listed !== 100) throw new Error(`dry run ${round}: listed ${dry.listed}, expected 100`);
+    const ids = dry.pages.flatMap((p) => p["would-delete"].map((w) => w.uuid)).reverse();
+    const start = performance.now();
+    const res = await call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "block-ids": ids });
+    timings.push(Math.round(performance.now() - start));
+    const label = `apply ${round}`;
+    if (res.status !== 200) throw new Error(`${label}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.deleted !== 100) throw new Error(`${label}: deleted ${body.deleted}, expected 100`);
+    const pages = body.pages ?? [];
+    const order = pages.map((p) => p.uuid);
+    if (JSON.stringify(order) !== JSON.stringify(pageIds)) throw new Error(`${label}: pages in the order ${JSON.stringify(order)}, expected ${JSON.stringify(pageIds)}`);
+    const deleted = pages.map((p) => p.deleted);
+    if (deleted[0] !== 100 || deleted.slice(1).some((n) => n !== 0)) throw new Error(`${label}: deleted ${deleted.join(", ")} per page, expected 100 on the first`);
+    const remaining = pages.map((p) => p["remaining-blocks"]);
+    const expected = pageIds.map((_, i) => (i === 0 ? BLANK.blocksPerPage - 100 * round : BLANK.blocksPerPage));
+    if (JSON.stringify(remaining) !== JSON.stringify(expected)) throw new Error(`${label}: remaining-blocks ${remaining.join(", ")}, expected ${expected.join(", ")}`);
+  }
+  const after = await dryRun("the dry run after the applies");
+  if (after.total !== total - 300) throw new Error(`the dry run after the applies counts ${after.total}, expected ${total - 300}`);
+  const median = [...timings].sort((a, b) => a - b)[1];
+  const note = `${timings.join(", ")} ms (median ${median} ms)`;
+  if (median > limitMs) throw new Error(`applied after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
 /** The blank-blocks checks, run after the scale checks on the same graph. */
 function blankChecks(ctx) {
   const { stub } = ctx;
@@ -447,6 +499,13 @@ function blankChecks(ctx) {
       async () => {
         if (!ctx.blankPages) throw new Error("the blank-blocks pages were not seeded");
         return checkBlankDryRun(stub, ctx.blankPages);
+      },
+    ],
+    [
+      `at the caps: a deleteBlankBlocks apply of 100 listed ids over 10000 blocks deletes them within ${BLANK_APPLY_MS} ms`,
+      async () => {
+        if (!ctx.blankPages) throw new Error("the blank-blocks pages were not seeded");
+        return checkBlankApply(stub, ctx.blankPages);
       },
     ],
   ];

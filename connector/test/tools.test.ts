@@ -11,7 +11,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { registerAssetTools } from "../src/tools/assets";
 import { CODE_BLOCKS_HELP, CONNECTOR_HELP, QUERIES_HELP, SERVER_INSTRUCTIONS } from "../src/tools/handwritten";
 import { buildGraphTools, registerGraphTools } from "../src/tools/semantic";
-import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, toAffectedTargets } from "../src/tools/readable";
+import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS, describeWrite, toAffectedTargets } from "../src/tools/readable";
 import { DELETE_RULES, DRY_RUN_TOOLS } from "../src/tools/deletes.mjs";
 import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
@@ -227,14 +227,25 @@ describe("tool list", () => {
     expect(committedManifest.filter((e) => e.name === "get_sync_status").map((e) => [e.method, e.path])).toEqual([[null, null]]);
   });
 
-  it("deleteBlankBlocks (patch 0056) is vendored and generates no tool until its apply is built", async () => {
-    const vendored = Object.values(spec.paths).flatMap((item) => Object.values(item).map((op) => op.operationId));
-    expect(vendored).toContain("deleteBlankBlocks");
+  it("deleteBlankBlocks (patch 0056) generates delete_blank_blocks: listed, destructive and idempotent, with the caps in its schema", async () => {
     expect(spec.paths["/api/v1/graphs/{graph-id}/blank-blocks/delete"]?.post?.operationId).toBe("deleteBlankBlocks");
-    expect(graphOperations(spec).map((op) => op.operationId)).not.toContain("deleteBlankBlocks");
-    const names = (await listTools()).map((t) => t.name);
-    expect(names).not.toContain("delete_blank_blocks");
-    expect(committedManifest.map((e) => e.name)).not.toContain("delete_blank_blocks");
+    expect(graphOperations(spec).map((op) => op.operationId)).toContain("deleteBlankBlocks");
+    const tool = (await listTools()).find((t) => t.name === "delete_blank_blocks") as
+      | { name: string; description: string; annotations: unknown; inputSchema: any }
+      | undefined;
+    expect(tool, "listed").toBeDefined();
+    expect(tool!.annotations).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
+    expect(FIRST_LINES.delete_blank_blocks).toBe("Delete empty leaf blocks from up to 20 pages: dry-run first, then pass the block ids it listed.");
+    expect(tool!.description.split("\n")[0]).toBe(FIRST_LINES.delete_blank_blocks);
+    expect(FIRST_LINES.delete_blank_blocks.length).toBe(95);
+    const body = tool!.inputSchema.properties.body;
+    expect(body.required).toEqual(["page-ids"]);
+    expect(body.properties["page-ids"]).toMatchObject({ type: "array", minItems: 1, maxItems: 20 });
+    expect(body.properties["dry-run"]).toMatchObject({ type: "boolean" });
+    expect(body.properties["block-ids"]).toMatchObject({ type: "array", minItems: 1, maxItems: 100 });
+    expect(committedManifest.filter((e) => e.name === "delete_blank_blocks").map((e) => [e.method, e.path])).toEqual([
+      ["POST", "/api/v1/graphs/{graph-id}/blank-blocks/delete"],
+    ]);
   });
 });
 
@@ -1758,6 +1769,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   delete_property: { "property-id": "Venue" },
   set_page_favorite: { "page-id": PAGE_UUID, body: { favorite: true } },
   reorder_favorites: { body: { "page-ids": [PAGE_UUID, NOTES_PAGE] } },
+  delete_blank_blocks: { body: { "page-ids": [PAGE_UUID, "Notes"], "block-ids": [B1, B2] } },
 };
 
 /** The selectors each call above names, as `addressed` stores them. */
@@ -1790,6 +1802,8 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   set_page_favorite: [PAGE_UUID],
   // page-ids is not one of the audit log's address keys, so the entries aren't recorded as addressed.
   reorder_favorites: [],
+  // block-ids are addressed; page-ids, as for reorder_favorites, are not an address key.
+  delete_blank_blocks: [B1, B2],
 };
 
 /** Where each tool with a dry run takes its flag. */
@@ -1805,6 +1819,7 @@ const DRY_RUN_IN: Record<string, "query" | "body"> = {
   batch_insert_block_trees: "body",
   set_page_favorite: "body",
   reorder_favorites: "body",
+  delete_blank_blocks: "body",
 };
 
 /** A response naming one target and one affected block, as patch 0028's BlockContext does. */
@@ -1822,6 +1837,23 @@ const CONTEXT_RESPONSE = {
     },
   ],
 };
+
+/** delete_blank_blocks' answer (patch 0056): the pages it deleted from, which its targets name. */
+const BLANK_RESPONSE = {
+  deleted: 2,
+  t: 9,
+  pages: [
+    { page: "Nov 5th, 2026", uuid: PAGE_UUID, deleted: 1, "remaining-blocks": 3 },
+    { page: "Notes", uuid: NOTES_PAGE, deleted: 1, "remaining-blocks": 0 },
+  ],
+};
+
+/** The answer a successful call of `name` gets here: delete_blank_blocks' own shape, else CONTEXT_RESPONSE. */
+const okResponse = (name: string): Record<string, unknown> => (name === "delete_blank_blocks" ? BLANK_RESPONSE : CONTEXT_RESPONSE);
+
+/** The targets the audit row keeps for `response` to a call of `name`, as describeWrite reads them. */
+const targetsOf = (name: string, response: unknown) =>
+  describeWrite(name, { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined).targets;
 
 interface AuditDbRow {
   id: number;
@@ -1905,7 +1937,7 @@ describe("audit log", () => {
 
     // Success: the row is ok, with the reason, the addressed selectors and describeWrite's targets.
     syncRequests = [];
-    syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
+    syncHandler = preReadsEmpty(() => Response.json(okResponse(name)));
     const ok = await callAudited(name, { ...args, reason: REASON });
     expect(ok.result.isError, name).toBe(false);
     expect(writeRequests(), name).toHaveLength(1);
@@ -1922,7 +1954,8 @@ describe("audit log", () => {
       rows_read: 1,
     });
     expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
-    expect(JSON.parse(ok.row.targets!), name).toEqual(toAffectedTargets(CONTEXT_RESPONSE));
+    expect(JSON.parse(ok.row.targets!), name).toEqual(targetsOf(name, okResponse(name)));
+    expect(JSON.parse(ok.row.targets!).length, name).toBeGreaterThan(0);
     // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
     const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
     expect(ok.row.pages!.split("\n").sort(), name).toEqual(["notes", "nov 5th, 2026", NOTES_PAGE, PAGE_UUID, ...named].sort());
@@ -1970,14 +2003,14 @@ describe("audit log", () => {
     // Dry run, where the tool has one: dry_run = 1, targets from the dry-run response.
     const where = DRY_RUN_IN[name];
     if (where !== undefined) {
-      const dry = { ...CONTEXT_RESPONSE, "dry-run": true };
+      const dry = { ...okResponse(name), "dry-run": true };
       // A delete's dry run reads first, as its real call does, so the read is answered too.
       syncHandler = preReadsEmpty(() => Response.json(dry));
       const dryArgs =
         where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
       const preview = await callAudited(name, dryArgs);
       expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
-      expect(JSON.parse(preview.row.targets!), name).toEqual(toAffectedTargets(dry));
+      expect(JSON.parse(preview.row.targets!), name).toEqual(targetsOf(name, dry));
       // dry-run: false is a real call.
       const real =
         where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };
@@ -2427,7 +2460,7 @@ describe("edit stamps header", () => {
     let gets = 0;
     for (const name of GENERATED_WRITES) {
       const args = { graph: "work", ...AUDIT_CALLS[name], reason: REASON };
-      syncHandler = preReadsEmpty(() => Response.json(CONTEXT_RESPONSE));
+      syncHandler = preReadsEmpty(() => Response.json(okResponse(name)));
       const on = await stampedRun(name, args, true);
       const off = await stampedRun(name, args, false);
       expect(on.result.isError, name).toBe(false);
