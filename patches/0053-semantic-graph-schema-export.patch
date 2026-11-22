@@ -1,0 +1,593 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 1d3e9be..a0fe825 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -5767,6 +5767,92 @@
+ (def ^:private insight-handlers
+   #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
+ 
++;; getGraphSchema lists the graph's tags and properties with their usage, for a drift review, in one
++;; call. Like the health checks it reads titles, so it refuses E2EE graphs, and it builds the private
++;; set once: no Private or Recycle-bin entity is an item, a counted object, a counted holder or a tag
++;; in used-by-tags. Class attributes are read from datoms, as an uploaded graph can hold them at
++;; cardinality one.
++
++(def ^:private schema-sections ["tags" "properties"])
++
++(defn- datom-entities
++  "The entities `e`'s `attr` datoms point to, in db id order."
++  [db e attr]
++  (map #(d/entity db %) (sort (map :v (d/datoms db :eavt e attr)))))
++
++(defn- schema-items
++  "The visible entities tagged with `class-ident` (tags or properties): none private or hidden, and
++  no built-in one unless `built-in?`."
++  [db class-ident private built-in?]
++  (->> (d/datoms db :avet :block/tags (d/entid db class-ident))
++       (map :e)
++       (remove #(contains? private %))
++       (map #(d/entity db %))
++       (remove entity-util/hidden?)
++       (filter #(or built-in? (not (:logseq.property/built-in? %))))))
++
++(defn- schema-tag-response [db private tag]
++  (let [id (:db/id tag)]
++    (assoc (tag-response tag)
++           :extends (mapv #(select-keys (class-response %) [:uuid :title])
++                          (datom-entities db id :logseq.property.class/extends))
++           :properties (mapv class-response (datom-entities db id :logseq.property.class/properties))
++           :object-count (count (remove #(contains? private (:e %)) (d/datoms db :avet :block/tags id))))))
++
++(defn- schema-property-response
++  "property-response plus value-count (values on visible holders, the empty placeholder not one),
++  each choice's usage-count (counted by the choice's id) and used-by-tags (the visible tags whose
++  class/properties datoms hold it)."
++  [db private property]
++  (let [placeholder (d/entid db :logseq.property/empty-placeholder)
++        values (when-let [ident (:db/ident property)]
++                 (->> (d/datoms db :aevt ident)
++                      (remove #(contains? private (:e %)))
++                      (remove #(= placeholder (:v %)))
++                      (map :v)))
++        usage (frequencies values)
++        response (property-response property)]
++    (cond-> (assoc response
++                   :value-count (count values)
++                   :used-by-tags (->> (d/datoms db :avet :logseq.property.class/properties (:db/id property))
++                                      (map :e)
++                                      (remove #(contains? private %))
++                                      (map #(d/entity db %))
++                                      (remove entity-util/hidden?)
++                                      (sort-by (partial title-key db))
++                                      (mapv #(select-keys (class-response %) [:uuid :title]))))
++      (:choices response)
++      (assoc :choices (mapv (fn [choice]
++                              (assoc (property-choice-detail-response choice)
++                                     :usage-count (get usage (:db/id choice) 0)))
++                            (property-choices property))))))
++
++(defn- handle-graph-schema [{:keys [^js url db e2ee?]}]
++  (let [params (.-searchParams url)
++        raw-sections (.get params "sections")
++        sections (if (some? raw-sections) (vec (distinct (string/split raw-sections #","))) schema-sections)
++        raw-built-in (.get params "built-in")
++        {:keys [limit raw-cursor cursor]} (pagination-options url)]
++    (cond
++      e2ee? (http/error-response "graph insights are unavailable for E2EE graphs" 409)
++      (not-every? (set schema-sections) sections) (http/bad-request "invalid sections")
++      (not (contains? #{nil "true" "false"} raw-built-in)) (http/bad-request "invalid built-in: give true or false")
++      (nil? limit) (http/bad-request "invalid limit")
++      (and raw-cursor (nil? cursor)) (http/bad-request "invalid cursor")
++      (and cursor (not= 1 (count sections))) (http/bad-request "cursor needs exactly one section")
++      :else
++      (let [private (datalog/private-ids db)
++            built-in? (= "true" raw-built-in)
++            section (fn [class-ident response-fn]
++                      (update (paginate-by (partial title-key db) (schema-items db class-ident private built-in?)
++                                           limit cursor)
++                              :items #(mapv (partial response-fn db private) %)))]
++        (http/json-response nil (cond-> {}
++                                  (some #{"tags"} sections)
++                                  (assoc :tags (section :logseq.class/Tag schema-tag-response))
++                                  (some #{"properties"} sections)
++                                  (assoc :properties (section :logseq.class/Property schema-property-response))))))))
++
+ ;; listBlockChanges feeds an external search index. Without `since` it lists every content block
+ ;; in UUID order; with `since` (a graph t from an earlier response) and that response's `epoch`, it
+ ;; lists the blocks whose indexed text may have changed since then, read from the tx log, plus the
+@@ -6540,6 +6626,7 @@
+     (contains? insight-handlers handler) (handle-insights context)
+     (= :semantic/block-changes handler) (handle-block-changes context)
+     (= :semantic/changes-since handler) (handle-changes-since context)
++    (= :semantic/graph-schema handler) (handle-graph-schema context)
+     (= :semantic/datalog-query handler) (datalog/handle-query context)
+     (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
+                                                                          :resolve-tag resolve-tag-selector
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index ee1ae2c..3071092 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -106,6 +106,8 @@
+     :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/changes" :internal-path "/semantic/changes"
+     :handler :semantic/changes-since :operation-id "listChangesSince" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/schema" :internal-path "/semantic/schema"
++    :handler :semantic/graph-schema :operation-id "getGraphSchema" :scope "logseq/read" :rate-class :read}
+    ;; A read: POST only because the query can be long.
+    {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
+     :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
+@@ -219,6 +221,8 @@
+    "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
+    "listChangesSince" ["List what changed since a time"
+                        "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To get everything since the last run, store this call's until and pass it as the next since. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
++   "getGraphSchema" ["Get the graph's schema"
++                     "Lists every user tag and property with its details and usage counts in one call, for a schema or drift review, instead of list_tags and get_tag per tag. sections is tags, properties or both (the default, comma-separated); any other value is refused. Each tag has uuid, ident, title, extends (the tags it extends), properties (its own tag properties, built-in ones included) and object-count (the objects tagged with it directly; a tag that extends it counts its own). Each property has uuid, ident, title, type, cardinality, choices (in the editor's order, each with usage-count: how many values are that choice, counted by the choice's id), classes for a node property, value-count (its values, one per value of a many property; Logseq's empty placeholder is not a value) and used-by-tags (the tags that list it as a tag property). Private content and the Recycle bin are left out of every item and every count: a tag, property or object tagged Private (or with a tag that extends Private), on or under such a page or block, or in the Recycle bin is neither listed nor counted, so a choice held only by Private blocks has usage-count 0. Built-in tags and properties (Task, Status and the like) are hidden unless built-in=true. Each section is in title order with a complete count and at most limit items (1 to 200, default 50); to page through one section, pass that section alone in sections with its next-cursor. Each refusal names its parameter. Unavailable for E2EE graphs."]
+    "datalogQuery" ["Run a read-only Datalog query"
+                    (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
+                         " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
+@@ -635,6 +639,15 @@
+             :description "Most blocks listed per page, newest first (1 to 50, default 10). The created and updated counts stay complete."}
+            {:name "cursor" :in "query" :schema {:type "string"}
+             :description "The previous response's next-cursor, with the same since."}])
++    (= "getGraphSchema" operation-id)
++    (into [{:name "sections" :in "query" :schema {:type "string"}
++            :description "Comma-separated sections: tags, properties. Defaults to both; any other value is rejected."}
++           {:name "built-in" :in "query" :schema {:type "boolean" :default false}
++            :description "true also lists built-in tags and properties (Task, Status and the like); true or false only."}
++           {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
++            :description "Most items listed per section. Counts are always complete."}
++           {:name "cursor" :in "query" :schema {:type "string"}
++            :description "A section's next-cursor; pass that section alone in sections."}])
+     (= "listGraphs" operation-id)
+     (into [{:name "name" :in "query" :schema {:type "string"}
+             :description "Exact graph name, matched case-insensitively."}])
+@@ -717,6 +730,7 @@
+                   (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
+                   "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
+                   "listChangesSince" (entity-response "ChangesSinceResponse" "The pages changed in the window, newest first")
++                  "getGraphSchema" (entity-response "GraphSchemaResponse" "The sections asked for, each a count and a page of items")
+                   "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+@@ -753,6 +767,7 @@
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
+            "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
++           "getGraphSchema" {"400" {:description "A parameter that can't be read, named: sections, built-in, limit or cursor (a cursor needs exactly one section)"}}
+            "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
+                                "422" {:description "More than 20,000 changes in the window; pass a later since or an until"}
+                                "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
+@@ -1187,6 +1202,34 @@
+                                           :tags {:type "array" :items {:type "string"}
+                                                  :description "Titles of the tags on the block, its ancestors and its page."}
+                                           :updated-at {:type "integer"}}}
++               :GraphSchemaResponse
++               {:type "object"
++                :description "Only the sections asked for."
++                :properties {:tags {:type "object" :required ["count" "items"]
++                                    :properties {:count {:type "integer" :description "Every tag listed, across all pages."}
++                                                 :items {:type "array"
++                                                         :items {:allOf [{:$ref "#/components/schemas/TagResponse"}
++                                                                         {:type "object" :required ["extends" "properties" "object-count"]
++                                                                          :properties {:object-count {:type "integer"
++                                                                                                      :description "Visible objects tagged with it directly."}}}]}}
++                                                 :next-cursor {:type "string"}}}
++                             :properties {:type "object" :required ["count" "items"]
++                                          :properties {:count {:type "integer" :description "Every property listed, across all pages."}
++                                                       :items {:type "array"
++                                                               :items {:allOf [{:$ref "#/components/schemas/PropertyResponse"}
++                                                                               {:type "object" :required ["value-count" "used-by-tags"]
++                                                                                :properties {:value-count {:type "integer"
++                                                                                                           :description "Values on visible holders; the empty placeholder is not one."}
++                                                                                             :choices {:type "array"
++                                                                                                       :items {:allOf [{:$ref "#/components/schemas/PropertyChoice"}
++                                                                                                                       {:type "object" :required ["usage-count"]
++                                                                                                                        :properties {:usage-count {:type "integer"
++                                                                                                                                                   :description "Values on visible holders that are this choice."}}}]}}
++                                                                                             :used-by-tags {:type "array"
++                                                                                                            :items {:type "object" :required ["uuid" "title"]
++                                                                                                                    :properties {:uuid {:type "string"}
++                                                                                                                                 :title {:type "string"}}}}}}]}}
++                                                       :next-cursor {:type "string"}}}}}
+                :ChangesSinceResponse
+                {:type "object" :required ["since" "until" "time-zone" "pages" "recycled" "next-cursor"]
+                 :properties {:since {:type "integer" :description "The window's start, exclusive, as epoch ms."}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs
+new file mode 100644
+index 0000000..fb6871c
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs
+@@ -0,0 +1,381 @@
++(ns logseq.db-sync.semantic-graph-schema-test
++  "getGraphSchema (patch 0053): the graph's tags and properties in one call, for a drift review. Tags
++  carry extends, properties and object-count; properties carry type, cardinality, choices (each with
++  usage-count), value-count and used-by-tags. Private content and the Recycle bin are left out of every
++  item and every count; built-ins are hidden unless built-in=true; sections, limit and a one-section
++  cursor page through it, and every bad parameter is refused by name. E2EE graphs answer 409.
++
++  The graph is written through the real handler (tags, properties, pages, blocks, tags and values) and
++  transacted directly only for what the API can't store: a block or tag in the Recycle bin and Logseq's
++  empty placeholder as a value. Every fixture title holds zz, apart from the Private tag."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test :as uploaded]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.semantic :as semantic]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- uuid-of [response] (uuid (get-in response [:body :uuid])))
++
++(defn- eid [conn id] (:db/id (d/entity @conn [:block/uuid id])))
++
++(defn- snapshot [conn] [(:max-tx @conn) (count (d/datoms @conn :eavt))])
++
++(defn- writer [self]
++  {:tag! (fn [title & [body]]
++           (p/let [r (ok! (request! self "POST" "/semantic/tags" (merge {:title title} body)) 201)] (uuid-of r)))
++   :property! (fn [title type & [body]]
++                (p/let [r (ok! (request! self "POST" "/semantic/properties" (merge {:title title :type type} body)) 201)]
++                  {:uuid (uuid-of r) :ident (get-in r [:body :ident]) :title title}))
++   :page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++   :put! (fn [id property value]
++           (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent property))
++                          {:value value})
++                200))
++   :insert! (fn [target titles]
++              (p/let [r (ok! (request! self "POST" "/semantic/block-trees"
++                                       {:target-id (str target) :blocks (mapv (fn [t] {:title t}) titles)})
++                             201)]
++                (mapv #(uuid (:uuid %)) (get-in r [:body :blocks]))))})
++
++(defn- seed-graph
++  "Tags Private, zz Book (zz author, zz colour), zz Novel extending zz Book (zz rating), zz Shelf (no
++  objects), zz Binned tag (in the Recycle bin); properties zz author, zz colour (choices Red, Green,
++  Blue), zz rating, zz only private, zz unused and zz binned property (in the bin). Blocks on zz Library:
++  two visible Books, a visible Novel, a Novel holding the empty placeholder, a Book tagged Private and a
++  Book in the bin; a block on the page zz Secret, which is tagged Private."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true :env #js {}}
++          {:keys [tag! property! page! put! insert!]} (writer self)
++          private (tag! "Private")
++          author (property! "zz author" "default")
++          colour (property! "zz colour" "default" {:choices [{:title "Red"} {:title "Green"} {:title "Blue"}]})
++          rating (property! "zz rating" "number")
++          only-private (property! "zz only private" "default")
++          unused (property! "zz unused" "default")
++          binned-property (property! "zz binned property" "default")
++          shade (property! "zz shade" "default" {:choices [{:title "Red"}]})
++          book (tag! "zz Book" {:properties ["zz author" "zz colour"]})
++          novel (tag! "zz Novel" {:extends ["zz Book"] :properties ["zz rating"]})
++          shelf (tag! "zz Shelf")
++          binned-tag (tag! "zz Binned tag")
++          library (page! "zz Library")
++          secret (page! "zz Secret")
++          _ (put! secret "block/tags" ["Private"])
++          [secret-block] (insert! secret ["zz secret block"])
++          [b1 b2 n1 placeholder private-book binned-book odd]
++          (insert! library ["zz book one" "zz book two" "zz novel one" "zz novel placeholder" "zz private book"
++                            "zz binned book" "zz odd colour"])
++          _ (p/doseq [id [b1 b2 binned-book]] (put! id "block/tags" ["zz Book"]))
++          _ (p/doseq [id [n1 placeholder]] (put! id "block/tags" ["zz Novel"]))
++          _ (put! private-book "block/tags" ["zz Book" "Private"])
++          _ (put! b1 (:ident author) "zz Ann")
++          _ (put! b1 (:ident colour) "Red")
++          _ (put! b2 (:ident author) "zz Ben")
++          _ (put! b2 (:ident colour) "Red")
++          _ (put! n1 (:ident colour) "Green")
++          _ (put! n1 (:ident rating) 4)
++          _ (put! private-book (:ident author) "zz Pat")
++          _ (put! private-book (:ident colour) "Blue")
++          _ (put! private-book (:ident only-private) "zz hush")
++          _ (put! secret-block (:ident colour) "Blue")
++          _ (put! secret-block (:ident only-private) "zz hush")
++          _ (put! binned-book (:ident colour) "Green")
++          _ (put! binned-book (:ident author) "zz Bin")
++          placeholder-id (d/entid @conn :logseq.property/empty-placeholder)
++          shade-red (:e (first (d/datoms @conn :avet :block/closed-value-property (d/entid @conn (keyword (:ident shade))))))
++          ;; zz odd colour holds zz shade's Red as its zz colour: a value, but not zz colour's Red.
++          _ (d/transact! conn [[:db/add (eid conn odd) (keyword (:ident colour)) shade-red]
++                               [:db/add (eid conn placeholder) (keyword (:ident author)) placeholder-id]
++                               [:db/add (eid conn binned-book) :logseq.property/deleted-at 1]
++                               [:db/add (eid conn binned-tag) :logseq.property/deleted-at 1]
++                               [:db/add [:db/ident (keyword (:ident binned-property))] :logseq.property/deleted-at 1]])]
++    {:conn conn :self self
++     :properties {:author author :colour colour :rating rating :only-private only-private :unused unused
++                  :binned-property binned-property}
++     :tags {:private private :book book :novel novel :shelf shelf :binned-tag binned-tag}}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(defn- schema! [self q]
++  (request! self "GET" (str "/semantic/schema" (when (seq q) (str "?" q))) nil))
++
++(defn- by-title [section] (into {} (map (juxt :title identity)) (:items section)))
++
++(deftest schema-tags-test
++  ;; Each user tag with what it extends, its own properties and the objects tagged with it directly,
++  ;; Private objects and the Recycle bin left out. A tag in the bin is not listed.
++  (async done
++    (with-graph done
++      (fn [{:keys [self tags properties]}]
++        (p/let [response (schema! self "sections=tags")
++                section (get-in response [:body :tags])
++                items (by-title section)]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{:tags} (set (keys (:body response)))) "only the section asked for")
++          (is (= #{"Private" "zz Book" "zz Novel" "zz Shelf"} (set (keys items))))
++          (is (= 4 (:count section)))
++          (is (= {"Private" 0 "zz Book" 2 "zz Novel" 2 "zz Shelf" 0}
++                 (update-vals items :object-count))
++              "zz private book (Private) and zz binned book (bin) are not counted; the Private tag counts no visible object")
++          (is (= [{:uuid (str (:book tags)) :title "zz Book"}] (get-in items ["zz Novel" :extends])))
++          (is (= ["Root Tag"] (mapv :title (get-in items ["zz Book" :extends])))
++              "a tag given no parent extends Root Tag, as get_tag shows")
++          (is (= [(:ident (:author properties)) (:ident (:colour properties))]
++                 (mapv :ident (get-in items ["zz Book" :properties]))))
++          (is (= ["zz rating"] (mapv :title (get-in items ["zz Novel" :properties]))))
++          (is (= {:uuid (str (:novel tags)) :ident (get-in items ["zz Novel" :ident])}
++                 (select-keys (items "zz Novel") [:uuid :ident]))))))))
++
++(deftest schema-properties-test
++  ;; Each user property with its value-count (values on visible holders), each choice's usage-count
++  ;; (by the choice's id) and the tags that list it. Values held only by Private holders count 0.
++  (async done
++    (with-graph done
++      (fn [{:keys [self tags]}]
++        (p/let [response (schema! self "sections=properties")
++                section (get-in response [:body :properties])
++                items (by-title section)
++                colour (items "zz colour")]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= #{:properties} (set (keys (:body response)))))
++          (is (= #{"zz author" "zz colour" "zz rating" "zz only private" "zz unused" "zz shade"} (set (keys items)))
++              "zz binned property, in the Recycle bin, is not listed")
++          (is (= 6 (:count section)))
++          (is (= {"zz author" 2 "zz colour" 4 "zz rating" 1 "zz only private" 0 "zz unused" 0 "zz shade" 0}
++                 (update-vals items :value-count))
++              "Private holders, a binned holder and the empty placeholder are not values; zz shade's Red held as a zz colour value counts for zz colour")
++          (is (= {"Red" 2 "Green" 1 "Blue" 0}
++                 (into {} (map (juxt :title :usage-count)) (:choices colour)))
++              "Blue is held only by a Private block and a block on a Private page; zz shade's Red is not zz colour's Red")
++          (is (= [0] (mapv :usage-count (get-in items ["zz shade" :choices])))
++              "a choice is counted under its own property only")
++          (is (= ["Red" "Green" "Blue"] (mapv :title (:choices colour))) "choices keep the editor's order")
++          (is (every? :uuid (:choices colour)))
++          (is (= [{:uuid (str (:book tags)) :title "zz Book"}] (:used-by-tags colour)))
++          (is (= [{:uuid (str (:novel tags)) :title "zz Novel"}] (get-in items ["zz rating" :used-by-tags])))
++          (is (= [] (get-in items ["zz unused" :used-by-tags])))
++          (is (= ["default" "one"] ((juxt :type :cardinality) colour)))
++          (is (= "number" (get-in items ["zz rating" :type])))
++          (is (not (contains? (items "zz author") :choices)) "no choices key on a property without them"))))))
++
++(deftest schema-value-count-per-type-test
++  ;; value-count counts one value per holder for every property type, whatever stores it: a value block
++  ;; (default, url, number), a scalar (checkbox, datetime), a ref (node, date) or a choice; the empty
++  ;; placeholder is no value, whatever the type.
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true :env #js {}}
++                {:keys [property! page! put! insert!]} (writer self)
++                journal (ok! (request! self "POST" "/semantic/block-trees/batch"
++                                       {:entries [{:page "2026-11-06" :blocks [{:title "zz j"}]}]})
++                             201)
++                _ journal
++                journal-id (d/q '[:find ?u . :where [?p :block/journal-day 20261106] [?p :block/uuid ?u]] @conn)
++                target (page! "zz Target")
++                page (page! "zz Values")
++                types [["zz t default" "default" "zz text"] ["zz t url" "url" "https://example.com"]
++                       ["zz t number" "number" 3] ["zz t checkbox" "checkbox" true]
++                       ["zz t datetime" "datetime" 1763251200000] ["zz t node" "node" (str target)]
++                       ["zz t date" "date" (str journal-id)] ["zz t choice" "default" "zz one"]]
++                props (p/all (map (fn [[title type]]
++                                    (property! title type (when (= title "zz t choice") {:choices [{:title "zz one"}]})))
++                                  types))
++                [holder empty-holder] (insert! page ["zz holder" "zz empty holder"])
++                _ (p/doseq [[prop [_ _ value]] (map vector props types)] (put! holder (:ident prop) value))
++                placeholder-id (d/entid @conn :logseq.property/empty-placeholder)
++                _ (d/transact! conn (mapv (fn [prop] [:db/add (eid conn empty-holder) (keyword (:ident prop)) placeholder-id])
++                                          props))
++                response (schema! self "sections=properties")
++                items (by-title (get-in response [:body :properties]))]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= (zipmap (map first types) (repeat 1))
++                 (update-vals (select-keys items (map first types)) :value-count))
++              "one value per type; the empty placeholder on the second holder is not counted"))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest schema-built-in-test
++  ;; Built-in tags and properties (Task, Status) are hidden by default and with built-in=false, and
++  ;; listed with built-in=true.
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [default (schema! self "")
++                off (schema! self "built-in=false")
++                on (schema! self "built-in=true&limit=200")
++                titles (fn [r section] (set (map :title (get-in r [:body section :items]))))]
++          (is (= 200 (:status default)) (pr-str default))
++          (is (= #{:tags :properties} (set (keys (:body default)))) "both sections by default")
++          (is (not (contains? (titles default :tags) "Task")))
++          (is (not (contains? (titles default :properties) "Status")))
++          (is (= (:body default) (:body off)) "built-in=false is the default")
++          (is (= 200 (:status on)) (pr-str on))
++          (is (contains? (titles on :tags) "Task"))
++          (is (contains? (titles on :properties) "Status"))
++          (is (> (get-in on [:body :tags :count]) (get-in default [:body :tags :count])))
++          (is (every? #(contains? (titles on :properties) %) (titles default :properties))
++              "built-in=true adds to the user items"))))))
++
++(deftest schema-paging-test
++  ;; limit pages one section through its cursor, with a complete count on every page; a cursor needs
++  ;; exactly one section (after de-duplication).
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [walk (fn walk [section q acc]
++                       (p/let [r (schema! self q)
++                               body (get-in r [:body (keyword section)])
++                               acc (conj acc [(:status r) (:count body) (mapv :title (:items body))])]
++                         (if-let [cursor (:next-cursor body)]
++                           (walk section (str "sections=" section "&limit=1&cursor=" (js/encodeURIComponent cursor)) acc)
++                           acc)))
++                pages (walk "tags" "sections=tags&limit=1" [])
++                first-page (schema! self "sections=tags&limit=1")
++                cursor (js/encodeURIComponent (get-in first-page [:body :tags :next-cursor]))
++                both (schema! self (str "limit=1&cursor=" cursor))
++                both-named (schema! self (str "sections=tags,properties&limit=1&cursor=" cursor))
++                deduped (schema! self (str "sections=tags,tags&limit=1&cursor=" cursor))
++                other-section (schema! self (str "sections=properties&limit=1&cursor=" cursor))
++                properties-pages (walk "properties" "sections=properties&limit=2" [])]
++          (is (= [[200 4 ["Private"]] [200 4 ["zz Book"]] [200 4 ["zz Novel"]] [200 4 ["zz Shelf"]]] pages)
++              "title order, one per page, count complete on each")
++          (is (= {:status 400 :body {:error "cursor needs exactly one section"}} both))
++          (is (= {:status 400 :body {:error "cursor needs exactly one section"}} both-named))
++          (is (= 200 (:status deduped)) "tags,tags is one section")
++          (is (= ["zz Book"] (mapv :title (get-in deduped [:body :tags :items]))))
++          (is (= 200 (:status other-section)) "a cursor is a title key, read in whichever one section is named")
++          (is (= ["zz author" "zz colour" "zz only private" "zz rating" "zz shade" "zz unused"]
++                 (mapcat last properties-pages)))
++          (is (every? #(= 6 (second %)) properties-pages)))))))
++
++(deftest schema-refusals-test
++  ;; Every bad parameter is refused by name and nothing is written; E2EE answers 409 before any
++  ;; parameter. The inputs these refusals sit next to still answer: a repeated section, both sections in
++  ;; either order, built-in given as true or false, and a limit over the maximum (capped).
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [before (snapshot conn)
++                refusals [["sections=" "invalid sections"]
++                          ["sections=pages" "invalid sections"]
++                          ["sections=tags,pages" "invalid sections"]
++                          ["sections=,tags" "invalid sections"]
++                          ["sections=tags,,properties" "invalid sections"]
++                          ["sections=Tags" "invalid sections"]
++                          ["sections=%20tags" "invalid sections"]
++                          ["built-in=yes" "invalid built-in: give true or false"]
++                          ["built-in=" "invalid built-in: give true or false"]
++                          ["built-in=TRUE" "invalid built-in: give true or false"]
++                          ["built-in=1" "invalid built-in: give true or false"]
++                          ["limit=0" "invalid limit"]
++                          ["limit=x" "invalid limit"]
++                          ["sections=tags&cursor=nope" "invalid cursor"]
++                          ["cursor=nope" "invalid cursor"]]
++                refused (p/all (map (fn [[q _]] (schema! self q)) refusals))
++                e2ee (schema! self "sections=pages&graph-e2ee=true")
++                e2ee-valid (schema! self "graph-e2ee=true")
++                works (p/all (map #(schema! self %)
++                                  ["sections=tags,tags" "sections=properties,tags" "sections=tags,properties"
++                                   "built-in=true" "built-in=false" "limit=500" "sections=properties&limit=200"]))
++                after (snapshot conn)]
++          (doseq [[[q message] response] (map vector refusals refused)]
++            (is (= {:status 400 :body {:error message}} response) q))
++          (is (= {:status 409 :body {:error "graph insights are unavailable for E2EE graphs"}} e2ee)
++              "E2EE is refused before any parameter")
++          (is (= 409 (:status e2ee-valid)))
++          (is (every? #(= 200 (:status %)) works) (pr-str (map :status works)))
++          (is (= [#{:tags} #{:tags :properties} #{:tags :properties}]
++                 (map #(set (keys (:body %))) (take 3 works))))
++          (is (= 6 (count (get-in (nth works 5) [:body :properties :items]))) "limit over 200 is capped, not refused")
++          (is (= before after) "nothing was written"))))))
++
++(deftest schema-route-documented-test
++  (let [operation (get-in (semantic-routes/openapi-document "https://issuer.example")
++                          [:paths "/api/v1/graphs/{graph-id}/schema" :get])
++        param (fn [n] (first (filter #(= n (:name %)) (:parameters operation))))
++        description (:description operation)
++        route (first (filter #(= "getGraphSchema" (:operation-id %)) semantic-routes/operations))]
++    (is (= "getGraphSchema" (:operationId operation)))
++    (is (= {:method "GET" :handler :semantic/graph-schema :scope "logseq/read" :rate-class :read}
++           (select-keys route [:method :handler :scope :rate-class])))
++    (is (every? param ["sections" "built-in" "limit" "cursor"]))
++    (is (= {:type "boolean" :default false} (:schema (param "built-in"))))
++    (is (= @#'semantic/max-limit (get-in (param "limit") [:schema :maximum])))
++    (is (every? #(contains? (:responses operation) %) ["200" "400" "409"]))
++    (is (string/includes? (get-in operation [:responses "400" :description]) "sections, built-in, limit or cursor"))
++    (is (every? #(string/includes? description %)
++                ["object-count" "value-count" "usage-count" "used-by-tags" "Private" "Recycle bin"
++                 "built-in=true" "pass that section alone in sections" "Unavailable for E2EE graphs"
++                 (str "1 to " @#'semantic/max-limit)]))))
++
++(deftest schema-upload-path-test
++  ;; On a graph that arrived through the app's snapshot upload, with the class attributes and
++  ;; closed-value-property held at cardinality one in the open conn's schema (the app's schema drift):
++  ;; extends, properties, used-by-tags and each choice's usage-count are read from datoms.
++  (async done
++    (let [request! #'uploaded/request!
++          signed @#'uploaded/signed]
++      (-> (p/let [{:keys [self]} (#'uploaded/uploaded-graph)
++                  conn (#'uploaded/open! self)
++                  created (fn [r] (assert (= 201 (:status r)) (pr-str r)) r)
++                  ok (fn [r] (assert (= 200 (:status r)) (pr-str r)) r)
++                  colour (p/let [r (request! self "POST" "/semantic/properties"
++                                             {:title "zz colour" :type "default" :choices [{:title "Red"} {:title "Green"}]}
++                                             signed)]
++                           (get-in (created r) [:body :ident]))
++                  _ (p/let [r (request! self "POST" "/semantic/properties" {:title "zz author" :type "default"} signed)] (created r))
++                  _ (p/let [r (request! self "POST" "/semantic/tags" {:title "zz Base"} signed)] (created r))
++                  _ (p/let [r (request! self "POST" "/semantic/tags" {:title "zz Book" :properties ["zz author" "zz colour"]} signed)] (created r))
++                  _ (p/let [r (request! self "POST" "/semantic/tags" {:title "zz Novel" :extends ["zz Base" "zz Book"]
++                                                                       :properties ["zz colour"]} signed)] (created r))
++                  page (p/let [r (request! self "POST" "/semantic/pages" {:title "zz Library"} signed)] (uuid-of (created r)))
++                  [a b] (p/let [r (request! self "POST" "/semantic/block-trees"
++                                            {:target-id (str page) :blocks [{:title "zz a"} {:title "zz b"}]} signed)]
++                          (mapv #(uuid (:uuid %)) (get-in (created r) [:body :blocks])))
++                  _ (p/doseq [id [a b]]
++                      (p/let [r (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent colour))
++                                          {:value "Red"} signed)] (ok r)))
++                  _ (d/reset-schema! conn (-> (d/schema @conn)
++                                              (assoc-in [:logseq.property.class/properties :db/cardinality] :db.cardinality/one)
++                                              (assoc-in [:logseq.property.class/extends :db/cardinality] :db.cardinality/one)
++                                              (assoc-in [:block/closed-value-property :db/cardinality] :db.cardinality/one)))
++                  response (request! self "GET" "/semantic/schema" nil signed)
++                  tags (by-title (get-in response [:body :tags]))
++                  props (by-title (get-in response [:body :properties]))]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= #{"zz Base" "zz Book"} (set (map :title (get-in tags ["zz Novel" :extends])))))
++            (is (= #{"zz author" "zz colour"} (set (map :title (get-in tags ["zz Book" :properties])))))
++            (is (= #{"zz Book" "zz Novel"} (set (map :title (get-in props ["zz colour" :used-by-tags])))))
++            (is (= {"Red" 2 "Green" 0} (into {} (map (juxt :title :usage-count)) (get-in props ["zz colour" :choices]))))
++            (is (= 2 (get-in props ["zz colour" :value-count]))))
++          (p/catch #(is false (str % "\n" (.-stack %))))
++          (p/finally done)))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 7c05207..f5b04c4 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -19,6 +19,7 @@
+             [logseq.db-sync.semantic-graph-health-private-test]
+             [logseq.db-sync.semantic-graph-health-refs-test]
+             [logseq.db-sync.semantic-graph-health-tag-properties-test]
++            [logseq.db-sync.semantic-graph-schema-test]
+             [logseq.db-sync.semantic-block-changes-test]
+             [logseq.db-sync.semantic-choice-values-test]
+             [logseq.db-sync.semantic-headings-test]

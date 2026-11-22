@@ -252,6 +252,18 @@
     "firstLine": "Tidy-up report: unused tags and properties, duplicates, page gaps, broken refs, missing tag values."
   },
   {
+    "name": "get_graph_schema",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/schema",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "Every tag and property with types, choices and usage counts, in one call."
+  },
+  {
     "name": "get_page",
     "method": "GET",
     "path": "/api/v1/graphs/{graph-id}/pages/{page-id}",

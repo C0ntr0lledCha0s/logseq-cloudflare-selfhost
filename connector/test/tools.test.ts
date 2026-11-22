@@ -2957,7 +2957,7 @@ describe("list_changes_since", () => {
     const tool = (await listTools()).find((t) => t.name === "list_changes_since");
     expect(tool, "list_changes_since is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(58);
+    expect(committedManifest).toHaveLength(59);
   });
 
   it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
@@ -2983,6 +2983,43 @@ describe("list_changes_since", () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
       "For what changed since a time (a daily digest or weekly review), call list_changes_since with since set to the previous run's until (an ISO date such as 2026-11-16 works for a first run) and keep this call's until for the next; a move shows only as page-changed on both pages.",
+    );
+  });
+});
+// Patch 0053: get_graph_schema lists every tag and property with usage counts in one call.
+describe("get_graph_schema", () => {
+  it("is offered read-only, under exactly that name", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
+    expect(tool, "get_graph_schema is listed").toBeDefined();
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(committedManifest).toHaveLength(59);
+    expect(committedManifest.map((t) => t.name)).toContain("get_graph_schema");
+  });
+
+  it("starts with its routing line and says what each count counts", async () => {
+    expect(FIRST_LINES.get_graph_schema).toBe("Every tag and property with types, choices and usage counts, in one call.");
+    const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_schema)).toBe(true);
+    for (const phrase of [
+      "object-count (the objects tagged with it directly",
+      "usage-count: how many values are that choice, counted by the choice's id",
+      "value-count (its values",
+      "used-by-tags (the tags that list it as a tag property)",
+      "Private content and the Recycle bin are left out of every item and every count",
+      "hidden unless built-in=true",
+      "pass that section alone in sections with its next-cursor",
+      "Unavailable for E2EE graphs",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(expect.arrayContaining(["sections", "built-in", "limit", "cursor"]));
+    expect(tool.inputSchema.required ?? []).not.toContain("sections");
+  });
+
+  it("connector_help sends a schema review to it", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "For a schema or drift review, call get_graph_schema: one call lists every tag (extends, properties, object-count) and property (type, choices with usage-count, value-count, used-by-tags), instead of list_tags plus get_tag per tag; Private content and the Recycle bin are left out of every count.",
     );
   });
 });
