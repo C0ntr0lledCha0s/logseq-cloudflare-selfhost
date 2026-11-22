@@ -17,11 +17,13 @@ import { SNAPSHOT_PLAN } from "../src/audit/snapshot";
 import deleteBlocksFixture from "./fixtures/readable/delete-blocks.json";
 import {
   ANNOTATIONS,
+  FIRST_LINES,
   type OpenApiSpec,
   SEMANTIC_TOOLS,
   annotationsFor,
   buildManifest,
   checkManifest,
+  firstLineFor,
 } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
@@ -301,6 +303,26 @@ describe("server instructions", () => {
     expect(named.length).toBeGreaterThan(5);
     expect(named.filter((n) => !names.has(n))).toEqual([]);
     expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1500);
+  });
+});
+
+describe("first lines", () => {
+  // claude.ai lists a connector's tools with each description cut to its first line, so that line
+  // says what the tool is for and when to choose it (item 58).
+  it("every tool's description starts with its own first line, short enough to survive the cut", async () => {
+    const tools = (await rpc(connector(semanticOnEnv()), "tools/list", {}, semanticOnEnv())).tools;
+    expect(tools.length).toBe(committedManifest.length);
+    for (const tool of tools as { name: string; description: string }[]) {
+      const [first, rest] = [tool.description.split("\n")[0], tool.description.split("\n").slice(1).join("\n")];
+      expect(first, tool.name).toBe(FIRST_LINES[tool.name as keyof typeof FIRST_LINES]);
+      expect(first.length, tool.name).toBeLessThanOrEqual(100);
+      expect(rest.startsWith("\n"), `${tool.name}: a blank line follows the first line`).toBe(true);
+    }
+  });
+
+  it("has a first line for exactly the tools the connector registers, and refuses a tool without one", () => {
+    expect(Object.keys(FIRST_LINES).sort()).toEqual(committedManifest.map((e: { name: string }) => e.name).sort());
+    expect(() => firstLineFor("no_such_tool")).toThrow(/no_such_tool/);
   });
 });
 
@@ -1558,7 +1580,7 @@ describe("tools manifest", () => {
 
     const [first, ...rest] = committedManifest;
     expect(checkManifest(rest, spec)).toEqual([
-      "+ batch_delete_block_property POST /api/v1/graphs/{graph-id}/block-properties/batch-delete [destructive idempotent]",
+      `+ batch_delete_block_property POST /api/v1/graphs/{graph-id}/block-properties/batch-delete [destructive idempotent] "${FIRST_LINES.batch_delete_block_property}"`,
     ]);
     expect(first.name).toBe("batch_delete_block_property");
     // An operation with no annotations entry stops the manifest from being built at all.
@@ -1573,12 +1595,26 @@ describe("tools manifest", () => {
     const flipped = structuredClone(committedManifest) as { name: string; annotations: Record<string, boolean> }[];
     flipped.find((e) => e.name === "update_block")!.annotations.destructiveHint = false;
     expect(checkManifest(flipped, spec)).toEqual([
-      "+ update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [destructive]",
-      "- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [no hints]",
+      `+ update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [destructive] "${FIRST_LINES.update_block}"`,
+      `- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [no hints] "${FIRST_LINES.update_block}"`,
     ]);
     // A committed manifest from before annotations were recorded is stale.
     const bare = committedManifest.map(({ name, method, path }) => ({ name, method, path }));
-    expect(checkManifest(bare, spec)).toContain("- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [annotations missing]");
+    expect(checkManifest(bare, spec)).toContain(
+      '- update_block PATCH /api/v1/graphs/{graph-id}/blocks/{block-id} [annotations missing] "(no first line)"',
+    );
+  });
+
+  it("manifest records each first line (checkManifest flags a changed one)", () => {
+    for (const entry of committedManifest as { name: string; firstLine?: string }[]) {
+      expect(entry.firstLine, entry.name).toBe(FIRST_LINES[entry.name as keyof typeof FIRST_LINES]);
+    }
+    const changed = structuredClone(committedManifest) as { name: string; firstLine: string }[];
+    changed.find((e) => e.name === "kb_index")!.firstLine = "Build the index";
+    expect(checkManifest(changed, spec)).toEqual([
+      `+ kb_index (hand-written) [read-only idempotent] "${FIRST_LINES.kb_index}"`,
+      '- kb_index (hand-written) [read-only idempotent] "Build the index"',
+    ]);
   });
 
   it("refuses operations it does not understand", () => {

@@ -12,7 +12,7 @@ import { mcpApiHandler, mcpHandler } from "../src/mcp";
 import { CONNECTOR_HELP } from "../src/tools/handwritten";
 import { CONTEXT_TOOLS, NO_CONTEXT_TOOLS } from "../src/tools/readable";
 import { LOGGED_READS } from "../src/tools/semantic";
-import { ANNOTATIONS } from "../src/tools/spec.mjs";
+import { ANNOTATIONS, FIRST_LINES } from "../src/tools/spec.mjs";
 import outline from "./fixtures/audit/get-blocks-outline.json";
 import summary from "./fixtures/audit/get-blocks-summary.json";
 
@@ -1091,7 +1091,7 @@ describe("contract", () => {
   it("get_activity_log is in the manifest read-only and idempotent, listed by tools/list, and outside the write tables", async () => {
     const entry = committedManifest.find((e) => e.name === "get_activity_log");
     const hints = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-    expect(entry).toEqual({ name: "get_activity_log", method: null, path: null, annotations: hints });
+    expect(entry).toEqual({ name: "get_activity_log", method: null, path: null, annotations: hints, firstLine: FIRST_LINES.get_activity_log });
     const { tools } = await rpc("tools/list", {});
     const listed = tools.find((t: { name: string }) => t.name === "get_activity_log");
     expect(listed.annotations).toEqual(hints);

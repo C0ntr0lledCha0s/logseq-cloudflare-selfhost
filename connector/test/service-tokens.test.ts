@@ -1268,6 +1268,10 @@ describe("HTTP", () => {
     });
     expect(init.status, init.body).toBe(200);
     expect(init.json.result.serverInfo.name).toBe("logseq-connector");
+    expect(init.json.result.serverInfo.title).toBe("Logseq");
+    expect(init.json.result.serverInfo.icons).toEqual([
+      { src: "https://mcp.example.com/favicon.png", mimeType: "image/png", sizes: ["192x192"] },
+    ]);
     const listed = await post(token, "tools/list");
     expect(listed.status, listed.body).toBe(200);
     expect(listed.json.result.tools.map((t: { name: string }) => t.name).sort()).toEqual(committedManifest.map((t) => t.name).sort());
