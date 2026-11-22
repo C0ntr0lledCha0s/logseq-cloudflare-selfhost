@@ -2648,6 +2648,10 @@ describe("code, math and quote blocks", () => {
     ["converting an existing block", "update_block with the title and display-type together"],
     ["the \\# warning", "\\# escapes"],
     ["quote keeps tag handling", "A quote block keeps tag and link handling"],
+    ["Query refused as a tag", "Query can't be given as a tag"],
+    ["the query property refused on the property paths", "refuse logseq.property/query, naming the entry"],
+    ["a reset keeps Query", "a reset tag list keeps a Query block's Query tag"],
+    ["the delete paths keep Query", "refuse removing the Query tag or the query from a Query block"],
   ])("the section names %s", (_point, phrase) => {
     expect(CODE_BLOCKS_HELP).toContain(phrase);
   });
@@ -2669,6 +2673,19 @@ describe("code, math and quote blocks", () => {
       expect(description, name).not.toContain("a Query block is not supported yet");
     }
     expect(tools.find((t) => t.name === "update_block").description).toContain("updateBlock doesn't make Query blocks");
+  });
+
+  // Patch 0050 stage 3: the property paths can't store a query or the Query tag, or strand one.
+  it("the property tools' vendored descriptions name the query and Query tag refusals", async () => {
+    const tools = await listTools();
+    const description = (name: string) => tools.find((t) => t.name === name).description;
+    for (const name of ["set_block_property", "batch_set_block_property"]) {
+      expect(description(name), name).toContain("logseq.property/query and the Query tag are refused");
+      expect(description(name), name).toContain("a Query block's Query tag are kept");
+    }
+    for (const name of ["delete_block_property", "batch_delete_block_property"]) {
+      expect(description(name), name).toContain("Removing the Query tag or logseq.property/query from a Query block is refused");
+    }
   });
 
   it("the heading sentence agrees with the section: no heading for a code, math or quote block, and quote keeps tag handling", () => {
