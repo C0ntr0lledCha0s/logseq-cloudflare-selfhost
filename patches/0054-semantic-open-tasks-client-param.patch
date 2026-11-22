@@ -384,7 +384,7 @@ index 39eccae..4ddedc9 100644
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
-index 047acfc..f3517aa 100644
+index 047acfc..5dfa09e 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
 @@ -2028,6 +2028,26 @@
@@ -461,7 +461,7 @@ index 047acfc..f3517aa 100644
             ["pages-missing-property" :tagged "pages-missing-property stopped after 2,500 tagged pages and blocks (its tagged bound); give a narrower tag"]]]
      (is (= text (named-queries/bound-message {:query query-name :bound bound :value (get named-queries/default-bounds bound)})))))
  
-@@ -4070,3 +4097,767 @@
+@@ -4070,3 +4097,803 @@
            (is (identical? own after-answered) "restored after an answered query")
            (is (identical? own after-refused) "restored after a refused query")
            (is (pos? direct) "a query outside run-query runs uncharged"))))))
@@ -642,12 +642,23 @@ index 047acfc..f3517aa 100644
 +                ;; Text client properties, a value block and a choice titled like a client.
 +                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq client text" :type "default"}) 201)
 +                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq client url" :type "url"}) 201)
++                _ (ok! (request! self "POST" "/semantic/properties" {:title "zq client flag" :type "checkbox"}) 201)
 +                text-ident (d/q '[:find ?i . :where [?e :block/title "zq client text"] [?e :db/ident ?i]] @conn)
 +                _ (ok! (request! self "PUT" (str "/semantic/blocks/" other-work "/properties/" (js/encodeURIComponent (subs (str text-ident) 1)))
 +                                 {:value "zq Value Only"}) 200)
 +                kind (outliner-property/upsert-property! conn nil {:logseq.property/type :default} {:property-name "zq kind"})
 +                _ (outliner-property/upsert-closed-value! conn (:db/ident kind) {:value "zq Choice"})
 +                _ (assert (some? (d/q '[:find ?e . :where [?e :block/title "zq Choice"] [?e :block/closed-value-property _]] @conn)))
++                ;; Built-in hidden pages (hide? true, neither recycled nor Private-tagged).
++                recycle (uuid-titled conn "Recycle")
++                favorites (uuid-titled conn "$$$favorites")
++                views (uuid-titled conn "$$$views")
++                ;; A journal page and another page sharing its title: both are pages.
++                _ (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "zq refusal journal note"}]}) 201)
++                journal (str (:block/uuid (:block/page (d/entity @conn [:block/uuid (uuid (uuid-titled conn "zq refusal journal note"))]))))
++                journal-title (:block/title (d/entity @conn [:block/uuid (uuid journal)]))
++                journal-twin (page-id! self "zq Journal Twin")
++                _ (retitle! conn journal-twin journal-title)
 +                unknown (str (random-uuid))
 +                before (snapshot conn)
 +                type-message "params.client: must be a client title or UUID (a string)"
@@ -685,7 +696,23 @@ index 047acfc..f3517aa 100644
 +                       ["a default client_property" {:client_property "zq client text" :client "zq Acme"} (text-message "zq client text" "default")]
 +                       ["a url client_property" {:client_property "zq client url" :client "zq Acme"} (text-message "zq client url" "url")]
 +                       ["client before a default client_property" (array-map :client "zq Acme" :client_property "zq client text")
-+                        (text-message "zq client text" "default")]]
++                        (text-message "zq client text" "default")]
++                       ["the hidden Recycle page by title" {:client "Recycle"} (no-title "Recycle")]
++                       ["the hidden Recycle page by UUID" {:client recycle} (no-uuid recycle)]
++                       ["the hidden favourites page by title" {:client "$$$favorites"} (no-title "$$$favorites")]
++                       ["the hidden favourites page by UUID" {:client favorites} (no-uuid favorites)]
++                       ["the hidden views page by title" {:client "$$$views"} (no-title "$$$views")]
++                       ["the hidden views page by UUID" {:client views} (no-uuid views)]
++                       ["a journal and a page sharing its title" {:client journal-title}
++                        (client-message journal-title (sort-by #(:db/id (d/entity @conn [:block/uuid (uuid (nth % 2))]))
++                                                               [[journal-title "page" journal] [journal-title "page" (str journal-twin)]]))]
++                       ["an unknown client_property: only its own error" {:client_property "zq no such property" :client "zq Nobody"}
++                        "params.client_property: no property titled zq no such property"]
++                       ["an unknown client_property UUID: only its own error" {:client_property unknown :client "zq Nobody"}
++                        (str "params.client_property: no property titled " unknown)]
++                       ["a client_property of a refused type: only its own error" {:client_property "zq client flag" :client "zq Nobody"}
++                        (str "params.client_property: zq client flag is a checkbox property; give one whose values"
++                             " are pages or text (a node, default, url or date property)")]]
 +                responses (p/all (map (fn [[_ params]] (client-run! self params)) cases))
 +                dry (p/all (map (fn [[_ params]] (client-run! self params {:dry-run true})) cases))]
 +          (doseq [[[label _ message] r d] (map vector cases responses dry)]
@@ -717,6 +744,12 @@ index 047acfc..f3517aa 100644
 +                exact-block (block-id! self other-work "zq Exacto")
 +                exact-page (page-id! self "zq Exacto Page")
 +                _ (retitle! conn exact-page "ZQ EXACTO")
++                ;; A journal page and a block whose text is the journal's title.
++                _ (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "zq wins journal note"}]}) 201)
++                journal (str (:block/uuid (:block/page (d/entity @conn [:block/uuid (uuid (uuid-titled conn "zq wins journal note"))]))))
++                journal-title (:block/title (d/entity @conn [:block/uuid (uuid journal)]))
++                _ (block-id! self other-work journal-title)
++                journal-r (client-run! self {:client journal-title})
 +                acme-r (client-run! self {:client "zq Acme"})
 +                beta-r (client-run! self {:client "zq Beta"})
 +                decoy-r (client-run! self {:client "zq Decoy"})
@@ -740,6 +773,9 @@ index 047acfc..f3517aa 100644
 +            (is (not (string/includes? (:text decoy-r) (str decoy-page)))))
 +          (testing "an exact title on a block is the only tier; the case-only page is not considered"
 +            (is (= {:title "zq Exacto" :uuid (str exact-block)} (get-in exact-r [:body :params :client]))))
++          (testing "a journal and a block: the journal is a page, and wins"
++            (is (= 200 (:status journal-r)) (head-of journal-r))
++            (is (= {:title journal-title :uuid journal} (get-in journal-r [:body :params :client]))))
 +          (testing "with no exact title, the page by name"
 +            (is (= {:title "ZQ EXACTO" :uuid (str exact-page)} (get-in name-r [:body :params :client])))))))))
 +
