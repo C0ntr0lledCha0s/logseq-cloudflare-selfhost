@@ -85,7 +85,7 @@ index a682bda..f98b81a 100644
    "The body's query and inputs parsed, normalised and validated: {:query :inputs :given} or a
    refusal. A body with rules never gets here (`body-errors`)."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 3704114..1664999 100644
+index 3704114..b8af24e 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1027,7 +1027,9 @@
@@ -322,9 +322,9 @@ index 3704114..1664999 100644
 -                (set-node-display! conn block-id node)))
 +                (set-node-display! conn block-id node)
 +                (when-let [text (::query node)]
-+                  (set-query-block! conn block-id text {:mark? false})
++                  (set-query-block! conn block-id text {:mark? true})
 +                  (unverified! (map #(str (::path node) ": " %)
-+                                    (read-back-query-block @conn block-id text false))))))
++                                    (read-back-query-block @conn block-id text true))))))
              (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
                    children (when (seq (:children node))
                               (insert-tree! conn existing (:children node) "append" e2ee?))]
@@ -345,7 +345,7 @@ index 3704114..1664999 100644
               (:children %) (assoc :children (tree-response (:children %) false)))
            nodes)))
  
-@@ -2104,6 +2203,47 @@
+@@ -2104,6 +2203,99 @@
  ;; one and seven days back in epoch milliseconds, which is what claudeEditedAt holds. A page, tag or
  ;; property (anything holding the :block/name) already titled Claude Activity is left alone.
  
@@ -359,17 +359,70 @@ index 3704114..1664999 100644
 +  [db block-id]
 +  (:v (first (d/datoms db :eavt block-id :logseq.property/query))))
 +
++;; "Created by Claude" (stage 4) is a hidden checkbox property, claudeQueryBlock, set to true on each
++;; Query block an insert makes (never on its value block, nor on the Activity page's blocks, whose
++;; text the server pins). The edit stamps can't say it: they exist only when "Mark Claude's edits" is
++;; on and mean "Claude edited", and created-by-ref names the signed-in owner for the app and the
++;; connector alike. Like the stamps, the property is found by ident, created on first use in the
++;; write's own transaction, and a property in its way refuses the write with a 409. Only
++;; set-query-block! writes it; the property paths refuse it. Its limits: a block the owner copies in
++;; the app keeps the marker, and the owner can set it; both only widen what Claude may edit to blocks
++;; the owner chose.
++
++(def query-marker-ident :user.property/claude-queryBlock)
++
++(def ^:private query-marker-title "claudeQueryBlock")
++
++(defn- query-marker-property?
++  "Whether `entity` is the marker property as it is created: a checkbox property of cardinality one."
++  [entity]
++  (and (property? entity)
++       (= :checkbox (:logseq.property/type entity))
++       (not (db-property/many? entity))))
++
++(defn check-query-marker-schema
++  "nil when the marker property can be used or created in `db`, else the 409 that refuses the write:
++  its ident held by anything but a checkbox property of cardinality one, or another property titled
++  claudeQueryBlock (compared as :block/name; pages and tags don't count)."
++  [db]
++  (when-let [holder (or (when-let [own (d/entity db query-marker-ident)]
++                          (when-not (query-marker-property? own) own))
++                        (some (fn [datom]
++                                (let [holder (d/entity db (:e datom))]
++                                  (when (and (property? holder) (not= query-marker-ident (:db/ident holder)))
++                                    holder)))
++                              (d/datoms db :avet :block/name (common-util/page-name-sanity-lc query-marker-title))))]
++    {:status 409
++     :error (str "query blocks: property " (:block/title holder) " (" (entity-ident holder) ") is in the way of "
++                 query-marker-title "; rename it in the app")}))
++
++(defn- ensure-query-marker-schema!
++  "Creates the hidden marker property on `conn` (the write's tx-conn) unless it exists. A property in
++  its way throws the 409 as refuse-stamp-conflict! does, so `handle` answers it and the temp conn,
++  with everything the write did, is dropped. An existing marker property is left as it is."
++  [conn]
++  (when-let [conflict (check-query-marker-schema @conn)]
++    (throw (ex-info (:error conflict) {::stamp-conflict conflict})))
++  (when-not (d/entity @conn query-marker-ident)
++    (outliner-property/upsert-property! conn query-marker-ident {:logseq.property/type :checkbox
++                                                                 :db/cardinality :db.cardinality/one}
++                                        {:property-name query-marker-title
++                                         :properties {:logseq.property/hide? true}})))
++
 +(defn set-query-block!
 +  "Makes block `block-id` on `conn` a Query block holding `text`: tagged Query, the text in its query
-+  value block, which shows as code in Clojure. `_opts` takes {:mark? bool}: :mark? asks for the created-by-Claude marker, which
-+  stage 4 adds; nothing writes it yet, so `read-back-query-block` reports it missing. The caller
++  value block, which shows as code in Clojure. With {:mark? true} it also sets the created-by-Claude
++  marker on the block (not its value block), creating the marker property on first use. The caller
 +  checks `text` first (`datalog/check-query-block`) and reads the write back."
-+  [conn block-id text _opts]
++  [conn block-id text {:keys [mark?]}]
++  (when mark? (ensure-query-marker-schema! conn))
 +  (outliner-property/set-block-property! conn block-id :block/tags :logseq.class/Query)
 +  (outliner-property/set-block-property! conn block-id :logseq.property/query text)
 +  (when-let [query-id (query-value-id @conn block-id)]
 +    (outliner-property/set-block-property! conn query-id :logseq.property.node/display-type :code)
 +    (outliner-property/set-block-property! conn query-id :logseq.property.code/lang "clojure"))
++  (when mark?
++    (outliner-property/set-block-property! conn block-id query-marker-ident true))
 +  nil)
 +
 +(defn read-back-query-block
@@ -387,13 +440,12 @@ index 3704114..1664999 100644
 +      (conj "the query is not shown as code")
 +      (and query-id (not= "clojure" (value query-id :logseq.property.code/lang)))
 +      (conj "the query's lang is not clojure")
-+      ;; Stage 4 writes the marker and reads it here; until then a request for it can't hold.
-+      mark? (conj "claudeQueryBlock is not set"))))
++      (and mark? (not (true? (value block-id query-marker-ident)))) (conj "claudeQueryBlock is not set"))))
 +
  (def ^:private activity-page-title "Claude Activity")
  
  (defn- activity-query-text
-@@ -2138,12 +2278,8 @@
+@@ -2138,12 +2330,8 @@
                                      {:sibling? false :bottom? true :keep-uuid? true :keep-block-order? true})
        (doseq [[{:keys [text]} {:block/keys [uuid]}] (map vector activity-queries blocks)]
          (let [id (:db/id (d/entity @conn [:block/uuid uuid]))]
@@ -408,7 +460,7 @@ index 3704114..1664999 100644
            (ldb/transact! conn [[:db/add id :logseq.property.table/sorting
                                  [{:id :user.property/claude-editedAt :asc? false}]]]))))))
  
-@@ -2168,10 +2304,28 @@
+@@ -2168,10 +2356,85 @@
    (when-let [tool (get class-schema-tools property-ident)]
      (str (subs (str property-ident) 1) " can't be set here; use " tool)))
  
@@ -429,16 +481,73 @@ index 3704114..1664999 100644
 +             (seq (d/datoms db :eavt (:db/id block) :logseq.property/query)))
 +    {:error "logseq.property/query can't be removed from a Query block; delete the block instead"}))
 +
++(defn- query-marker-refusal
++  "Why a block-property set naming the created-by-Claude marker is refused: only set-query-block!
++  writes it. Deleting it stays allowed: that only makes a block not Claude's, the stricter way."
++  [property-ident]
++  (when (= query-marker-ident property-ident)
++    (str query-marker-title " is set by the server and can't be written")))
++
  (defn- set-property-refusal
    "Why a block-property set naming `property-ident` is refused, or nil."
    [property-ident]
 -  (or (stamp-property-refusal property-ident) (class-schema-refusal property-ident)))
 +  (or (stamp-property-refusal property-ident) (class-schema-refusal property-ident)
-+      (query-property-refusal property-ident)))
++      (query-property-refusal property-ident) (query-marker-refusal property-ident)))
++
++;; The update_block guard (patch 0050, stage 4): a Query block, and the value block holding its query,
++;; change only when Claude made the Query block. Everything is read from datoms (an uploaded graph
++;; may keep the app's schema), and the holder is found through the query ref, never :block/parent.
++
++(defn query-holder
++  "The one block whose :logseq.property/query points at value block `value-id`, or nil when none or
++  more than one does."
++  [db value-id]
++  (let [holders (into #{} (map :e) (d/datoms db :avet :logseq.property/query value-id))]
++    (when (= 1 (count holders)) (first holders))))
++
++(defn claude-query-block?
++  "Whether Claude made the Query block `holder` (a db id, or nil): :yes when the marker property is
++  the checkbox it is created as and the block holds true, :no when the block holds anything else,
++  :unknown when there is no holder or the marker property is missing or not that checkbox."
++  [db holder]
++  (cond
++    (or (nil? holder) (not (query-marker-property? (d/entity db query-marker-ident)))) :unknown
++    (true? (:v (first (d/datoms db :eavt holder query-marker-ident)))) :yes
++    :else :no))
++
++(defn- query-block-part
++  "For update_block's target `block`: {:holder id :value? true} for a value block of
++  logseq.property/query (holder nil when it can't be told), {:holder id :value? false} for a block
++  tagged Query, else nil."
++  [db block]
++  (let [id (:db/id block)
++        from (some->> (first (d/datoms db :eavt id :logseq.property/created-from-property)) :v (d/entity db) :db/ident)]
++    (cond
++      (= :logseq.property/query from) {:holder (query-holder db id) :value? true}
++      (some #(= :logseq.class/Query (:db/ident (d/entity db (:v %)))) (d/datoms db :eavt id :block/tags))
++      {:holder id :value? false})))
++
++(defn query-block-refusal
++  "The update_block guard: {:status :error} when the update in `body` may not change `block`, else nil
++  (`block` is not part of a Query block, or the update may go ahead). A Query block or its value
++  block that Claude didn't make, or can't be told, is refused 409 naming the block. On a Claude-made
++  value block, display-type and lang are refused and the new title must pass check-query-block."
++  [db block body]
++  (when-let [{:keys [holder value?]} (query-block-part db block)]
++    (let [named (str "block " (:block/uuid block) ": ")]
++      (case (claude-query-block? db holder)
++        :unknown {:status 409 :error (str named "can't tell whether Claude created this Query block, so it isn't changed")}
++        :no {:status 409 :error (str named "update_block changes only Query blocks Claude created")}
++        :yes (when value?
++               (if (or (contains? body :display-type) (contains? body :lang))
++                 {:status 400 :error "title: query: a Query block takes no display-type or lang"}
++                 (when-let [error (:error (datalog/check-query-block (:title body)))]
++                   {:status 400 :error (str "title: " error)})))))))
  
  (defn- request-creator [request e2ee?]
    (when-let [encoded (.get (.-headers request) "x-logseq-sync-actor")]
-@@ -3022,6 +3176,8 @@
+@@ -3022,6 +3285,8 @@
              fence (when (and (true? convert?) (not e2ee?) (= "block" (some-> block block-kind))
                               (nil? (display-type-ident block)))
                      (fence-display-block (:title body)))
@@ -447,7 +556,37 @@ index 3704114..1664999 100644
              converted (when (:type fence) fence)
              fence-error (when converted
                            (fence-refusal converted (get explicit display-type-ident) (get explicit lang-ident)))
-@@ -3231,8 +3387,10 @@
+@@ -3029,10 +3294,15 @@
+             lang (or (get explicit lang-ident) (:lang converted))
+             given (cond-> {} type (assoc display-type-ident type) lang (assoc lang-ident lang))
+             title (if converted (:title converted) (:title body))
+-            final-type (or type (display-type-ident block))]
++            final-type (or type (display-type-ident block))
++            ;; patch 0050: only a Query block Claude made changes; its value block takes checked text.
++            query-guard (when (and block (non-blank-string? (:title body))) (query-block-refusal db block body))
++            query-holder-id (when (and block (nil? query-guard))
++                              (let [part (query-block-part db block)] (when (:value? part) (:holder part))))]
+         (cond
+           (or (nil? block) (not (non-blank-string? (:title body))))
+           (http/bad-request "invalid block-id or title")
++          query-guard (http/error-response (:error query-guard) (:status query-guard))
+           (= ::invalid convert?) (http/bad-request convert-fences-refusal)
+           (some (comp :error second) fields) (http/bad-request (some (comp :error second) fields))
+           fence-error (http/bad-request fence-error)
+@@ -3057,7 +3327,11 @@
+                                                              (assoc @prepared :block/uuid (:block/uuid block))
+                                                              :encrypted-title? e2ee? :encrypted-name (:name body))
+                                   (unverified! (keep (fn [[ident value]] (read-back-display @tx-conn (:db/id block) ident value))
+-                                                     given))))
++                                                     given))
++                                  ;; A Claude-made query is stored as sent and stays Clojure code.
++                                  (when query-holder-id
++                                    (unverified! (map (fn [reason] (str "title: " reason))
++                                                      (read-back-query-block @tx-conn query-holder-id (:title body) true))))))
+                  (broadcast-change! self)
+                  (let [stored (d/entity @conn [:block/uuid (:block/uuid block)])]
+                    (http/json-response nil (with-context-or-unavailable
+@@ -3231,8 +3505,10 @@
              block (find-entity db (:block-id path-params))
              property-ident (resolve-property-ident db (:property-id path-params))
              ;; An optional value removes only that value (patch 0042).
@@ -460,7 +599,7 @@ index 3704114..1664999 100644
        (cond
          (or (nil? block) (nil? property-ident))
          (http/bad-request "invalid block or property")
-@@ -3328,8 +3486,10 @@
+@@ -3328,8 +3604,10 @@
                                   {:block block
                                    :property-ident property-ident
                                    ;; An optional value removes only that value (patch 0042).
@@ -473,7 +612,7 @@ index 3704114..1664999 100644
                               entries))]
        (if-let [error (or (batch-delete-fields-error body) (labels-error entries) (batch-entries-error entries resolved))]
          (http/bad-request error)
-@@ -3482,6 +3642,8 @@
+@@ -3482,6 +3760,8 @@
          (http/bad-request "missing blocks")
          ;; Before today's journal is made, so a refused call writes nothing.
          (= ::invalid (convert-fences-option url)) (http/bad-request convert-fences-refusal)
@@ -483,7 +622,7 @@ index 3704114..1664999 100644
          (if-let [time-zone (owner-time-zone self)]
            (let [today (authored-write! conn creator ensure-today-page! time-zone)]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..9e3b638 100644
+index 39eccae..eaa3e05 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -148,7 +148,15 @@
@@ -495,7 +634,7 @@ index 39eccae..9e3b638 100644
 +
 +(def ^:private query-block-note
 +  "How the insert operations make a Query block (patch 0050), shared by the four that take tree nodes."
-+  (str "A node with a query field, or whose whole title is a ```query fence (any case) holding an EDN map (an advanced query), becomes a Query block, as the app's advanced query command makes one: tagged Query, with logseq.property/query holding the text as a Clojure code block, read back in the transaction. The map is {:query [:find … :where …]} with optional :inputs (a vector), :title (a string) and the flags :collapsed?, :group-by-page?, :remove-block-children? and :breadcrumb-show?; at most 4,000 characters."
++  (str "A node with a query field, or whose whole title is a ```query fence (any case) holding an EDN map (an advanced query), becomes a Query block, as the app's advanced query command makes one: tagged Query, with logseq.property/query holding the text as a Clojure code block, read back in the transaction, and marked with the hidden claudeQueryBlock property (true), which tells updateBlock that Claude made it; the property is created, hidden, on first use, and a property already in its way (another property titled claudeQueryBlock, or its ident held by a property of another type) refuses the call with 409 naming it. The map is {:query [:find … :where …]} with optional :inputs (a vector), :title (a string) and the flags :collapsed?, :group-by-page?, :remove-block-children? and :breadcrumb-show?; at most 4,000 characters."
 +       " A fence-made block's title is \"\" and the response marks it converted: query; a field-made block keeps its title as a caption. Every Query block the call makes carries query (the stored text) in the response, also with verbose=false. A block reused by its uuid is left as it is."
 +       " The query is checked as datalog_query checks a query before it runs: one EDN form, read-only, no rules (no :rules, % in :in or rule call), only the pure functions datalog_query allows, no cross product, at most 12 function bindings and 20 inputs, matching :in. :query must be a vector starting with :find, the only form the app runs, and :view and :result-transform are refused because they run as code in the app."
 +       " A refused query answers 400 naming the node and the reason (blocks[0].children[1]: query: …, entries[2].blocks[0]: query: …) and writes nothing; so do a query field and a ```query fence on one node, a query with display-type or lang (fields or properties), a query with the Query, Code, Math or Quote tag, and a query field on an E2EE graph. A ```query fence whose body doesn't start with { (a simple query such as (task todo)) stays text, listed under kept (only an advanced query ({:query [...]}) becomes a Query block; a simple query stays text)."
@@ -503,7 +642,7 @@ index 39eccae..9e3b638 100644
  
  (def ^:private operation-docs
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
-@@ -166,7 +174,7 @@
+@@ -166,22 +174,24 @@
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
@@ -512,8 +651,12 @@ index 39eccae..9e3b638 100644
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
     "refreshRefs" ["Refresh links and tags" "Re-applies write-time title handling to blocks already in the graph: inline #tags naming an existing tag are applied, other # that Logseq would read as a tag are escaped as \\#, and [[links]] still stored as text are resolved. Covers one page's blocks when page-id is given, else the whole graph (page titles and property values are skipped, and code and math blocks keep their titles as stored). Returns each changed block's before and after text and the tags it gains, at most 200 per call (truncated is true when more remain; call again after applying). Previews without writing unless apply is true. Unavailable for E2EE graphs."]
     "updateBlock" ["Update a block" (str "Replaces the title of one block identified by UUID. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note
-@@ -175,13 +183,13 @@
-                                                typed-block-note)]
+                                                " To remove a block's heading, delete logseq.property/heading with deleteBlockProperty."
+                                                " A page's, tag's or property's title is a name, not block text: a title for one starting with # to ###### and whitespace is refused with 400 naming the title, and nothing changes. "
+-                                               typed-block-note)]
++                                               typed-block-note
++                                               " A Query block's caption and its query (the value block holding logseq.property/query) can be changed only on the Query blocks Claude created, which an insert marks with the hidden claudeQueryBlock property: on any other Query block (one made in the app, or the Claude Activity page's) the call is refused with 409 naming the block (block <uuid>: update_block changes only Query blocks Claude created), and when it can't tell (the marker property is missing, or the value block has no holder or more than one) it is refused with 409 too, and nothing changes."
++                                               " On a Claude-made Query block the caption changes as any title does; its query takes a new text only when it is checked as datalog_query checks a query, as on insert (title: query: <reason>, 400), and is then stored as sent, keeping its code display and Clojure lang. A query takes no display-type or lang (title: query: a Query block takes no display-type or lang, 400). claudeQueryBlock is set by the server: setBlockProperty, batchSetBlockProperty and node or entry properties refuse it.")]
     "deleteBlock" ["Delete a block" "Deletes one block and its descendants. Asset blocks are deleted through this same operation. Pages, tags and properties are refused with 400; delete them with deletePage, deleteTag or deleteProperty. Answers the block's page, breadcrumb and snippet (affected), read before the delete; a block still there afterwards answers 500, naming it in the error and under not-removed."]
     "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order. Each moved block is named under affected with where it was (from) and is (to): page and breadcrumb. Pass dry-run=true to move them in a throwaway copy of the graph instead and get the same answer with dry-run: true, changing nothing."]
 -   "insertBlockChildren" ["Insert child block trees" (str "Appends or prepends one or more recursive block trees as children of the addressed block, with each new block's properties, in one transaction." " dry-run checks the insert and applies it to a throwaway copy of the graph, answering 200 with dry-run: true and the blocks, conversions and kept fences the call would give, without changing the graph." " " value-notes " Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note)]
@@ -533,7 +676,7 @@ index 39eccae..9e3b638 100644
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" (str "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties, on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Never encode a task as Markdown TODO text. " heading-note)]
     "promotePageToTag" ["Promote a page to a tag" "Turns an existing page, given by page-id (its UUID or title), into a tag in place, as the app's Convert to tag does: it keeps its UUID, title, blocks, property values, other tags and every reference, gains the Tag class and a unique ident, stops being a page, and extends Root, or the tags given in extends (each by UUID, ident or title, set in the same transaction). Links to it stay page references; they aren't tagged. Afterwards getTag and listTagObjects read it as a tag, and getBlocks with view=outline reads its blocks (getPage and listPageBlocks take pages only). Refuses with 400, writing nothing, a journal, a built-in page or tag, a property, a page in the Recycle bin, a namespaced page (including one in the Library), a whiteboard, an asset or a block, any body field but extends, and an extends entry createTag would refuse (a built-in tag the app hides from its extends picker such as Tag or Page, a page that isn't a tag, or the page itself); with 409 a page that is already a tag (use updateTag) or a title another tag uses, compared ignoring case as Logseq compares page names (existing names that tag); with 404 an id that names no visible page. Each refusal names page-id or the field and the reason. Returns the tag as getTag does, plus promoted: how many blocks it kept and how many entities reference it. Pass dry-run=true to run the same checks and conversion on a throwaway copy of the graph and get the same answer with dry-run: true (what it would extend and the counts, but no ident: the real call generates the tag's ident afresh), with nothing written. Unavailable for E2EE graphs."]
-@@ -345,7 +353,7 @@
+@@ -345,7 +355,7 @@
  
  (def ^:private convert-fences-parameter
    {:name "convert-fences" :in "query" :schema {:type "boolean" :default true}
@@ -542,7 +685,7 @@ index 39eccae..9e3b638 100644
  
  (def ^:private summary-prefix-parameter
    {:name "summary-prefix" :in "query" :schema {:type "string" :minLength 1 :default "**Summary:**"}
-@@ -379,6 +387,11 @@
+@@ -379,6 +389,11 @@
    {:type "string" :minLength 1 :maxLength 40
     :description "A code block's language, such as python or mermaid (1 to 40 characters, no spaces, case kept); needs display-type code. Also accepted in properties as logseq.property.code/lang."})
  
@@ -554,7 +697,7 @@ index 39eccae..9e3b638 100644
  (def ^:private dry-run-schema
    {:type "boolean" :default false
     :description "Check the request and apply it to a throwaway copy of the graph, reporting the result without changing the graph."})
-@@ -888,7 +901,7 @@
+@@ -888,7 +903,7 @@
                      :description "Property values to set on the new block or target, keyed by property UUID, ident or exact title, e.g. {\"Tags\": [\"Person\"], \"Description\": \"text\"}. Values take the same forms as in setBlockProperty; many-valued properties add to the block's values. A block reused by its uuid keeps its properties."
                      :additionalProperties {:$ref "#/components/schemas/PropertyValue"}}
     :KeptFences {:type "array"
@@ -563,7 +706,7 @@ index 39eccae..9e3b638 100644
                  :items {:type "object" :required ["path" "reason"]
                          :properties {:path {:type "string"} :reason {:type "string"}}}}
     :InsertedBlock {:type "object" :required ["uuid"]
-@@ -897,8 +910,10 @@
+@@ -897,8 +912,10 @@
                                  :display-type {:type "string" :enum ["code" "math" "quote"]
                                                 :description "The block's type, when it has one. Omitted when verbose is false."}
                                  :lang {:type "string" :description "A code block's language, when set. Omitted when verbose is false."}
@@ -576,7 +719,7 @@ index 39eccae..9e3b638 100644
                                  :children {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}}}
     :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
                              :properties {:target {:$ref "#/components/schemas/BlockContext"}
-@@ -971,6 +986,7 @@
+@@ -971,6 +988,7 @@
                                          :title {:type "string"}
                                          :display-type display-type-schema
                                          :lang lang-schema
@@ -671,10 +814,10 @@ index cf2d9a7..fad4718 100644
            (str path ": dry-run")))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
 new file mode 100644
-index 0000000..a2e0898
+index 0000000..109622f
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_query_block_test.cljs
-@@ -0,0 +1,1138 @@
+@@ -0,0 +1,1663 @@
 +(ns logseq.db-sync.semantic-query-block-test
 +  "Query blocks (patch 0050), stage 1: the static check a stored query passes and the one write of a
 +  Query block. `check-query-block` takes the text Claude gives as a Query block's query and answers
@@ -696,7 +839,16 @@ index 0000000..a2e0898
 +  ident) are refused on set_block_property, batch_set_block_property, a node's properties and a batch
 +  entry's properties, naming the entry, and write nothing; a held Query is a no-op. A reset keeps
 +  the Query tag, the batch class check's final-tags agrees, and the delete paths refuse removing the
-+  Query tag or the query from a Query block."
++  Query tag or the query from a Query block.
++
++  Stage 4: \"created by Claude\" is a hidden checkbox property claudeQueryBlock
++  (:user.property/claude-queryBlock), created on first use in the insert's own transaction and set
++  to true on each Query block an insert makes, never on its value block or the Activity page's
++  blocks. A property in its way refuses the insert with a 409. The property paths refuse writing
++  it. update_block on a Query block or its value block (holder found through datoms) is refused
++  with a 409 naming the block unless the marker reads true; it can't tell (no marker property, no
++  holder or two) is refused too. A Claude-made value block takes only text check-query-block
++  accepts, keeps :code and clojure, and refuses display-type and lang; its caption updates freely."
 +  (:require [cljs.test :refer [async deftest is testing]]
 +            [clojure.string :as string]
 +            [datascript.core :as d]
@@ -709,6 +861,7 @@ index 0000000..a2e0898
 +            [logseq.db-sync.worker.handler.sync :as sync-handler]
 +            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
 +            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.property :as outliner-property]
 +            [promesa.core :as p]))
 +
 +(def ^:private actor
@@ -1101,7 +1254,7 @@ index 0000000..a2e0898
 +                 (semantic/read-back-query-block (without value :logseq.property.node/display-type) block text false)))
 +          (is (= ["the query's lang is not clojure"]
 +                 (semantic/read-back-query-block (without value :logseq.property.code/lang) block text false)))
-+          (testing "the marker is not written before stage 4, so asking for it reads back as missing"
++          (testing "the Activity page's blocks are never marked, so asking for the marker reads back as missing"
 +            (is (= ["claudeQueryBlock is not set"]
 +                   (semantic/read-back-query-block @conn block text true)))))))))
 +
@@ -1813,6 +1966,521 @@ index 0000000..a2e0898
 +          (is (= #{} (tags-of conn a)))
 +          (is (empty? (d/datoms @conn :avet :logseq.property/query))
 +              "no block holds a query"))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Stage 4: the created-by-Claude marker and the update_block guard.
++
++(def ^:private marker-ident :user.property/claude-queryBlock)
++(def ^:private marker-reason "claudeQueryBlock is set by the server and can't be written")
++(def ^:private signed [["x-logseq-sync-actor" actor]])
++(def ^:private other-query "{:query [:find (pull ?b [*]) :where [?b :block/title \"zq\"]]}")
++
++(defn- eid [db id] (:db/id (d/entity db [:block/uuid (uuid (str id))])))
++
++(defn- marker-of
++  "Block `id`'s marker value, read from :eavt (nil when it holds none)."
++  [conn id]
++  (datom-v @conn (eid @conn id) marker-ident))
++
++(defn- value-uuid
++  "The uuid of the value block holding Query block `id`'s query, from :eavt."
++  [conn id]
++  (:block/uuid (d/entity @conn (datom-v @conn (eid @conn id) :logseq.property/query))))
++
++(defn- marker-properties
++  "Every property whose :block/name is claudequeryblock."
++  [db]
++  (map #(d/entity db (:e %)) (d/datoms db :avet :block/name "claudequeryblock")))
++
++(defn- stamped? [conn id]
++  (seq (d/datoms @conn :eavt (eid @conn id) :user.property/claude-editedBy)))
++
++(defn- ops-of!
++  "The :outliner-op of each transaction `write` (a thunk answering a promise of a response) commits."
++  [conn write]
++  (let [ops (atom [])]
++    (d/listen! conn ::ops #(swap! ops conj (:outliner-op (:tx-meta %))))
++    (-> (p/let [response (write)] [response @ops])
++        (p/finally #(d/unlisten! conn ::ops)))))
++
++(defn- fresh-graph
++  "As with-graph, but answers the graph instead of taking a callback."
++  []
++  (p/let [conn (sqlite-export/create-conn)
++          self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true :env #js {"TIMEZONE" "UTC"}}
++          notes (random-uuid)
++          a (random-uuid)]
++    (d/transact! conn [(raw-page notes "Notes")])
++    (d/transact! conn [{:block/uuid a :block/title "zq A" :block/order "a0"
++                        :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                        :block/created-at 1 :block/updated-at 1}])
++    {:conn conn :self self :notes notes :a a}))
++
++;; Before the fix (Stage 3 tree) nothing wrote the marker:
++;;   (filled in from the run)
++(deftest insert-marks-query-block-test
++  (async done
++    (-> (p/doseq [[label headers] [["unsigned" nil] ["signed, stamps off" signed] ["stamps on" stamped]]]
++          (p/let [{:keys [conn self notes a]} (fresh-graph)
++                  plain-graph (fresh-graph)
++                  [plain plain-ops] (ops-of! (:conn plain-graph)
++                                             #(request! (:self plain-graph) "POST" "/semantic/block-trees"
++                                                        {:target-id (str (:notes plain-graph)) :blocks [{:title "zq P"}]}
++                                                        :headers headers))
++                  _ (is (= 201 (:status plain)) (str label ": " (pr-str (:body plain))))
++                  _ (is (empty? (marker-properties @(:conn plain-graph)))
++                        (str label ": a call that makes no Query block creates no marker property"))
++                  [fence-id field-id child-id batch-id capture-id nested-id] (repeatedly 6 random-uuid)
++                  [first-insert ops] (ops-of! conn #(request! self "POST" "/semantic/block-trees"
++                                                              {:target-id (str notes)
++                                                               :blocks [{:uuid (str fence-id) :title book-fence}
++                                                                        {:title "zq parent"
++                                                                         :children [{:uuid (str nested-id) :title "zq N"
++                                                                                     :query book-query}]}]}
++                                                              :headers headers))
++                  field (request! self "POST" "/semantic/block-trees"
++                                  {:target-id (str notes) :blocks [{:uuid (str field-id) :title "zq F" :query book-query}]}
++                                  :headers headers)
++                  child (request! self "POST" (str "/semantic/blocks/" a "/children")
++                                  {:position "append" :blocks [{:uuid (str child-id) :title "zq C" :query book-query}]}
++                                  :headers headers)
++                  batch (request! self "POST" "/semantic/block-trees/batch"
++                                  {:entries [{:page "Notes" :blocks [{:uuid (str batch-id) :title book-fence}]}]}
++                                  :headers headers)
++                  captured (request! self "POST" "/semantic/capture"
++                                     {:blocks [{:uuid (str capture-id) :title "zq K" :query book-query}]}
++                                     :headers headers)
++                  db @conn
++                  property (d/entity db marker-ident)]
++            (testing label
++              (doseq [[op response] [["first insert" first-insert] ["field" field] ["children" child]
++                                     ["batch" batch] ["capture" captured]]]
++                (is (= 201 (:status response)) (str op ": " (pr-str (:body response)))))
++              (is (= ops plain-ops) "the first marking insert commits once, under the insert's own op")
++              (doseq [[what id] [["fence" fence-id] ["nested field" nested-id] ["field" field-id]
++                                 ["children" child-id] ["batch" batch-id] ["capture" capture-id]]]
++                (is (true? (marker-of conn id)) (str what ": the Query block is marked"))
++                (is (nil? (datom-v db (eid db (value-uuid conn id)) marker-ident))
++                    (str what ": its value block is not"))
++                (is (= [] (semantic/read-back-query-block db (eid db id) book-query true))
++                    (str what ": it reads back with the marker"))
++                (if (= headers stamped)
++                  (do (is (stamped? conn id) (str what ": the Query block is stamped"))
++                      (is (not (stamped? conn (value-uuid conn id))) (str what ": the value block is not")))
++                  (is (not (stamped? conn id)) (str what ": no stamp without the header"))))
++              (testing "the marker property: one, hidden, checkbox, cardinality one"
++                (is (= [marker-ident] (map :db/ident (marker-properties db))))
++                (is (= :checkbox (:logseq.property/type property)))
++                (is (true? (:logseq.property/hide? property)))
++                (is (= "claudeQueryBlock" (:block/title property)))
++                (is (not= :db.cardinality/many (:db/cardinality property))))
++              (is (nil? (marker-of conn a)) "a plain block is never marked")
++              (when (= headers stamped)
++                (doseq [block (activity-blocks db)]
++                  (is (nil? (datom-v db block marker-ident)) "the Activity page's blocks are never marked"))))))
++        (p/catch #(is false (str "unexpected error: " % (some-> % .-stack))))
++        (p/finally done))))
++
++(defn- marker-conflict [property-title ident]
++  (str "query blocks: property " property-title " (" ident ") is in the way of claudeQueryBlock; rename it in the app"))
++
++;; Before the fix (Stage 3 tree) each insert stored the Query block and answered 201:
++;;   (filled in from the run)
++(deftest marker-conflict-test
++  (async done
++    (-> (p/doseq [[label setup expected]
++                  [["the ident held as a text property"
++                    #(outliner-property/upsert-property! % marker-ident {:logseq.property/type :default}
++                                                         {:property-name "claudeQueryBlock"})
++                    (marker-conflict "claudeQueryBlock" "user.property/claude-queryBlock")]
++                   ["the ident held as a node property"
++                    #(outliner-property/upsert-property! % marker-ident {:logseq.property/type :node}
++                                                         {:property-name "claudeQueryBlock"})
++                    (marker-conflict "claudeQueryBlock" "user.property/claude-queryBlock")]
++                   ["another checkbox property titled claudeQueryBlock"
++                    #(outliner-property/upsert-property! % :user.property/zq-decoy {:logseq.property/type :checkbox}
++                                                         {:property-name "claudeQueryBlock"})
++                    (marker-conflict "claudeQueryBlock" "user.property/zq-decoy")]
++                   ["a text property titled ClaudeQueryBlock, another case"
++                    #(outliner-property/upsert-property! % :user.property/zq-decoy2 {:logseq.property/type :default}
++                                                         {:property-name "ClaudeQueryBlock"})
++                    (marker-conflict "ClaudeQueryBlock" "user.property/zq-decoy2")]]]
++          (p/let [{:keys [conn self notes a]} (fresh-graph)
++                  _ (setup conn)
++                  before (snapshot conn)
++                  fence (tree! self notes [{:title book-fence}])
++                  field (children! self a [{:title "zq F" :query book-query}])
++                  batch (batch! self [{:page "Notes" :blocks [{:title "zq ok"}]}
++                                      {:page "Notes" :blocks [{:title "zq B" :query book-query}]}])
++                  dry (tree! self notes [{:title "zq D" :query book-query}] :extra {:dry-run true})
++                  stamped-call (request! self "POST" "/semantic/block-trees"
++                                         {:target-id (str notes) :blocks [{:title book-fence}]} :headers stamped)]
++            (testing label
++              (doseq [[op response] [["fence" fence] ["field" field] ["batch" batch] ["dry run" dry]
++                                     ["stamps on" stamped-call]]]
++                (is (= 409 (:status response)) (str op ": " (pr-str (:body response))))
++                (is (= expected (get-in response [:body :error])) op))
++              (is (= before (snapshot conn)) "nothing stored")
++              (is (empty? (d/datoms @conn :avet :logseq.property/query)) "no Query block"))))
++        (p/then (fn []
++                  (testing "what already works and the check could catch"
++                    (p/let [{:keys [conn self notes]} (fresh-graph)
++                            _ (d/transact! conn [(raw-page (random-uuid) "claudeQueryBlock")])
++                            _ (outliner-property/upsert-property! conn marker-ident {:logseq.property/type :checkbox}
++                                                                  {:property-name "claudeQueryBlock"})
++                            id (random-uuid)
++                            page-ok (tree! self notes [{:uuid (str id) :title "zq P" :query book-query}])
++                            plain-ok (tree! self notes [{:title "zq plain"}])]
++                      (is (= 201 (:status page-ok)) (str "a page titled claudeQueryBlock is not in the way, and an"
++                                                         " unhidden checkbox at the ident is used as it is: "
++                                                         (pr-str (:body page-ok))))
++                      (is (true? (marker-of conn id)))
++                      (is (= 201 (:status plain-ok)) "an insert with no Query block is never checked")))))
++        (p/then (fn []
++                  (p/let [{:keys [conn self notes]} (fresh-graph)
++                          _ (outliner-property/upsert-property! conn marker-ident {:logseq.property/type :default}
++                                                                {:property-name "claudeQueryBlock"})
++                          plain (tree! self notes [{:title "zq plain"}])]
++                    (is (= 201 (:status plain)) "a call that makes no Query block is not refused by a conflict"))))
++        (p/catch #(is false (str "unexpected error: " % (some-> % .-stack))))
++        (p/finally done))))
++
++;; Before the fix (Stage 3 tree) every write stored the marker and answered 200 or 201:
++;;   (filled in from the run)
++(deftest marker-refused-on-property-paths-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes a]}]
++        (p/let [qb (query-block! self notes "zq Books")
++                ;; The insert made the marker property; made here too if it didn't, so the paths are
++                ;; judged on writing it, not on finding it.
++                _ (when-not (d/entity @conn marker-ident)
++                    (outliner-property/upsert-property! conn marker-ident {:logseq.property/type :checkbox}
++                                                        {:property-name "claudeQueryBlock"
++                                                         :properties {:logseq.property/hide? true}}))
++                book (tag! self "Book")
++                property (d/entity @conn marker-ident)
++                selectors ["user.property/claude-queryBlock" "claudeQueryBlock" (str (:block/uuid property))]]
++          (p/doseq [[selector value [target label]] (for [selector selectors
++                                                          value [true false]
++                                                          target [[a "a plain block"] [qb "a marked Query block"]]]
++                                                      [selector value target])]
++            (p/let [what (str selector " = " value " on " label)
++                    before (snapshot conn)
++                    single (put! self target selector value)
++                    batch (batch-set! self [[a "block/tags" book] [notes "block/tags" book] [target selector value]])
++                    reversed (batch-set! self [[target selector value] [notes "block/tags" book] [a "block/tags" book]])]
++              (refused-unchanged conn before single (str "entry 0: " marker-reason) (str what ": set"))
++              (refused-unchanged conn before batch (str "entry 2: " marker-reason) (str what ": batch entry 2"))
++              (refused-unchanged conn before reversed (str "entry 0: " marker-reason) (str what ": batch reversed"))))
++          (p/doseq [selector selectors]
++            (p/let [before (snapshot conn)
++                    node (tree! self notes [{:title "zq ok"} {:title "zq P" :properties {selector true}}])
++                    query-node (tree! self notes [{:title "zq Q" :query book-query :properties {selector true}}])
++                    child (children! self a [{:title "zq P" :properties {"Tags" ["Book"] selector true}}])
++                    entry (batch! self [{:page "Notes" :blocks [{:title "zq ok"}]}
++                                        {:page "Notes" :properties {selector true}}])
++                    entry-target (batch! self [{:target-id (str notes) :properties {selector false}
++                                                :blocks [{:title "zq ok"}]}])]
++              (refused-unchanged conn before node (str "blocks[1]: " marker-reason) (str selector ": node properties"))
++              (refused-unchanged conn before query-node (str "blocks[0]: " marker-reason) (str selector ": a Query node's properties"))
++              (refused-unchanged conn before child (str "blocks[0]: " marker-reason) (str selector ": child properties"))
++              (refused-unchanged conn before entry (str "entries[1]: " marker-reason) (str selector ": batch entry page properties"))
++              (refused-unchanged conn before entry-target (str "entries[0]: " marker-reason)
++                                 (str selector ": batch entry target properties"))))
++          (testing "what already works beside it"
++            (p/let [done-prop (request! self "POST" "/semantic/properties" {:title "zqDone" :type "checkbox"})
++                    other (put! self qb "zqDone" true)
++                    reset (batch-set! self [[qb "block/tags" book]] :reset? true)]
++              (is (= 201 (:status done-prop)) (pr-str (:body done-prop)))
++              (ok-200 other "another checkbox on the Query block")
++              (ok-200 reset "a Tags reset on the Query block")
++              (is (true? (marker-of conn qb)) "the marker stays through both")
++              (is (= (dissoc (query-block "zq Books" book-query) :tags) (dissoc (held conn qb) :tags)))
++              (p/let [deleted (delete-property! self qb "claudeQueryBlock")]
++                (ok-200 deleted "deleting the marker is allowed: the block becomes not Claude's")
++                (is (not (true? (marker-of conn qb))))))))))))
++
++(defn- guard-reason [id] (str "block " id ": update_block changes only Query blocks Claude created"))
++(defn- cant-tell-reason [id] (str "block " id ": can't tell whether Claude created this Query block, so it isn't changed"))
++
++(defn- refused-409
++  [conn before response error label]
++  (is (= 409 (:status response)) (str label ": " (pr-str (:body response))))
++  (is (= error (get-in response [:body :error])) label)
++  (is (= before (snapshot conn)) (str label ": nothing written")))
++
++(def ^:private page-ref-text "{:query [:find ?b :where [?b :block/title] (page-ref ?b ?p)]}")
++
++;; Before the fix (Stage 3 tree), the repro's third 200: update_block stored a rule call:
++;;   (filled in from the run)
++(deftest update-own-query-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes]}]
++        (p/let [qb (query-block! self notes "zq Books")
++                fence-id (random-uuid)
++                fence (tree! self notes [{:uuid (str fence-id) :title book-fence}])
++                _ (is (= 201 (:status fence)))
++                vb (value-uuid conn qb)
++                long-text (padded 4001)]
++          (p/doseq [[label text] [["a rule call" page-ref-text] ["rules" rules-text]
++                                  ["a task rule" rule-call-text]
++                                  [":view" "{:query [:find ?b :where [?b :block/title]] :view (fn [r] r)}"]
++                                  ["a simple query" "(task todo)"] ["map-form :query" "{:query {:find [?b]}}"]
++                                  ["4,001 characters" long-text]]]
++            (p/let [before (snapshot conn)
++                    response (update! self vb {:title text})]
++              (refused-unchanged conn before response (str "title: " (:error (datalog/check-query-block text))) label)
++              (is (string/starts-with? (str (get-in response [:body :error])) "title: query: ") label)))
++          (p/let [before (snapshot conn)
++                  rule (update! self vb {:title page-ref-text})]
++            (is (string/starts-with? (str (get-in rule [:body :error])) "title: query: where 2: (page-ref …) calls a rule; ")
++                (pr-str (:body rule)))
++            (is (= before (snapshot conn))))
++          (p/doseq [[label body] [["display-type code" {:title other-query :display-type "code"}]
++                                  ["display-type quote" {:title other-query :display-type "quote"}]
++                                  ["lang clojure" {:title other-query :lang "clojure"}]
++                                  ["lang sql" {:title other-query :lang "sql"}]]]
++            (p/let [before (snapshot conn)
++                    response (update! self vb body)]
++              (refused-unchanged conn before response "title: query: a Query block takes no display-type or lang" label)))
++          (p/let [valid (update! self vb {:title other-query})
++                  _ (ok-200 valid "a valid map")
++                  _ (is (= (query-block "zq Books" other-query) (held conn qb)) "stored verbatim, :code and clojure kept")
++                  _ (is (true? (marker-of conn qb)) "still marked")
++                  again (update! self vb {:title other-query})
++                  _ (ok-200 again "the same text again")
++                  every-key (update! self vb {:title (str "{:query [:find ?b :where [?b :block/title]] :inputs []"
++                                                          " :title \"t\" :collapsed? true :group-by-page? false"
++                                                          " :remove-block-children? true :breadcrumb-show? false}")})
++                  _ (ok-200 every-key "every allowed key")
++                  caption (update! self qb {:title "zq Books renamed"})
++                  _ (ok-200 caption "the caption")
++                  _ (is (= "zq Books renamed" (:title (held conn qb))))
++                  rule-caption (update! self qb {:title "zq (page-ref ?b ?p)"})
++                  _ (ok-200 rule-caption "a caption is not a query, so it is not checked")
++                  fenced (update! self qb {:title book-fence})
++                  _ (ok-200 fenced "a fence in the caption")
++                  _ (is (= [{:path "title" :reason update-reason}] (get-in fenced [:body :kept])))
++                  _ (is (= book-fence (:title (held conn qb))) "the fence stays text")
++                  _ (is (= #{:logseq.class/Query} (:tags (held conn qb))) "still a Query block")
++                  fence-vb (value-uuid conn fence-id)
++                  fence-valid (update! self fence-vb {:title other-query})
++                  _ (ok-200 fence-valid "a fence-made Query block's value block")
++                  fence-caption (update! self fence-id {:title "zq now captioned"})]
++            (ok-200 fence-caption "a fence-made Query block's caption")
++            (is (= (query-block "zq now captioned" other-query) (held conn fence-id)))))))))
++
++(defn- app-query-block!
++  "A Query block made as the app's advanced-query command makes it, with the outliner directly, not
++  through the API: a block tagged Query whose query value block holds `text`, shown as Clojure code
++  when `code?`. Unmarked. Returns its uuid."
++  [conn notes text code? order]
++  (let [id (random-uuid)]
++    (d/transact! conn [{:block/uuid id :block/title "zq Owner" :block/order order
++                        :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                        :block/created-at 1 :block/updated-at 1}])
++    (let [e (eid @conn id)]
++      (outliner-property/set-block-property! conn e :block/tags :logseq.class/Query)
++      (outliner-property/set-block-property! conn e :logseq.property/query text)
++      (when code?
++        (let [v (datom-v @conn e :logseq.property/query)]
++          (outliner-property/set-block-property! conn v :logseq.property.node/display-type :code)
++          (outliner-property/set-block-property! conn v :logseq.property.code/lang "clojure"))))
++    id))
++
++;; Before the fix (Stage 3 tree) update_block changed the owner's Query blocks:
++;;   (filled in from the run)
++(deftest update-owner-query-block-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes a]}]
++        (p/let [;; A stamped write makes the Activity page, and one Claude Query block makes the marker property.
++                _ (request! self "PATCH" (str "/semantic/blocks/" a) {:title "zq A edited"} :headers stamped)
++                _ (query-block! self notes "zq Mine")
++                advanced (app-query-block! conn notes book-query true "a1")
++                simple (app-query-block! conn notes "(task todo)" false "a2")
++                activity (map #(:block/uuid (d/entity @conn %)) (activity-blocks @conn))]
++          (p/doseq [[label qb] (concat [["an app-made advanced Query block" advanced]
++                                        ["an app-made simple Query block" simple]]
++                                       (map (fn [id] ["an Activity page block" id]) activity))]
++            (p/let [vb (value-uuid conn qb)
++                    before (snapshot conn)
++                    held-before (held conn qb)
++                    value-valid (update! self vb {:title other-query})
++                    value-typed (update! self vb {:title other-query :display-type "code"})
++                    value-rule (update! self vb {:title page-ref-text})
++                    caption (update! self qb {:title "zq caption"})
++                    caption-stamped (request! self "PATCH" (str "/semantic/blocks/" qb) {:title "zq caption"}
++                                              :headers stamped)]
++              (refused-409 conn before value-valid (guard-reason vb) (str label ": value block, valid text"))
++              (refused-409 conn before value-typed (guard-reason vb) (str label ": value block, display-type"))
++              (refused-409 conn before value-rule (guard-reason vb) (str label ": value block, a rule call"))
++              (refused-409 conn before caption (guard-reason qb) (str label ": caption"))
++              (refused-409 conn before caption-stamped (guard-reason qb) (str label ": caption, stamps on"))
++              (is (= held-before (held conn qb)) (str label ": unchanged"))))
++          (testing "the Activity page's pinned text is unchanged"
++            (is (= [(activity-text :-1d-ms) (activity-text :-7d-ms)]
++                   (map #(-> (held conn %) :values first :text) activity)))))))))
++
++;; Before the fix (Stage 3 tree) each case answered 200:
++;;   (filled in from the run)
++(deftest update-cant-tell-test
++  (async done
++    (-> (p/doseq [[label setup reason-of target-of]
++                  [["the marker removed with delete_block_property"
++                    (fn [{:keys [self qb]}]
++                      (p/let [r (delete-property! self qb "claudeQueryBlock")] (ok-200 r "delete the marker")))
++                    guard-reason :both]
++                   ["the marker set false underneath"
++                    (fn [{:keys [conn qb]}] (d/transact! conn [[:db/add (eid @conn qb) marker-ident false]]))
++                    guard-reason :both]
++                   ["the marker property deleted with delete_property"
++                    (fn [{:keys [self conn]}]
++                      (p/let [r (request! self "DELETE" (str "/semantic/properties/"
++                                                             (js/encodeURIComponent "user.property/claude-queryBlock")) nil)]
++                        (when (= 200 (:status r))
++                          (is (nil? (d/entity @conn marker-ident)) "the property is gone"))
++                        ;; If the property tool refuses it, retract it underneath.
++                        (when (d/entity @conn marker-ident)
++                          (d/transact! conn [[:db/retractEntity marker-ident]]))))
++                    cant-tell-reason :both]
++                   ["the marker ident turned into a text property"
++                    (fn [{:keys [conn]}]
++                      (d/transact! conn [[:db/add (:db/id (d/entity @conn marker-ident)) :logseq.property/type :default]]))
++                    cant-tell-reason :both]
++                   ["a value block with two holders"
++                    (fn [{:keys [conn notes qb]}]
++                      (let [other (random-uuid)]
++                        (d/transact! conn [{:block/uuid other :block/title "zq Other" :block/order "a9"
++                                            :block/page [:block/uuid notes] :block/parent [:block/uuid notes]
++                                            :block/created-at 1 :block/updated-at 1
++                                            marker-ident true}])
++                        (d/transact! conn [[:db/add (eid @conn other) :logseq.property/query
++                                            (datom-v @conn (eid @conn qb) :logseq.property/query)]])))
++                    cant-tell-reason :value]
++                   ["a value block with no holder"
++                    (fn [{:keys [conn qb]}]
++                      (let [e (eid @conn qb)]
++                        (d/transact! conn [[:db/retract e :logseq.property/query (datom-v @conn e :logseq.property/query)]])))
++                    cant-tell-reason :value]]]
++          (p/let [{:keys [conn self notes] :as graph} (fresh-graph)
++                  qb (query-block! self notes "zq Books")
++                  vb (value-uuid conn qb)
++                  ;; Marked as the insert marks it, so each case starts from a block Claude may change.
++                  _ (when-not (d/entity @conn marker-ident)
++                      (outliner-property/upsert-property! conn marker-ident {:logseq.property/type :checkbox}
++                                                          {:property-name "claudeQueryBlock"
++                                                           :properties {:logseq.property/hide? true}})
++                      (d/transact! conn [[:db/add (eid @conn qb) marker-ident true]]))
++                  _ (setup (assoc graph :qb qb))
++                  before (snapshot conn)
++                  value (update! self vb {:title other-query})
++                  _ (testing label (refused-409 conn before value (reason-of vb) "value block"))
++                  caption (update! self qb {:title "zq caption"})]
++            (testing label
++              (if (= :both target-of)
++                (refused-409 conn before caption (reason-of qb) "caption")
++                ;; The Query block itself still holds the marker, so its caption may change.
++                (ok-200 caption "caption of the marked holder")))))
++        (p/catch #(is false (str "unexpected error: " % (some-> % .-stack))))
++        (p/finally done))))
++
++;; The read-back is wired to update_block on a Claude-made value block: when it finds a gap, the call
++;; answers 500 naming the title and the transaction is rolled back. A correct write always reads
++;; back, so the read-back is replaced, after the insert, by one that reports a gap.
++;; Found by the mutation step (dropping the read-back left every other test green); before the fix
++;; nothing read the update back:
++;;   expected: (= 500 (:status response))  actual: (not (= 500 200))
++(deftest update-query-read-back-failure-rolls-back-test
++  (async done
++    (let [real semantic/read-back-query-block]
++      (with-graph (fn [] (set! semantic/read-back-query-block real) (done))
++        (fn [{:keys [conn self notes]}]
++          (p/let [qb (query-block! self notes "zq Books")
++                  vb (value-uuid conn qb)
++                  _ (set! semantic/read-back-query-block (fn [& _] ["the query text is not what was given"]))
++                  before (snapshot conn)
++                  response (update! self vb {:title other-query})
++                  _ (set! semantic/read-back-query-block real)
++                  _ (is (= 500 (:status response)) (pr-str (:body response)))
++                  _ (is (= "the write did not store what was asked: title: the query text is not what was given"
++                           (get-in response [:body :error])))
++                  _ (is (= before (snapshot conn)) "rolled back")
++                  _ (is (= (query-block "zq Books" book-query) (held conn qb)))
++                  _ (set! semantic/read-back-query-block (fn [& _] ["the query text is not what was given"]))
++                  caption (update! self qb {:title "zq caption"})]
++            (set! semantic/read-back-query-block real)
++            (ok-200 caption "a caption update doesn't read the query back")))))))
++
++;; The class sweep: every other kind of block update_block reaches is not a Query block, so the guard
++;; leaves it alone: a plain block, a page, a tag, a property, and the value blocks of a text, number
++;; and URL property and a choice. A pin; each answers as it did before the guard.
++(deftest update-other-blocks-unguarded-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self notes a]}]
++        (p/let [_ (query-block! self notes "zq Mine")
++                props (p/all (map (fn [[title type extra]]
++                                    (p/let [r (request! self "POST" "/semantic/properties" (merge {:title title :type type} extra))]
++                                      (is (= 201 (:status r)) (pr-str (:body r)))
++                                      (keyword "user.property" (last (string/split (get-in r [:body :ident]) #"/")))))
++                                  [["zqText" "default"] ["zqNum" "number"] ["zqLink" "url"]
++                                   ["zqMood" "default" {:choices [{:title "zq calm"} {:title "zq busy"}]}]]))
++                [text-ident num-ident link-ident mood-ident] props
++                b-id (random-uuid)
++                _ (tree! self notes [{:uuid (str b-id) :title "zq B"
++                                      :properties {"zqText" "zq x" "zqNum" 3 "zqLink" "https://example.com/a"
++                                                   "zqMood" "zq calm"}}])
++                tag-id (tag! self "zqTag")
++                value-of (fn [ident] (:block/uuid (d/entity @conn (datom-v @conn (eid @conn b-id) ident))))
++                cases [["a plain block" a "zq A2" 200]
++                       ["a page" notes "Notes2" 200]
++                       ["a tag" tag-id "zqTag2" 200]
++                       ["a text value block" (value-of text-ident) "zq y" 200]
++                       ["a number value block" (value-of num-ident) "4" 200]
++                       ["a URL value block" (value-of link-ident) "https://example.com/b" 200]
++                       ["a choice" (value-of mood-ident) "zq quiet" 200]]]
++          (p/doseq [[label id title status] cases]
++            (p/let [response (update! self id {:title title})]
++              (is (= status (:status response)) (str label ": " (pr-str (:body response))))
++              (is (not (string/includes? (str (get-in response [:body :error])) "Query")) label))))))))
++
++;; The upload path: a graph uploaded from the app stores some attributes with the app's schema. The
++;; guard reads the marker and the holder from datoms, so it works there too.
++(deftest update-guard-upload-path-test
++  (async done
++    (#'uploaded/with-uploaded
++     done
++     (fn [{:keys [conn self]}]
++       (p/let [[page-id] (#'uploaded/notes-page! self)
++               id (random-uuid)
++               response (request! self "POST" "/semantic/block-trees"
++                                  {:target-id page-id :blocks [{:uuid (str id) :title "zq U" :query book-query}]})
++               vb (value-uuid conn id)
++               rule (update! self vb {:title page-ref-text})
++               valid (update! self vb {:title other-query})]
++         (is (= 201 (:status response)) (pr-str (:body response)))
++         (is (true? (marker-of conn id)))
++         (is (= 400 (:status rule)) (pr-str (:body rule)))
++         (is (= 200 (:status valid)) (pr-str (:body valid)))
++         (is (= (query-block "zq U" other-query) (held conn id))))))))
++
++;; The contract: updateBlock's description names the guard and the check, and the insert tools
++;; mention the hidden marker.
++;; Before the fix (Stage 3 tree):
++;;   (filled in from the run)
++(deftest openapi-update-guard-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        description (fn [path method] (get-in document [:paths path method :description]))
++        update-text (description "/api/v1/graphs/{graph-id}/blocks/{block-id}" :patch)]
++    (doseq [phrase ["only on the Query blocks Claude created" "checked as datalog_query checks a query"
++                    "title: query:" "takes no display-type or lang" "409"]]
++      (is (string/includes? update-text phrase) phrase))
++    (doseq [path ["/api/v1/graphs/{graph-id}/block-trees" "/api/v1/graphs/{graph-id}/blocks/{block-id}/children"
++                  "/api/v1/graphs/{graph-id}/block-trees/batch" "/api/v1/graphs/{graph-id}/capture"]]
++      (is (string/includes? (description path :post) "hidden claudeQueryBlock") path))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index 1a146f3..90c1ced 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs

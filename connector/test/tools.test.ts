@@ -2642,6 +2642,11 @@ describe("code, math and quote blocks", () => {
     ["refusals name the node", "refuse the whole call naming the node (blocks[0]: query: …)"],
     ["a simple query stays text", "A simple query stays text"],
     ["update_block makes none", "update_block never makes a Query block"],
+    ["update_block changes only Claude's Query blocks", "update_block changes only the Query blocks Claude made"],
+    ["the new query is checked on update", "only with a new text that passes the same check (title: query: …)"],
+    ["no display-type or lang on a query", "with no display-type or lang"],
+    ["the owner's Query blocks are refused", "the owner's own Query blocks, and any it can't tell, are refused with 409 naming the block"],
+    ["the hidden marker", "hidden claudeQueryBlock property, which the property tools refuse"],
     ["it runs in the app", "runs in the owner's app, not on the server"],
     ["no server caps or Private filter", "without datalog_query's caps or its Private filter"],
     ["kept", "listed under kept"],
@@ -2673,6 +2678,7 @@ describe("code, math and quote blocks", () => {
       expect(description, name).not.toContain("a Query block is not supported yet");
     }
     expect(tools.find((t) => t.name === "update_block").description).toContain("updateBlock doesn't make Query blocks");
+    expect(tools.find((t) => t.name === "update_block").description).toContain("only on the Query blocks Claude created");
   });
 
   // Patch 0050 stage 3: the property paths can't store a query or the Query tag, or strand one.
