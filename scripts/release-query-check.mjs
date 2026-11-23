@@ -28,8 +28,8 @@
 // it then makes a tag that lists an expected property, two blocks tagged with it (one holding the
 // property) and a block linking a uuid nothing has, and sends one call to each read through
 // SyncDO.fetch: checks=broken-refs,missing-tag-properties with tag-properties, the default health
-// call with the pair stored in the Worker's HEALTH_TAG_PROPERTIES secret (the SyncDO gets the env
-// insightEnv gives, with TIMEZONE UTC), list_changes_since from an ISO local time (the Intl zone
+// call (its four checks), checks=missing-tag-properties with the pair stored in the Worker's
+// HEALTH_TAG_PROPERTIES secret (the SyncDO gets the env insightEnv gives, with TIMEZONE UTC), list_changes_since from an ISO local time (the Intl zone
 // code) and get_graph_schema with both sections. Each check reads the counts and items back.
 //
 // It then seeds a graph at scale (scaleFixture, about 20,000 blocks) through SyncDO.fetch, in
@@ -357,7 +357,7 @@ function queryBlockChecks(ctx) {
 /** The insights fixture: a tag listing an expected property, and the page its blocks are on. */
 export const INSIGHT = { tag: "Release Insight Book", property: "release-insight-author", page: "Release Insight Page" };
 
-/** getGraphHealth's checks, in the order the handler runs them by default. */
+/** getGraphHealth's checks, in the handler's order. */
 export const HEALTH_CHECKS = [
   "orphan-tags",
   "orphan-properties",
@@ -369,6 +369,9 @@ export const HEALTH_CHECKS = [
   "broken-refs",
   "missing-tag-properties",
 ];
+
+/** The checks a getGraphHealth call without checks runs; the other five run only when named. */
+export const DEFAULT_HEALTH_CHECKS = ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"];
 
 /** The Worker variables render-wrangler.mjs would set: the stored pair and a zone for the feed. */
 export function insightEnv() {
@@ -528,10 +531,18 @@ function insightChecks(ctx) {
       },
     ],
     [
-      "graph insights: the default health call runs every check, with the stored HEALTH_TAG_PROPERTIES pairs",
+      "graph insights: the default health call runs the four cheap checks",
       async () => {
         const ins = seeded();
-        fail(healthInsightErrors(await read("/semantic/health?limit=200"), ins, { from: "settings", checks: HEALTH_CHECKS }));
+        fail(healthInsightErrors(await read("/semantic/health?limit=200"), ins, { from: "settings", checks: DEFAULT_HEALTH_CHECKS }));
+      },
+    ],
+    [
+      "graph insights: missing-tag-properties named alone checks the stored HEALTH_TAG_PROPERTIES pairs",
+      async () => {
+        const ins = seeded();
+        const body = await read("/semantic/health?checks=missing-tag-properties&limit=200");
+        fail(healthInsightErrors(body, ins, { from: "settings", checks: ["missing-tag-properties"] }));
       },
     ],
     [

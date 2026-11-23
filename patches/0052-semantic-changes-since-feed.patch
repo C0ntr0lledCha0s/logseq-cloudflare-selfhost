@@ -63,10 +63,10 @@ index f98b81a..61f8d81 100644
  (def ^:private join-limit
    "The join cap while run-query's d/q runs, else nil: join-tuples counts only then."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 85edf44..9b1c707 100644
+index 381291f..0414f60 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5945,6 +5945,232 @@
+@@ -5954,6 +5954,234 @@
            (http/json-response nil (assoc feed :epoch epoch :t t))
            (http/error-response "changes since that point are no longer available; list again without since" 410))))))
  
@@ -77,8 +77,10 @@ index 85edf44..9b1c707 100644
 +;; under its page, and a page's own change marks the page page-changed. A property value block counts
 +;; as its owner. Private, hidden and built-in entities are left out.
 +(def ^:private max-changes
-+  "The most :block/updated-at datoms one window may hold; a larger window answers 422."
-+  20000)
++  "The most :block/updated-at datoms one window may hold; a larger window answers 422. 2,500 keep a
++  call under 1 s of Durable Object CPU at 5,000 pages (scripts/bench-graph-insights.mjs, x1.65 for
++  Cloudflare); 20,000 cost 2.3 to 5.4 s."
++  2500)
 +(def ^:private default-blocks-per-page 10)
 +(def ^:private max-blocks-per-page 50)
 +(def ^:private max-time-ms
@@ -299,7 +301,7 @@ index 85edf44..9b1c707 100644
  ;; Page favourites (patch 0038). The sidebar's Favorites list is the hidden page $$$favorites, whose
  ;; children each link one favourite with :block/link (ldb/build-favorite-tx); sibling order is the
  ;; list's order. The app's db worker reads and writes it, and deps/db-sync has no copy of that code,
-@@ -6334,6 +6560,7 @@
+@@ -6343,6 +6571,7 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -308,7 +310,7 @@ index 85edf44..9b1c707 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index eb0f05f..712fe76 100644
+index 733a9a4..ec88eaf 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,8 @@
@@ -325,7 +327,7 @@ index eb0f05f..712fe76 100644
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "listChangesSince" ["List what changed since a time"
-+                       "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
++                       "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 2,500 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
     "datalogQuery" ["Run a read-only Datalog query"
                     (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
                          " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
@@ -360,7 +362,7 @@ index eb0f05f..712fe76 100644
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
 +           "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
-+                               "422" {:description "More than 20,000 changes in the window; pass a later since or an until"}
++                               "422" {:description "More than 2,500 changes in the window; pass a later since or an until"}
 +                               "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
             "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
                              "404" {:description "No named query has that name; the error lists the names"}
@@ -398,10 +400,10 @@ index eb0f05f..712fe76 100644
                                        :properties {:epoch {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
 new file mode 100644
-index 0000000..8321dad
+index 0000000..7e1f167
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,770 @@
 +(ns logseq.db-sync.semantic-changes-since-test
 +  "listChangesSince (patch 0052): GET /semantic/changes lists the pages changed in a window
 +  (since, until], newest first, read from the :block/updated-at index. Each page carries
@@ -892,12 +894,14 @@ index 0000000..8321dad
 +                  _ (set! d/index-range index-range)
 +                  narrowed (changes self "since=5000&until=100000")
 +                  after (snapshot conn)]
-+            (is (= 20000 cap))
++            ;; Review s-stage-6-2: 20,000 changes cost 2.3 to 5.4 s of Durable Object CPU (x1.65); 2,500
++            ;; keep a call under 1 s at 5,000 pages (scripts/bench-graph-insights.mjs).
++            (is (= 2500 cap))
 +            (is (= 200 (:status at-cap)) (str "exactly " cap " changes answer: " (pr-str (:body at-cap))))
 +            (is (= [] (get-in at-cap [:body :pages])))
-+            (is (= {:status 422 :body {:error "too many changes in that window (more than 20,000); pass a later since or an until"}}
++            (is (= {:status 422 :body {:error "too many changes in that window (more than 2,500); pass a later since or an until"}}
 +                   over)
-+                "20,001 changes")
++                "2,501 changes")
 +            (is (= 422 (:status far-over)))
 +            (is (<= @realised (inc cap)) (str "realised " @realised " datoms; the take stops at the cap plus one"))
 +            (is (= 422 (:status narrowed)) "a later since still holds more than the cap")

@@ -1,7 +1,7 @@
 // Bench for the three graph-insight reads at their caps (spec 2026-11-20 §5, plan 2026-11-22 Stage 6):
-// getGraphHealth (the default call with three stored tag-property pairs, and broken-refs and
-// missing-tag-properties alone), listChangesSince over a window of 20,000 changes (the cap) with
-// limit=200 and blocks-per-page=50, and getGraphSchema with both sections at limit=200.
+// getGraphHealth (the default call, with three stored tag-property pairs, and each of its nine checks
+// named alone), listChangesSince over a window of 2,500 changes (the cap) with limit=200 and
+// blocks-per-page=50, and getGraphSchema with both sections at limit=200.
 //
 // Each read runs in the sync Worker's graph Durable Object, where the clock does not move during
 // synchronous CPU work, so nothing stops a slow read but the Free plan's CPU limit. The times are
@@ -16,7 +16,7 @@
 // makes a new SyncDO over that file: its first fetch opens the conn and loads B-tree nodes lazily, as
 // the Durable Object does after a wake (cold); warm runs reuse that SyncDO.
 //
-//   node scripts/bench-graph-insights.mjs [--pages 5000,20000] [--changes 20000] [--runs 5]
+//   node scripts/bench-graph-insights.mjs [--pages 5000,20000] [--changes 2500] [--runs 5]
 //                                         [--upstream .upstream] [--json]
 //
 // The fixture: one page in ten a Bench Project (with an owner and a stage half the time each), one in
@@ -45,7 +45,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export const DEFAULT_PAGES = [5_000, 20_000];
 /** listChangesSince's max-changes: the most updated-at stamps one window may hold. */
-export const DEFAULT_CHANGES = 20_000;
+export const DEFAULT_CHANGES = 2_500;
 export const DEFAULT_RUNS = 5;
 /** Node on a developer machine to a Durable Object on Cloudflare (durable-object-cpu-limit-on-free.md). */
 export const CF_FACTOR = 1.65;
@@ -54,8 +54,6 @@ export const OVER_MS = 1_000;
 /** The feed's page limit and blocks per page, and the schema's limit: each read's maximum. */
 const LIMIT = 200;
 const BLOCKS_PER_PAGE = 50;
-
-export const SHAPES = ["health-default", "broken-refs", "missing-tag-properties", "changes", "schema"];
 
 /** getGraphHealth's checks, in the handler's order. */
 export const HEALTH_CHECKS = [
@@ -69,6 +67,12 @@ export const HEALTH_CHECKS = [
   "broken-refs",
   "missing-tag-properties",
 ];
+
+/** The checks a getGraphHealth call without checks runs (the handler's default-health-checks). */
+export const DEFAULT_HEALTH_CHECKS = ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"];
+
+/** The default health call, then each health check named alone, then the feed and the schema. */
+export const SHAPES = ["health-default", ...HEALTH_CHECKS, "changes", "schema"];
 
 /** The user tags the fixture makes, by role, and the tags' own properties. */
 export const TAGS = {
@@ -211,22 +215,28 @@ function expectedCounts({ pages, window }, entities) {
   const first = sorted.slice(0, LIMIT).map(([, g]) => g);
   const sum = (k) => first.reduce((n, g) => n + g[k], 0);
 
+  const checkCounts = {
+    "orphan-tags": orphanTags,
+    "orphan-properties": orphanProperties,
+    "duplicate-titles": 0,
+    "pages-without-summary": summaryless,
+    "pages-without-tags": untagged,
+    "mismatched-choice-values": 0,
+    "orphan-choices": 0,
+    "broken-refs": broken,
+    "missing-tag-properties": missing,
+  };
+
   return {
-    "health-default": {
-      checks: {
-        "orphan-tags": orphanTags,
-        "orphan-properties": orphanProperties,
-        "duplicate-titles": 0,
-        "pages-without-summary": summaryless,
-        "pages-without-tags": untagged,
-        "mismatched-choice-values": 0,
-        "orphan-choices": 0,
-        "broken-refs": broken,
-        "missing-tag-properties": missing,
-      },
-    },
-    "broken-refs": { count: broken },
-    "missing-tag-properties": { count: missing, pairs: PAIRS.length, "pairs-from": "settings" },
+    "health-default": { checks: Object.fromEntries(DEFAULT_HEALTH_CHECKS.map((c) => [c, checkCounts[c]])) },
+    ...Object.fromEntries(
+      HEALTH_CHECKS.map((check) => [
+        check,
+        check === "missing-tag-properties"
+          ? { count: missing, pairs: PAIRS.length, "pairs-from": "settings" }
+          : { count: checkCounts[check] },
+      ]),
+    ),
     changes: {
       pages: first.length,
       created: sum("created"),
@@ -246,12 +256,10 @@ function expectedCounts({ pages, window }, entities) {
 
 /** The request each shape sends, against `window`. */
 export function shapePath(shape, window) {
+  if (HEALTH_CHECKS.includes(shape)) return `/semantic/health?checks=${shape}`;
   switch (shape) {
     case "health-default":
       return "/semantic/health";
-    case "broken-refs":
-    case "missing-tag-properties":
-      return `/semantic/health?checks=${shape}`;
     case "changes":
       return `/semantic/changes?since=${window.since}&until=${window.until}&limit=${LIMIT}&blocks-per-page=${BLOCKS_PER_PAGE}`;
     case "schema":
@@ -262,11 +270,10 @@ export function shapePath(shape, window) {
 
 /** The counts a shape's response gives, in the shape of the fixture's expected counts. */
 export function responseCounts(shape, body) {
+  if (HEALTH_CHECKS.includes(shape) && shape !== "missing-tag-properties") return { count: body.checks?.[shape]?.count };
   switch (shape) {
     case "health-default":
-      return { checks: Object.fromEntries(HEALTH_CHECKS.map((c) => [c, body.checks?.[c]?.count])) };
-    case "broken-refs":
-      return { count: body.checks?.["broken-refs"]?.count };
+      return { checks: Object.fromEntries(Object.keys(body.checks ?? {}).map((c) => [c, body.checks[c]?.count])) };
     case "missing-tag-properties": {
       const c = body.checks?.["missing-tag-properties"] ?? {};
       return { count: c.count, pairs: c.pairs?.length, "pairs-from": c["pairs-from"] };

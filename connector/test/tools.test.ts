@@ -2950,12 +2950,33 @@ describe("get_graph_health and missing tag properties", () => {
     ]) {
       expect(tool.description, phrase).toContain(phrase);
     }
-    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to all");
+    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to orphan-tags");
     const param = tool.inputSchema.properties["tag-properties"];
     expect(param?.type).toBe("string");
     expect(param.description).toContain("JSON array of 1 to 50 pairs");
   });
 });
+// Review s-stage-6-2: five checks each cost over 1 s of Durable Object CPU at 20,000 pages, so the
+// default call leaves them out and a call runs them only when it names them.
+describe("get_graph_health's default check set", () => {
+  it("connector_help names the default four and says the other five run only when named, one per call on a large graph", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks, and on a large graph name one of them per call.",
+    );
+  });
+
+  it("the vendored description and checks parameter name the default four and say the others run only when named", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description).toContain(
+      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks",
+    );
+    expect(tool.inputSchema.properties.checks.description).toContain(
+      "Defaults to orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; the others run only when named",
+    );
+  });
+});
+
 // Patch 0052: list_changes_since lists what changed in a window, grouped by page.
 describe("list_changes_since", () => {
   it("is offered read-only, under exactly that name", async () => {
@@ -2983,6 +3004,8 @@ describe("list_changes_since", () => {
       "of the connector's write tools, set_page_favorite",
       "Permanent deletes leave nothing to read",
       "Unavailable for E2EE graphs",
+      // Review s-stage-6-2: the change cap is 2,500, the most that keep a call under 1 s at 5,000 pages.
+      "A window of more than 2,500 changes is refused with 422",
     ]) {
       expect(tool.description, phrase).toContain(phrase);
     }

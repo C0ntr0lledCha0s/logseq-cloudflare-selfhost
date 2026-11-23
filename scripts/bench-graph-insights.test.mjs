@@ -21,7 +21,6 @@ const skip = !existsSync(bundle)
     ? ".upstream/deps/db-sync/worker/dist/worker-test.js missing: compile upstream's test build with scripts/upstream-test.sh .upstream (scripts/build.sh alone removes it)"
     : false;
 
-const SHAPES = ["health-default", "broken-refs", "missing-tag-properties", "changes", "schema"];
 const HEALTH_CHECKS = [
   "orphan-tags",
   "orphan-properties",
@@ -33,14 +32,18 @@ const HEALTH_CHECKS = [
   "broken-refs",
   "missing-tag-properties",
 ];
+const SHAPES = ["health-default", ...HEALTH_CHECKS, "changes", "schema"];
+// Review s-stage-6-2: the default call runs only the four checks that stay under 1 s at 20,000 pages.
+const DEFAULT_HEALTH_CHECKS = ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"];
 
 const runBench = (args) =>
   spawnSync(process.execPath, [script, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 
-test("the bench's caps are the spec's: 5,000 and 20,000 pages, 20,000 changes, and x1.65 for Cloudflare", async () => {
-  const { DEFAULT_PAGES, DEFAULT_CHANGES, CF_FACTOR, SHAPES: exported } = await import(script);
+test("the bench's caps are the handler's: 5,000 and 20,000 pages, 2,500 changes, and x1.65 for Cloudflare", async () => {
+  const { DEFAULT_PAGES, DEFAULT_CHANGES, CF_FACTOR, SHAPES: exported, DEFAULT_HEALTH_CHECKS: defaults } = await import(script);
   assert.deepEqual(DEFAULT_PAGES, [5_000, 20_000]);
-  assert.equal(DEFAULT_CHANGES, 20_000);
+  assert.equal(DEFAULT_CHANGES, 2_500);
+  assert.deepEqual(defaults, DEFAULT_HEALTH_CHECKS);
   assert.equal(CF_FACTOR, 1.65);
   assert.deepEqual(exported, SHAPES);
 });
@@ -81,10 +84,14 @@ test("every shape answers 200 with the counts the fixture expects, on a small se
     for (const k of ["cold_ms", "warm_ms", "cf_cold_ms", "cf_warm_ms"]) assert.equal(typeof r[k], "number", `${r.shape}: ${k}`);
   }
   const by = Object.fromEntries(out.records.map((r) => [r.shape, r]));
-  assert.deepEqual(Object.keys(by["health-default"].counts.checks), HEALTH_CHECKS, "the default call runs every check");
+  assert.deepEqual(Object.keys(by["health-default"].counts.checks), DEFAULT_HEALTH_CHECKS, "the default call runs the four cheap checks");
+  for (const check of HEALTH_CHECKS) {
+    const named = by[check].counts.count;
+    if (DEFAULT_HEALTH_CHECKS.includes(check)) assert.equal(by["health-default"].counts.checks[check], named, `${check} counts the same by default and named`);
+    else assert.equal(by["health-default"].counts.checks[check], undefined, `${check} runs only when named`);
+  }
   assert.equal(by["missing-tag-properties"].counts["pairs-from"], "settings", "the stored pairs, as deploy sets them");
   assert.equal(by["missing-tag-properties"].counts.pairs, 3);
-  assert.equal(by["health-default"].counts.checks["broken-refs"], by["broken-refs"].counts.count);
   assert.ok(by["broken-refs"].counts.count > 0);
 });
 

@@ -362,10 +362,12 @@ const goodHealth = (from, checks = ["broken-refs", "missing-tag-properties"]) =>
   return { checks: out };
 };
 
-test("the insights fixture's names, the nine health checks and the env deploy would give the Worker", async () => {
-  const { INSIGHT, HEALTH_CHECKS, insightEnv } = await import(script);
+test("the insights fixture's names, the nine health checks, the default four and the env deploy would give the Worker", async () => {
+  const { INSIGHT, HEALTH_CHECKS, DEFAULT_HEALTH_CHECKS, insightEnv } = await import(script);
   assert.deepEqual(INSIGHT, { tag: "Release Insight Book", property: "release-insight-author", page: "Release Insight Page" });
   assert.deepEqual(HEALTH_CHECKS, ALL_CHECKS);
+  // Review s-stage-6-2: a call without checks runs only these four.
+  assert.deepEqual(DEFAULT_HEALTH_CHECKS, ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"]);
   const env = insightEnv();
   assert.deepEqual(JSON.parse(env.HEALTH_TAG_PROPERTIES), [{ tag: "Release Insight Book", property: "release-insight-author" }]);
   assert.equal(env.TIMEZONE, "UTC");
@@ -518,7 +520,8 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "Query blocks: a :rules query and a rule call are refused naming the node, store nothing and log nothing",
     "graph insights: seed a tag with an expected property, two tagged blocks and a broken ref through SyncDO.fetch",
     "graph insights: checks=broken-refs,missing-tag-properties with tag-properties answers the broken ref and the bare book",
-    "graph insights: the default health call runs every check, with the stored HEALTH_TAG_PROPERTIES pairs",
+    "graph insights: the default health call runs the four cheap checks",
+    "graph insights: missing-tag-properties named alone checks the stored HEALTH_TAG_PROPERTIES pairs",
     "graph insights: list_changes_since from an ISO local time lists the page's three new blocks",
     "graph insights: get_graph_schema lists the tag with its property and objects, and the property with its value",
   ]) {

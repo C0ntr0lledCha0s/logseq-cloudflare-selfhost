@@ -315,7 +315,7 @@ Where the result differs from the design above (section 12 already overrode sect
 
 - **`since` and `until`** take epoch ms, an ISO date (local midnight in `TIMEZONE`) or an ISO datetime (with `Z` or an offset, or local time in `TIMEZONE`), per decision 5. A date that doesn't exist is refused by round trip. A local time in a daylight-saving gap moves on by the gap (02:30 becomes 03:30), and one that occurs twice takes the first. One `Intl.DateTimeFormat` is made per request, and only when a local form needs it. An invalid `TIMEZONE` answers 500 only then. The response adds `time-zone`. The window is open at `since`.
 - **The cursor** holds `[since until latest page-uuid]`, not `[until, last-key]`, so a cursor given with another `since` is also refused (`cursor belongs to another since`).
-- **The 422** reads `too many changes in that window (more than 20,000); pass a later since or an until`. The handler takes at most 20,001 datoms from the index and stops there, so it never names the exact count above the cap.
+- **The 422** reads `too many changes in that window (more than 2,500); pass a later since or an until`. The handler takes at most 2,501 datoms from the index and stops there, so it never names the exact count above the cap. The cap was 20,000 as designed and was lowered after the bench (below).
 - **`recycled`** reads the `deleted-at` datoms in the window from `:aevt` and subtracts the Private set alone (`private-ids` gained a `{:recycle-bin? false}` arity).
 - **Which blocks are left out.** A block is left out only when it or its owner is Private, binned, hidden or built-in. A page check as well dropped every block on the built-in Contents page, so it was removed.
 - **Late syncs.** `:block/updated-at` is set by the editing device and kept by sync, so an offline edit can arrive with a stamp before the last `until`. The tool text and `connector_help` tell callers to start at the last `until` less a margin (a day) and skip blocks already reported with the same `uuid` and `updated-at`.
@@ -327,21 +327,39 @@ Where the result differs from the design above (section 12 already overrode sect
 
 **Connector.** No hand-written tool code. `get_graph_schema` and `list_changes_since` are generated with read-only annotations and the first lines in `FIRST_LINES`. The first line of `get_graph_health` changed too. `tools-manifest.json` went from 57 to 59 tools.
 
-**Bench and the stop condition.** `scripts/bench-graph-insights.mjs` times each shape on the release bundle at 5,000 and 20,000 pages and at the 20,000-change cap, and `scripts/release-query-check.mjs` checks all five shapes on the bundle. Figures in ms, release bundle, Node 22, with the x1.65 Cloudflare factor applied (first call / warm median, ranges over three runs):
+**Bench and the stop condition.** `scripts/bench-graph-insights.mjs` times the default health call, each of the nine checks named alone, the feed and the schema export on the release bundle at 5,000 and 20,000 pages, and `scripts/release-query-check.mjs` checks the shapes on the bundle. The first bench, at the designed caps, put the default health call at 2,924 to 3,398 ms cold at 5,000 pages and 11,611 to 12,661 ms at 20,000, `broken-refs` alone at about 6.5 s and a 20,000-change feed at 4.2 to 5.4 s at 20,000 pages (x1.65), far above the estimates in section 5. Seven of ten figures went over the 1 s line; the schema export stayed under it. The stage stopped and the owner decided (review finding s-stage-6-2): make the default call run a cheaper set of checks and lower the feed's change cap, and don't index the title scan.
 
-| Shape | Pages | Cold | Warm |
-|---|---|---|---|
-| default health | 5,000 | 2,924 to 2,991 | 1,484 to 1,551 |
-| `broken-refs` | 5,000 | 1,275 to 1,418 | 480 to 522 |
-| `missing-tag-properties` | 5,000 | 595 to 646 | 201 to 223 |
-| `list_changes_since` (20,000 changes) | 5,000 | 2,392 to 2,395 | 976 to 1,004 |
-| `get_graph_schema` | 5,000 | 172 to 250 | 73 to 80 |
-| default health | 20,000 | 11,759 to 12,424 | 6,446 to 6,679 |
-| `broken-refs` | 20,000 | 5,756 to 6,150 | 2,197 to 2,317 |
-| `missing-tag-properties` | 20,000 | 2,281 to 2,453 | 776 to 791 |
-| `list_changes_since` (20,000 changes) | 20,000 | 4,187 to 4,581 | 1,438 to 1,604 |
-| `get_graph_schema` | 20,000 | 547 to 642 | 257 to 275 |
+**Default checks.** A call without `checks` runs `orphan-tags`, `orphan-properties`, `mismatched-choice-values` and `orphan-choices`. The other five run only when named. The bench measured each check alone before the change (ms, x1.65, cold / warm, two runs):
 
-These are far above the design's estimates in section 5 (under 300 ms for the default health call at 5,000 pages). Seven shapes pass one second, and only the schema export stays under it at both sizes. The plan's stop condition applies: no cap was changed, and the choice (lower the caps, run a cheaper default set of checks, or index the title scan, then bench again) is held for the owner. The README Backlog lists it (item 32). The per-call cost is otherwise as designed: 2 Worker requests, no D1 rows beyond the connector's auth lookup, none written, no neurons and no Vectorize.
+| Check alone | 5,000 pages | 20,000 pages |
+|---|---|---|
+| `orphan-tags` | 124 to 159 / 55 to 65 | 447 to 576 / 227 to 243 |
+| `orphan-properties` | 117 to 126 / 55 to 66 | 459 to 468 / 239 to 248 |
+| `mismatched-choice-values` | 129 to 141 / 63 to 65 | 500 to 527 / 268 to 271 |
+| `orphan-choices` | 109 to 166 / 58 to 65 | 493 to 525 / 263 to 270 |
+| `duplicate-titles` | 321 to 348 / 144 to 162 | 1,403 to 1,505 / 649 to 653 |
+| `pages-without-tags` | 572 to 637 / 328 to 348 | 2,382 to 2,524 / 1,394 to 1,474 |
+| `pages-without-summary` | 1,462 to 1,588 / 513 to 557 | 5,916 to 6,151 / 2,231 to 2,424 |
+| `broken-refs` | 1,380 to 1,501 / 533 to 586 | 6,458 to 6,649 / 2,274 to 2,399 |
+| `missing-tag-properties` | 582 to 658 / 204 to 276 | 2,963 to 2,978 / 835 to 849 |
 
-**Still to do once deployed** (section 9 items 2, 3 and 5): the owner's run of `get_graph_health` with `checks=broken-refs,missing-tag-properties` on their graph, their comparison of `list_changes_since` for a week against what they remember editing (including a move and a property change), and the measured Durable Object CPU of a default health call from Workers analytics.
+The line is 1 s cold at 20,000 pages, the largest graph the bench and `kb_index` support. Every check costs about 450 ms cold there on its own, most of it the shared private set and the first read of a woken graph, so only the four cheapest fit together: those four in one call measured 634 to 713 ms cold, and adding `duplicate-titles` 1,383 to 1,620 ms. So the three pre-existing checks `duplicate-titles`, `pages-without-summary` and `pages-without-tags` left the default with the two new ones; each goes over the line alone at 20,000 pages. No check has a page cap to lower (none existed), so the five opt-in checks still go over the line alone at 20,000 pages, and `pages-without-summary` and `broken-refs` go over it at 5,000 too; the tool text says to name one per call on a large graph. A cap that refuses them on large graphs, or an index, is the owner's call (README Backlog item 32).
+
+**Change cap.** `max-changes` went from 20,000 to 2,500. Measured as the first call in its process at 5,000 pages, the feed took 1,148 to 1,213 ms at 4,000 and 5,000 changes, 959 to 1,035 ms at 3,000, and 844 to 921 ms at 2,500 (x1.65), so 2,500 is the largest round figure that met the line in every run. At 20,000 pages no cap meets it: 1,000 changes still took 1,154 ms cold, because the private and hidden sets cover the whole graph.
+
+**After the change** (ms, x1.65, cold / warm medians of 3 runs, two runs each):
+
+| Shape | 5,000 pages | 20,000 pages |
+|---|---|---|
+| default health (four checks) | 229 to 293 / 57 to 67 | 686 to 700 / 219 to 239 |
+| `duplicate-titles` alone | 360 to 476 / 150 to 162 | 1,356 to 1,432 / 652 to 793 |
+| `pages-without-summary` alone | 1,363 to 1,502 / 568 to 579 | 5,785 to 5,997 / 2,247 to 2,282 |
+| `pages-without-tags` alone | 574 to 708 / 314 to 348 | 2,259 to 2,583 / 1,377 to 1,381 |
+| `broken-refs` alone | 1,544 to 1,612 / 572 to 574 | 6,235 to 6,256 / 2,298 to 2,505 |
+| `missing-tag-properties` alone | 630 to 694 / 197 to 207 | 2,752 to 2,876 / 819 to 833 |
+| `list_changes_since` (2,500 changes) | 711 to 728 / 286 to 291 | 1,330 to 1,503 / 579 to 647 |
+| `get_graph_schema` | 160 to 163 / 68 to 72 | 644 to 658 / 240 to 298 |
+
+The default health call and the schema export meet the line at both sizes, and the feed at 5,000 pages. The opt-in checks named above and the feed at 20,000 pages don't. The per-call cost is otherwise as designed: 2 Worker requests, no D1 rows beyond the connector's auth lookup, none written, no neurons and no Vectorize.
+
+**Still to do once deployed** (section 9 items 2, 3 and 5): the owner's run of `get_graph_health` with `checks=broken-refs`, then `checks=missing-tag-properties`, on their graph, their comparison of `list_changes_since` for a week against what they remember editing (including a move and a property change), and the measured Durable Object CPU of a default health call from Workers analytics.
