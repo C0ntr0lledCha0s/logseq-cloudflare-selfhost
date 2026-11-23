@@ -100,7 +100,7 @@ The rule: Opus where a wrong call ships a bad fix or lets a defect through, and 
   - **Class sweep.** A fix that narrows a type or a resolver lists every property type or input kind that reaches the same resolver, tests a representative input for each, and runs the mutation step on its own new rules before the stage ends.
 - **Approval.** A feature always stops after its spec unless an approved `spec` is passed in.
 - **Claims.** The closeout runs the gate once on HEAD and reports the SHA. The PR body only claims checks run there.
-- **Logseq.** No lane writes to Logseq. `/lane` shows the draft and writes it only on the owner's yes.
+- **Logseq.** No lane writes to Logseq. Each lane returns a draft update and `logseq_properties` (the task's Status, phase, branch and pr-url). `/lane` shows both and writes them only on the owner's yes.
 
 ## The compound loop
 

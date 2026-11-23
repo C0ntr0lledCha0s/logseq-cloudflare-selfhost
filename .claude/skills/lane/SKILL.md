@@ -12,13 +12,16 @@ The lanes are described in `docs/lanes/README.md`, and `CLAUDE.md` has the repo 
 
 1. Get today's date in the owner's time zone with `TZ=Pacific/Auckland date +%F`.
 2. Read the tracker settings from `.claude/lanes.local.json` (`{"graph": "<alias>", "page": "<issues page title>"}`). The file is untracked, so it keeps the graph's name out of the repo. If it's missing, call `list_graphs`: if exactly one graph is connected, use it with the page **Logseq Connector Issues**. Otherwise ask the owner, and offer to write the file. Never put the graph name or page UUIDs in a committed file, commit message or PR body.
-3. If the argument is an item number, read that item's section on the issues page. Use `get_page_outline` on the page found by title, or `search_graph` for "Connector #N" if the outline is truncated. Read only.
+3. If the argument is an item number, find the item's task by its `itemNumber` property. Read only.
+   - Run one `datalog_query` scoped to the issues page (matched by its title): the block on that page whose `itemNumber` property equals N. Match properties by their title (`itemNumber`, `component`, `dependsOn`, `branch`, `pr-url`, plus the built-in Priority and Status), never by a hard-coded ident or UUID, and pull the task's uuid, title, tags, Priority, Status, component, dependsOn, branch and pr-url with titles for the referenced values. Then read the item's section (the task and its children) with `get_block` on that uuid.
+   - Fall back to the "## N." heading for an older item without `itemNumber`: `get_page_outline` on the page found by title, or `search_graph` for "Connector #N" if the outline is truncated.
+   - Take the labels from the task's tags and component, and the dependencies from `dependsOn`. Ignore "**Labels:**" or "Depends on" text lines in the section when the properties are set; read them only for an item found by its heading that has no properties.
    - If the task is already Done or Canceled, say so and stop unless the owner insists.
-   - If it depends on an item that isn't done, say so and ask before continuing.
+   - If it depends on an item that isn't done (a `dependsOn` task whose Status isn't Done), say so and ask before continuing.
 4. Pick the lane, unless the owner named one:
-   - `bug` for Labels *bug*, or a described defect
-   - `feature` for Labels *enhancement*
-   - `spike` for Labels *spike*, or a question to answer
+   - `bug` for a task tagged Bug (or an old *bug* label), or a described defect
+   - `feature` for a task tagged Feature or Improvement (or an old *enhancement* label)
+   - `spike` for a spike (a Work Item titled or labelled as one), or a question to answer
    - `review` to review the current branch only
 5. If the description is ambiguous between bug and feature, ask. Otherwise proceed.
 
@@ -67,11 +70,11 @@ Read `status` first.
 
 ## 5. Logseq write-back (always ask)
 
-Show `closeout.logseq_update` (or the spike's `logseq_update_hint`). Ask once: "Write this to item N on the issues page and set its task to In Review?" Only on yes, follow the Logseq skill's writing rules:
+Show `closeout.logseq_update` (or the spike's `logseq_update_hint`) and the result's `logseq_properties` (`{status, phase, branch, pr_url}`; a feature stopped at its spec or plan returns it too). If you opened a PR, put its URL in `pr_url` first. Ask once: "Write this to item N on the issues page and set its task's Status to <status>, phase, branch and pr-url?" Only on yes, follow the Logseq skill's writing rules:
 
-- Find the item's `## N.` block, and insert the draft as its children with one `insert_block_children` call.
-- Set the task's Status with `set_block_property`.
+- Find the item's task as in section 1 step 3 (by `itemNumber`, or its `## N.` block for an older item), and insert the draft as its children with one `insert_block_children` call.
+- Set the properties on the task in one `batch_set_block_property` call: Status from `status`, `phase`, `branch` and `pr-url` from `pr_url`. Leave out any that are null: the token can't clear a value, so a null means "leave it as it is".
 - For a feature still in spec, add only a "**Spec <date>**" block with a link to the file.
-- Read back once to confirm, and report in one line.
+- Read the task back once with `get_block`, and report in one line, naming any property that didn't take (missing, or a different value from the one sent).
 
 Also pass on `compound.skill_suggestions` and `docs.skill_note`. They are changes for the owner's own Logseq skill, which lives outside this repo. Offer them as suggestions; don't apply them.
