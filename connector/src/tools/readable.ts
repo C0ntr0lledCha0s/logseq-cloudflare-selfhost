@@ -68,6 +68,7 @@ export const CONTEXT_TOOLS: Readonly<Record<string, readonly [string, string]>> 
   delete_block: ["Deleted", "delete"],
   delete_blocks: ["Deleted", "delete"],
   delete_page: ["Deleted", "delete"],
+  delete_blank_blocks: ["Deleted blank blocks from", "delete blank blocks from"],
   move_blocks: ["Moved", "move"],
   batch_move_blocks: ["Moved", "move"],
   insert_block_children: ["Inserted", "insert"],
@@ -185,6 +186,22 @@ export function toAffectedTargets(response: unknown): AffectedTarget[] {
   collect(top);
   if (Array.isArray(top?.entries)) for (const entry of top.entries) collect(record(entry));
   return out;
+}
+
+/**
+ * delete_blank_blocks' targets (patch 0056): each page the apply deleted from, or its dry run would,
+ * with how many blocks (`deleted`, or the block ids listed under `would-delete`). Pages with none are
+ * left out.
+ */
+function blankBlockTargets(response: Record<string, unknown> | undefined): AffectedTarget[] {
+  const pages = Array.isArray(response?.pages) ? response.pages : [];
+  return pages.flatMap((item) => {
+    const p = record(item);
+    const n = typeof p?.deleted === "number" ? p.deleted : Array.isArray(p?.["would-delete"]) ? p["would-delete"].length : 0;
+    if (typeof p?.uuid !== "string" || n === 0) return [];
+    const title = text(p.page);
+    return [{ uuid: p.uuid, kind: "page", role: "affected" as const, breadcrumb: [], pageUuid: p.uuid, pageTitle: title, snippet: title, blocks: n }];
+  });
 }
 
 /** What `onSuccess` learns about an accepted write. `targets` is empty until the server names them. */
@@ -355,7 +372,7 @@ export function resultJson(result: CallToolResult): unknown {
  */
 export function describeWrite(tool: string, result: CallToolResult, reason: string | undefined): { targets: AffectedTarget[]; summary: string } {
   const response = record(resultJson(result));
-  const targets = toAffectedTargets(response);
+  const targets = tool === "delete_blank_blocks" ? blankBlockTargets(response) : toAffectedTargets(response);
   const unavailable = response?.context === "unavailable" ? (text(response["context-reason"]) ?? "") : undefined;
   const truncated = response?.truncated === true ? { cleared: typeof response.cleared === "number" ? response.cleared : undefined } : undefined;
   return { targets, summary: summarise(targets, { tool, reason, dryRun: response?.["dry-run"] === true, unavailable, truncated }) };

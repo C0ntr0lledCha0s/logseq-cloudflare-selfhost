@@ -1,0 +1,730 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker.cljs b/deps/db-sync/src/logseq/db_sync/worker.cljs
+index e7f58a7..e2ca584 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker.cljs
+@@ -36,15 +36,10 @@
+                             :transaction (fn [f] (.transactionSync storage f))}))
+                (set! (.-conn this) nil)
+                (set! (.-schema-ready this) false)
+-               (let [presence (presence/presence* this)
+-                     sockets (.getWebSockets state)]
+-                 (doseq [^js ws sockets]
+-                   (when-let [attachment (.deserializeAttachment ws)]
+-                     (when-let [user (presence/attachment->user attachment)]
+-                       (swap! presence assoc ws user))))
+-                 (.setWebSocketAutoResponse
+-                  state
+-                  (js/WebSocketRequestResponsePair. "ping" "pong"))))
++               (presence/rebuild-presence! this (.getWebSockets state))
++               (.setWebSocketAutoResponse
++                state
++                (js/WebSocketRequestResponsePair. "ping" "pong")))
+ 
+   Object
+   (fetch [this request]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index a48a97f..1f5d922 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -18,6 +18,7 @@
+             [logseq.db-sync.worker.handler.datalog :as datalog]
+             [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
+             [logseq.db-sync.worker.http :as http]
++            [logseq.db-sync.worker.presence :as presence]
+             [logseq.db-sync.worker.ws :as ws]
+             [logseq.db.frontend.asset :as db-asset]
+             [logseq.db.frontend.class :as db-class]
+@@ -5798,6 +5799,55 @@
+ (def ^:private insight-handlers
+   #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
+ 
++;; getSyncStatus (patch 0055) answers where a graph's sync log stands, how big the graph is as the
++;; reads show it, and how many clients are connected, as counts. It reads two sync_meta values and
++;; the tx_log row at t by its primary key, never recomputes the checksum, and writes nothing.
++
++(defn- counted-page-ids
++  "The ids of the pages and journals listPages lists (no hidden page) that aren't in `private`
++  (Private content and the Recycle bin, datalog/private-ids)."
++  [db private]
++  (into #{} (comp (map :db/id) (remove #(contains? private %))) (list-pages db)))
++
++(defn- block-count
++  "Blocks on a counted page (property value blocks included, as they sit on their owner's page)
++  that aren't in `private`: one pass over the :block/page datoms, with no entity reads."
++  [db page-ids private]
++  (reduce (fn [n datom]
++            (if (and (contains? page-ids (:v datom)) (not (contains? private (:e datom))))
++              (inc n)
++              n))
++          0
++          (d/datoms db :aevt :block/page)))
++
++(defn- last-write
++  "The tx_log row at t: when it was written (ISO) and its outliner op. Both nil when no row holds t,
++  as on a graph that arrived by snapshot upload."
++  [sql t]
++  (let [row (first (common/get-sql-rows
++                    (common/sql-exec sql "select created_at, outliner_op from tx_log where t = ?" t)))
++        created-at (some-> row (aget "created_at"))
++        op (some-> row (aget "outliner_op"))]
++    {:last-written-at (when (number? created-at) (.toISOString (js/Date. created-at)))
++     :last-op (when (string? op) op)}))
++
++(defn- sync-status
++  "The getSyncStatus answer. On an E2EE graph class titles are ciphertext, so Private can't be
++  recognised and the counts may include it (counts-include-private)."
++  [^js self db e2ee? caller-user-id]
++  (let [sql (.-sql self)
++        t (storage/get-t sql)
++        private (datalog/private-ids db)
++        page-ids (counted-page-ids db private)]
++    (merge {:t t}
++           (last-write sql t)
++           {:checksum (storage/get-checksum sql)
++            :page-count (count page-ids)
++            :block-count (block-count db page-ids private)
++            :counts-include-private (boolean e2ee?)
++            :e2ee (boolean e2ee?)
++            :clients (presence/presence-summary self caller-user-id)})))
++
+ ;; getGraphSchema lists the graph's tags and properties with their usage, for a drift review, in one
+ ;; call. Like the health checks it reads titles, so it refuses E2EE graphs, and it builds the private
+ ;; set once: no Private or Recycle-bin entity is an item, a counted object, a counted holder or a tag
+@@ -6657,6 +6707,8 @@
+     (contains? bulk-handlers handler) (handle-bulk context)
+     (contains? insight-handlers handler) (handle-insights context)
+     (= :semantic/block-changes handler) (handle-block-changes context)
++    (= :semantic/sync-status handler) (let [{:keys [self db e2ee? creator]} context]
++                                        (http/json-response nil (sync-status self db e2ee? (some-> creator :uuid str))))
+     (= :semantic/changes-since handler) (handle-changes-since context)
+     (= :semantic/graph-schema handler) (handle-graph-schema context)
+     (= :semantic/datalog-query handler) (datalog/handle-query context)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/presence.cljs b/deps/db-sync/src/logseq/db_sync/worker/presence.cljs
+index cca6a94..3aa96b9 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/presence.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/presence.cljs
+@@ -31,6 +31,17 @@
+   (or (.-presence self)
+       (set! (.-presence self) (atom {}))))
+ 
++(defn rebuild-presence!
++  "Puts each socket's user back in the presence atom from its serialised attachment, as the DO
++  constructor does after a wake from hibernation. A socket whose attachment holds no user (one that
++  never identified a user) stays out, as it was before the wake."
++  [^js self sockets]
++  (let [presence (presence* self)]
++    (doseq [^js ws sockets]
++      (when-let [attachment (.deserializeAttachment ws)]
++        (when-let [user (attachment->user attachment)]
++          (swap! presence assoc ws user))))))
++
+ (defn online-users
+   [^js self]
+   (vec (distinct (vals @(presence* self)))))
+@@ -66,3 +77,26 @@
+ (defn remove-presence!
+   [^js self ^js ws]
+   (swap! (presence* self) dissoc ws))
++
++(defn presence-summary
++  "Counts only, never who: sockets in presence (connected), distinct user ids (users), the sockets
++  whose user id is caller-user-id (own) and the rest (others), and sockets that report a block being
++  edited (editing). own and others are nil without a caller-user-id."
++  [^js self caller-user-id]
++  (let [users (vals @(presence* self))
++        connected (count users)
++        own (when (string? caller-user-id)
++              (count (filter #(= caller-user-id (:user-id %)) users)))]
++    {:connected connected
++     :users (count (into #{} (keep :user-id) users))
++     :own own
++     :others (when own (- connected own))
++     :editing (count (filter :editing-block-uuid users))}))
++
++(defn editing-block-uuids
++  "The UUIDs of the blocks sockets report as being edited, as a set."
++  [^js self]
++  (into #{}
++        (keep (fn [{:keys [editing-block-uuid]}]
++                (when (string? editing-block-uuid) (parse-uuid editing-block-uuid))))
++        (vals @(presence* self))))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 5ec45fe..b806c62 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -20,6 +20,8 @@
+     :handler :semantic/pages-backlinks :operation-id "getPageBacklinks" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/health" :internal-path "/semantic/health"
+     :handler :semantic/graph-health :operation-id "getGraphHealth" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/sync-status" :internal-path "/semantic/sync-status"
++    :handler :semantic/sync-status :operation-id "getSyncStatus" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/knowledge-index" :internal-path "/semantic/knowledge-index"
+     :handler :semantic/knowledge-index :operation-id "listKnowledgeIndex" :scope "logseq/read" :rate-class :read}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
+@@ -171,6 +173,7 @@
+    "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
++   "getSyncStatus" ["Read a graph's sync status" "Returns where the graph's sync log stands, how big the graph is and how many clients are connected, in one read that writes nothing. t is the latest sync transaction; last-written-at (ISO) and last-op (the outliner operation, such as delete-blocks) are those of the transaction at t, both null when the log holds no row for t. checksum is the checksum as stored, never recomputed, null when none is stored. page-count is the pages and journals listPages lists, and block-count counts the blocks on those pages, property value blocks included, so it can be higher than listPageBlocks shows; neither counts hidden pages, the Recycle bin or Private content (anything tagged Private or a tag extending it, and everything on or under it). On an E2EE graph tag titles are encrypted, so Private can't be recognised and the counts may include it: counts-include-private is then true, as is e2ee. clients holds counts only, from the app's live connections (WebSockets; API calls are not connections): connected (connections that identified a user), users (distinct users), own (the caller's connections), others (connected minus own; own and others are null when the request names no caller) and editing (connections reporting a block being edited). It names no user, email, device or block, and presence carries no device or client kind."]
+    "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists, and code holds no refs: a code or math block, an inline code span and a fenced block are not scanned) and missing-tag-properties (objects tagged with a tag, or with a tag that extends it, that hold no value for one of that tag's expected properties or hold Logseq's empty placeholder for it, in holder order; each item names the holder, its page, the tag and the missing properties by ident and title, one per object and tag). missing-tag-properties checks only the expected tag-property pairs: tag-properties, a JSON array of 1 to 50 pairs {\"tag\": …, \"property\": …} (each a UUID, ident or title), or, when it is not given, the stored pairs in the Worker's HEALTH_TAG_PROPERTIES secret, set from the HEALTH_TAG_PROPERTIES GitHub secret or config/settings.json health.expectedTagProperties. Each pair's tag must be a user tag and its property a user property that the tag, or a tag it extends, lists and that has no default value; any other tag-properties pair is refused with 400 naming its entry (tag-properties[N]) and the reason, and nothing is checked. The stored pairs serve every graph on the Worker, so a stored pair that doesn't resolve in this graph is skipped, not refused: skipped names each one by its entry (HEALTH_TAG_PROPERTIES[N]) and reason, and the other pairs are checked. A malformed stored value is refused with 400. The stored pairs are read only when the check runs. With no pairs the check lists nothing and answers a note saying how to give them. Its result names the pairs it checked (pairs, each tag's uuid and title and the property's ident and title) and where they came from (pairs-from: input, settings or none). tag-properties without the missing-tag-properties check is refused. Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks: each reads every page, title or tagged object, so on a large graph name one of them per call. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
+    "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
+    "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
+@@ -708,7 +711,10 @@
+     (or (contains? label-checked-operations operation-id)
+         (contains? #{"batchInsertBlockTrees" "batchMoveBlocks" "batchSetBlockProperty" "batchDeleteBlockProperty"
+                      "deleteBlocks"} operation-id))
+-    (assoc "409" label-refusal-response)))
++    (assoc "409" label-refusal-response)
++    ;; It works on E2EE graphs and refuses nothing a caller can change.
++    (= "getSyncStatus" operation-id)
++    (dissoc "409")))
+ 
+ (defn- operation-responses* [operation-id]
+   (merge {"200" (case operation-id
+@@ -726,6 +732,7 @@
+                   "searchGraph" (list-response :results "SearchResultResponse" "A cursor page of search results")
+                   "getPageBacklinks" (entity-response "PageBacklinksResponse" "A page's usage grouped by relation")
+                   "getGraphHealth" (entity-response "GraphHealthResponse" "Counts and items for each check run")
++                  "getSyncStatus" (entity-response "SyncStatusResponse" "The graph's sync position, counts and connected clients")
+                   "listKnowledgeIndex"
+                   (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
+                   "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
+@@ -1155,6 +1162,29 @@
+                                                                 :description "The whole list after the call, in sidebar order, as listFavorites returns it."
+                                                                 :items {:$ref "#/components/schemas/Favorite"}}
+                                                     :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written."}}}
++               :SyncStatusResponse {:type "object"
++                                    :required ["t" "last-written-at" "last-op" "checksum" "page-count" "block-count"
++                                               "counts-include-private" "e2ee" "clients"]
++                                    :properties {:t {:type "integer" :description "The latest sync transaction."}
++                                                 :last-written-at {:type ["string" "null"] :format "date-time"
++                                                                   :description "When the transaction at t was written; null when the log holds no row for t."}
++                                                 :last-op {:type ["string" "null"]
++                                                           :description "The outliner operation of the transaction at t; null when unknown."}
++                                                 :checksum {:type ["string" "null"]
++                                                            :description "The graph checksum as stored, never recomputed; null when none is stored."}
++                                                 :page-count {:type "integer" :minimum 0}
++                                                 :block-count {:type "integer" :minimum 0}
++                                                 :counts-include-private {:type "boolean"
++                                                                          :description "true on E2EE graphs, where Private content can't be recognised and may be counted."}
++                                                 :e2ee {:type "boolean"}
++                                                 :clients {:type "object"
++                                                           :required ["connected" "users" "own" "others" "editing"]
++                                                           :description "Counts only; no user, device or block is named."
++                                                           :properties {:connected {:type "integer" :minimum 0}
++                                                                        :users {:type "integer" :minimum 0}
++                                                                        :own {:type ["integer" "null"] :minimum 0}
++                                                                        :others {:type ["integer" "null"] :minimum 0}
++                                                                        :editing {:type "integer" :minimum 0}}}}}
+                :FavoritesResponse {:type "object" :required ["favorites"]
+                                    :properties {:favorites {:type "array"
+                                                             :description "In sidebar order; empty when the graph has none."
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_sync_status_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_sync_status_test.cljs
+new file mode 100644
+index 0000000..d4b0b6b
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_sync_status_test.cljs
+@@ -0,0 +1,491 @@
++(ns logseq.db-sync.semantic-sync-status-test
++  "getSyncStatus (patch 0055): one read-only answer for a graph's sync state. t and checksum are the
++  DO's sync_meta values (the checksum as stored, never recomputed), last-written-at and last-op the
++  tx_log row at t (null when no row holds it, as on a graph that arrived by snapshot upload), and
++  page-count and block-count what the reads show: no hidden page, nothing in the Recycle bin and,
++  except on E2EE graphs where Private can't be recognised, nothing Private. clients counts the
++  presence atom's sockets, which the DO constructor rebuilds from socket attachments after a wake;
++  it names no user and no block. Graphs here sit on a real SQLite store (better-sqlite3), so tx_log
++  and sync_meta are the ones the handler writes, and every call goes through handle-http."
++  (:require ["better-sqlite3" :as sqlite3]
++            [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.checksum :as sync-checksum]
++            [logseq.db-sync.common :as common]
++            [logseq.db-sync.index :as index]
++            [logseq.db-sync.storage :as storage]
++            [logseq.db-sync.worker.dispatch :as dispatch]
++            [logseq.db-sync.worker.handler.index :as index-handler]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.presence :as presence]
++            [logseq.db.frontend.schema :as db-schema]
++            [logseq.db.sqlite.create-graph :as sqlite-create-graph]
++            [promesa.core :as p]))
++
++;; ---------------------------------------------------------------------------------------------
++;; Fixture users. The DO keeps each socket's JWT claims as presence; none of this may come back.
++
++(def ^:private user-a {:user-id "0b7c2f4e-1d3a-4c5b-8e6f-7a9b0c1d2e3f" :email "user-a@example.com"
++                       :username "user-a-name" :name "User A Example"})
++(def ^:private user-b {:user-id "5e8d9a0b-2c4f-4a6e-9b1d-3f5a7c9e1b2d" :email "user-b@example.com"
++                       :username "user-b-name" :name "User B Example"})
++(def ^:private editing-uuid "9c1e3a5b-7d9f-4b2a-8c6e-0f1a2b3c4d5e")
++
++(defn- actor-header
++  "The x-logseq-sync-actor header dispatch sets from the caller's claims."
++  [user]
++  (js/encodeURIComponent
++   (js/JSON.stringify #js {"sub" (:user-id user)
++                           "cognito:username" (:username user)
++                           "email" (:email user)})))
++
++(defn- memory-sql []
++  (let [db (new sqlite3 ":memory:" nil)]
++    #js {:transaction (fn [f] ((.transaction db f)))
++         :exec (fn [sql-str & args]
++                 (let [stmt (.prepare db sql-str)]
++                   (if (string/starts-with? (-> sql-str string/trim string/lower-case) "select")
++                     (.apply (.-all stmt) stmt (to-array args))
++                     (do (.apply (.-run stmt) stmt (to-array args)) nil))))}))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body :text}. Without
++  `user` it carries no actor header."
++  [self method path body & {:keys [user e2ee?]}]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1"
++                   (when e2ee? "&graph-e2ee=true"))
++          headers (js/Headers. #js {"content-type" "application/json"})
++          _ (when user (.set headers "x-logseq-sync-actor" (actor-header user)))
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method :headers headers}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :text text
++     :body (when (seq text) (try (js->clj (js/JSON.parse text) :keywordize-keys true) (catch :default _ text)))}))
++
++(defn- status! [self & opts]
++  (apply request! self "GET" "/semantic/sync-status" nil opts))
++
++(defn- ok!
++  [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- seeded-graph
++  "A graph created on the server (never uploaded), not yet opened: a fresh self on real SQLite."
++  []
++  (let [sql (memory-sql)
++        conn (storage/open-conn sql)]
++    (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
++    {:sql sql :self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}}))
++
++(defn- upload-rows
++  "The kvs rows the app uploads for `client`, as <prepare-upload-temp-sqlite! makes them."
++  [client]
++  (let [sql (memory-sql)
++        _ (storage/init-schema! sql)
++        temp (d/conn-from-datoms [] (d/schema @client) {:storage (storage/new-sqlite-storage sql)})]
++    (d/transact! temp (mapv (fn [datom] [:db/add (:e datom) (:a datom) (:v datom)]) (d/datoms @client :eavt))
++                 {:initial-db? true})
++    (mapv (fn [row] [(aget row "addr") (aget row "content") (aget row "addresses")])
++          (.exec sql "select addr, content, addresses from kvs order by addr"))))
++
++(defn- uploaded-graph
++  "A graph that arrived through the snapshot upload of a fresh app graph, imported by the real
++  handler: its kvs rows only, with no tx_log row and no stored checksum."
++  []
++  (let [client (d/create-conn db-schema/schema)
++        _ (d/transact! client (sqlite-create-graph/build-db-initial-data "{}"))
++        sql (memory-sql)
++        self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}}]
++    (#'sync-handler/import-snapshot! self (upload-rows client) true)
++    {:sql sql :self self}))
++
++(defn- tx-log-count [sql]
++  (aget (first (.exec sql "select count(*) as n from tx_log")) "n"))
++
++(defn- tx-log-row [sql t]
++  (first (.exec sql "select created_at, outliner_op from tx_log where t = ?" t)))
++
++(defn- run [done f]
++  (-> (p/do (f))
++      (p/catch #(is false (str % (some-> % .-stack))))
++      (p/finally done)))
++
++;; ---------------------------------------------------------------------------------------------
++;; Presence: fake sockets as the Workers runtime gives them, with a real attachment store.
++
++(defn- socket
++  "A socket whose attachment round-trips as the runtime's serializeAttachment/deserializeAttachment
++  do (structured clone); `attachment` presets one, as a socket a client never identified on has."
++  ([] (socket ::none))
++  ([attachment]
++   (let [stored (atom (when-not (= ::none attachment) attachment))]
++     #js {:readyState 1
++          :serializeAttachment (fn [value] (reset! stored (js/structuredClone value)))
++          :deserializeAttachment (fn [] (some-> @stored js/structuredClone))})))
++
++(defn- connect!
++  "Sockets for user A on two clients (one editing a block), user B on one, and one socket whose
++  attachment holds no user, connected through the real presence functions."
++  [self]
++  (let [[a1 a2 b1] (repeatedly 3 socket)
++        anonymous (socket #js {})
++        never-identified (socket)]
++    (presence/add-presence! self a1 user-a)
++    (presence/add-presence! self a2 user-a)
++    (presence/add-presence! self b1 user-b)
++    (presence/update-presence! self a2 {:editing-block-uuid editing-uuid})
++    [a1 a2 b1 anonymous never-identified]))
++
++(defn- woken
++  "A fresh DO over the same storage and sockets, as after hibernation: the constructor rebuilds
++  presence from the sockets' attachments with presence/rebuild-presence!."
++  [sql sockets]
++  (let [self #js {:sql sql :conn nil :schema-ready false :env #js {"TIMEZONE" "UTC"}
++                  :state #js {:getWebSockets (fn [] (to-array sockets))}}]
++    (presence/rebuild-presence! self (.getWebSockets (.-state self)))
++    self))
++
++;; ---------------------------------------------------------------------------------------------
++;; t, last write and checksum
++
++;; Before patch 0055 there is no such route: 404.
++(deftest t-and-last-write-follow-a-write-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [sql self]} (seeded-graph)
++                page (ok! (request! self "POST" "/semantic/pages" {:title "Example"} :user user-a) 201)
++                block (str (random-uuid))
++                _ (ok! (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (get-in page [:body :uuid]) :blocks [{:uuid block :title "Projects"}]}
++                                 :user user-a) 201)
++                before (ok! (status! self :user user-a) 200)
++                _ (ok! (request! self "DELETE" (str "/semantic/blocks/" block) nil :user user-a) 200)
++                after (ok! (status! self :user user-a) 200)
++                t (storage/get-t sql)
++                row (tx-log-row sql t)]
++          (is (= (get-in before [:body :t]) (dec (get-in after [:body :t]))) "one delete is one transaction")
++          (is (= t (get-in after [:body :t])) "t is the DO's sync_meta t")
++          (is (= "delete-blocks" (get-in after [:body :last-op])))
++          (is (not= "delete-blocks" (get-in before [:body :last-op])))
++          (is (= (.toISOString (js/Date. (aget row "created_at"))) (get-in after [:body :last-written-at]))
++              "last-written-at is the tx_log row's created_at at t, as ISO")
++          (is (= (storage/get-checksum sql) (get-in after [:body :checksum])))
++          (is (string? (get-in after [:body :checksum])))
++          (is (false? (get-in after [:body :e2ee]))))))))
++
++(deftest last-written-at-null-on-upload-test
++  ;; The snapshot import writes kvs rows and no tx_log row. Opening the graph repairs the app's
++  ;; schema drift in one logged transaction, so the opened graph has a row at t. Two states the log
++  ;; can be in are then made directly (the stubbed steps here): t moved past the last row, and a
++  ;; log with no row at all.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [sql self]} (uploaded-graph)
++                rows-before-open (tx-log-count sql)
++                opened (ok! (status! self :user user-a) 200)
++                _ (storage/set-t! sql (inc (storage/get-t sql)))
++                moved (ok! (status! self :user user-a) 200)
++                _ (.exec sql "delete from tx_log")
++                emptied (ok! (status! self :user user-a) 200)]
++          (is (zero? rows-before-open) "the upload writes no tx_log row")
++          (is (string? (get-in opened [:body :last-written-at])) "the opening repair's row is at t")
++          (doseq [[label response] [["t past the last log row" moved] ["no log row at all" emptied]]]
++            (testing label
++              (is (pos? (get-in response [:body :t])))
++              (is (contains? (:body response) :last-written-at) "present, as null")
++              (is (nil? (get-in response [:body :last-written-at])))
++              (is (contains? (:body response) :last-op))
++              (is (nil? (get-in response [:body :last-op]))))))))))
++
++(deftest checksum-not-recomputed-test
++  ;; Stubs a step: the checksum recompute is redefined to throw, so an answer proves it never ran.
++  ;; Both graphs are opened first (an uploaded graph's open repairs its schema, which recomputes),
++  ;; and the second graph's stored checksum is then removed directly, the state of a graph with none.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [sql self]} (seeded-graph)
++                _ (ok! (request! self "POST" "/semantic/pages" {:title "Example"} :user user-a) 201)
++                stored (storage/get-checksum sql)
++                {other :self other-sql :sql} (uploaded-graph)
++                _ (ok! (status! other :user user-a) 200)
++                _ (.exec other-sql "delete from sync_meta where key = 'checksum'")
++                [with-checksum without]
++                (p/with-redefs [sync-checksum/recompute-checksum
++                                (fn [& _] (throw (js/Error. "recompute-checksum was called")))
++                                sync-checksum/recompute-checksum-diagnostics
++                                (fn [& _] (throw (js/Error. "recompute-checksum-diagnostics was called")))]
++                  (p/all [(status! self :user user-a) (status! other :user user-a)]))]
++          (is (string? stored))
++          (is (= [200 stored] [(:status with-checksum) (get-in with-checksum [:body :checksum])])
++              (pr-str with-checksum))
++          (is (= 200 (:status without)) (pr-str without))
++          (is (contains? (:body without) :checksum))
++          (is (nil? (get-in without [:body :checksum]))))))))
++
++(deftest read-only-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [sql self]} (seeded-graph)
++                _ (ok! (request! self "POST" "/semantic/pages" {:title "Example"} :user user-a) 201)
++                t (storage/get-t sql)
++                rows (tx-log-count sql)
++                checksum (storage/get-checksum sql)
++                _ (ok! (status! self :user user-a) 200)
++                _ (ok! (status! self) 200)
++                _ (ok! (status! self :e2ee? true) 200)
++                post (request! self "POST" "/semantic/sync-status" {})]
++          (is (= [t rows checksum] [(storage/get-t sql) (tx-log-count sql) (storage/get-checksum sql)])
++              "no write: t, the tx_log and the checksum are unchanged")
++          (is (= 404 (:status post)) "only GET is routed"))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Counts
++
++(defn- tag! [self title]
++  (p/let [r (ok! (request! self "POST" "/semantic/tags" {:title title} :user user-a) 201)]
++    (get-in r [:body :uuid])))
++
++(defn- page! [self title]
++  (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title} :user user-a) 201)]
++    (get-in r [:body :uuid])))
++
++(defn- insert! [self target blocks]
++  (p/let [r (ok! (request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks} :user user-a) 201)]
++    (get-in r [:body :blocks])))
++
++(defn- set-tags! [self id titles]
++  (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent "block/tags"))
++                 {:value titles} :user user-a)
++       200))
++
++(defn- set-attr!
++  "Sets a datom directly on the opened graph (hide? or deleted-at, which no write route sets this way)."
++  [self id attr value]
++  (d/transact! (.-conn self) [[:db/add [:block/uuid (uuid (str id))] attr value]]))
++
++(defn- counts [response]
++  (select-keys (:body response) [:page-count :block-count :counts-include-private :e2ee]))
++
++(defn- count-fixture!
++  "Adds, on top of the graph's built-in content, what the counts must take in and leave out:
++  - counted: page Example (4 blocks: Projects, a child of it, a block holding a text property
++    value and that value block, which sits on the page too), today's journal (1 block) and the page that
++    stands for the writes' author (user A), which an authored write creates as the app does;
++  - left out: hidden page Hidden (1 block), page Recycled in the Recycle bin (1 block), page
++    Private Plans tagged Private (1 block), page Secret Plans tagged Secret, which extends
++    Private (1 block), a block tagged Private on Example with a child, a recycled block on Example,
++    tag Topic with a block on its page, and property Rating's page.
++  Returns the uuids it made."
++  [self]
++  (p/let [private-tag (tag! self "Private")
++          secret-tag (ok! (request! self "POST" "/semantic/tags" {:title "Secret" :extends ["Private"]} :user user-a) 201)
++          topic (tag! self "Topic")
++          example (page! self "Example")
++          hidden (page! self "Hidden")
++          recycled (page! self "Recycled")
++          private-page (page! self "Private Plans")
++          secret-page (page! self "Secret Plans")
++          [projects private-block recycled-block] (insert! self example [{:title "Projects" :children [{:title "a child"}]}
++                                                                         {:title "a private block" :children [{:title "under it"}]}
++                                                                         {:title "a recycled block"}])
++          [rated] (insert! self example [{:title "a rated block"}])
++          rating (ok! (request! self "POST" "/semantic/properties" {:title "Rating" :type "default"} :user user-a) 201)
++          _ (ok! (request! self "PUT" (str "/semantic/blocks/" (:uuid rated) "/properties/"
++                                           (js/encodeURIComponent (get-in rating [:body :ident])))
++                           {:value "four stars"} :user user-a) 200)
++          journal (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "a journal block"}]} :user user-a) 201)
++          _ (insert! self hidden [{:title "on a hidden page"}])
++          _ (insert! self recycled [{:title "on a recycled page"}])
++          _ (insert! self private-page [{:title "on a private page"}])
++          _ (insert! self secret-page [{:title "on a secret page"}])
++          _ (insert! self topic [{:title "on a tag page"}])
++          _ (set-tags! self private-page ["Private"])
++          _ (set-tags! self secret-page ["Secret"])
++          _ (set-tags! self (:uuid private-block) ["Private"])
++          _ (set-attr! self hidden :logseq.property/hide? true)
++          _ (set-attr! self recycled :logseq.property/deleted-at 1)
++          _ (set-attr! self (:uuid recycled-block) :logseq.property/deleted-at 1)]
++    {:example example :projects projects :journal journal
++     :tags [private-tag (get-in secret-tag [:body :uuid])]}))
++
++(deftest counts-exclude-hidden-recycled-private-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (seeded-graph)
++                base (ok! (status! self :user user-a) 200)
++                _ (count-fixture! self)
++                after (ok! (status! self :user user-a) 200)]
++          (is (= {:counts-include-private false :e2ee false}
++                 (select-keys (counts after) [:counts-include-private :e2ee])))
++          ;; Hand count: pages Example, today's journal and user A's author page; blocks Projects, its
++          ;; child, the rated block, its property value block and the journal block. Nothing else in
++          ;; the fixture is counted.
++          (is (= 3 (- (get-in after [:body :page-count]) (get-in base [:body :page-count])))
++              (pr-str (counts base) (counts after)))
++          (is (= 5 (- (get-in after [:body :block-count]) (get-in base [:body :block-count])))
++              (pr-str (counts base) (counts after))))))))
++
++(deftest counts-on-e2ee-test
++  ;; On an E2EE graph, class titles are ciphertext, so Private can't be recognised: the counts take
++  ;; Private content in and say so. The Recycle bin and hidden pages are still left out.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (seeded-graph)
++                base (ok! (status! self :user user-a :e2ee? true) 200)
++                plain-base (ok! (status! self :user user-a) 200)
++                {:keys [tags]} (count-fixture! self)
++                ;; The tag titles as an E2EE graph stores them: not readable as "private".
++                conn (.-conn self)
++                _ (doseq [tag tags]
++                    (d/transact! conn [[:db/add [:block/uuid (uuid tag)] :block/title (str "ciphertext-" (random-uuid))]]))
++                after (ok! (status! self :user user-a :e2ee? true) 200)]
++          (is (= {:counts-include-private true :e2ee true}
++                 (select-keys (counts after) [:counts-include-private :e2ee])))
++          (is (= (counts plain-base) (assoc (counts base) :counts-include-private false :e2ee false))
++              "the same graph counts the same either way before any Private content exists")
++          ;; Hand count: the three counted pages and five blocks above, plus pages Private Plans and
++          ;; Secret Plans, their blocks, and the Private block on Example with its child.
++          (is (= 5 (- (get-in after [:body :page-count]) (get-in base [:body :page-count])))
++              (pr-str (counts base) (counts after)))
++          (is (= 9 (- (get-in after [:body :block-count]) (get-in base [:body :block-count])))
++              (pr-str (counts base) (counts after))))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; Clients
++
++(def ^:private expected-clients {:connected 3 :users 2 :own 2 :others 1 :editing 1})
++
++(deftest clients-after-rebuild-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [sql self]} (seeded-graph)
++                sockets (connect! self)
++                live (ok! (status! self :user user-a) 200)
++                awake (woken sql sockets)
++                after-wake (ok! (status! awake :user user-a) 200)
++                as-b (ok! (status! awake :user user-b) 200)
++                no-actor (ok! (status! awake) 200)
++                empty-do (woken sql [])
++                none (ok! (status! empty-do :user user-a) 200)]
++          (testing "live presence: user A on two sockets (one editing), user B on one; a socket that
++                    never identified a user is not in presence and isn't counted"
++            (is (= expected-clients (get-in live [:body :clients])) (pr-str (:body live))))
++          (testing "a DO rebuilt from socket attachments alone counts the same"
++            (is (= 3 (count @(presence/presence* awake))) "rebuild-presence! put back the three users' sockets")
++            (is (= expected-clients (get-in after-wake [:body :clients])) (pr-str (:body after-wake))))
++          (testing "own is the caller's sockets"
++            (is (= (assoc expected-clients :own 1 :others 2) (get-in as-b [:body :clients]))))
++          (testing "without a caller, own and others are unknown"
++            (is (= (assoc expected-clients :own nil :others nil) (get-in no-actor [:body :clients])))
++            (is (contains? (get-in no-actor [:body :clients]) :own)))
++          (testing "no sockets"
++            (is (= {:connected 0 :users 0 :own 0 :others 0 :editing 0} (get-in none [:body :clients])))))))))
++
++(deftest editing-cleared-is-not-counted-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (seeded-graph)
++                [_ a2] (connect! self)
++                _ (presence/update-presence! self a2 {:editing-block-uuid nil})
++                response (ok! (status! self :user user-a) 200)]
++          (is (= 0 (get-in response [:body :clients :editing])))
++          (is (= #{} (presence/editing-block-uuids self))))))))
++
++(deftest editing-block-uuids-test
++  (let [self #js {}
++        [a1 a2 b1] (repeatedly 3 socket)
++        other (str (random-uuid))]
++    (is (= #{} (presence/editing-block-uuids self)))
++    (presence/add-presence! self a1 user-a)
++    (presence/add-presence! self a2 user-a)
++    (presence/add-presence! self b1 user-b)
++    (presence/update-presence! self a2 {:editing-block-uuid editing-uuid})
++    (presence/update-presence! self b1 {:editing-block-uuid other})
++    (is (= #{(uuid editing-uuid) (uuid other)} (presence/editing-block-uuids self)))
++    (presence/update-presence! self a1 {:editing-block-uuid editing-uuid})
++    (is (= #{(uuid editing-uuid) (uuid other)} (presence/editing-block-uuids self)) "a set: two sockets, one block")
++    (is (= {:connected 3 :users 2 :own 2 :others 1 :editing 3}
++           (presence/presence-summary self (:user-id user-a))))))
++
++(deftest no-identities-in-json-test
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self]} (seeded-graph)
++                _ (connect! self)
++                responses (p/all [(status! self :user user-a) (status! self :user user-b) (status! self)
++                                  (status! self :user user-a :e2ee? true)])]
++          (doseq [{:keys [status text]} responses]
++            (is (= 200 status))
++            (doseq [user [user-a user-b]
++                    value (vals user)]
++              (is (not (string/includes? text value)) (str "the response names " value)))
++            (is (not (string/includes? text editing-uuid)) "the editing block is not named")
++            (is (not (string/includes? (string/lower-case text) "example.com")))
++            (is (= #{:t :last-written-at :last-op :checksum :page-count :block-count
++                     :counts-include-private :e2ee :clients}
++                   (set (keys (js->clj (js/JSON.parse text) :keywordize-keys true))))
++                "exactly the documented fields")))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; A service token's call, through dispatch: whose user id the DO sees
++
++(defn- capturing-do-namespace [requests]
++  #js {:idFromName (fn [graph-id] graph-id)
++       :get (fn [_]
++              #js {:fetch (fn [request]
++                            (swap! requests conj request)
++                            (p/resolved (js/Response. "{}" #js {:status 200})))})})
++
++(deftest own-for-service-token-test
++  ;; The connector calls the sync server with the graph's personal access token for every caller,
++  ;; service tokens included. Stubs the index's D1 lookups (the PAT row, graph access, the e2ee
++  ;; flag); dispatch, auth and the DO handler are real. The PAT is user A's, made by user A, so
++  ;; the actor header carries user A's id, and own counts user A's sockets.
++  (async done
++    (let [forwarded (atom [])
++          env #js {"DB" #js {}
++                   "DB_SYNC_ALLOWED_USERS" (:user-id user-a)
++                   "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)
++                   "SEMANTIC_READ_RATE_LIMITER" #js {:limit (fn [_] (p/resolved #js {:success true}))}}
++          request (js/Request. "http://localhost/api/v1/graphs/graph-1/sync-status"
++                               #js {:method "GET"
++                                    :headers #js {"authorization" "Bearer logseq_pat_service0123456789"}})]
++      (run done
++        (fn []
++          (p/let [{:keys [self]} (seeded-graph)
++                  _ (connect! self)
++                  response (p/with-redefs [index/<personal-access-token-by-hash
++                                           (fn [_db _hash]
++                                             (p/resolved {:id "pat-1" :user-id (:user-id user-a) :graph-id "graph-1"
++                                                          :permission "read"
++                                                          :expires-at (+ (common/now-ms) 60000)}))
++                                           index/<user-has-access-to-graph? (fn [& _] (p/resolved true))
++                                           index/<graph-e2ee? (fn [& _] (p/resolved false))
++                                           index-handler/graph-access-response
++                                           (fn [& _] (throw (js/Error. "a PAT call checks access by its user")))]
++                             (dispatch/handle-worker-fetch request env))
++                  forwarded-request (first @forwarded)
++                  actor (some-> forwarded-request .-headers (.get "x-logseq-sync-actor")
++                                js/decodeURIComponent js/JSON.parse (js->clj))
++                  answer (when forwarded-request (sync-handler/handle-http self forwarded-request))
++                  body (when answer (p/let [text (.text answer)] (js->clj (js/JSON.parse text) :keywordize-keys true)))]
++            (is (= 200 (.-status response)) "a read-permission PAT reaches the route")
++            (is (= 1 (count @forwarded)))
++            (is (= "/semantic/sync-status" (some-> forwarded-request .-url js/URL. .-pathname)))
++            (is (= (:user-id user-a) (get actor "sub")) "the actor is the PAT's user, the owner")
++            (is (= expected-clients (:clients body)) (pr-str body))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index f5b04c4..49d3f49 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -45,6 +45,7 @@
+             [logseq.db-sync.semantic-value-block-by-uuid-test]
+             [logseq.db-sync.semantic-page-title-heading-test]
+             [logseq.db-sync.semantic-query-block-test]
++            [logseq.db-sync.semantic-sync-status-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

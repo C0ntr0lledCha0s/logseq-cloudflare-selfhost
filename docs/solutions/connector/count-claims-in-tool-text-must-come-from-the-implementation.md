@@ -4,7 +4,8 @@ area: connector
 tags: [contract, tool-description, connector_help, reference-count, docs-drift, readme]
 seen:
   - 2026-11-08 – semantic-search recency and importance ranking, review round 1 and 2 (should-fix, deferred)
-promoted_to: []
+  - 2026-11-22 – blank-blocks-sync-status, review (should-fix, deferred): `get_sync_status` says `block-count` is what `list_page_blocks` shows, but the route also counts property value blocks, which `list_page_blocks` leaves out; the spec said only that it matched the other reads, and the as-built note records the difference. Fixed 2026-11-23 (r1-light-2): the description, `connector_help`, README §11.8 and the 0055 route now say `block-count` counts the blocks on those pages, property value blocks included, so it can be higher than `list_page_blocks` shows, and a test pins that sentence in the description and the help
+promoted_to: ["REVIEW.md"]
 ---
 
 ## Symptom
@@ -20,5 +21,7 @@ The contract text was copied from the design's intent. Nobody ran a case (a bloc
 Open at the end of the lane. Correct the sentence to what the view counts, or change the walk, and make README 11.8 and 11.11 list `rank`, `half_life_days`, `demote_tags`, `demote_property` and `updated_after`.
 
 ## How to catch it next time
+
+Twice now (semantic ranking, then sync status) a sentence that defines a count was written from the design and the code counted something wider. A count that reuses an existing traversal inherits what that traversal includes (value blocks, own-page referrers), so name the inclusions from the test's output.
 
 For each sentence in tool text that defines a count or a filter, point to the test that pins it with a decoy (same-page referrer, child referrer). If there is none, write the sentence from the test's output, not the spec. A stub view in a fake (`semantic-fakes.ts` serves signals from fixtures) hides this, since the fake never computes a count.

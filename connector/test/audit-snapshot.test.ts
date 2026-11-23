@@ -220,6 +220,8 @@ const PRE_READS: Record<string, { args: Record<string, unknown>; path: string; i
   set_page_favorite: { args: { "page-id": J5, body: { favorite: false } }, path: "/favorites", source: "getFavorites" },
   // A reorder's before-snapshot is the whole list in its old order.
   reorder_favorites: { args: { body: { "page-ids": [TAG, J5] } }, path: "/favorites", source: "getFavorites" },
+  // Patch 0056: an apply's before-snapshot is exactly its block-ids (summaries), never its pages.
+  delete_blank_blocks: { args: { body: { "page-ids": [J5, "Meeting"], "block-ids": [B2, B1] } }, path: "/blocks", ids: `${B2},${B1}`, view: "summary", source: "getBlocks" },
 };
 
 /** Writes that overwrite nothing, so read nothing first. */
@@ -961,6 +963,63 @@ describe("dry runs of deletes", () => {
     expect(ok.row).toMatchObject({ status: "ok", dry_run: 1, before: null });
     expect(gets()).toHaveLength(1);
     expect(writes()).toHaveLength(1);
+  });
+});
+
+describe("delete_blank_blocks (patch 0056)", () => {
+  const apply = (blockIds: unknown, pageIds: unknown[] = [J5, "Meeting"]) => ({ body: { "page-ids": pageIds, "block-ids": blockIds } });
+
+  it("an apply reads exactly body.block-ids with getBlocks (summaries, in call order) before the POST, and stores them", async () => {
+    for (const [args, ids] of [
+      [apply([B1]), B1],
+      [apply([B2, B1]), `${B2},${B1}`],
+      [apply([B1, B2], ["Meeting"]), `${B1},${B2}`],
+      [{ body: { "page-ids": [J5], "dry-run": false, "block-ids": [B1, B2] } }, `${B1},${B2}`],
+    ] as const) {
+      syncCalls = [];
+      serve(fixtures, () => Response.json({ deleted: 2, t: 9, pages: [] }));
+      const { result, row } = await audited("delete_blank_blocks", args as Record<string, unknown>);
+      expect(result.isError, result.text).toBe(false);
+      expect(syncCalls.map((c) => [c.method, c.path, c.ids, c.view]), ids).toEqual([
+        ["GET", `${GRAPH}/blocks`, ids, "summary"],
+        ["POST", `${GRAPH}/blank-blocks/delete`, null, null],
+      ]);
+      expect(before(row)).toEqual({ source: "getBlocks", data: summary });
+      expect(row).toMatchObject({ status: "ok", dry_run: 0 });
+    }
+  });
+
+  it("a dry run takes no snapshot and reads nothing: its POST is the only request", async () => {
+    // block-ids on a dry run are refused by the server (400); the connector still reads nothing for them.
+    for (const body of [
+      { "page-ids": [J5], "dry-run": true },
+      { "page-ids": [J5, "Meeting", "2026-11-05"], "dry-run": true },
+      { "page-ids": [J5], "dry-run": true, "block-ids": [B1, B2] },
+    ]) {
+      syncCalls = [];
+      serve(fixtures, () => Response.json({ "dry-run": true, t: 9, total: 0, listed: 0, pages: [], note: "no blank blocks to delete on these pages" }));
+      const { result, row } = await audited("delete_blank_blocks", { body });
+      expect(result.isError, result.text).toBe(false);
+      expect(syncCalls.map((c) => c.method)).toEqual(["POST"]);
+      expect(row).toMatchObject({ status: "ok", dry_run: 1, before: null });
+    }
+  });
+
+  it("is a delete: an id the read doesn't return refuses the apply before the POST, naming the entry", async () => {
+    serve(() => Response.json({ blocks: [summary.blocks[0]], missing: [B3] }));
+    const { result, row } = await audited("delete_blank_blocks", apply([B1, B3]));
+    expect(result.isError).toBe(true);
+    expect(result.text).toBe(`entry 1: ${B3} can't be read (hidden, in the Recycle bin or not found); nothing was deleted`);
+    expect(row).toMatchObject({ status: "refused", before: null });
+    expect(writes()).toEqual([]);
+  });
+
+  it("a read that fails refuses the apply: nothing is sent to the write", async () => {
+    serve(() => Response.json({ error: "boom" }, { status: 500 }));
+    const { result, row } = await audited("delete_blank_blocks", apply([B1]));
+    expect(result.isError).toBe(true);
+    expect(row.error).toBe("audit snapshot failed: sync server error (HTTP 500): boom; nothing was deleted");
+    expect(writes()).toEqual([]);
   });
 });
 

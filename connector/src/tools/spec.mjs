@@ -19,6 +19,7 @@ export const GRAPH_PARAM_DESCRIPTION = "Graph alias from list_graphs";
 export const HANDWRITTEN_TOOLS = [
   "connector_help",
   "get_activity_log",
+  "get_sync_status",
   "kb_index",
   "list_graphs",
   "read_file",
@@ -67,6 +68,8 @@ export const ANNOTATIONS = Object.freeze({
   create_task: ADDITIVE,
   // Patch 0039: a POST only because the query can be long; it runs on a read-only view of the graph.
   datalog_query: READ,
+  // Patch 0056: an apply deletes only the listed blank leaves; a re-sent apply finds them gone (404).
+  delete_blank_blocks: DESTRUCTIVE_IDEMPOTENT,
   delete_block: DESTRUCTIVE_IDEMPOTENT,
   delete_block_property: DESTRUCTIVE_IDEMPOTENT,
   delete_blocks: DESTRUCTIVE_IDEMPOTENT,
@@ -82,6 +85,7 @@ export const ANNOTATIONS = Object.freeze({
   get_page_backlinks: READ,
   get_page_outline: READ,
   get_property: READ,
+  get_sync_status: READ,
   get_tag: READ,
   insert_block_children: ADDITIVE,
   insert_block_tree: ADDITIVE,
@@ -133,10 +137,19 @@ export function annotationsFor(name) {
 const GRAPH_PREFIX = "/api/v1/graphs/{graph-id}/";
 const METHODS = new Set(["get", "post", "put", "patch", "delete"]);
 /**
- * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), or, for listBlockChanges,
- * the semantic indexer's feed rather than something Claude needs. `/e2ee/` paths are dropped too.
+ * Replaced by hand-written tools (read_file, save_*, list_graphs, kb_index), kept for one
+ * (getSyncStatus: a hand-written get_sync_status is to fold it with the semantic index's state, spec
+ * 2026-11-20 §3.3), or, for listBlockChanges, the semantic indexer's feed rather than something
+ * Claude needs. `/e2ee/` paths are dropped too.
  */
-const EXCLUDED_OPERATIONS = new Set(["createAsset", "getAsset", "listGraphs", "listKnowledgeIndex", "listBlockChanges"]);
+const EXCLUDED_OPERATIONS = new Set([
+  "createAsset",
+  "getAsset",
+  "listGraphs",
+  "listKnowledgeIndex",
+  "listBlockChanges",
+  "getSyncStatus",
+]);
 /** Argument names the upstream generator reserves or the connector adds. */
 const RESERVED_PARAMETERS = new Set(["graph", "body"]);
 /**
@@ -236,6 +249,15 @@ export function transformSpec(spec) {
 }
 
 /**
+ * delete_blank_blocks' caps (patch 0056, spec 2026-11-20-blank-blocks-and-sync-status-design §3.4): pages
+ * per call (max-blank-pages), block ids per apply and listed by a dry run (max-blank-deletes), blocks
+ * per page (max-outline-blocks), blocks per call (max-blank-scan) and kept examples per page
+ * (max-kept-examples). The tool text interpolates them, and tools.test.ts checks each against the
+ * vendored openapi schema and the route's description, so the text can't state a cap the server lacks.
+ */
+export const BLANK_BLOCK_CAPS = Object.freeze({ pages: 20, blockIds: 100, pageBlocks: 2000, callBlocks: 10000, keptExamples: 20 });
+
+/**
  * The first line of every tool's description: what the tool is for and when to choose it, in at most
  * 100 characters. claude.ai lists a connector's tools with each description cut to its first line and
  * loads the rest only after a tool search, so this line carries the routing hint (item 58). The
@@ -254,6 +276,7 @@ export const FIRST_LINES = Object.freeze({
   create_tag: "Create a tag (class) with what it extends and its properties; check list_tags first.",
   create_task: "Create a task with status, priority and dates; use it for every action item, never TODO text.",
   datalog_query: "Read-only Datalog for questions no other tool answers; try run_named_query first.",
+  delete_blank_blocks: `Delete empty leaf blocks from up to ${BLANK_BLOCK_CAPS.pages} pages: dry-run first, then pass the block ids it listed.`,
   delete_block: "Delete one block and its children; use delete_blocks for several.",
   delete_block_property: "Remove one property value from a block or page.",
   delete_blocks: "Delete up to 100 blocks in one call; dry-run first and show the user what goes.",
@@ -269,6 +292,7 @@ export const FIRST_LINES = Object.freeze({
   get_page_backlinks: "How a page is used: links, tagged objects and property values pointing at it, with counts.",
   get_page_outline: "Read a whole page as markdown with tags, properties and links resolved; the usual way to read.",
   get_property: "A property's type, choices and classes; check it before setting a choice or node value.",
+  get_sync_status: "A graph's sync state: latest t, last write, block and page counts, clients online, index status.",
   get_tag: "A tag's properties, the tags it extends and the tags that extend it.",
   insert_block_children: "Add block trees under an existing block; insert_block_tree also takes a page as target.",
   insert_block_tree: "Write a whole note as one nested block tree on a page or under a block; the usual way to write.",

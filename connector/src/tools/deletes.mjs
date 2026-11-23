@@ -147,6 +147,12 @@ export const DELETE_RULES = Object.freeze({
     when: (args) => (bodyOf(args)?.favorite === false ? "removes the page from the favourites list" : null),
   },
 
+  // Patch 0056: an apply deletes the blank leaves its block-ids name. Only dry-run true in the body (where
+  // the operation declares it) lists without deleting; false, a missing flag or no body is an apply.
+  delete_blank_blocks: {
+    when: (args) => (bodyOf(args)?.["dry-run"] === true ? null : "deletes blank blocks"),
+  },
+
   update_block: { never: "overwrites the block's text; the before-snapshot keeps the old text" },
   update_page: { never: "overwrites the page's title; the before-snapshot keeps the old one" },
   refresh_refs: { never: "rewrites each changed block's text; the before-snapshot keeps it" },
@@ -203,6 +209,7 @@ export const DRY_RUN_TOOLS = Object.freeze({
   insert_block_tree: "body",
   set_page_favorite: "body",
   reorder_favorites: "body",
+  delete_blank_blocks: "body",
 });
 
 /**

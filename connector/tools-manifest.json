@@ -132,6 +132,18 @@
     "firstLine": "Read-only Datalog for questions no other tool answers; try run_named_query first."
   },
   {
+    "name": "delete_blank_blocks",
+    "method": "POST",
+    "path": "/api/v1/graphs/{graph-id}/blank-blocks/delete",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "Delete empty leaf blocks from up to 20 pages: dry-run first, then pass the block ids it listed."
+  },
+  {
     "name": "delete_block",
     "method": "DELETE",
     "path": "/api/v1/graphs/{graph-id}/blocks/{block-id}",
@@ -310,6 +322,18 @@
       "openWorldHint": false
     },
     "firstLine": "A property's type, choices and classes; check it before setting a choice or node value."
+  },
+  {
+    "name": "get_sync_status",
+    "method": null,
+    "path": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "A graph's sync state: latest t, last write, block and page counts, clients online, index status."
   },
   {
     "name": "get_tag",

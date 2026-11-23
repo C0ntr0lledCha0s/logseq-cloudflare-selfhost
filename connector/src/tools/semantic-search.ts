@@ -27,6 +27,7 @@ import {
   phraseFirst,
 } from "../semantic/ranking";
 import { reciprocalRankFusion } from "../semantic/rrf";
+import { statusFields } from "../semantic/status";
 import type { SemanticStore, StoredBlock } from "../semantic/store";
 import type { OnSuccess } from "./readable";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
@@ -458,13 +459,14 @@ export function registerSemanticTools(
           deps.bindings.index.describe(),
         ]);
         const listing = state?.cursor ? (state.t === null ? "full" : "changes") : null;
+        const fields = statusFields(state, counts);
         const status = {
           graph: args.graph,
-          status: state?.status ?? "not started",
-          "indexed-blocks": counts.graph,
+          status: fields.status,
+          "indexed-blocks": fields["indexed-blocks"],
           "listing-in-progress": listing,
-          "indexed-at": state?.indexedAt ?? null,
-          error: state?.error ?? null,
+          "indexed-at": fields["indexed-at"],
+          error: fields.error,
           index: {
             model: EMBEDDING_MODEL,
             dimensions: info.dimensions,

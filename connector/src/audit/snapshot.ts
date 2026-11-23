@@ -157,6 +157,16 @@ export const SNAPSHOT_PLAN: Readonly<Record<string, SnapshotPlanEntry>> = Object
   },
   delete_block: blockDelete((a) => [a["block-id"]]),
   delete_blocks: blockDelete((a) => list(record(a.body)?.["block-ids"])),
+  // Patch 0056: an apply deletes exactly its block-ids, each a blank leaf with no subtree, so their
+  // summaries are the whole of what goes. A dry run names no ids and reads nothing. A delete: a block
+  // the read doesn't return refuses the apply. getBlocks' summaries answer on E2EE graphs too (where the
+  // server refuses the write), so there is no fallback read.
+  delete_blank_blocks: {
+    source: "getBlocks",
+    read: (a) => (record(a.body)?.["dry-run"] === true ? null : blocksRead(list(record(a.body)?.["block-ids"]), "summary")),
+    delete: { e2ee: () => null },
+    keep: "each listed block's title, order, parent-id and page-id (a blank leaf has no subtree)",
+  },
   delete_page: {
     source: "getPageOutline",
     read: (a) => entityRead("getPageOutline", "pages", a["page-id"], "/outline"),
