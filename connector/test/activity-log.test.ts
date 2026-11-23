@@ -974,12 +974,14 @@ describe("query reads", () => {
     await call("run_named_query", { name: "projects-untouched", body: { params: { days: 4321 } } });
     await call("run_named_query", { name: "open-tasks-by-client" });
     await call("run_named_query", { name: "meetings-without-decision", body: { params: {} } });
+    await call("run_named_query", { name: "open-tasks-by-client", body: { params: { client: "Projets secrets", client_property: "forClient" } } });
     const rows = await allRows();
     expect(rows.map((r) => [r.tool, r.kind, r.status, JSON.parse(r.addressed), r.rows_read, r.rows_written])).toEqual([
       ["run_named_query", "read", "ok", ["named:pages-missing-property", "param:property", "param:tag"], 0, READ_ROW_WRITES],
       ["run_named_query", "read", "ok", ["named:projects-untouched", "param:days"], 0, READ_ROW_WRITES],
       ["run_named_query", "read", "ok", ["named:open-tasks-by-client"], 0, READ_ROW_WRITES],
       ["run_named_query", "read", "ok", ["named:meetings-without-decision"], 0, READ_ROW_WRITES],
+      ["run_named_query", "read", "ok", ["named:open-tasks-by-client", "param:client", "param:client_property"], 0, READ_ROW_WRITES],
     ]);
     const stored = JSON.stringify(rows);
     for (const value of ["Projets secrets", "forClient", "4321"]) expect(stored, value).not.toContain(value);
