@@ -4,6 +4,7 @@ area: api
 tags: [edit-stamps, editedBy, claudeEditedAt, authored-write, header, stamp-tx, cost, design-panel, reserved-ident]
 seen:
   - 2026-11-07 – item 29, patch 0034, design panel and review round 1 (r1-correctness-1)
+  - 2026-11-22 – item 49, patch 0050: edit stamps rejected as the "created by Claude" test for Query blocks
 promoted_to: []
 ---
 
@@ -25,3 +26,5 @@ The connector sends `x-logseq-edit-stamp: claude` on non-GET calls when the grap
 - Derive "what this call changed" from the datoms the write produced and pin the negative cases (siblings, children, value blocks) with a mutation.
 - A reserved property ident must be refused on every route that accepts properties, flagged or not. Review round 1 found `prepare-properties`, used by inserts, never checked the stamp idents, so an unflagged insert could store `editedBy=claude`. See `new-selector-form-needs-every-lookup-site.md` for the same shape.
 - Deletes and `update_property` stamp the blocks whose values they remove. That is accurate, but docs said otherwise. Describe what a derived rule does, not what was intended.
+
+- Do not use the stamps to prove that Claude created a block (item 49). They mean "Claude edited", exist only while "Mark Claude's edits" is on, and `created-by-ref` names the owner for both the app and the connector. Patch 0050 sets a hidden checkbox property, `claudeQueryBlock`, at creation instead. Known limit: a copy of a marked block keeps the marker.
