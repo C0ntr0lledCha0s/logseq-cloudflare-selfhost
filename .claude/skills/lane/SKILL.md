@@ -19,9 +19,9 @@ The lanes are described in `docs/lanes/README.md`, and `CLAUDE.md` has the repo 
    - If the task is already Done or Canceled, say so and stop unless the owner insists.
    - If it depends on an item that isn't done (a `dependsOn` task whose Status isn't Done), say so and ask before continuing.
 4. Pick the lane, unless the owner named one:
-   - `bug` for a *bug* label, or a described defect
-   - `feature` for an *enhancement* label
-   - `spike` for a *spike* label, or a question to answer
+   - `bug` for a task tagged Bug (or an old *bug* label), or a described defect
+   - `feature` for a task tagged Feature or Improvement (or an old *enhancement* label)
+   - `spike` for a spike (a Work Item titled or labelled as one), or a question to answer
    - `review` to review the current branch only
 5. If the description is ambiguous between bug and feature, ask. Otherwise proceed.
 
