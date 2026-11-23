@@ -77,6 +77,13 @@ test("unsafe or unused vars are removed or rejected", () => {
   assert.equal(out.vars.COGNITO_CLIENT_ID, "69cs1lgme7p8kbgld8n5kseii6");
 });
 
+test("upstream's direct-upload bucket var is removed", () => {
+  // Upstream names its own R2 bucket for presigned uploads over 100 MiB. The self-hosted
+  // entry has no signer, so the var would make those uploads answer 503 instead of "proxy".
+  const out = render();
+  assert.equal("R2_ASSET_UPLOAD_BUCKET" in out.vars, false);
+});
+
 test("forbidden vars throw", () => {
   for (const key of ["DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS", "SENTRY_DSN"]) {
     assert.throws(

@@ -81,6 +81,10 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
   if (cfg.vars) {
     delete cfg.vars.COGNITO_CLIENT_IDS;
     delete cfg.vars.OPENAI_APPS_CHALLENGE;
+    // Upstream's own bucket for presigned direct uploads. entry.mjs (patch 0020) wires no
+    // signer, so with it set an app upload over 100 MiB gets a 503; without it the server
+    // answers "proxy" and the upload streams through the Worker as before.
+    delete cfg.vars.R2_ASSET_UPLOAD_BUCKET;
   }
 
   // Upstream turns invocation logs off, so Workers Logs show only what the code logs and no
