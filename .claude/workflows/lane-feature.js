@@ -56,7 +56,10 @@ const TIERS = {
   full: { fix_rounds: 2, review: 'full', mutation_cap: 12, investigate_lenses: 2, cause_skeptics: 2, take_should_fix: true, design_panel: true, stage_check: true },
 }
 const TIER_RULES = `Suggest a tier (suggested_tier, with tier_reason). full: the change deletes, retires, converts or restructures stored data or the schema (properties, classes, choices, pages becoming tags), touches auth, tokens, secrets or access, or adds a migration. quick: a small, non-destructive change in one place (one tool's text or output, one resolver branch, a script) with no change to what is stored. standard: everything else, including fixes that change how values are stored or read.`
-const classSweep = cap => `Class sweep: if the fix narrows a type, a resolver or what an input may be, list every property type or input kind that reaches the same resolver (for example number, node, default, url, date, datetime, checkbox, a choice, a UUID, a title, a bare integer) and add a test with a representative input for each, saying in notes which kinds you covered and why any were left out. Before the stage ends, run the mutation step on your own new rules: for each rule or branch you added in this stage (at most ${cap}, choosing first the rules with no test that clearly targets them, then the rules guarding writes, deletes and refusals; list the rest in notes), make a one-line mutation that removes it in a scratch copy, run its namespace in one warm watch, restore it, and add a test for any rule that survives.`
+const classSweep = cap => `Class sweep: if the fix narrows a type, a resolver or what an input may be, list every property type or input kind that reaches the same resolver (for example number, node, default, url, date, datetime, checkbox, a choice, a UUID, a title, a bare integer) and add a test with a representative input for each, saying in notes which kinds you covered and why any were left out.`
+// The mutation step is required in every build stage and fix: its figures go in the change's
+// mutations field, the stage check verifies them, and the run log shows them.
+const mutationStep = cap => `Mutation step (required, before the stage ends): for each rule or branch you added (at most ${cap}, choosing first the rules with no test that clearly targets them, then the rules guarding writes, deletes and refusals), make a one-line mutation that removes it in a scratch copy, run its namespace in one warm watch, restore it, and add a test for any rule that survives. Report it in mutations: run (mutants made), killed (mutants the suite fails on at the end, after any tests you added), survivors (any still green, with the reason) and skipped (each rule you didn't mutate, with the reason). A stage that adds no rule says so with run 0.`
 
 // ---------- schemas ----------
 const BRIEF_SCHEMA = {
@@ -149,6 +152,12 @@ const CHANGE_SCHEMA = {
     summary: { type: 'string' },
     tests_added: { type: 'array', items: TEST_ITEM },
     addressed: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, status: { type: 'string', enum: ['fixed', 'disputed'] }, note: { type: 'string' } }, required: ['id', 'status', 'note'] } },
+    mutations: {
+      type: 'object',
+      description: "the stage's mutation step",
+      properties: { run: { type: 'integer' }, killed: { type: 'integer' }, survivors: { type: 'array', items: { type: 'string' } }, skipped: { type: 'array', items: { type: 'string' } } },
+      required: ['run', 'killed'],
+    },
     checks: { type: 'array', items: { type: 'object', properties: { check: { type: 'string' }, result: { type: 'string', enum: ['passed', 'failed', 'skipped'] }, detail: { type: 'string' } }, required: ['check', 'result'] } },
     gate_green: { type: 'boolean' },
     head_sha: { type: 'string' },
@@ -202,6 +211,11 @@ const COMPOUND_SCHEMA = {
     false_positives: { type: 'array', items: { type: 'string' } },
     retro_proposals: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, change: { type: 'string' }, evidence: { type: 'string' } }, required: ['target', 'change', 'evidence'] } },
     skill_suggestions: { type: 'array', items: { type: 'string' } },
+    deferred_backlog: {
+      type: 'array',
+      description: 'the deferred should-fix items merged by meaning (same defect, same place), one backlog item each',
+      items: { type: 'object', properties: { ids: { type: 'array', items: { type: 'string' } }, title: { type: 'string' }, where: { type: 'string', description: 'file:line or the handler' }, evidence: { type: 'string', description: 'the probe or test path that shows it' } }, required: ['ids', 'title', 'where'] },
+    },
   },
   required: ['entries', 'promotions', 'retro_proposals'],
 }
@@ -255,7 +269,7 @@ if ((brief.env.behind_base || 0) > 10) log(`Warning: HEAD is ${brief.env.behind_
 const TIER_NAME = TIERS[A.tier] ? A.tier : (TIERS[brief.suggested_tier] ? brief.suggested_tier : 'standard')
 const T = TIERS[TIER_NAME]
 const MAX_FIX_ROUNDS = A.max_fix_rounds ?? T.fix_rounds
-const CLASS_SWEEP = classSweep(T.mutation_cap)
+const CLASS_SWEEP = `${classSweep(T.mutation_cap)}\n${mutationStep(T.mutation_cap)}`
 log(`Tier: ${TIER_NAME}${A.tier ? ' (set by the owner)' : ` (suggested: ${brief.tier_reason || 'no reason given'})`}; up to ${MAX_FIX_ROUNDS + 1} review round(s), mutation cap ${T.mutation_cap}.`)
 const BRIEF = J(brief)
 // Reviewers see only what this lane changed: commits before the lane started were reviewed by
@@ -333,10 +347,12 @@ for (const stage of plan.stages) {
     { ...M('implement'), label: `build:${stage.id}`, phase: 'Build', agentType: 'implementer', schema: CHANGE_SCHEMA },
   )
   if (!change) return { status: 'blocked', stage: `build:${stage.id}`, brief, spec, plan, built }
+  const mut = change.mutations
+  log(mut ? `Stage ${stage.id} mutations: ${mut.run} run, ${mut.killed} killed${(mut.survivors || []).length ? `, survivors: ${mut.survivors.join('; ')}` : ''}${(mut.skipped || []).length ? `; not mutated: ${mut.skipped.join('; ')}` : ''}` : `Warning: stage ${stage.id} reported no mutation step.`)
   const prevHead = built.length ? built[built.length - 1].change.head_sha : BASE
   // The quick tier skips per-stage checks: its one review pass covers the whole change.
   const check = !T.stage_check ? null : await agent(
-    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? If the stage changed patches/, rebuild the release bundle with scripts/build.sh .upstream and run scripts/check.sh --upstream on the committed HEAD yourself, and quote the SHA: a red gate or a WARNING naming a skipped test is a major finding. Stage agents commit and don't push (the lane pushes at closeout and checks the remote then), so don't raise an unpushed stage commit as a finding. Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
+    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? Check the mutation step: the builder's mutations report must be there, with run and killed. List the rules the stage added; for each one it says it mutated, confirm a test fails without it (re-run one or two mutations yourself), and for each it skipped, judge the reason. A missing mutation report, a rule that is neither mutated nor skipped with a reason, or a survivor with no new test is a major finding. If the stage changed patches/, rebuild the release bundle with scripts/build.sh .upstream and run scripts/check.sh --upstream on the committed HEAD yourself, and quote the SHA: a red gate or a WARNING naming a skipped test is a major finding. Stage agents commit and don't push (the lane pushes at closeout and checks the remote then), so don't raise an unpushed stage commit as a finding. Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
     { ...M('stage_check'), label: `check:${stage.id}`, phase: 'Build', agentType: 'adversarial-reviewer', schema: FINDINGS_SCHEMA, effort: 'medium' },
   )
   const serious = ((check && check.findings) || []).filter(f => ['security', 'blocker', 'major'].includes(f.severity)).map((f, i) => ({ ...f, id: `s-${stage.id}-${i + 1}` }))
@@ -393,9 +409,11 @@ const rounds = []
 // Pre-existing defects that skeptics confirmed, collected across rounds for the closeout.
 const backlog = []
 const addBacklog = items => { for (const f of items || []) if (!backlog.some(b => b.id === f.id)) backlog.push(f) }
-// Should-fix items the tier doesn't fix in this lane; the closeout proposes them as backlog items.
+// Should-fix items the tier doesn't fix in this lane. Rounds word the same defect differently, so
+// this list keeps every item (dropping only a repeated id), and the compound step merges items by
+// meaning and files them; the closeout proposes what it filed.
 const deferred = []
-const addDeferred = items => { for (const f of items || []) if (!deferred.some(d => (d.id && d.id === f.id) || d.title === f.title)) deferred.push(f) }
+const addDeferred = items => { for (const f of items || []) if (!(f.id && deferred.some(d => d.id === f.id))) deferred.push(f) }
 for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
   phase('Review')
   review = await workflow('lane-review', {
@@ -418,7 +436,7 @@ for (let round = 1; round <= MAX_FIX_ROUNDS + 1; round++) {
   if (!open.length || round > MAX_FIX_ROUNDS) break
   log(`Review round ${round}: ${open.length} open finding(s); fixing.`)
   const next = await agent(
-    `Address these open review findings by id. Stay inside the spec's scope: record anything beyond it in notes as a backlog item rather than building it. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. ${T.take_should_fix ? 'Take the cheap should-fix items too.' : 'Leave the should-fix items: the closeout proposes them as backlog items.'} Keep the docs true in the same commit.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
+    `Address these open review findings by id. Stay inside the spec's scope: record anything beyond it in notes as a backlog item rather than building it. Fix each, with a test seen to fail first where the finding is behavioural, or dispute it with evidence. Report every id in addressed. ${T.take_should_fix ? 'Take the cheap should-fix items too.' : 'Leave the should-fix items: the compound step files them as backlog items.'} Keep the docs true in the same commit.\n${CLASS_SWEEP}\n${ITERATE}\nRun the gate and commit as "fix(<scope>): address review round ${round}".${TRAILER}\nOpen findings:\n${J(open)}\nShould fix:\n${J(review.should_fix)}`,
     { ...M('implement'), label: `address-review:r${round}`, phase: 'Review', agentType: 'implementer', schema: CHANGE_SCHEMA },
   )
   if (next) open = open.map(f => ({ ...f, fixer_note: ((next.addressed || []).find(a => a.id === f.id) || {}).note }))
@@ -439,7 +457,7 @@ const docs = await agent(
 phase('Compound')
 const stats = { design: design && { totals: design.totals, disagreements: design.disagreements }, stages: built.map(b => ({ id: b.stage.id, stage_findings: b.stage_findings.length })), review_rounds: rounds, open_at_end: open.map(f => ({ id: f.id, severity: f.severity, title: f.title })), pre_existing_to_backlog: backlog.map(f => ({ id: f.id, severity: f.severity, title: f.title })), tier: TIER_NAME, should_fix_deferred: deferred.map(f => f.title), vendor: brief.env.vendor }
 const compound = await agent(
-  `Close the compound loop for this feature, then commit only your learning files as "docs(learnings): …".${TRAILER} Look for lessons in what the design judges disagreed on, what the stage checks caught, what the review confirmed or refuted, and any cost arithmetic worth keeping.\nFeature:\n${BRIEF}\nStage findings:\n${J(built.map(b => ({ id: b.stage.id, findings: b.stage_findings })))}\nReview: open ${J(open)}\nrefuted ${J(review && review.refuted)}\nRun statistics for the retro:\n${J(stats)}`,
+  `Close the compound loop for this feature, then commit only your learning files as "docs(learnings): …".${TRAILER} Look for lessons in what the design judges disagreed on, what the stage checks caught, what the review confirmed or refuted, and any cost arithmetic worth keeping.\nFeature:\n${BRIEF}\nStage findings:\n${J(built.map(b => ({ id: b.stage.id, findings: b.stage_findings })))}\nReview: open ${J(open)}\nrefuted ${J(review && review.refuted)}\nDeferred should-fix items (file these: merge the ones that describe the same defect in the same place, whatever their ids or wording, and return one deferred_backlog item for each, listing every id it covers; don't edit the README Backlog or Logseq):\n${J(deferred)}\nRun statistics for the retro:\n${J(stats)}`,
   { ...M('compound'), label: 'compound', agentType: 'compounder', schema: COMPOUND_SCHEMA },
 )
 
@@ -453,7 +471,7 @@ const closeout = await agent(
 - logseq_update: a markdown block tree for item ${brief.issue_number ?? '(no issue)'} on ${PAGE}, in that page's style, led by "**Built ${TODAY}** –", with a child block for each proposed backlog item.
 - logseq_properties: the task properties /lane sets beside logseq_update. status is one of the graph's Status choices (Backlog, Todo, Doing, In Review, Done, Canceled): "In Review" when the gate is green and the branch is ready for a PR (open findings included, as a draft), "Doing" when the gate is red or a security finding is open. phase: "review" when ready for a PR, "execute" otherwise. branch: ${J(brief.env.branch)} (the lane's branch). pr_url: null, because no PR exists yet (/lane fills it in if it opens one).
 - live_verification: steps against the live connector after deploy, using throwaway pages only.
-Feature:\n${BRIEF}\nSpec: ${spec.path}\nPlan: ${plan.path}\nStages:\n${J(built.map(b => b.change))}\nReview rounds:\n${J(rounds)}\nOpen:\n${J(open)}\nPre-existing (skeptics found these predate this change; propose as backlog items):\n${J(backlog)}\nShould-fix left by the ${TIER_NAME} tier (propose as backlog items):\n${J(deferred)}\nRefuted:\n${J(review && review.refuted)}\nDocs:\n${J(docs)}\nCompound:\n${J(compound)}`,
+Feature:\n${BRIEF}\nSpec: ${spec.path}\nPlan: ${plan.path}\nStages:\n${J(built.map(b => b.change))}\nReview rounds:\n${J(rounds)}\nOpen:\n${J(open)}\nPre-existing (skeptics found these predate this change; propose as backlog items):\n${J(backlog)}\nShould-fix left by the ${TIER_NAME} tier, as the compound step filed them (propose each as one backlog item):\n${J((compound && compound.deferred_backlog) || deferred)}\nRefuted:\n${J(review && review.refuted)}\nDocs:\n${J(docs)}\nCompound:\n${J(compound)}`,
   { ...M('closeout'), label: 'closeout', schema: CLOSEOUT_SCHEMA, effort: 'medium' },
 )
 

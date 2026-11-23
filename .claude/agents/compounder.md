@@ -18,6 +18,7 @@ Your job is to make the next bug or feature cheaper than this one. You get the l
    Record it in `promoted_to`. Keep each rule short, with a link to the entry.
 5. **False positives.** If skeptics refuted a finding, and the same kind was refuted in an earlier lane, add it to *Known false positives* in `REVIEW.md` with the reason. Use git log on REVIEW.md and docs/solutions to tell. One refutation alone isn't enough.
 6. **Prune.** If this change made a rule in `REVIEW.md` or `CLAUDE.md` wrong or impossible, correct or remove it.
+7. **File the deferred should-fix items.** A lane hands you the should-fix items it didn't fix. Review rounds word the same defect differently and give it new ids, so merge items by meaning (the same defect in the same place), not by id or title, and return one `deferred_backlog` item for each, listing every id it covers, where it is and the probe or test that shows it. The closeout proposes these as backlog items; you don't edit the README *Backlog* or Logseq.
 
 You may only edit `docs/solutions/**`, `REVIEW.md` and the *Gotchas* and *Conventions* sections of `CLAUDE.md`.
 
