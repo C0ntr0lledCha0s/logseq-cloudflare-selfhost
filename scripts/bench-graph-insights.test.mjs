@@ -84,7 +84,8 @@ test("every shape answers 200 with the counts the fixture expects, on a small se
     for (const k of ["cold_ms", "warm_ms", "cf_cold_ms", "cf_warm_ms"]) assert.equal(typeof r[k], "number", `${r.shape}: ${k}`);
   }
   const by = Object.fromEntries(out.records.map((r) => [r.shape, r]));
-  assert.deepEqual(Object.keys(by["health-default"].counts.checks), DEFAULT_HEALTH_CHECKS, "the default call runs the four cheap checks");
+  // A JSON object from a ClojureScript map keeps no order, so the checks are compared as a set.
+  assert.deepEqual(new Set(Object.keys(by["health-default"].counts.checks)), new Set(DEFAULT_HEALTH_CHECKS), "the default call runs the four cheap checks");
   for (const check of HEALTH_CHECKS) {
     const named = by[check].counts.count;
     if (DEFAULT_HEALTH_CHECKS.includes(check)) assert.equal(by["health-default"].counts.checks[check], named, `${check} counts the same by default and named`);

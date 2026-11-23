@@ -1,6 +1,6 @@
 // Bench for the three graph-insight reads at their caps (spec 2026-11-20 §5, plan 2026-11-22 Stage 6):
-// getGraphHealth (the default call, with three stored tag-property pairs, and each of its nine checks
-// named alone), listChangesSince over a window of 2,500 changes (the cap) with limit=200 and
+// getGraphHealth (the default call, which runs four checks and reads no tag-property pairs, and
+// each of its nine checks named alone, missing-tag-properties with three stored pairs), listChangesSince over a window of 2,500 changes (the cap) with limit=200 and
 // blocks-per-page=50, and getGraphSchema with both sections at limit=200.
 //
 // Each read runs in the sync Worker's graph Durable Object, where the clock does not move during

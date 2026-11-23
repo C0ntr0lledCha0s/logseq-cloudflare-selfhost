@@ -3215,6 +3215,22 @@ describe("get_graph_health's default check set", () => {
     );
   });
 
+  it("connector_help says the page-check parameters are refused without their checks", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "created-after and updated-after narrow only pages-without-summary and pages-without-tags, and summary-prefix only pages-without-summary; each is refused unless checks names a check it applies to.",
+    );
+  });
+
+  it("the vendored page-check parameters say which checks they need", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    const props = tool.inputSchema.properties;
+    expect(props["created-after"].description).toContain("Refused unless checks names one of them.");
+    expect(props["updated-after"].description).toContain("Refused unless checks names one of them.");
+    expect(props["summary-prefix"].description).toContain("for pages-without-summary. Refused unless checks names it.");
+    expect(tool.description).toContain("each is refused with 400 unless checks names a check it applies to");
+  });
+
   it("the vendored description and checks parameter name the default four and say the others run only when named", async () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_health");
     expect(tool.description).toContain(

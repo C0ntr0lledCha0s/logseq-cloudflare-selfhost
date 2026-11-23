@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 0414f60..a48a97f 100644
+index f8eece6..4a310a3 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5798,6 +5798,92 @@
+@@ -5816,6 +5816,92 @@
  (def ^:private insight-handlers
    #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
  
@@ -95,7 +95,7 @@ index 0414f60..a48a97f 100644
  ;; listBlockChanges feeds an external search index. Without `since` it lists every content block
  ;; in UUID order; with `since` (a graph t from an earlier response) and that response's `epoch`, it
  ;; lists the blocks whose indexed text may have changed since then, read from the tx log, plus the
-@@ -6572,6 +6658,7 @@
+@@ -6589,6 +6675,7 @@
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
      (= :semantic/changes-since handler) (handle-changes-since context)
@@ -104,10 +104,10 @@ index 0414f60..a48a97f 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index ec88eaf..5ec45fe 100644
+index 75fe5d5..d75b1a5 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -106,6 +106,8 @@
+@@ -118,6 +118,8 @@
      :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
     {:method "GET" :path "/api/v1/graphs/:graph-id/changes" :internal-path "/semantic/changes"
      :handler :semantic/changes-since :operation-id "listChangesSince" :scope "logseq/read" :rate-class :read}
@@ -116,16 +116,16 @@ index ec88eaf..5ec45fe 100644
     ;; A read: POST only because the query can be long.
     {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
      :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
-@@ -219,6 +221,8 @@
+@@ -231,6 +233,8 @@
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
     "listChangesSince" ["List what changed since a time"
-                        "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 2,500 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
+                        (str "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than " (format-count max-changes) " changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs.")]
 +   "getGraphSchema" ["Get the graph's schema"
 +                     "Lists every user tag and property with its details and usage counts in one call, for a schema or drift review, instead of list_tags and get_tag per tag. sections is tags, properties or both (the default, comma-separated); any other value is refused. Each tag has uuid, ident, title, extends (the tags it extends), properties (its own tag properties, built-in ones included) and object-count (the objects tagged with it directly; a tag that extends it counts its own). Each property has uuid, ident, title, type, cardinality, choices (in the editor's order, each with usage-count: how many values are that choice, counted by the choice's id), classes for a node property, value-count (its values, one per value of a many property; Logseq's empty placeholder is not a value) and used-by-tags (the tags that list it as a tag property). Private content and the Recycle bin are left out of every item and every count: a tag, property or object tagged Private (or with a tag that extends Private), on or under such a page or block, or in the Recycle bin is neither listed nor counted, so a choice held only by Private blocks has usage-count 0. Built-in tags and properties (Task, Status and the like) are hidden unless built-in=true. Each section is in title order with a complete count and at most limit items (1 to 200, default 50); to page through one section, pass that section alone in sections with its next-cursor. Each refusal names its parameter. Unavailable for E2EE graphs."]
     "datalogQuery" ["Run a read-only Datalog query"
                     (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
                          " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
-@@ -635,6 +639,15 @@
+@@ -655,6 +659,15 @@
              :description "Most blocks listed per page, newest first (1 to 50, default 10). The created and updated counts stay complete."}
             {:name "cursor" :in "query" :schema {:type "string"}
              :description "The previous response's next-cursor, with the same since."}])
@@ -141,7 +141,7 @@ index ec88eaf..5ec45fe 100644
      (= "listGraphs" operation-id)
      (into [{:name "name" :in "query" :schema {:type "string"}
              :description "Exact graph name, matched case-insensitively."}])
-@@ -717,6 +730,7 @@
+@@ -737,6 +750,7 @@
                    (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
                    "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
                    "listChangesSince" (entity-response "ChangesSinceResponse" "The pages changed in the window, newest first")
@@ -149,15 +149,15 @@ index ec88eaf..5ec45fe 100644
                    "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
                    "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
                    "updatePage" (entity-response "PageResponse" "The updated page")
-@@ -753,6 +767,7 @@
+@@ -773,6 +787,7 @@
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
 +           "getGraphSchema" {"400" {:description "A parameter that can't be read, named: sections, built-in, limit or cursor (a cursor needs exactly one section)"}}
             "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
-                                "422" {:description "More than 2,500 changes in the window; pass a later since or an until"}
+                                "422" {:description (str "More than " (format-count max-changes) " changes in the window; pass a later since or an until")}
                                 "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
-@@ -1191,6 +1206,34 @@
+@@ -1211,6 +1226,34 @@
                                            :tags {:type "array" :items {:type "string"}
                                                   :description "Titles of the tags on the block, its ancestors and its page."}
                                            :updated-at {:type "integer"}}}

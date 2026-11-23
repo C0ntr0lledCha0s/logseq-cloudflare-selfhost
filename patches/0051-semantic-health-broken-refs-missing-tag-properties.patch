@@ -122,10 +122,10 @@ index 7ed17ad..5caba9c 100644
 +                                  (when-let [missing (seq (filter #(missing? object-id (:db/ident %)) properties))]
 +                                    {:holder (d/entity db object-id) :tag tag :missing (vec missing)}))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d22c921..381291f 100644
+index d22c921..932ce1d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5504,7 +5504,134 @@
+@@ -5504,7 +5504,150 @@
  
  (def ^:private health-checks
    ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"
@@ -140,6 +140,22 @@ index d22c921..381291f 100644
 +
 +(def ^:private default-health-checks
 +  (vec (remove opt-in-health-checks health-checks)))
++
++(def ^:private health-page-check-parameters
++  "Parameters that only change the page checks, each with the checks it applies to. Since the page
++  checks left the default, a call that runs none of them would ignore the parameter, so it is
++  refused naming the checks it needs."
++  [["created-after" ["pages-without-summary" "pages-without-tags"]]
++   ["updated-after" ["pages-without-summary" "pages-without-tags"]]
++   ["summary-prefix" ["pages-without-summary"]]])
++
++(defn- unused-health-parameter-error
++  "The 400 text for the first page-check parameter in `url` whose checks `checks` runs none of."
++  [^js url checks]
++  (some (fn [[param needs]]
++          (when (and (.has (.-searchParams url) param) (not-any? (set needs) checks))
++            (str param " needs the " (string/join " or " needs) " check")))
++        health-page-check-parameters))
 +
 +(def ^:private max-tag-property-pairs
 +  "The most expected tag-property pairs one missing-tag-properties call checks."
@@ -261,7 +277,7 @@ index d22c921..381291f 100644
  
  (defn- orphan-choices
    "Every choice whose owners are all gone or nameless (stranded-choice?)."
-@@ -5536,16 +5663,25 @@
+@@ -5536,16 +5679,25 @@
    (let [raw (.get (.-searchParams url) param)]
      (when (seq raw) (vec (distinct (string/split raw #","))))))
  
@@ -293,7 +309,7 @@ index d22c921..381291f 100644
                                   :items #(mapv (fn [group]
                                                   {:title (:block/title (first group))
                                                    :entities (mapv page-ref-response group)})
-@@ -5556,12 +5692,34 @@
+@@ -5556,12 +5708,34 @@
        (update (paginate-by (fn [{:keys [holder property value]}]
                               [(uuid-string (:block/uuid holder))
                                (str (entity-ident property) " " (uuid-string (:block/uuid value)))])
@@ -331,7 +347,7 @@ index d22c921..381291f 100644
  
  (defn- knowledge-index-aliases
    "Titles of the page's :block/alias targets, sorted: none hidden or in the Recycle bin (itself or
-@@ -5586,7 +5744,7 @@
+@@ -5586,7 +5760,7 @@
               :updated-at (:block/updated-at page)}
        summary (assoc :summary summary))))
  
@@ -340,12 +356,12 @@ index d22c921..381291f 100644
    (let [{:keys [limit raw-cursor cursor]} (pagination-options url)
          prefix (or (.get (.-searchParams url) "summary-prefix") graph-insights/default-summary-prefix)]
      (cond
-@@ -5604,16 +5762,25 @@
+@@ -5604,16 +5778,26 @@
                (http/not-found))))
  
          :semantic/graph-health
 -        (let [checks (or (comma-list url "checks") health-checks)
-+        (let [checks (or (comma-list url "checks") default-health-checks)
++        (let [checks (or (not-empty (comma-list url "checks")) default-health-checks)
                time-filters (time-filter-options url)]
            (cond
              (not-every? (set health-checks) checks) (http/bad-request "invalid checks")
@@ -353,6 +369,7 @@ index d22c921..381291f 100644
              (:invalid? time-filters) (http/bad-request "invalid time filter")
 +            (and (.has (.-searchParams url) "tag-properties") (not (some #{"missing-tag-properties"} checks)))
 +            (http/bad-request "tag-properties needs the missing-tag-properties check")
++            (unused-health-parameter-error url checks) (http/bad-request (unused-health-parameter-error url checks))
              :else
 -            (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor}]
 -              (http/json-response nil {:checks (into {} (map (fn [check] [check (health-check db check options)]))
@@ -371,7 +388,7 @@ index d22c921..381291f 100644
          :semantic/knowledge-index
          (let [excluded (set (map string/lower-case (comma-list url "exclude-tags")))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index cbf0844..733a9a4 100644
+index cbf0844..d589362 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -167,7 +167,7 @@
@@ -379,11 +396,11 @@ index cbf0844..733a9a4 100644
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
 -   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
-+   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists, and code holds no refs: a code or math block, an inline code span and a fenced block are not scanned) and missing-tag-properties (objects tagged with a tag, or with a tag that extends it, that hold no value for one of that tag's expected properties or hold Logseq's empty placeholder for it, in holder order; each item names the holder, its page, the tag and the missing properties by ident and title, one per object and tag). missing-tag-properties checks only the expected tag-property pairs: tag-properties, a JSON array of 1 to 50 pairs {\"tag\": …, \"property\": …} (each a UUID, ident or title), or, when it is not given, the stored pairs in the Worker's HEALTH_TAG_PROPERTIES secret, set from the HEALTH_TAG_PROPERTIES GitHub secret or config/settings.json health.expectedTagProperties. Each pair's tag must be a user tag and its property a user property that the tag, or a tag it extends, lists and that has no default value; any other tag-properties pair is refused with 400 naming its entry (tag-properties[N]) and the reason, and nothing is checked. The stored pairs serve every graph on the Worker, so a stored pair that doesn't resolve in this graph is skipped, not refused: skipped names each one by its entry (HEALTH_TAG_PROPERTIES[N]) and reason, and the other pairs are checked. A malformed stored value is refused with 400. The stored pairs are read only when the check runs. With no pairs the check lists nothing and answers a note saying how to give them. Its result names the pairs it checked (pairs, each tag's uuid and title and the property's ident and title) and where they came from (pairs-from: input, settings or none). tag-properties without the missing-tag-properties check is refused. Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks: each reads every page, title or tagged object, so on a large graph name one of them per call. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists, and code holds no refs: a code or math block, an inline code span and a fenced block are not scanned) and missing-tag-properties (objects tagged with a tag, or with a tag that extends it, that hold no value for one of that tag's expected properties or hold Logseq's empty placeholder for it, in holder order; each item names the holder, its page, the tag and the missing properties by ident and title, one per object and tag). missing-tag-properties checks only the expected tag-property pairs: tag-properties, a JSON array of 1 to 50 pairs {\"tag\": …, \"property\": …} (each a UUID, ident or title), or, when it is not given, the stored pairs in the Worker's HEALTH_TAG_PROPERTIES secret, set from the HEALTH_TAG_PROPERTIES GitHub secret or config/settings.json health.expectedTagProperties. Each pair's tag must be a user tag and its property a user property that the tag, or a tag it extends, lists and that has no default value; any other tag-properties pair is refused with 400 naming its entry (tag-properties[N]) and the reason, and nothing is checked. The stored pairs serve every graph on the Worker, so a stored pair that doesn't resolve in this graph is skipped, not refused: skipped names each one by its entry (HEALTH_TAG_PROPERTIES[N]) and reason, and the other pairs are checked. A malformed stored value is refused with 400. The stored pairs are read only when the check runs. With no pairs the check lists nothing and answers a note saying how to give them. Its result names the pairs it checked (pairs, each tag's uuid and title and the property's ident and title) and where they came from (pairs-from: input, settings or none). tag-properties without the missing-tag-properties check is refused. Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks and summary-prefix sets pages-without-summary's prefix; each is refused with 400 unless checks names a check it applies to. A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks: each reads every page, title or tagged object, so on a large graph name one of them per call. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
-@@ -598,7 +598,9 @@
+@@ -598,13 +598,23 @@
              :description "Most items listed per relation. Counts are always complete."}])
      (= "getGraphHealth" operation-id)
      (into (concat [{:name "checks" :in "query" :schema {:type "string"}
@@ -394,7 +411,23 @@ index cbf0844..733a9a4 100644
                     {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
                      :description "Most items listed per check. Counts are always complete."}
                     {:name "cursor" :in "query" :schema {:type "string"}
-@@ -1055,9 +1057,22 @@
+                     :description "A check's next-cursor; pass that check alone in checks."}
+-                   summary-prefix-parameter]
+-                  time-filter-parameters))
++                   (assoc summary-prefix-parameter
++                          :description (str "Text a page's first top-level block starts with when it is the page's summary,"
++                                            " for pages-without-summary. Refused unless checks names it."))]
++                  (map (fn [{:keys [name] :as parameter}]
++                         (assoc parameter :description
++                                (str "Narrow pages-without-summary and pages-without-tags to pages "
++                                     (if (= "created-after" name) "created" "updated")
++                                     " strictly after this Unix epoch timestamp in milliseconds. Refused unless checks"
++                                     " names one of them.")))
++                       time-filter-parameters)))
+     (= "listKnowledgeIndex" operation-id)
+     (into (concat pagination-parameters
+                   [{:name "exclude-tags" :in "query" :schema {:type "string"}
+@@ -1055,9 +1065,22 @@
                 :HealthCheckResult {:type "object" :required ["count" "items"]
                                     :properties {:count {:type "integer"}
                                                  :items {:type "array"
@@ -831,10 +864,10 @@ index 0000000..46537c8
 +          (p/finally done)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
 new file mode 100644
-index 0000000..568e832
+index 0000000..202b96c
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,424 @@
 +(ns logseq.db-sync.semantic-graph-health-refs-test
 +  "getGraphHealth's broken-refs check (patch 0051): every visible block or page whose stored title
 +  refers to a uuid, as [[uuid]] (which a #[[uuid]] tag holds) or ((uuid)), that has no entity
@@ -1167,6 +1200,41 @@ index 0000000..568e832
 +          (is (= (count expected) (get-in every [:body :checks :broken-refs :count])))
 +          (is (= {:status 400 :body {:error "invalid checks"}} typo)))))))
 +
++;; Review of s-stage-6-2, finding 1: the page checks are no longer in the default, so a parameter that
++;; only narrows them would be ignored on a default call. It is refused naming the checks it needs,
++;; as tag-properties is. created-after and updated-after narrow both page checks; summary-prefix only
++;; pages-without-summary. Finding 2: a checks that is empty after splitting is the default.
++(deftest health-page-check-parameters-need-their-checks-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self]}]
++        (p/let [health (fn [q] (request! self "GET" (str "/semantic/health?limit=200" q) nil))
++                time-needs (fn [param] {:status 400
++                                        :body {:error (str param " needs the pages-without-summary or"
++                                                           " pages-without-tags check")}})
++                prefix-needs {:status 400 :body {:error "summary-prefix needs the pages-without-summary check"}}
++                refused (p/all (map health ["&created-after=0" "&updated-after=0" "&summary-prefix=Abstract:"
++                                            "&checks=broken-refs,orphan-tags&created-after=0"
++                                            "&checks=missing-tag-properties&updated-after=0"
++                                            "&checks=pages-without-tags&summary-prefix=Abstract:"
++                                            "&checks=,&updated-after=0"]))
++                allowed (p/all (map health ["&checks=pages-without-tags&created-after=0"
++                                            "&checks=pages-without-tags&updated-after=0"
++                                            "&checks=pages-without-summary&created-after=0"
++                                            "&checks=pages-without-summary&updated-after=0"
++                                            "&checks=pages-without-summary&summary-prefix=Abstract:"
++                                            "&checks=pages-without-summary,orphan-tags&summary-prefix=Abstract:&updated-after=0"]))
++                blank (p/all (map health ["&checks=," "&checks=,,"]))]
++          (is (= [(time-needs "created-after") (time-needs "updated-after") prefix-needs
++                  (time-needs "created-after") (time-needs "updated-after") prefix-needs
++                  (time-needs "updated-after")]
++                 refused))
++          (is (= [200 200 200 200 200 200] (map :status allowed)) (pr-str (remove #(= 200 (:status %)) allowed)))
++          (doseq [response blank]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= default-checks (set (keys (get-in response [:body :checks]))))
++                "a checks that is empty after splitting runs the default four, as checks= does")))))))
++
 +(deftest broken-refs-upload-path-test
 +  ;; The same check on a graph that arrived through the app's snapshot upload.
 +  (async done
@@ -1208,7 +1276,22 @@ index 0000000..568e832
 +                          (str "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and"
 +                               " orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs"
 +                               " and missing-tag-properties run only when named in checks"))
-+        "review s-stage-6-2")))
++        "review s-stage-6-2")
++    ;; Review of s-stage-6-2, finding 1: each page-check parameter says which checks it needs.
++    (let [param (fn [n] (:description (first (filter #(= n (:name %)) (:parameters operation)))))]
++      (is (string/includes? (:description operation)
++                            (str "created-after and updated-after narrow the two page checks and summary-prefix sets"
++                                 " pages-without-summary's prefix; each is refused with 400 unless checks names a check"
++                                 " it applies to")))
++      (is (= (str "Narrow pages-without-summary and pages-without-tags to pages created strictly after this Unix epoch"
++                  " timestamp in milliseconds. Refused unless checks names one of them.")
++             (param "created-after")))
++      (is (= (str "Narrow pages-without-summary and pages-without-tags to pages updated strictly after this Unix epoch"
++                  " timestamp in milliseconds. Refused unless checks names one of them.")
++             (param "updated-after")))
++      (is (= (str "Text a page's first top-level block starts with when it is the page's summary, for"
++                  " pages-without-summary. Refused unless checks names it.")
++             (param "summary-prefix"))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_tag_properties_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_tag_properties_test.cljs
 new file mode 100644
 index 0000000..ac4da07

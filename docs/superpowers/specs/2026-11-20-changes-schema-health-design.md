@@ -95,7 +95,7 @@ Holders in `private-ids` (Private, or in the Recycle bin) are skipped, so a bloc
 
 For each visible, non-private object tagged with the class, a property counts as missing when the object has no `:eavt` datom for it or holds Logseq's empty placeholder (as `mismatched-choice-values` already detects it). One item per holder and tag: holder response, `tag {uuid, title}` and `missing [{ident, title}]`, in holder-uuid order.
 
-Both run in the default all-checks call. Limits, cursors and the `created-after` / `updated-after` behaviour match the other checks: the time filters still narrow only the two page checks.
+Both run only when named in `checks` (superseded: the design ran them in the default all-checks call; see section 13, As built). Limits and cursors match the other checks. The time filters still narrow only the two page checks, and as built they are refused unless `checks` names one.
 
 ### 3.3 (a) Patch 0052: the change feed
 
@@ -109,7 +109,7 @@ New route `GET /api/v1/graphs/{graph-id}/changes`, operationId `listChangesSince
 - `blocks-per-page` (default 10, 1 to 50).
 - `cursor`.
 
-**How it reads.** `d/index-range db :block/updated-at (inc since) until`. The attribute is indexed (`schema.cljs` line 86, `:block/updated-at {:db/index true}`), so the read costs the number of changed entities, not the size of the graph. If more than `max-changes` (20,000, the same figure as `scan-cap` and `max-feed-changes`) datoms fall in the window, it answers 422 `too many changes in that window (N); pass a later since or an until`, naming the count. It then:
+**How it reads.** `d/index-range db :block/updated-at (inc since) until`. The attribute is indexed (`schema.cljs` line 86, `:block/updated-at {:db/index true}`), so the read costs the number of changed entities, not the size of the graph. If more than `max-changes` datoms fall in the window, it answers 422 (superseded: the design set 20,000 and named the count; as built the cap is 2,500 and the text is `too many changes in that window (more than 2,500); pass a later since or an until`, see section 13, As built). It then:
 
 - drops `private-ids`, hidden ids and built-in entities;
 - maps a property value block to its owner block (so a property set shows as a change on its block, which the repro shows is where the stamp lands);
@@ -170,7 +170,7 @@ No hand-written connector code. Re-vendor (`scripts/vendor-upstream-api.sh .upst
 
 ## 4. Tool contract
 
-**CHANGED `get_graph_health` (`getGraphHealth`).** `checks` also accepts `broken-refs` and `missing-tag-properties`; both run by default.
+**CHANGED `get_graph_health` (`getGraphHealth`).** `checks` also accepts `broken-refs` and `missing-tag-properties`. Superseded: the design ran both by default; as built a call without `checks` runs only `orphan-tags`, `orphan-properties`, `mismatched-choice-values` and `orphan-choices`, and the other five run only when named (section 13, As built).
 
 - `broken-refs` item: `{uuid, kind, title, page-id, page-title, target-uuid, reason: "missing"|"in-recycle-bin"}`.
 - `missing-tag-properties` item: `{uuid, kind, title, page-id, page-title, tag: {uuid, title}, missing: [{ident, title}]}`.
@@ -215,14 +215,14 @@ All are two orders of magnitude below the DO's roughly 30 s limit. They are size
 
 - **Read-only.** Three GET routes with `logseq/read` scope and `:read` rate class. Nothing is written, so there is no dry run, read-back or order-key concern.
 - **Refuse, don't widen.** A bad `since`, `until`, `sections` or cursor answers 400 naming the parameter; the feed never falls back to a full listing.
-- **Bounded.** The feed refuses windows over 20,000 changes with the count; every list is capped per item with complete counts.
+- **Bounded.** The feed refuses windows over its change cap (2,500 as built, section 13; the design said 20,000 with the count); every list is capped per item with complete counts.
 - **Private content.** All three new reads drop `private-ids` (Private and the Recycle bin). The existing health checks don't; that gap is sent to the backlog, not widened here (section 7, risk 4).
 - **E2EE.** 409, as health does: titles are ciphertext.
 - **The owner's graph.** Never written. Tests use fixtures and `sync.example.com`; no graph name or page UUID appears in any file.
 
 ## 7. Risks
 
-1. **Large responses.** The default health run now returns 9 checks. A digest that passes a large limit can near the connector's result cap. Every list is capped and keeps complete counts, and the tool text recommends `checks=` for a narrow run.
+1. **Large responses.** The design's default health run returned 9 checks (superseded: as built it returns 4, section 13). A run that names many checks with a large limit can near the connector's result cap. Every list is capped and keeps complete counts, and the tool text recommends `checks=` for a narrow run.
 2. **`missing-tag-properties` can be noisy.** On a graph that uses tag properties loosely it can list most tagged objects. Built-ins and properties with a default are excluded. Section 11 asks whether to add a `tags` filter now.
 3. **Upload-path schema drift.** A graph uploaded from the app can store `class/properties` or `closed-value-property` with another cardinality. The new code reads datoms, never entity sets, and each test runs once on an upload-path graph.
 4. **Private content in old checks.** The new checks filter private holders and the old ones don't, so one health call mixes both behaviours. Sent to the backlog.
@@ -329,7 +329,7 @@ Where the result differs from the design above (section 12 already overrode sect
 
 **Bench and the stop condition.** `scripts/bench-graph-insights.mjs` times the default health call, each of the nine checks named alone, the feed and the schema export on the release bundle at 5,000 and 20,000 pages, and `scripts/release-query-check.mjs` checks the shapes on the bundle. The first bench, at the designed caps, put the default health call at 2,924 to 3,398 ms cold at 5,000 pages and 11,611 to 12,661 ms at 20,000, `broken-refs` alone at about 6.5 s and a 20,000-change feed at 4.2 to 5.4 s at 20,000 pages (x1.65), far above the estimates in section 5. Seven of ten figures went over the 1 s line; the schema export stayed under it. The stage stopped and the owner decided (review finding s-stage-6-2): make the default call run a cheaper set of checks and lower the feed's change cap, and don't index the title scan.
 
-**Default checks.** A call without `checks` runs `orphan-tags`, `orphan-properties`, `mismatched-choice-values` and `orphan-choices`. The other five run only when named. The bench measured each check alone before the change (ms, x1.65, cold / warm, two runs):
+**Default checks.** A call without `checks` runs `orphan-tags`, `orphan-properties`, `mismatched-choice-values` and `orphan-choices`. The other five run only when named. A `checks` that is empty after splitting (`checks=,`) runs the default, as `checks=` does. Since the page checks left the default, `created-after` and `updated-after` (which narrow `pages-without-summary` and `pages-without-tags`) and `summary-prefix` (which only `pages-without-summary` reads) are refused with 400 unless `checks` names a check they apply to, as `tag-properties` is without `missing-tag-properties`, so an older caller's filter is never silently ignored. The bench measured each check alone before the change (ms, x1.65, cold / warm, two runs):
 
 | Check alone | 5,000 pages | 20,000 pages |
 |---|---|---|
