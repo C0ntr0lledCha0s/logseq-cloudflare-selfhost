@@ -261,7 +261,19 @@
       "idempotentHint": true,
       "openWorldHint": false
     },
-    "firstLine": "A tidy-up report: unused tags and properties, duplicate titles, pages with no summary or tag."
+    "firstLine": "Tidy-up report: unused tags and properties, duplicates, page gaps, broken refs, missing tag values."
+  },
+  {
+    "name": "get_graph_schema",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/schema",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "Every tag and property with types, choices and usage counts, in one call."
   },
   {
     "name": "get_page",
@@ -382,6 +394,18 @@
       "openWorldHint": false
     },
     "firstLine": "The graph's files and images, with the asset UUIDs read_file takes."
+  },
+  {
+    "name": "list_changes_since",
+    "method": "GET",
+    "path": "/api/v1/graphs/{graph-id}/changes",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "firstLine": "What changed in the graph since a time, grouped by page; for digests and reviews."
   },
   {
     "name": "list_favorites",

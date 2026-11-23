@@ -1,0 +1,1188 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+index f98b81a..61f8d81 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+@@ -213,7 +213,9 @@
+ 
+ (defn- refusal? [x] (and (map? x) (contains? x ::error)))
+ 
+-(defn- format-count [n]
++(defn format-count
++  "`n` with commas between thousands (20,000)."
++  [n]
+   (string/replace (str n) #"\B(?=(\d{3})+(?!\d))" ","))
+ 
+ ;; Parsing
+@@ -530,26 +532,28 @@
+   "Every entity a query must not see: whatever is tagged with a class titled private (any case) or
+   with a class extending one, whatever is in the Recycle bin (has deleted-at, as delete_page and
+   delete_block leave it), every block whose page is one of those, and every descendant of those. A
+-  property value block is under its owner, so it follows its owner."
+-  [db]
+-  (let [lineage (graph-insights/class-lineage-fn db)
+-        tag-class (d/entid db :logseq.class/Tag)
+-        classes (map :e (d/datoms db :avet :block/tags tag-class))
+-        private-class? (fn [class-id]
+-                         (some #(= "private" (some-> (:block/title %) string/lower-case)) (lineage class-id)))
+-        roots (concat (->> classes
+-                           (filter private-class?)
+-                           (mapcat #(d/datoms db :avet :block/tags %))
+-                           (map :e))
+-                      (map :e (d/datoms db :aevt :logseq.property/deleted-at)))
+-        children (fn [id] (concat (map :e (d/datoms db :avet :block/parent id))
+-                                  (map :e (d/datoms db :avet :block/page id))))]
+-    (loop [seen (transient #{}) queue (vec roots)]
+-      (if-let [id (peek queue)]
+-        (if (contains? seen id)
+-          (recur seen (pop queue))
+-          (recur (conj! seen id) (into (pop queue) (children id))))
+-        (persistent! seen)))))
++  property value block is under its owner, so it follows its owner. With {:recycle-bin? false}, the
++  Private set alone: the Recycle bin is not a root (listChangesSince counts recycled entities with it)."
++  ([db] (private-ids db {:recycle-bin? true}))
++  ([db {:keys [recycle-bin?]}]
++   (let [lineage (graph-insights/class-lineage-fn db)
++         tag-class (d/entid db :logseq.class/Tag)
++         classes (map :e (d/datoms db :avet :block/tags tag-class))
++         private-class? (fn [class-id]
++                          (some #(= "private" (some-> (:block/title %) string/lower-case)) (lineage class-id)))
++         roots (concat (->> classes
++                            (filter private-class?)
++                            (mapcat #(d/datoms db :avet :block/tags %))
++                            (map :e))
++                       (when recycle-bin? (map :e (d/datoms db :aevt :logseq.property/deleted-at))))
++         children (fn [id] (concat (map :e (d/datoms db :avet :block/parent id))
++                                   (map :e (d/datoms db :avet :block/page id))))]
++     (loop [seen (transient #{}) queue (vec roots)]
++       (if-let [id (peek queue)]
++         (if (contains? seen id)
++           (recur seen (pop queue))
++           (recur (conj! seen id) (into (pop queue) (children id))))
++         (persistent! seen))))))
+ 
+ (def ^:private join-limit
+   "The join cap while run-query's d/q runs, else nil: join-tuples counts only then."
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 381291f..0414f60 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -5954,6 +5954,234 @@
+           (http/json-response nil (assoc feed :epoch epoch :t t))
+           (http/error-response "changes since that point are no longer available; list again without since" 410))))))
+ 
++;; listChangesSince (patch 0052): the pages changed in a window (since, until], read from the
++;; :block/updated-at index, so a call costs the window's changes, not the graph. The repro behind it
++;; (spec 2026-11-20 section 2) found neither stamp complete alone: a move bumps both pages but not the
++;; block, and a property set bumps the block but not its page. So a block's change lists the block
++;; under its page, and a page's own change marks the page page-changed. A property value block counts
++;; as its owner. Private, hidden and built-in entities are left out.
++(def ^:private max-changes
++  "The most :block/updated-at datoms one window may hold; a larger window answers 422. 2,500 keep a
++  call under 1 s of Durable Object CPU at 5,000 pages (scripts/bench-graph-insights.mjs, x1.65 for
++  Cloudflare); 20,000 cost 2.3 to 5.4 s."
++  2500)
++(def ^:private default-blocks-per-page 10)
++(def ^:private max-blocks-per-page 50)
++(def ^:private max-time-ms
++  "The largest instant a JS Date holds."
++  8640000000000000)
++
++(def ^:private time-bound-pattern
++  #"^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?)?$")
++
++(defn- zone-offset
++  "The formatter's zone's offset from UTC, in ms, at instant `ms`. `formatter` shows every field in
++  the 24-hour cycle."
++  [^js formatter ms]
++  (let [parts (.formatToParts formatter (js/Date. ms))
++        part (fn [part-type] (js/parseInt (.-value (.find parts #(= part-type (.-type %)))) 10))
++        wall (js/Date.UTC (part "year") (dec (part "month")) (part "day")
++                          (mod (part "hour") 24) (part "minute") (part "second"))]
++    (- wall (* 1000 (js/Math.floor (/ ms 1000))))))
++
++(defn- local-instant
++  "The instant at which the formatter's zone shows wall-clock time `wall` (its fields read as UTC
++  ms). A time that occurs twice, as clocks go back, is the first; one that never occurs, as clocks go
++  forward, is moved on by the gap (02:30 becomes 03:30), as Temporal's compatible option does."
++  [formatter wall]
++  (let [day 86400000
++        before (zone-offset formatter (- wall day))
++        after (zone-offset formatter (+ wall day))
++        fits (filter #(= % (zone-offset formatter (- wall %))) (distinct [before after]))]
++    (if (seq fits)
++      (apply min (map #(- wall %) fits))
++      (- wall before))))
++
++(defn- parse-time-bound
++  "since or until as epoch ms. Digits are epoch ms; YYYY-MM-DD is local midnight in the owner's zone;
++  YYYY-MM-DDTHH:MM[:SS[.sss]] is that instant with Z or ±HH:MM, else that local time in the owner's
++  zone. nil when `raw` is nil; ::invalid when it can't be read, a date or time that doesn't exist
++  included (checked by round trip); ::no-zone when it needs the zone and `time-zone` is nil (an
++  invalid TIMEZONE). `formatter` is a delay of the request's one Intl.DateTimeFormat for the zone."
++  [raw time-zone formatter]
++  (cond
++    (nil? raw) nil
++    (re-matches #"\d+" raw) (let [ms (js/parseInt raw 10)] (if (<= ms max-time-ms) ms ::invalid))
++    :else
++    (if-let [[_ year month day hour minute second fraction offset] (re-matches time-bound-pattern raw)]
++      (let [number #(if % (js/parseInt % 10) 0)
++            [year month day hour minute second] (map number [year month day hour minute second])
++            millis (if fraction (js/parseInt (subs (str fraction "00") 0 3) 10) 0)
++            wall (js/Date.UTC year (dec month) day hour minute second millis)
++            date (js/Date. wall)
++            [offset-hours offset-minutes] (when (and offset (not= "Z" offset))
++                                            [(number (subs offset 1 3)) (number (subs offset 4 6))])]
++        (cond
++          (not (and (= year (.getUTCFullYear date)) (= month (inc (.getUTCMonth date))) (= day (.getUTCDate date))
++                    (< hour 24) (< minute 60) (< second 60)
++                    (or (nil? offset-hours) (and (< offset-hours 24) (< offset-minutes 60)))))
++          ::invalid
++          (= "Z" offset) wall
++          offset (- wall (* (if (string/starts-with? offset "-") -1 1)
++                            (+ (* offset-hours 3600000) (* offset-minutes 60000))))
++          (nil? time-zone) ::no-zone
++          :else (local-instant @formatter wall)))
++      ::invalid)))
++
++(defn- parse-blocks-per-page [raw]
++  (cond
++    (nil? raw) default-blocks-per-page
++    (and (re-matches #"\d{1,3}" raw) (<= 1 (js/parseInt raw 10) max-blocks-per-page)) (js/parseInt raw 10)
++    :else nil))
++
++(defn- decode-changes-cursor
++  "A listChangesSince cursor, [since until latest-updated-at page-uuid], or nil."
++  [value]
++  (try
++    (let [binary (js/atob value)
++          payload (js/Uint8Array.from (js/Array.from binary #(.charCodeAt % 0)))
++          decoded (js->clj (js/JSON.parse (.decode text-decoder payload)))]
++      (when (and (vector? decoded) (= 4 (count decoded))
++                 (every? integer? (pop decoded)) (string? (peek decoded)))
++        decoded))
++    (catch :default _ nil)))
++
++(defn- datom-value [db e attr]
++  (:v (first (d/datoms db :eavt e attr))))
++
++(defn- hidden-ids
++  "Everything the app hides (:logseq.property/hide?, such as the favourites page) and everything under
++  it, built once per call."
++  [db]
++  (let [children (fn [id] (concat (map :e (d/datoms db :avet :block/parent id))
++                                  (map :e (d/datoms db :avet :block/page id))))]
++    (loop [seen (transient #{})
++           queue (into [] (comp (filter #(true? (:v %))) (map :e)) (d/datoms db :aevt :logseq.property/hide?))]
++      (if-let [id (peek queue)]
++        (if (contains? seen id)
++          (recur seen (pop queue))
++          (recur (conj! seen id) (into (pop queue) (children id))))
++        (persistent! seen)))))
++
++(defn- change-owner
++  "What a change to `e` counts as: a property value block counts as its owner; anything else as itself."
++  [db e]
++  (or (when (and (datom-value db e :logseq.property/created-from-property)
++                 (not (datom-value db e :block/closed-value-property)))
++        (datom-value db e :block/parent))
++      e))
++
++(defn- changed-pages
++  "The window's `datoms` grouped by page, as {page-id {:latest ms :page-changed true :blocks {id ms}}}:
++  a block's change (its own, or its value block's) goes under its page; a page's, tag's, property's or
++  journal's own change marks it page-changed. Entities `excluded?` names are left out. A block on a
++  Private, binned or hidden page is in those sets itself; a user's block on a page that is only
++  built-in (Contents) is listed."
++  [db datoms excluded?]
++  (reduce (fn [groups {:keys [e v]}]
++            (let [owner (change-owner db e)
++                  page (datom-value db owner :block/page)]
++              (cond
++                (or (excluded? e) (excluded? owner)) groups
++                page (-> groups
++                         (update-in [page :blocks owner] (fnil max 0) v)
++                         (update-in [page :latest] (fnil max 0) v))
++                (datom-value db owner :block/name) (-> groups
++                                                       (assoc-in [owner :page-changed] true)
++                                                       (update-in [owner :latest] (fnil max 0) v))
++                :else groups)))
++          {}
++          datoms))
++
++(defn- created-in-window? [db since id]
++  (> (or (datom-value db id :block/created-at) 0) since))
++
++(defn- changed-page-response [db since blocks-per-page [page-id {:keys [latest page-changed blocks]}]]
++  (let [page (d/entity db page-id)
++        created (count (filter #(created-in-window? db since (key %)) blocks))
++        newest (->> blocks
++                    (map (fn [[id stamp]] [[(- stamp) (uuid-string (datom-value db id :block/uuid))] id stamp]))
++                    (sort-by first)
++                    (take blocks-per-page))]
++    {:page {:uuid (uuid-string (:block/uuid page)) :title (:block/title page) :kind (title-holder-kind page)}
++     :latest-updated-at latest
++     :page-changed (true? page-changed)
++     :created created
++     :updated (- (count blocks) created)
++     :blocks (mapv (fn [[[_ block-uuid] id stamp]]
++                     {:uuid block-uuid
++                      :change (if (created-in-window? db since id) "created" "updated")
++                      :updated-at stamp
++                      :snippet (context-snippet (feed-text (d/entity db id)))})
++                   newest)}))
++
++(defn- recycled-count
++  "Entities moved to the Recycle bin in the window (deleted-at, which only the deleted root holds),
++  read from that attribute's datoms, which aren't indexed by value; Private ones are left out."
++  [db since until]
++  (let [private (datalog/private-ids db {:recycle-bin? false})]
++    (count (filter (fn [{:keys [e v]}] (and (number? v) (< since v) (<= v until) (not (contains? private e))))
++                   (d/datoms db :aevt :logseq.property/deleted-at)))))
++
++(def ^:private time-bound-hint "give epoch ms, an ISO date (2026-11-16) or an ISO datetime")
++
++(defn- handle-changes-since [{:keys [^js self ^js url db e2ee?]}]
++  (let [params (.-searchParams url)
++        time-zone (owner-time-zone self)
++        formatter (delay (js/Intl.DateTimeFormat. "en-US" #js {:timeZone time-zone :hourCycle "h23"
++                                                                :year "numeric" :month "numeric" :day "numeric"
++                                                                :hour "numeric" :minute "numeric" :second "numeric"}))
++        since (parse-time-bound (.get params "since") time-zone formatter)
++        raw-until (.get params "until")
++        given-until (parse-time-bound raw-until time-zone formatter)
++        limit (parse-limit url)
++        blocks-per-page (parse-blocks-per-page (.get params "blocks-per-page"))
++        raw-cursor (.get params "cursor")
++        cursor (some-> raw-cursor decode-changes-cursor)
++        until (cond (some? raw-until) given-until
++                    cursor (nth cursor 1)
++                    :else (js/Date.now))]
++    (cond
++      e2ee? (http/error-response "graph insights are unavailable for E2EE graphs" 409)
++      (or (nil? since) (= ::invalid since)) (http/bad-request (str "invalid since: " time-bound-hint))
++      (= ::invalid until) (http/bad-request (str "invalid until: " time-bound-hint))
++      (or (= ::no-zone since) (= ::no-zone until)) (invalid-time-zone-response self)
++      (nil? limit) (http/bad-request "invalid limit")
++      (nil? blocks-per-page) (http/bad-request (str "invalid blocks-per-page: give 1 to " max-blocks-per-page))
++      (and raw-cursor (nil? cursor)) (http/bad-request "invalid cursor")
++      (and cursor (not= since (nth cursor 0))) (http/bad-request "cursor belongs to another since")
++      (and cursor (not= until (nth cursor 1))) (http/bad-request "cursor belongs to another until")
++      (<= until since) (http/bad-request "until must be after since")
++      :else
++      ;; Take one datom past the cap and stop: a window over the cap is never realised in full.
++      (let [datoms (vec (take (inc max-changes) (d/index-range db :block/updated-at (inc since) until)))]
++        (if (> (count datoms) max-changes)
++          (http/error-response (str "too many changes in that window (more than " (datalog/format-count max-changes)
++                                    "); pass a later since or an until")
++                               422)
++          (let [private (datalog/private-ids db)
++                hidden (hidden-ids db)
++                excluded? (fn [e] (or (contains? private e) (contains? hidden e)
++                                      (true? (datom-value db e :logseq.property/built-in?))))
++                keyed (->> (changed-pages db datoms excluded?)
++                           (map (fn [[page-id group :as entry]]
++                                  [[(- (:latest group)) (uuid-string (datom-value db page-id :block/uuid))] entry]))
++                           (sort-by first))
++                after-cursor (cond->> keyed
++                               cursor (drop-while #(not (pos? (compare (first %) [(- (nth cursor 2)) (nth cursor 3)])))))
++                selected (take (inc limit) after-cursor)
++                page (take limit selected)
++                [[last-stamp last-uuid]] (last page)]
++            (http/json-response
++             nil
++             {:since since
++              :until until
++              :time-zone time-zone
++              :pages (mapv #(changed-page-response db since blocks-per-page (second %)) page)
++              :recycled (recycled-count db since until)
++              :next-cursor (when (> (count selected) limit)
++                             (encode-cursor [since until (- last-stamp) last-uuid]))})))))))
++
+ ;; Page favourites (patch 0038). The sidebar's Favorites list is the hidden page $$$favorites, whose
+ ;; children each link one favourite with :block/link (ldb/build-favorite-tx); sibling order is the
+ ;; list's order. The app's db worker reads and writes it, and deps/db-sync has no copy of that code,
+@@ -6343,6 +6571,7 @@
+     (contains? bulk-handlers handler) (handle-bulk context)
+     (contains? insight-handlers handler) (handle-insights context)
+     (= :semantic/block-changes handler) (handle-block-changes context)
++    (= :semantic/changes-since handler) (handle-changes-since context)
+     (= :semantic/datalog-query handler) (datalog/handle-query context)
+     (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
+                                                                          :resolve-tag resolve-tag-selector
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 733a9a4..ec88eaf 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -104,6 +104,8 @@
+     :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
+    {:method "GET" :path "/api/v1/graphs/:graph-id/block-changes" :internal-path "/semantic/block-changes"
+     :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
++   {:method "GET" :path "/api/v1/graphs/:graph-id/changes" :internal-path "/semantic/changes"
++    :handler :semantic/changes-since :operation-id "listChangesSince" :scope "logseq/read" :rate-class :read}
+    ;; A read: POST only because the query can be long.
+    {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
+     :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
+@@ -215,6 +217,8 @@
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+    "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
+    "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
++   "listChangesSince" ["List what changed since a time"
++                       "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 2,500 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
+    "datalogQuery" ["Run a read-only Datalog query"
+                    (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
+                         " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
+@@ -620,6 +624,17 @@
+                  {:name "epoch" :in "query"
+                   :description "The epoch of the response that since came from."
+                   :schema {:type "string"}}]))
++    (= "listChangesSince" operation-id)
++    (into [{:name "since" :in "query" :required true :schema {:type "string"}
++            :description "Start of the window, exclusive: epoch ms (1763251200000), an ISO date (2026-11-16, local midnight in TIMEZONE) or an ISO datetime (2026-11-16T09:00 local, or with Z or +13:00). Pass the previous call's until, less a margin, to continue from it: edits synced late keep the device's earlier stamp."}
++           {:name "until" :in "query" :schema {:type "string"}
++            :description "End of the window, inclusive, in the same forms as since. Defaults to now, or with cursor to the cursor's until."}
++           {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
++            :description "Most pages per call."}
++           {:name "blocks-per-page" :in "query" :schema {:type "integer" :minimum 1 :maximum 50 :default 10}
++            :description "Most blocks listed per page, newest first (1 to 50, default 10). The created and updated counts stay complete."}
++           {:name "cursor" :in "query" :schema {:type "string"}
++            :description "The previous response's next-cursor, with the same since."}])
+     (= "listGraphs" operation-id)
+     (into [{:name "name" :in "query" :schema {:type "string"}
+             :description "Exact graph name, matched case-insensitively."}])
+@@ -701,6 +716,7 @@
+                   "listKnowledgeIndex"
+                   (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
+                   "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
++                  "listChangesSince" (entity-response "ChangesSinceResponse" "The pages changed in the window, newest first")
+                   "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
+                   "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
+                   "updatePage" (entity-response "PageResponse" "The updated page")
+@@ -737,6 +753,9 @@
+           "429" {:description "Rate limit exceeded"}}
+          (case operation-id
+            "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
++           "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
++                               "422" {:description "More than 2,500 changes in the window; pass a later since or an until"}
++                               "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
+            "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
+                             "404" {:description "No named query has that name; the error lists the names"}
+                             "409" {:description "The graph is E2EE"}
+@@ -1172,6 +1191,30 @@
+                                           :tags {:type "array" :items {:type "string"}
+                                                  :description "Titles of the tags on the block, its ancestors and its page."}
+                                           :updated-at {:type "integer"}}}
++               :ChangesSinceResponse
++               {:type "object" :required ["since" "until" "time-zone" "pages" "recycled" "next-cursor"]
++                :properties {:since {:type "integer" :description "The window's start, exclusive, as epoch ms."}
++                             :until {:type "integer" :description "The window's end, inclusive, as epoch ms."}
++                             :time-zone {:type ["string" "null"] :description "The zone dates and local times are read in (TIMEZONE, or UTC when unset); null when TIMEZONE is invalid."}
++                             :pages {:type "array"
++                                     :items {:type "object" :required ["page" "latest-updated-at" "page-changed" "created" "updated" "blocks"]
++                                             :properties {:page {:type "object" :required ["uuid" "title" "kind"]
++                                                                 :properties {:uuid {:type "string"}
++                                                                              :title {:type "string"}
++                                                                              :kind {:enum ["page" "journal" "tag" "property" "asset" "block"]}}}
++                                                          :latest-updated-at {:type "integer" :description "The newest stamp in the window on the page or its blocks."}
++                                                          :page-changed {:type "boolean" :description "The page's own stamp moved in the window."}
++                                                          :created {:type "integer" :description "Changed blocks created after since; complete."}
++                                                          :updated {:type "integer" :description "The other changed blocks; complete."}
++                                                          :blocks {:type "array"
++                                                                   :description "At most blocks-per-page, newest first."
++                                                                   :items {:type "object" :required ["uuid" "change" "updated-at" "snippet"]
++                                                                           :properties {:uuid {:type "string"}
++                                                                                        :change {:enum ["created" "updated"]}
++                                                                                        :updated-at {:type "integer"}
++                                                                                        :snippet {:type "string"}}}}}}}
++                             :recycled {:type "integer" :description "Blocks and pages moved to the Recycle bin in the window, Private ones left out."}
++                             :next-cursor {:type ["string" "null"] :description "null on the last page."}}}
+                :BlockChangesResponse {:type "object"
+                                       :required ["epoch" "t" "blocks" "removed"]
+                                       :properties {:epoch {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
+new file mode 100644
+index 0000000..7e1f167
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
+@@ -0,0 +1,770 @@
++(ns logseq.db-sync.semantic-changes-since-test
++  "listChangesSince (patch 0052): GET /semantic/changes lists the pages changed in a window
++  (since, until], newest first, read from the :block/updated-at index. Each page carries
++  latest-updated-at, page-changed (its own stamp moved), complete created and updated counts and at
++  most blocks-per-page blocks; recycled counts what went to the Recycle bin in the window; the last
++  page answers next-cursor null. Private, hidden and built-in content is left out, and a property
++  value block is reported as its owner.
++
++  The graph is written through the real handler. Stamps are moved directly only to put the fixture's
++  own writes before the window (age!), to fix an order, or to build a window of 20,001 changes
++  quickly; the feed always reads them through the real route. Every fixture title holds zz."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.semantic-uploaded-graph-schema-test :as uploaded]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.semantic :as semantic]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.recycle :as recycle]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (assert (= status (:status response)) (pr-str response))
++    response))
++
++(defn- uuid-of [response] (uuid (get-in response [:body :uuid])))
++
++(defn- eid [conn id] (:db/id (d/entity @conn [:block/uuid id])))
++
++(defn- writer [self]
++  {:tag! (fn [title & [body]]
++           (p/let [r (ok! (request! self "POST" "/semantic/tags" (merge {:title title} body)) 201)] (uuid-of r)))
++   :property! (fn [title type & [body]]
++                (p/let [r (ok! (request! self "POST" "/semantic/properties" (merge {:title title :type type} body)) 201)]
++                  {:uuid (uuid-of r) :ident (get-in r [:body :ident]) :title title}))
++   :page! (fn [title] (p/let [r (ok! (request! self "POST" "/semantic/pages" {:title title}) 201)] (uuid-of r)))
++   :put! (fn [id property value]
++           (ok! (request! self "PUT" (str "/semantic/blocks/" id "/properties/" (js/encodeURIComponent property))
++                          {:value value})
++                200))
++   :edit! (fn [id title] (ok! (request! self "PATCH" (str "/semantic/blocks/" id) {:title title}) 200))
++   :move! (fn [ids target position]
++            (ok! (request! self "POST" "/semantic/block-moves"
++                           {:block-ids (mapv str ids) :target-id (str target) :position position})
++                 200))
++   :insert! (fn [target blocks]
++              (p/let [r (ok! (request! self "POST" "/semantic/block-trees" {:target-id (str target) :blocks blocks}) 201)]
++                (mapv #(uuid (:uuid %)) (get-in r [:body :blocks]))))
++   :delete-block! (fn [id] (ok! (request! self "DELETE" (str "/semantic/blocks/" id "?acknowledge-references=true") nil) 200))
++   :delete-page! (fn [id] (ok! (request! self "DELETE" (str "/semantic/pages/" id "?acknowledge-references=true") nil) 200))})
++
++(def ^:private old
++  "The stamp age! gives every entity: the fixture's own writes happen before a window that starts here."
++  1000)
++
++(def ^:private far-until
++  "An until after every real write (2100-01-01), for calls that must not depend on the clock."
++  4102444800000)
++
++(defn- age!
++  "Moves every :block/created-at and :block/updated-at to `old`, so a window (old, now] holds only
++  what the test writes after this. Transacted directly: it is fixture setup, not a write under test."
++  [conn]
++  (d/transact! conn (vec (for [attr [:block/created-at :block/updated-at]
++                               datom (d/datoms @conn :aevt attr)]
++                           [:db/add (:e datom) attr old]))))
++
++(defn- stamp! [conn id attr value]
++  (d/transact! conn [[:db/add (eid conn id) attr value]]))
++
++(defn- stamp-of [conn id] (:block/updated-at (d/entity @conn [:block/uuid id])))
++
++(defn- snapshot [conn] [(:max-tx @conn) (count (d/datoms @conn :eavt))])
++
++(defn- new-graph [env]
++  (p/let [conn (sqlite-export/create-conn)]
++    {:conn conn :self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true :env (clj->js env)}}))
++
++(defn- seed-graph
++  "Pages zz A (blocks zz a1 to zz a3) and zz B (zz b1), a Private page zz Secret (zz s1), a tag
++  zz Book and a text property zz note."
++  []
++  (p/let [{:keys [conn self]} (new-graph {"TIMEZONE" "UTC"})
++          {:keys [tag! property! page! insert!]} (writer self)
++          _private (tag! "Private")
++          book (tag! "zz Book")
++          note (property! "zz note" "default")
++          a (page! "zz A")
++          b (page! "zz B")
++          secret (page! "zz Secret")
++          [a1 a2 a3] (insert! a [{:title "zz a1"} {:title "zz a2"} {:title "zz a3"}])
++          [b1] (insert! b [{:title "zz b1"}])
++          [s1] (insert! secret [{:title "zz s1"}])
++          _ ((:put! (writer self)) secret "block/tags" ["Private"])]
++    {:conn conn :self self
++     :ids {:a a :b b :secret secret :a1 a1 :a2 a2 :a3 a3 :b1 b1 :s1 s1 :book book}
++     :note note}))
++
++(defn- with-graph [done run]
++  (-> (p/let [graph (seed-graph)] (run graph))
++      (p/catch #(is false (str % "\n" (.-stack %))))
++      (p/finally done)))
++
++(defn- changes [self q] (request! self "GET" (str "/semantic/changes?" q) nil))
++
++(defn- feed!
++  "The 200 body of GET /semantic/changes?`q`."
++  [self q]
++  (p/let [r (ok! (changes self q) 200)] (:body r)))
++
++(defn- group [body page-id] (first (filter #(= (str page-id) (get-in % [:page :uuid])) (:pages body))))
++
++(defn- block-ids [g] (mapv #(uuid (:uuid %)) (:blocks g)))
++
++(defn- listed-ids [body] (set (mapcat block-ids (:pages body))))
++
++(defn- since-old [& [more]] (str "since=" old (or more "")))
++
++;; Before the fix (Stage 3 tree, patches 0001 to 0051) every call answered 404:
++;;   AssertionError: Assert failed: {:status 404, :body {:error "not found"}}
++(deftest changes-created-edited-old-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a a1 a2 a3 b]} ids
++                {:keys [insert! edit!]} (writer self)
++                _ (age! conn)
++                _ (stamp! conn a3 :block/updated-at 500)
++                [fresh] (insert! a [{:title "zz fresh"}])
++                _ (edit! a1 (str "zz a1 edited [[" b "]]"))
++                body (feed! self (since-old))
++                g (group body a)
++                entries (into {} (map (juxt #(uuid (:uuid %)) identity)) (:blocks g))]
++          (is (= {:uuid (str a) :title "zz A" :kind "page"} (:page g)))
++          (is (= [1 1] [(:created g) (:updated g)]) "one created and one edited block")
++          (is (= "created" (:change (get entries fresh))))
++          (is (= "updated" (:change (get entries a1))))
++          (is (= "zz a1 edited [[zz B]]" (:snippet (get entries a1))) "the snippet shows a ref as its title")
++          (is (= #{:uuid :change :updated-at :snippet} (set (keys (get entries a1)))))
++          (is (not (contains? entries a2)) "a block untouched since the window began is not listed")
++          (is (not (contains? entries a3)) "nor is one edited before since")
++          (is (= (:latest-updated-at g)
++                 (apply max (cond-> (map :updated-at (:blocks g))
++                              (:page-changed g) (conj (stamp-of conn a)))))
++              "the newest stamp on the page or its blocks")
++          (is (= old (:since body)))
++          (is (number? (:until body)))
++          (is (= "UTC" (:time-zone body)))
++          (is (contains? body :next-cursor))
++          (is (nil? (:next-cursor body)) "one page of results: next-cursor is null")
++          (is (= 0 (:recycled body))))))))
++
++(deftest changes-property-set-test
++  ;; The spec's repro: a property set bumps the block's stamp but not its page's.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a a1 a2]} ids
++                {:keys [put!]} (writer self)
++                _ (age! conn)
++                _ (put! a1 "block/tags" ["zz Book"])
++                _ (put! a2 "logseq.property/heading" 2)
++                body (feed! self (since-old))
++                g (group body a)]
++          (is (= #{a1 a2} (set (block-ids g))) "both blocks listed in their page's group")
++          (is (every? #(= "updated" (:change %)) (:blocks g)))
++          (is (false? (:page-changed g)) "the page's own stamp did not move")
++          (is (= [0 2] [(:created g) (:updated g)])))))))
++
++(deftest changes-value-block-test
++  ;; Review focus 13: a property value block is reported as its owner, once, though the owner
++  ;; changed too; a value block on a page is a change to the page.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids note]}]
++        (p/let [{:keys [a a1 a2 b]} ids
++                {:keys [put! edit!]} (writer self)
++                _ (put! a1 (:ident note) "zz first")
++                _ (put! a2 (:ident note) "zz second")
++                _ (put! b (:ident note) "zz on page")
++                value-of (fn [owner] (->> (d/datoms @conn :avet :block/parent (eid conn owner))
++                                          (map #(d/entity @conn (:e %)))
++                                          (filter :logseq.property/created-from-property)
++                                          first))
++                [v1 v2 vb] (map value-of [a1 a2 b])
++                _ (age! conn)
++                now (js/Date.now)
++                _ (d/transact! conn (vec (for [v [v1 v2 vb]]
++                                           [:db/add (:db/id v) :block/updated-at now])))
++                _ (edit! a1 "zz a1 again")
++                body (feed! self (since-old))
++                g (group body a)
++                value-ids (set (map :block/uuid [v1 v2 vb]))]
++          (is (some? v1))
++          (is (= #{a1 a2} (set (block-ids g))) "each owner once: a1 (value and title changed) and a2 (value only)")
++          (is (= 2 (count (:blocks g))) "not two entries for a1")
++          (is (= [0 2] [(:created g) (:updated g)]))
++          (is (not-any? value-ids (listed-ids body)) "no value block is listed")
++          (is (true? (:page-changed (group body b))) "a value block on page zz B is a change to the page")
++          (is (empty? (:blocks (group body b)))))))))
++
++(deftest changes-move-test
++  ;; Spec section 12 decision 3: a move shows as page-changed on both pages, with no block entry; a
++  ;; block edited and then moved is listed once, under its current page (review focus 12).
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a a1 a2 b]} ids
++                {:keys [move! edit!]} (writer self)
++                _ (age! conn)
++                _ (move! [a1] b "last-child")
++                _ (edit! a2 "zz a2 edited")
++                _ (move! [a2] b "last-child")
++                body (feed! self (since-old))
++                ga (group body a)
++                gb (group body b)]
++          (is (true? (:page-changed ga)) "the source page")
++          (is (true? (:page-changed gb)) "the target page")
++          (is (not (contains? (listed-ids body) a1)) "the moved block's own stamp did not move")
++          (is (= [a2] (block-ids gb)) "the edited block is listed under its current page")
++          (is (empty? (:blocks ga)))
++          (is (= [0 0] [(:created ga) (:updated ga)])))))))
++
++(deftest changes-title-edit-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a a1]} ids
++                _ (age! conn)
++                _ ((:edit! (writer self)) a1 "zz a1 retitled")
++                body (feed! self (since-old))
++                g (group body a)]
++          (is (= [a1] (block-ids g)) "the block")
++          (is (true? (:page-changed g)) "and its page: a title edit moves both stamps"))))))
++
++(defn- recycle-block!
++  "Moves a block to the Recycle bin as the app does (deleteBlock on the server deletes for good)."
++  [conn id & [now-ms]]
++  (d/transact! conn (vec (recycle/recycle-blocks-tx-data @conn [(d/entity @conn [:block/uuid id])]
++                                                         {:now-ms (or now-ms (js/Date.now))}))))
++
++(deftest changes-private-and-bin-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [secret s1 a a2 a3 b b1]} ids
++                {:keys [edit! insert! put! delete-block! delete-page! page!]} (writer self)
++                [private-block gone] (insert! a [{:title "zz private block"} {:title "zz gone for good"}])
++                _ (put! private-block "block/tags" ["Private"])
++                doomed (page! "zz Doomed")
++                [old-bin] (insert! a [{:title "zz binned long ago"}])
++                _ (recycle-block! conn old-bin 500)
++                _ (age! conn)
++                _ (edit! s1 "zz s1 edited")
++                _ (edit! a2 "zz a2 edited")
++                _ (recycle-block! conn a3)
++                _ (delete-page! doomed)
++                _ (recycle-block! conn private-block)
++                _ (delete-block! gone)
++                _ (edit! b1 "zz b1 edited")
++                body (feed! self (since-old))
++                pages (set (map #(get-in % [:page :uuid]) (:pages body)))]
++          (is (not (contains? pages (str secret))) "a Private page's edits are not listed")
++          (is (not (contains? (listed-ids body) s1)))
++          (is (not (contains? pages (str doomed))) "a page deletePage recycled is not listed")
++          (is (not (contains? (listed-ids body) a3)) "nor a block recycled as the app does")
++          (is (not (contains? (listed-ids body) private-block)))
++          (is (not (contains? (listed-ids body) gone)) "a block deleted for good leaves nothing to list")
++          (is (= #{(str a) (str b)} pages) "only the visible pages; not the Recycle bin page")
++          (is (= [a2] (block-ids (group body a))))
++          (is (= 2 (:recycled body))
++              (str "the block and the page recycled in the window; not the Private block, one binned before"
++                   " since, nor the block deleted for good")))))))
++
++(deftest changes-order-and-caps-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a a1 a2 b b1]} ids
++                {:keys [insert! edit! page!]} (writer self)
++                [n1 n2 n3] (insert! a [{:title "zz n1"} {:title "zz n2"} {:title "zz n3"}])
++                _ (age! conn)
++                ;; Stamps set directly to fix the order: zz A's five changes at 2001 to 2005 (three
++                ;; created), zz B's one at 3000, so zz B comes first.
++                _ (d/transact! conn (vec (concat
++                                          (map-indexed (fn [i id] [:db/add (eid conn id) :block/updated-at (+ 2001 i)])
++                                                       [a1 a2 n1 n2 n3])
++                                          (map (fn [id] [:db/add (eid conn id) :block/created-at 2000]) [n1 n2 n3])
++                                          [[:db/add (eid conn b1) :block/updated-at 3000]])))
++                capped (feed! self (since-old "&until=10000&blocks-per-page=2"))
++                ga (group capped a)
++                first-page (feed! self (since-old "&until=10000&limit=1"))
++                cursor (:next-cursor first-page)
++                ;; Written after the pinned until: a new page with a block and an edit on zz A.
++                c (page! "zz C")
++                _ (insert! c [{:title "zz c1"}])
++                _ (edit! a1 "zz a1 after until")
++                second-page (feed! self (since-old (str "&limit=1&cursor=" (js/encodeURIComponent cursor))))]
++          (is (= [(str b) (str a)] (map #(get-in % [:page :uuid]) (:pages capped))) "newest first")
++          (is (= [n3 n2] (block-ids ga)) "blocks-per-page=2 keeps the two newest")
++          (is (= [3 2] [(:created ga) (:updated ga)]) "counts stay complete")
++          (is (= 2005 (:latest-updated-at ga)))
++          (is (= [(str b)] (map #(get-in % [:page :uuid]) (:pages first-page))))
++          (is (string? cursor))
++          (is (= 10000 (:until second-page)) "the cursor's until is used when until is left out")
++          (is (= [(str a)] (map #(get-in % [:page :uuid]) (:pages second-page)))
++              "page 2 is zz A, though zz C and an edit on zz A came after the pinned until")
++          (is (= [n3 n2 n1 a2] (block-ids (group second-page a)))
++              "zz a1's edit after until moved its stamp out of the window")
++          (is (nil? (:next-cursor second-page)) "the last page answers null")
++          (is (contains? second-page :next-cursor)))))))
++
++(defn- since-of [self zone since]
++  (set! (.-env self) (clj->js {"TIMEZONE" zone}))
++  (changes self (str "since=" (js/encodeURIComponent since) "&until=" far-until)))
++
++(def ^:private since-error "invalid since: give epoch ms, an ISO date (2026-11-16) or an ISO datetime")
++(def ^:private until-error "invalid until: give epoch ms, an ISO date (2026-11-16) or an ISO datetime")
++
++(deftest changes-since-forms-test
++  ;; Review focus 11. A date is local midnight in TIMEZONE; a datetime without an offset is local time.
++  (async done
++    (-> (p/let [{:keys [self]} (new-graph {"TIMEZONE" "UTC"})
++                cases [["Pacific/Auckland" "2026-09-27" (js/Date.UTC 2026 8 26 12) "NZ daylight saving starts that day; midnight is still +12"]
++                       ["Pacific/Auckland" "2026-09-28" (js/Date.UTC 2026 8 27 11) "the day after, +13"]
++                       ["Pacific/Auckland" "2026-04-05" (js/Date.UTC 2026 3 4 11) "NZ daylight saving ends that day; midnight is still +13"]
++                       ["Pacific/Auckland" "2026-04-06" (js/Date.UTC 2026 3 5 12) "the day after, +12"]
++                       ["Pacific/Auckland" "2026-11-16T09:00" (js/Date.UTC 2026 10 15 20) "local time, +13"]
++                       ["Pacific/Auckland" "2026-11-16T09:00:30.250" (js/Date.UTC 2026 10 15 20 0 30 250) "local, seconds and ms"]
++                       ["Pacific/Auckland" "2026-09-27T02:30" (js/Date.UTC 2026 8 26 14 30) "in the gap: the time after the change, 03:30 +13"]
++                       ["Pacific/Auckland" "2026-04-05T02:30" (js/Date.UTC 2026 3 4 13 30) "twice that night: the first, +13"]
++                       ["Pacific/Auckland" "2026-11-16T09:00:00Z" (js/Date.UTC 2026 10 16 9) "Z is that instant"]
++                       ["Pacific/Auckland" "2026-11-16T09:00+13:00" (js/Date.UTC 2026 10 15 20) "an offset is that instant"]
++                       ["Pacific/Auckland" "2026-11-16T09:00-05:30" (js/Date.UTC 2026 10 16 14 30) "a negative offset"]
++                       ["Pacific/Auckland" "1763251200000" 1763251200000 "epoch ms"]
++                       ["Pacific/Auckland" "0" 0 "zero"]
++                       ["UTC" "2026-09-27" (js/Date.UTC 2026 8 27) "UTC midnight"]
++                       ["UTC" "2026-11-16T09:00" (js/Date.UTC 2026 10 16 9) "UTC local time"]
++                       ["America/Los_Angeles" "2026-11-16" (js/Date.UTC 2026 10 16 8) "-08:00"]
++                       [" Pacific/Auckland " "2026-11-16" (js/Date.UTC 2026 10 15 11) "TIMEZONE is trimmed"]]
++                results (p/loop [xs cases acc []]
++                          (if (empty? xs)
++                            acc
++                            (p/let [[zone since] (first xs)
++                                    r (since-of self zone since)]
++                              (p/recur (rest xs) (conj acc r)))))]
++          (doseq [[[zone since expected why] r] (map vector cases results)]
++            (is (= 200 (:status r)) (str since " " (pr-str r)))
++            (is (= expected (get-in r [:body :since])) (str zone " " since ": " why))
++            (is (= (string/trim zone) (get-in r [:body :time-zone])))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest changes-since-refused-forms-test
++  ;; The forms refused naming since (review focus 11), until's forms, and TIMEZONE.
++  (async done
++    (-> (p/let [{:keys [self]} (new-graph {"TIMEZONE" "Pacific/Auckland"})
++                refused ["2026-02-30" "2026-13-01" "2026-11-16T24:00" "2026-11-16T09:60" "2026-11-16T09:00:61"
++                         "2026-11-16T09:00+14:60" "2026-11-16T09:00+24:00" "2026-11-16 09:00" "2026-11-16T09"
++                         "26-11-16" "1e12" "-1" "  17000 " "" "1.5" "99999999999999999999" "yesterday"]
++                outcomes (p/loop [xs refused acc []]
++                           (if (empty? xs)
++                             acc
++                             (p/let [r (since-of self "Pacific/Auckland" (first xs))]
++                               (p/recur (rest xs) (conj acc [(first xs) r])))))
++                missing (changes self (str "until=" far-until))
++                until-date (changes self "since=0&until=2026-11-16")
++                until-bad (changes self "since=0&until=2026-02-30")
++                _ (set! (.-env self) #js {"TIMEZONE" "Not/AZone"})
++                bad-zone-date (changes self (str "since=2026-11-16&until=" far-until))
++                bad-zone-local (changes self (str "since=2026-11-16T09:00&until=" far-until))
++                bad-zone-until (changes self "since=0&until=2026-11-16")
++                bad-zone-ms (changes self (str "since=0&until=" far-until))
++                bad-zone-offset (changes self (str "since=2026-11-16T09:00Z&until=" far-until))
++                _ (set! (.-env self) #js {})
++                unset (changes self (str "since=2026-11-16&until=" far-until))]
++          (doseq [[since r] outcomes]
++            (is (= {:status 400 :body {:error since-error}} r) (pr-str since)))
++          (is (= {:status 400 :body {:error since-error}} missing) "since is required")
++          (is (= (js/Date.UTC 2026 10 15 11) (get-in until-date [:body :until])) "until takes the same forms")
++          (is (= {:status 400 :body {:error until-error}} until-bad))
++          (is (= {:status 500 :body {:error "invalid TIMEZONE setting: Not/AZone"}} bad-zone-date)
++              "an invalid TIMEZONE answers 500 when a date needs it")
++          (is (= 500 (:status bad-zone-local)) "or a local datetime")
++          (is (= 500 (:status bad-zone-until)) "in until too")
++          (is (= 200 (:status bad-zone-ms)) "epoch ms needs no zone")
++          (is (nil? (get-in bad-zone-ms [:body :time-zone])))
++          (is (= 200 (:status bad-zone-offset)) "nor does a datetime with an offset")
++          (is (= [200 (js/Date.UTC 2026 10 16) "UTC"] [(:status unset) (get-in unset [:body :since]) (get-in unset [:body :time-zone])])
++              "TIMEZONE unset is UTC"))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
++(deftest changes-refusals-test
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [first-page (feed! self "since=0&until=10000000000000&limit=1")
++                cursor (js/encodeURIComponent (:next-cursor first-page))
++                bad-shape (js/encodeURIComponent (js/btoa "[\"a\",\"b\"]"))
++                before (snapshot conn)
++                cases [["until=10000000000000" since-error]
++                       ["since=" since-error]
++                       ["since=10&until=x" until-error]
++                       ["since=10&until=" until-error]
++                       ["since=10&until=10" "until must be after since"]
++                       ["since=10&until=9" "until must be after since"]
++                       ["since=2026-11-16&until=2026-11-15" "until must be after since"]
++                       ["since=0&limit=0" "invalid limit"]
++                       ["since=0&limit=x" "invalid limit"]
++                       ["since=0&blocks-per-page=0" "invalid blocks-per-page: give 1 to 50"]
++                       ["since=0&blocks-per-page=51" "invalid blocks-per-page: give 1 to 50"]
++                       ["since=0&blocks-per-page=x" "invalid blocks-per-page: give 1 to 50"]
++                       ["since=0&blocks-per-page=" "invalid blocks-per-page: give 1 to 50"]
++                       ["since=0&blocks-per-page=2.5" "invalid blocks-per-page: give 1 to 50"]
++                       ["since=0&cursor=zzz" "invalid cursor"]
++                       [(str "since=0&cursor=" bad-shape) "invalid cursor"]
++                       [(str "since=1&cursor=" cursor) "cursor belongs to another since"]
++                       [(str "since=0&until=10000000000001&cursor=" cursor) "cursor belongs to another until"]]
++                results (p/loop [xs cases acc []]
++                          (if (empty? xs)
++                            acc
++                            (p/let [r (changes self (ffirst xs))] (p/recur (rest xs) (conj acc r)))))
++                e2ee (request! self "GET" "/semantic/changes?since=x&graph-e2ee=true" nil)
++                e2ee-valid (request! self "GET" "/semantic/changes?since=0&graph-e2ee=true" nil)
++                same-until (changes self (str "since=0&until=10000000000000&cursor=" cursor))
++                no-until (changes self (str "since=0&cursor=" cursor))
++                edge (changes self "since=0&limit=500&blocks-per-page=50")
++                one (changes self "since=0&blocks-per-page=1")
++                after (snapshot conn)]
++          (doseq [[[q error] r] (map vector cases results)]
++            (is (= {:status 400 :body {:error error}} r) q))
++          (is (= {:status 409 :body {:error "graph insights are unavailable for E2EE graphs"}} e2ee)
++              "E2EE is refused before any parameter")
++          (is (= 409 (:status e2ee-valid)))
++          (testing "inputs that still work"
++            (is (= 200 (:status same-until)) "a cursor with its own until")
++            (is (= 10000000000000 (get-in no-until [:body :until])) "a cursor with until left out")
++            (is (= 200 (:status edge)) "limit over 200 is capped, as on every list; blocks-per-page 50")
++            (is (= 200 (:status one))))
++          (is (= before after) "nothing written"))))))
++
++(defn- counting
++  "`xs` as an unchunked lazy seq that counts, in `n`, the elements realised."
++  [n xs]
++  (lazy-seq (when-let [s (seq xs)]
++              (vswap! n inc)
++              (cons (first s) (counting n (rest s))))))
++
++(deftest changes-cap-test
++  ;; Review focus 14. The window is built from bare entities holding only a uuid and an updated-at,
++  ;; transacted at once so the fixture stays fast; the cap counts datoms in the window before any
++  ;; filter, so they count as changes (and, having no page, list nothing).
++  (async done
++    (let [index-range d/index-range
++          realised (volatile! 0)]
++      (-> (p/let [{:keys [conn self]} (new-graph {"TIMEZONE" "UTC"})
++                  cap @#'semantic/max-changes
++                  add! (fn [from n] (d/transact! conn (vec (for [i (range from (+ from n))]
++                                                             {:block/uuid (random-uuid) :block/updated-at (+ 5000 i)}))))
++                  _ (add! 0 cap)
++                  at-cap (changes self "since=4999&until=100000")
++                  _ (add! cap 1)
++                  over (changes self "since=4999&until=100000")
++                  _ (add! (inc cap) 49)
++                  before (snapshot conn)
++                  _ (set! d/index-range (fn [& args] (counting realised (apply index-range args))))
++                  far-over (changes self "since=4999&until=100000")
++                  _ (set! d/index-range index-range)
++                  narrowed (changes self "since=5000&until=100000")
++                  after (snapshot conn)]
++            ;; Review s-stage-6-2: 20,000 changes cost 2.3 to 5.4 s of Durable Object CPU (x1.65); 2,500
++            ;; keep a call under 1 s at 5,000 pages (scripts/bench-graph-insights.mjs).
++            (is (= 2500 cap))
++            (is (= 200 (:status at-cap)) (str "exactly " cap " changes answer: " (pr-str (:body at-cap))))
++            (is (= [] (get-in at-cap [:body :pages])))
++            (is (= {:status 422 :body {:error "too many changes in that window (more than 2,500); pass a later since or an until"}}
++                   over)
++                "2,501 changes")
++            (is (= 422 (:status far-over)))
++            (is (<= @realised (inc cap)) (str "realised " @realised " datoms; the take stops at the cap plus one"))
++            (is (= 422 (:status narrowed)) "a later since still holds more than the cap")
++            (is (= before after) "nothing written"))
++          (p/catch #(is false (str % "\n" (.-stack %))))
++          (p/finally (fn []
++                       (set! d/index-range index-range)
++                       (done)))))))
++
++(deftest changes-kinds-test
++  ;; Review focus 16: a tag, a property and a journal are their own groups with their kind; built-in
++  ;; and hidden entities never appear.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids note]}]
++        (p/let [{:keys [book]} ids
++                capture (ok! (request! self "POST" "/semantic/capture" {:blocks [{:title "zz captured"}]}) 201)
++                journal (uuid (get-in capture [:body :page-id]))
++                [captured] (map #(uuid (:uuid %)) (get-in capture [:body :blocks]))
++                _ (age! conn)
++                _ (ok! (request! self "PATCH" (str "/semantic/tags/" book) {:title "zz Book renamed"}) 200)
++                _ (ok! (request! self "PATCH" (str "/semantic/properties/" (:uuid note)) {:title "zz note renamed"}) 200)
++                _ ((:edit! (writer self)) captured "zz captured edited")
++                now (js/Date.now)
++                _ (d/transact! conn [[:db/add (d/entid @conn :logseq.class/Task) :block/updated-at now]
++                                     [:db/add (d/entid @conn :logseq.property/status) :block/updated-at now]])
++                body (feed! self (since-old))
++                kinds (into {} (map (juxt #(get-in % [:page :uuid]) #(get-in % [:page :kind]))) (:pages body))
++                task (str (:block/uuid (d/entity @conn :logseq.class/Task)))
++                status (str (:block/uuid (d/entity @conn :logseq.property/status)))]
++          (is (= "tag" (get kinds (str book))))
++          (is (= "zz Book renamed" (get-in (group body book) [:page :title])))
++          (is (true? (:page-changed (group body book))))
++          (is (= "property" (get kinds (str (:uuid note)))))
++          (is (= "journal" (get kinds (str journal))))
++          (is (= [captured] (block-ids (group body journal))))
++          (is (not (contains? kinds task)) "a built-in tag is never listed")
++          (is (not (contains? kinds status)) "nor a built-in property"))))))
++
++(defn- built-in-page
++  "The uuid of the built-in page titled `title` (Contents, Quick add or Library)."
++  [conn title]
++  (some (fn [d] (let [e (d/entity @conn (:e d))]
++                  (when (and (= title (:v d)) (:logseq.property/built-in? e) (nil? (:block/page e)))
++                    (:block/uuid e))))
++        (d/datoms @conn :aevt :block/title)))
++
++(deftest changes-built-in-page-blocks-test
++  ;; Review r1-tests-1 / r1-correctness-1: a user block on a built-in page is not a built-in entity.
++  ;; Contents is built-in and visible, so its blocks are listed; Quick add is built-in and hidden, so
++  ;; its blocks are left out with the rest of what the app hides. The other pages whose blocks are left
++  ;; out: a Private page (changes-private-and-bin-test) and a page in the Recycle bin (below).
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a1]} ids
++                {:keys [insert! edit! page! delete-page!]} (writer self)
++                contents (built-in-page conn "Contents")
++                quick-add (built-in-page conn "Quick add")
++                [on-contents] (insert! contents [{:title "zz on contents"}])
++                [on-quick-add] (insert! quick-add [{:title "zz on quick add"}])
++                doomed (page! "zz Doomed")
++                [on-doomed] (insert! doomed [{:title "zz on doomed"}])
++                _ (age! conn)
++                _ (edit! on-contents "zz on contents edited")
++                _ (edit! on-quick-add "zz on quick add edited")
++                _ (edit! on-doomed "zz on doomed edited")
++                _ (delete-page! doomed)
++                _ (edit! a1 "zz a1 edited")
++                [new-on-contents] (insert! contents [{:title "zz new on contents"}])
++                body (feed! self (since-old))
++                g (group body contents)]
++          (is (some? contents))
++          (is (some? quick-add))
++          (is (= #{on-contents new-on-contents} (set (block-ids g)))
++              "a block edited, and one created, on the built-in Contents page are listed")
++          (is (= [1 1] [(:created g) (:updated g)]))
++          (is (= "Contents" (get-in g [:page :title])))
++          (is (not (contains? (listed-ids body) on-quick-add)) "Quick add is hidden, so its blocks are not")
++          (is (nil? (group body quick-add)))
++          (is (not (contains? (listed-ids body) on-doomed)) "nor a block edited on a page then recycled")
++          (is (nil? (group body doomed)))
++          (is (contains? (listed-ids body) a1)))))))
++
++(deftest changes-recycled-until-test
++  ;; Review r1-tests-2: recycled counts only deletes inside (since, until].
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a2 b1]} ids
++                _ (age! conn)
++                _ (recycle-block! conn a2 5000)
++                _ (recycle-block! conn b1 7000)
++                before (feed! self (since-old "&until=4999"))
++                at (feed! self (since-old "&until=5000"))
++                between (feed! self (since-old "&until=6999"))
++                after (feed! self "since=5000&until=8000")
++                all (feed! self (since-old "&until=8000"))]
++          (is (= 0 (:recycled before)) "a recycle after until is not counted")
++          (is (= 1 (:recycled at)) "until is included")
++          (is (= 1 (:recycled between)))
++          (is (= 1 (:recycled after)) "since is excluded, so consecutive windows count each delete once")
++          (is (= 2 (:recycled all))))))))
++
++(deftest changes-built-in-owner-test
++  ;; Review r1-tests-3: a user property's value on a built-in tag is owned by that tag, which is
++  ;; never listed.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids note]}]
++        (p/let [{:keys [a1]} ids
++                {:keys [put! edit!]} (writer self)
++                task (:block/uuid (d/entity @conn :logseq.class/Task))
++                _ (age! conn)
++                _ (put! task (:ident note) "zz a note on Task")
++                _ (edit! a1 "zz a1 edited")
++                body (feed! self (since-old))
++                pages (set (map #(get-in % [:page :uuid]) (:pages body)))]
++          (is (some? (:logseq.property/built-in? (d/entity @conn :logseq.class/Task))))
++          (is (> (stamp-of conn task) old) "the value write did move a stamp in the window")
++          (is (not (contains? pages (str task))) "a built-in tag is not listed for a value set on it")
++          (is (contains? (listed-ids body) a1)))))))
++
++(defn- favorites-page-id [conn]
++  (some (fn [d] (when (= "$$$favorites" (:v d)) (:e d))) (d/datoms @conn :aevt :block/title)))
++
++(defn- write-tool-cases
++  "One case per connector write tool that edits existing content: what to call, and which block (or
++  none) and page to watch."
++  [{:keys [ids note]} self extra]
++  (let [{:keys [a a1 a2 b b1]} ids
++        {:keys [promote tag-block refresh-block]} extra
++        call (fn [method path body status] (fn [] (ok! (request! self method path body) status)))]
++    [["update_block" a1 a (call "PATCH" (str "/semantic/blocks/" a1) {:title "zz a1 by update_block"} 200)]
++     ["update_page" nil a (call "PATCH" (str "/semantic/pages/" a) {:title "zz A by update_page"} 200)]
++     ["set_block_property" a1 a (call "PUT" (str "/semantic/blocks/" a1 "/properties/" (js/encodeURIComponent (:ident note)))
++                                      {:value "zz set"} 200)]
++     ["batch_set_block_property" a2 a (call "POST" "/semantic/block-properties/batch-set"
++                                            {:entries [{:block-id (str a2) :property-id (:ident note) :value "zz batch"}]} 200)]
++     ["delete_block_property" a1 a (call "DELETE" (str "/semantic/blocks/" a1 "/properties/" (js/encodeURIComponent (:ident note)))
++                                         nil 200)]
++     ["batch_delete_block_property" a2 a (call "POST" "/semantic/block-properties/batch-delete"
++                                               {:entries [{:block-id (str a2) :property-id (:ident note)}]} 200)]
++     ["move_blocks" a1 b (call "POST" "/semantic/block-moves" {:block-ids [(str a1)] :target-id (str b) :position "last-child"} 200)]
++     ["batch_move_blocks" a1 a (call "POST" "/semantic/block-moves/batch"
++                                     {:moves [{:block-ids [(str a1)] :target-id (str a) :position "last-child"}]} 200)]
++     ["insert_block_children" b1 b (call "POST" (str "/semantic/blocks/" b1 "/children")
++                                         {:position "append" :blocks [{:title "zz child"}]} 201)]
++     ["update_tag" nil (:book ids) (call "PATCH" (str "/semantic/tags/" (:book ids)) {:title "zz Book by update_tag"} 200)]
++     ["update_property" nil (:uuid note) (call "PATCH" (str "/semantic/properties/" (:uuid note)) {:title "zz note by update_property"} 200)]
++     ["promote_page_to_tag" nil promote (call "POST" (str "/semantic/pages/" promote "/promote-to-tag") {} 200)]
++     ["refresh_refs" refresh-block b (call "POST" "/semantic/refresh-refs" {:page-id (str b) :apply true} 200)]
++     ["set_page_favorite" nil b (call "PUT" (str "/semantic/pages/" b "/favorite") {:favorite true} 200)]
++     ["tag via set_block_property" tag-block b (call "PUT" (str "/semantic/blocks/" tag-block "/properties/block%2Ftags")
++                                                     {:value ["zz Book by update_tag"]} 200)]]))
++
++(defn- stamp-row
++  "What one write moved: the watched block's and page's updated-at, and whether the feed lists it."
++  [conn self [tool block page run]]
++  (p/let [_ (age! conn)
++          _ (run)
++          body (feed! self (since-old))
++          g (group body page)]
++    {:tool tool
++     :block-bumped (when block (> (stamp-of conn block) old))
++     :page-bumped (> (stamp-of conn page) old)
++     :listed (boolean (or (and block (some #{block} (block-ids g))) (:page-changed g)))}))
++
++(def ^:private expected-stamps
++  "The stamp table (the commit body repeats it). nil: the tool has no block to watch."
++  {"update_block" [true true true]
++   "update_page" [nil true true]
++   "set_block_property" [true false true]
++   "batch_set_block_property" [true false true]
++   "delete_block_property" [false true true]
++   "batch_delete_block_property" [false true true]
++   "move_blocks" [false true true]
++   "batch_move_blocks" [false true true]
++   "insert_block_children" [false true true]
++   "update_tag" [nil true true]
++   "update_property" [nil true true]
++   "promote_page_to_tag" [nil true true]
++   "refresh_refs" [true true true]
++   "set_page_favorite" [nil false false]
++   "tag via set_block_property" [true false true]})
++
++(deftest changes-write-tool-stamps-test
++  ;; Which stamps each connector write tool moves, and whether the feed sees it. The tools that move
++  ;; neither are the blind spots listChangesSince's description names.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids] :as graph}]
++        (p/let [{:keys [page! insert! tag!]} (writer self)
++                promote (page! "zz To Promote")
++                [tag-block] (insert! (:b ids) [{:title "zz tag me"}])
++                _ (tag! "zzLater")
++                _ (tag! "zzMissing")
++                ;; Stored unescaped, as an older app write leaves it, so refreshRefs applies the tag.
++                refresh-block (random-uuid)
++                _ (outliner-core/insert-blocks! conn [{:block/uuid refresh-block :block/title "zz see #zzMissing"}]
++                                                (d/entity @conn [:block/uuid (:b ids)])
++                                                {:sibling? false :keep-uuid? true :bottom? true})
++                rows (p/loop [cases (write-tool-cases graph self {:promote promote :tag-block tag-block
++                                                                  :refresh-block refresh-block})
++                              acc []]
++                       (if (empty? cases)
++                         acc
++                         (p/let [row (stamp-row conn self (first cases))]
++                           (p/recur (rest cases) (conj acc row)))))
++                table (into {} (map (juxt :tool (juxt :block-bumped :page-bumped :listed))) rows)
++                blind (sort (keep (fn [[tool [block page]]] (when (and (not block) (not page)) tool)) table))
++                description (get-in (semantic-routes/openapi-document "https://issuer.example")
++                                    [:paths "/api/v1/graphs/{graph-id}/changes" :get :description])]
++          (println "STAMPS" (pr-str table))
++          (doseq [[tool expected] expected-stamps]
++            (is (= expected (get table tool)) (str tool ": [block-bumped page-bumped listed]")))
++          (is (= ["set_page_favorite"] blind) "the tools that move neither stamp")
++          (is (string/includes? description
++                                (str "A write that moves neither stamp is not seen: of the connector's write tools, "
++                                     (string/join ", " blind)
++                                     " (the favourites list is a hidden page).")))
++          (is (favorites-page-id conn) "set_page_favorite wrote the hidden favourites page"))))))
++
++(deftest changes-route-documented-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        operation (get-in document [:paths "/api/v1/graphs/{graph-id}/changes" :get])
++        param (fn [n] (first (filter #(= n (:name %)) (:parameters operation))))
++        fmt (fn [n] (string/replace (str n) #"\B(?=(\d{3})+(?!\d))" ","))
++        description (:description operation)]
++    (is (= "listChangesSince" (:operationId operation)))
++    (is (= ["graph-id" "since" "until" "limit" "blocks-per-page" "cursor"] (mapv :name (:parameters operation))))
++    (is (true? (:required (param "since"))))
++    (is (every? #(contains? (:responses operation) %) ["200" "400" "409" "422" "500"]))
++    (is (string/includes? description (str "more than " (fmt @#'semantic/max-changes) " changes")))
++    (is (string/includes? description (str "1 to " @#'semantic/max-blocks-per-page ", default " @#'semantic/default-blocks-per-page)))
++    (is (string/includes? (:description (param "blocks-per-page"))
++                          (str "1 to " @#'semantic/max-blocks-per-page ", default " @#'semantic/default-blocks-per-page)))
++    (is (string/includes? description (str "1 to " @#'semantic/max-limit)))
++    (is (string/includes? description "2026-11-16"))
++    (is (string/includes? description "TIMEZONE"))
++    (is (string/includes? description "store this call's until and pass it as the next since"))
++    ;; Review r1-correctness-2 / r1-integrity-2 / r1-light-2: stamps are the editing device's clock.
++    (is (string/includes? description "An edit's updated-at is set by the device that made it"))
++    (is (string/includes? description "overlap the windows"))
++    (is (string/includes? description "a block on a hidden page such as Quick add is left out"))
++    (is (string/includes? description "A move shows as page-changed on both pages"))
++    (is (string/includes? description "Permanent deletes"))
++    (is (= "ChangesSinceResponse" (last (string/split (get-in operation [:responses "200" :content "application/json" :schema :$ref]) #"/"))))
++    (is (some? (get-in document [:components :schemas :ChangesSinceResponse])))
++    (is (= {:method "GET" :handler :semantic/changes-since :scope "logseq/read" :rate-class :read}
++           (select-keys (semantic-routes/match-internal "GET" "/semantic/changes") [:method :handler :scope :rate-class])))))
++
++(deftest changes-upload-path-test
++  ;; On a graph that arrived through the app's snapshot upload.
++  (async done
++    (let [request! #'uploaded/request!
++          signed @#'uploaded/signed]
++      (-> (p/let [{:keys [self]} (#'uploaded/uploaded-graph)
++                  conn (#'uploaded/open! self)
++                  created (fn [r] (assert (= 201 (:status r)) (pr-str r)) r)
++                  page (p/let [r (request! self "POST" "/semantic/pages" {:title "zz Uploaded"} signed)] (uuid-of (created r)))
++                  [block] (p/let [r (request! self "POST" "/semantic/block-trees"
++                                              {:target-id (str page) :blocks [{:title "zz up"}]} signed)]
++                            (mapv #(uuid (:uuid %)) (get-in (created r) [:body :blocks])))
++                  _ (age! conn)
++                  _ (p/let [r (request! self "PATCH" (str "/semantic/blocks/" block) {:title "zz up edited"} signed)]
++                      (assert (= 200 (:status r)) (pr-str r)))
++                  response (request! self "GET" (str "/semantic/changes?since=" old) nil signed)]
++            (is (= 200 (:status response)) (pr-str response))
++            (is (= [block] (block-ids (group (:body response) page)))))
++          (p/catch #(is false (str % "\n" (.-stack %))))
++          (p/finally done)))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 930f019..7c05207 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -15,6 +15,7 @@
+             [logseq.db-sync.normalize-test]
+             [logseq.db-sync.semantic-write-guards-test]
+             [logseq.db-sync.semantic-index-health-test]
++            [logseq.db-sync.semantic-changes-since-test]
+             [logseq.db-sync.semantic-graph-health-private-test]
+             [logseq.db-sync.semantic-graph-health-refs-test]
+             [logseq.db-sync.semantic-graph-health-tag-properties-test]

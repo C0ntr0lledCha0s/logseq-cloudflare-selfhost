@@ -24,6 +24,14 @@
 // the reason, with neither node stored. The inserts and the refusals run with the console captured,
 // and fail if anything was logged.
 //
+// The graph-insight reads (patches 0051 to 0053) build datalog.cljs's private set on every call, so
+// it then makes a tag that lists an expected property, two blocks tagged with it (one holding the
+// property) and a block linking a uuid nothing has, and sends one call to each read through
+// SyncDO.fetch: checks=broken-refs,missing-tag-properties with tag-properties, the default health
+// call (its four checks), checks=missing-tag-properties with the pair stored in the Worker's
+// HEALTH_TAG_PROPERTIES secret (the SyncDO gets the env insightEnv gives, with TIMEZONE UTC), list_changes_since from an ISO local time (the Intl zone
+// code) and get_graph_schema with both sections. Each check reads the counts and items back.
+//
 // It then seeds a graph at scale (scaleFixture, about 20,000 blocks) through SyncDO.fetch, in
 // POST /semantic/block-trees/batch calls of 100 entries: 2,400 pages tagged Release Topic, 300
 // meetings with decisions under them (30 of them 40 levels down) or beside them, 400 tasks across
@@ -136,24 +144,18 @@ function seedBuiltInGraph(upstream, sql, preseed = []) {
 export function seededDatabase(upstream, preseed = []) {
   const Database = createRequire(join(upstream, "deps", "db-sync", "package.json"))("better-sqlite3");
   const db = new Database(":memory:");
-  const sql = {
-    exec(query, ...args) {
-      const stmt = db.prepare(query);
-      return stmt.reader ? stmt.all(...args) : (stmt.run(...args), []);
-    },
-  };
+  const { sql } = durableObjectState(db);
   seedBuiltInGraph(upstream, sql, preseed);
   return { db, sql };
 }
 
 /**
- * Loads the release SyncDO over an in-memory SQLite holding a new graph (`database`, from
- * seededDatabase, or one seeded here with `preseed`). Call close() when done.
+ * Imports the release bundle from a temporary copy whose Cloudflare, Sentry and mldoc imports point
+ * at stubs: {SyncDO, Database (better-sqlite3), close}. close() removes the copy.
  */
-export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [], database } = {}) {
+export async function importReleaseBundle(upstream, bundle = bundlePath(upstream)) {
   const dbSync = join(upstream, "deps", "db-sync");
   const dir = mkdtempSync(join(tmpdir(), "release-query-check-"));
-  let db;
   try {
     writeFileSync(join(dir, "main.mjs"), rewriteImports(readFileSync(bundle, "utf8")));
     for (const [i, text] of stubs(dbSync).entries()) writeFileSync(join(dir, `stub-${i}.mjs`), text);
@@ -161,25 +163,52 @@ export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream),
     if (existsSync(map)) copyFileSync(map, join(dir, "main.mjs.map"));
     globalThis.WebSocketRequestResponsePair ??= class {};
     const { SyncDO } = await import(pathToFileURL(join(dir, "main.mjs")).href);
-    const seeded = database ?? seededDatabase(upstream, preseed);
-    db = seeded.db;
-    const { sql } = seeded;
-    const state = {
-      storage: { sql, transactionSync: (f) => db.transaction(f)() },
-      getWebSockets: () => [],
-      setWebSocketAutoResponse() {},
-    };
-    const stub = new SyncDO(state, {});
+    const Database = createRequire(join(dbSync, "package.json"))("better-sqlite3");
+    return { SyncDO, Database, close: () => rmSync(dir, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** The Durable Object state a SyncDO reads, over better-sqlite3 database `db`: {sql, state}. */
+export function durableObjectState(db) {
+  const sql = {
+    exec(query, ...args) {
+      const stmt = db.prepare(query);
+      return stmt.reader ? stmt.all(...args) : (stmt.run(...args), []);
+    },
+  };
+  const state = {
+    storage: { sql, transactionSync: (f) => db.transaction(f)() },
+    getWebSockets: () => [],
+    setWebSocketAutoResponse() {},
+  };
+  return { sql, state };
+}
+
+/**
+ * Loads the release SyncDO over an in-memory SQLite holding a new graph (`database`, from
+ * seededDatabase, or one seeded here with `preseed`), with `env` as the Worker's variables. Call
+ * close() when done.
+ */
+export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [], database, env = {} } = {}) {
+  const release = await importReleaseBundle(upstream, bundle);
+  let db;
+  try {
+    db = (database ?? seededDatabase(upstream, preseed)).db;
+    const { state } = durableObjectState(db);
+    const stub = new release.SyncDO(state, env);
     return {
       stub,
       close() {
         db.close();
-        rmSync(dir, { recursive: true, force: true });
+        release.close();
       },
     };
   } catch (error) {
     db?.close();
-    rmSync(dir, { recursive: true, force: true });
+    release.close();
     throw error;
   }
 }
@@ -355,6 +384,223 @@ function queryBlockChecks(ctx) {
           if (error) throw new Error(`${label}: ${error}`);
           assertQuiet(`${label}: the refusal`, calls);
         }
+      },
+    ],
+  ];
+}
+
+// Graph insights
+// ==============
+//
+// Patches 0051 to 0053: the health checks broken-refs and missing-tag-properties (with pairs given
+// as tag-properties and as the stored HEALTH_TAG_PROPERTIES secret, which reads the Worker's env),
+// list_changes_since (from an ISO local time, which runs the Intl zone code) and get_graph_schema.
+// Every one of them builds datalog.cljs's private set, which Closure renaming broke before.
+
+/** The insights fixture: a tag listing an expected property, and the page its blocks are on. */
+export const INSIGHT = { tag: "Release Insight Book", property: "release-insight-author", page: "Release Insight Page" };
+
+/** getGraphHealth's checks, in the handler's order. */
+export const HEALTH_CHECKS = [
+  "orphan-tags",
+  "orphan-properties",
+  "duplicate-titles",
+  "pages-without-summary",
+  "pages-without-tags",
+  "mismatched-choice-values",
+  "orphan-choices",
+  "broken-refs",
+  "missing-tag-properties",
+];
+
+/** The checks a getGraphHealth call without checks runs; the other five run only when named. */
+export const DEFAULT_HEALTH_CHECKS = ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"];
+
+/** The Worker variables render-wrangler.mjs would set: the stored pair and a zone for the feed. */
+export function insightEnv() {
+  return { HEALTH_TAG_PROPERTIES: JSON.stringify([{ tag: INSIGHT.tag, property: INSIGHT.property }]), TIMEZONE: "UTC" };
+}
+
+/** A minute before `ms`, as an ISO local time with no offset in UTC ("2026-11-22T09:29") and its epoch ms. */
+export function isoLocalMinute(ms) {
+  const minute = Math.floor(ms / 60_000) * 60_000 - 60_000;
+  return { iso: new Date(minute).toISOString().slice(0, 16), ms: minute };
+}
+
+const show = (v) => JSON.stringify(v);
+
+/**
+ * The gaps in a getGraphHealth answer on the insights fixture (`ins`: the uuids it made): exactly
+ * `checks` (in any order), the broken ref (broken -> ghost, missing) as broken-refs' only item, and the bare book
+ * as missing-tag-properties' only item, missing the property, with one pair from `from`.
+ */
+export function healthInsightErrors(body, ins, { from, checks }) {
+  if (!body?.checks) return ["no checks in the answer"];
+  const errors = [];
+  // A JSON object from a ClojureScript map keeps no order, so the checks are compared as a set.
+  const got = Object.keys(body.checks).sort();
+  if (show(got) !== show([...checks].sort())) errors.push(`checks are ${show(got)}, expected ${show([...checks].sort())}`);
+  const counted = (name) => {
+    const c = body.checks[name];
+    if (!c) return undefined;
+    if (!Number.isInteger(c.count) || c.count !== c.items?.length) errors.push(`${name}: count ${show(c.count)} with ${c.items?.length} items`);
+    return c;
+  };
+  const refs = counted("broken-refs");
+  if (refs && !refs.items.some((i) => i.uuid === ins.broken && i["target-uuid"] === ins.ghost && i.reason === "missing")) {
+    errors.push(`broken-refs: no item for ${ins.broken} -> ${ins.ghost} (missing) in ${show(refs.items).slice(0, 300)}`);
+  }
+  const missing = counted("missing-tag-properties");
+  if (missing) {
+    const holders = missing.items.map((i) => i.uuid);
+    if (show(holders) !== show([ins.bare])) errors.push(`missing-tag-properties: items ${show(holders)}, expected only ${ins.bare}`);
+    const item = missing.items.find((i) => i.uuid === ins.bare);
+    if (item) {
+      if (item.tag?.title !== INSIGHT.tag) errors.push(`missing-tag-properties: ${ins.bare} under tag ${show(item.tag?.title)}`);
+      const titles = (item.missing ?? []).map((m) => m.title);
+      if (show(titles) !== show([INSIGHT.property])) errors.push(`missing-tag-properties: ${ins.bare} misses ${show(titles)}, expected ${show([INSIGHT.property])}`);
+    }
+    if (missing["pairs-from"] !== from) errors.push(`pairs-from ${show(missing["pairs-from"])}, expected ${show(from)}`);
+    const pairs = missing.pairs ?? [];
+    if (pairs.length !== 1 || pairs[0].tag?.title !== INSIGHT.tag || pairs[0].property?.title !== INSIGHT.property) {
+      errors.push(`pairs ${show(pairs)}, expected one pair ${INSIGHT.tag} / ${INSIGHT.property}`);
+    }
+  }
+  return errors;
+}
+
+/**
+ * The gaps in a listChangesSince answer from `ins.since` (an ISO local time in UTC): since echoed
+ * as ms, time-zone UTC, null next-cursor, a recycled count, and the insights page with its three
+ * blocks, each created in the window.
+ */
+export function changesInsightErrors(body, ins) {
+  const errors = [];
+  if (body?.since !== ins.since) errors.push(`since ${show(body?.since)}, expected ${ins.since} (the ISO local time in UTC)`);
+  if (body?.["time-zone"] !== "UTC") errors.push(`time-zone ${show(body?.["time-zone"])}, expected "UTC"`);
+  if (body?.["next-cursor"] !== null) errors.push(`next-cursor ${show(body?.["next-cursor"])}, expected null on the last page`);
+  if (!Number.isInteger(body?.recycled)) errors.push(`recycled ${show(body?.recycled)}, expected a count`);
+  const pages = body?.pages ?? [];
+  const page = pages.find((p) => p.page?.uuid === ins.page);
+  if (!page) return [...errors, `no page ${ins.page} among ${show(pages.map((p) => p.page?.uuid))}`];
+  const want = [ins.broken, ins.bare, ins.authored].sort();
+  const got = (page.blocks ?? []).map((b) => b.uuid).sort();
+  if (show(got) !== show(want)) errors.push(`blocks ${show(got)}, expected ${show(want)}`);
+  if (page.created !== 3) errors.push(`created ${show(page.created)}, expected 3`);
+  for (const b of page.blocks ?? []) if (b.change !== "created") errors.push(`change ${show(b.change)} for ${b.uuid}, expected "created"`);
+  return errors;
+}
+
+/**
+ * The gaps in a getGraphSchema answer: both sections with integer counts, the insights tag listing
+ * its property with object-count 2, and the property (type default) with value-count 1, used by the tag.
+ */
+export function schemaInsightErrors(body, ins) {
+  const errors = [];
+  const section = (name) => {
+    const s = body?.[name];
+    if (!s) return errors.push(`${name}: no section`), undefined;
+    if (!Number.isInteger(s.count)) errors.push(`${name}: count ${show(s.count)}`);
+    return s;
+  };
+  const tags = section("tags");
+  const properties = section("properties");
+  const tag = tags?.items?.find((t) => t.title === INSIGHT.tag);
+  if (tags && !tag) errors.push(`tags: no item titled ${show(INSIGHT.tag)}`);
+  if (tag) {
+    if (tag.uuid !== ins.tagUuid) errors.push(`tag uuid ${show(tag.uuid)}, expected ${ins.tagUuid}`);
+    if (tag["object-count"] !== 2) errors.push(`object-count ${show(tag["object-count"])}, expected 2`);
+    const own = (tag.properties ?? []).map((p) => p.title);
+    if (show(own) !== show([INSIGHT.property])) errors.push(`tag properties ${show(own)}, expected ${show([INSIGHT.property])}`);
+  }
+  const property = properties?.items?.find((p) => p.title === INSIGHT.property);
+  if (properties && !property) errors.push(`properties: no item titled ${show(INSIGHT.property)}`);
+  if (property) {
+    if (property.type !== "default") errors.push(`type ${show(property.type)}, expected "default"`);
+    if (property["value-count"] !== 1) errors.push(`value-count ${show(property["value-count"])}, expected 1`);
+    const users = (property["used-by-tags"] ?? []).map((t) => t.title);
+    if (show(users) !== show([INSIGHT.tag])) errors.push(`used-by-tags ${show(users)}, expected ${show([INSIGHT.tag])}`);
+  }
+  return errors;
+}
+
+/** The graph-insights checks: seed through SyncDO.fetch, then one call to each read. */
+function insightChecks(ctx) {
+  const { stub } = ctx;
+  const seeded = () => {
+    if (!ctx.insights) throw new Error("the insights fixture was not seeded");
+    return ctx.insights;
+  };
+  const read = async (path) => {
+    const res = await call(stub, "GET", path);
+    if (res.status !== 200) throw new Error(`GET ${path}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json;
+  };
+  const fail = (errors) => {
+    if (errors.length) throw new Error(errors.join("; "));
+  };
+  return [
+    [
+      "graph insights: seed a tag with an expected property, two tagged blocks and a broken ref through SyncDO.fetch",
+      async () => {
+        const ok = (step, res) => {
+          if (res.status < 200 || res.status > 299) throw new Error(`${step}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+          return res.json;
+        };
+        const { iso, ms } = isoLocalMinute(Date.now());
+        const ghost = randomUUID();
+        const property = ok("create the property", await call(stub, "POST", "/semantic/properties", { title: INSIGHT.property, type: "default" }));
+        const tag = ok("create the tag", await call(stub, "POST", "/semantic/tags", { title: INSIGHT.tag, properties: [INSIGHT.property] }));
+        const page = ok("create the page", await call(stub, "POST", "/semantic/pages", { title: INSIGHT.page }));
+        const titles = [`Release insight broken [[${ghost}]]`, "Release insight bare book", "Release insight authored book"];
+        const { blocks } = ok(
+          "insert the blocks",
+          await call(stub, "POST", "/semantic/block-trees", { "target-id": page.uuid, blocks: titles.map((title) => ({ title })) }),
+        );
+        const [broken, bare, authored] = blocks.map((b) => b.uuid);
+        const put = (id, key, value) => call(stub, "PUT", `/semantic/blocks/${id}/properties/${encodeURIComponent(key)}`, { value });
+        for (const id of [bare, authored]) ok(`tag ${id}`, await put(id, "block/tags", [INSIGHT.tag]));
+        ok("set the author", await put(authored, property.ident, "Release Author"));
+        ctx.insights = { since: ms, sinceIso: iso, ghost, tagUuid: tag.uuid, propertyIdent: property.ident, page: page.uuid, broken, bare, authored };
+      },
+    ],
+    [
+      "graph insights: checks=broken-refs,missing-tag-properties with tag-properties answers the broken ref and the bare book",
+      async () => {
+        const ins = seeded();
+        const pairs = encodeURIComponent(JSON.stringify([{ tag: ins.tagUuid, property: ins.propertyIdent }]));
+        const body = await read(`/semantic/health?checks=broken-refs,missing-tag-properties&limit=200&tag-properties=${pairs}`);
+        fail(healthInsightErrors(body, ins, { from: "input", checks: ["broken-refs", "missing-tag-properties"] }));
+      },
+    ],
+    [
+      "graph insights: the default health call runs the four cheap checks",
+      async () => {
+        const ins = seeded();
+        fail(healthInsightErrors(await read("/semantic/health?limit=200"), ins, { from: "settings", checks: DEFAULT_HEALTH_CHECKS }));
+      },
+    ],
+    [
+      "graph insights: missing-tag-properties named alone checks the stored HEALTH_TAG_PROPERTIES pairs",
+      async () => {
+        const ins = seeded();
+        const body = await read("/semantic/health?checks=missing-tag-properties&limit=200");
+        fail(healthInsightErrors(body, ins, { from: "settings", checks: ["missing-tag-properties"] }));
+      },
+    ],
+    [
+      "graph insights: list_changes_since from an ISO local time lists the page's three new blocks",
+      async () => {
+        const ins = seeded();
+        const body = await read(`/semantic/changes?since=${encodeURIComponent(ins.sinceIso)}&limit=200&blocks-per-page=50`);
+        fail(changesInsightErrors(body, ins));
+      },
+    ],
+    [
+      "graph insights: get_graph_schema lists the tag with its property and objects, and the property with its value",
+      async () => {
+        const ins = seeded();
+        fail(schemaInsightErrors(await read("/semantic/schema?sections=tags,properties&limit=200"), ins));
       },
     ],
   ];
@@ -1189,6 +1435,7 @@ export function checks(ctx) {
       },
     ],
     ...queryBlockChecks(ctx),
+    ...insightChecks(ctx),
     ...scaleChecks(ctx),
     ...blankChecks(ctx),
   ];
@@ -1251,7 +1498,7 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
   const database = seededDatabase(upstream, staleTx(fixture));
   const syncStatus = seedSyncStatus(upstream);
   const blankLarge = seedBlankLarge(upstream);
-  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database });
+  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database, env: insightEnv() });
   const results = [];
   try {
     const ctx = { stub, fixture };
