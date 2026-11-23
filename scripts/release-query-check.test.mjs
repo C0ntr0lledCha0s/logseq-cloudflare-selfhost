@@ -166,6 +166,40 @@ test("checkBlankApply passes three applies of the 100 ids each dry run listed, a
   assert.ok(BLANK_APPLY_MS > 50);
 });
 
+test("the sync-status fixture is 100,000 entities: 2,000 pages of 49 blocks, with Private and recycled pages the counts leave out", async () => {
+  const { syncStatusFixture, SYNC_STATUS } = await import(script);
+  const f = syncStatusFixture();
+  assert.deepEqual(syncStatusFixture(), f, "the same on every build");
+  assert.equal(SYNC_STATUS.pages, 2000);
+  assert.equal(SYNC_STATUS.blocksPerPage, 49);
+  assert.equal(f.entities, 100_000, "the spec's bench size (section 8)");
+  assert.equal(f.pages.length + f.pages.reduce((n, p) => n + p.blocks.length, 0), f.entities);
+  assert.equal(f.pages.filter((p) => p.private).length, 200, "every 10th page is tagged Private");
+  assert.equal(f.pages.filter((p) => p.recycled).length, 100, "every 20th page, offset 5, is in the Recycle bin");
+  assert.ok(!f.pages.some((p) => p.private && p.recycled));
+  assert.deepEqual(f.counted, { pages: 1700, blocks: 1700 * 49 }, "what getSyncStatus counts: the rest");
+  assert.equal(new Set(f.pages.flatMap((p) => [p.uuid, ...p.blocks])).size, f.entities, "every uuid once");
+});
+
+test("the sync-status bound at 100,000 entities is 750 ms", async () => {
+  const { SYNC_STATUS_MS } = await import(script);
+  assert.equal(SYNC_STATUS_MS, 750);
+});
+
+test("checkSyncStatus passes quick counts that grew by the fixture's, and fails a refusal, a wrong count or a slow answer", async () => {
+  const { checkSyncStatus, SYNC_STATUS_MS } = await import(script);
+  const baseline = { "page-count": 7, "block-count": 30 };
+  const added = { pages: 1700, blocks: 83_300 };
+  const good = { t: 4, "page-count": 1707, "block-count": 83_330, clients: { connected: 0 } };
+  assert.match(await checkSyncStatus(fakeStub({ status: 200, body: good }), baseline, added), /median \d+ ms/);
+  await assert.rejects(checkSyncStatus(fakeStub({ status: 500, body: { error: "boom" } }), baseline, added), /HTTP 500/);
+  await assert.rejects(checkSyncStatus(fakeStub({ status: 200, body: { ...good, "page-count": 1907 } }), baseline, added), /page-count 1907, expected 1707/);
+  await assert.rejects(checkSyncStatus(fakeStub({ status: 200, body: { ...good, "block-count": 98_030 } }), baseline, added), /block-count 98030, expected 83330/);
+  await assert.rejects(checkSyncStatus(fakeStub({ status: 200, body: good, delay: SYNC_STATUS_MS + 20 }), baseline, added), /expected under 750 ms/);
+  const slow = fakeStub({ status: 200, body: good, delay: 70 });
+  await assert.rejects(checkSyncStatus(slow, baseline, added, 50), /expected under 50 ms/);
+});
+
 test("the scale fixture is about 20,000 blocks of meetings, decisions, tasks, tagged pages and stale projects, the same on every build", async () => {
   const { scaleFixture, SCALE } = await import(script);
   const now = 1_762_646_400_000;
@@ -342,6 +376,7 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "seed deleteBlankBlocks' caps: 5 pages of 2000 blocks through SyncDO.fetch",
     "at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within 500 ms",
     "at the caps: a deleteBlankBlocks apply of 100 listed ids over 10000 blocks deletes them within 15000 ms",
+    "at 100,000 entities: getSyncStatus counts 1700 pages and 83300 blocks, leaving out Private and recycled ones, within 750 ms",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }

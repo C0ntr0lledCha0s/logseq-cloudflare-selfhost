@@ -32,11 +32,15 @@
 // 100 of the 5,000 blank leaves, in request order, within BLANK_MS (500 ms, the median of three
 // warm runs), then that three applies, each of the 100 ids a fresh dry run listed (in reverse order,
 // none adjacent), delete exactly those from the first page within BLANK_APPLY_MS (15,000 ms, half
-// the Durable Object's CPU limit, the median). It prints each timing under its check. Node on a developer machine
+// the Durable Object's CPU limit, the median). Last, on two graphs of its own, it checks getSyncStatus
+// at 100,000 entities (syncStatusFixture: 2,000 pages of 49 blocks, 300 of the pages Private or in the
+// Recycle bin, written by the dev build before the bundle loads): its counts must grow by exactly the
+// fixture's counted pages and blocks over the same graph without it, within SYNC_STATUS_MS (750 ms,
+// the median of three warm runs). It prints each timing under its check. Node on a developer machine
 // guides the numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
-// missing. Seeding takes about 100 s.
+// missing. Seeding takes about 150 s, 50 s of it the sync-status graph.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -91,6 +95,13 @@ function stubs(dbSync) {
   ];
 }
 
+/** The dev build, loaded once per process: a second load into the same globals breaks its protocols. */
+const devBuilds = new Map();
+function devBuild(build) {
+  if (!devBuilds.has(build.entry)) devBuilds.set(build.entry, loadBuild(build));
+  return devBuilds.get(build.entry);
+}
+
 /**
  * Stores the built-in graph (what a client's first upload holds) in the kvs table, with the dev
  * build, after transacting `preseed` (EDN transaction strings) into it.
@@ -98,17 +109,39 @@ function stubs(dbSync) {
 function seedBuiltInGraph(upstream, sql, preseed = []) {
   const build = findBuild(upstream);
   if (build.missing) throw new Error(build.missing);
-  const { cljs, d, logseq, reader } = loadBuild(build);
+  const { cljs, d, logseq, reader } = devBuild(build);
   sql.exec("create table if not exists kvs (addr INTEGER primary key, content TEXT, addresses JSON)");
   const conn = logseq.db.sqlite.export$.create_conn();
   for (const tx of preseed) d.transact_BANG_.cljs$core$IFn$_invoke$arity$2(conn, reader.read_string.cljs$core$IFn$_invoke$arity$1(tx));
   d.store.cljs$core$IFn$_invoke$arity$2(cljs.deref(conn), logseq.db_sync.storage.new_sqlite_storage(sql));
 }
 
-/** Loads the release SyncDO over an in-memory SQLite holding a new graph. Call close() when done. */
-export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [] } = {}) {
+/**
+ * An in-memory SQLite (better-sqlite3) holding the built-in graph and `preseed`, written by the dev
+ * build: {db, sql}. Seed every graph a run needs before the first release bundle runs: the dev
+ * build fails to transact once a release bundle has run in the same process.
+ */
+export function seededDatabase(upstream, preseed = []) {
+  const Database = createRequire(join(upstream, "deps", "db-sync", "package.json"))("better-sqlite3");
+  const db = new Database(":memory:");
+  const sql = {
+    exec(query, ...args) {
+      const stmt = db.prepare(query);
+      return stmt.reader ? stmt.all(...args) : (stmt.run(...args), []);
+    },
+  };
+  seedBuiltInGraph(upstream, sql, preseed);
+  return { db, sql };
+}
+
+/**
+ * Loads the release SyncDO over an in-memory SQLite holding a new graph (`database`, from
+ * seededDatabase, or one seeded here with `preseed`). Call close() when done.
+ */
+export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [], database } = {}) {
   const dbSync = join(upstream, "deps", "db-sync");
   const dir = mkdtempSync(join(tmpdir(), "release-query-check-"));
+  let db;
   try {
     writeFileSync(join(dir, "main.mjs"), rewriteImports(readFileSync(bundle, "utf8")));
     for (const [i, text] of stubs(dbSync).entries()) writeFileSync(join(dir, `stub-${i}.mjs`), text);
@@ -116,20 +149,14 @@ export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream),
     if (existsSync(map)) copyFileSync(map, join(dir, "main.mjs.map"));
     globalThis.WebSocketRequestResponsePair ??= class {};
     const { SyncDO } = await import(pathToFileURL(join(dir, "main.mjs")).href);
-    const Database = createRequire(join(dbSync, "package.json"))("better-sqlite3");
-    const db = new Database(":memory:");
-    const sql = {
-      exec(query, ...args) {
-        const stmt = db.prepare(query);
-        return stmt.reader ? stmt.all(...args) : (stmt.run(...args), []);
-      },
-    };
+    const seeded = database ?? seededDatabase(upstream, preseed);
+    db = seeded.db;
+    const { sql } = seeded;
     const state = {
       storage: { sql, transactionSync: (f) => db.transaction(f)() },
       getWebSockets: () => [],
       setWebSocketAutoResponse() {},
     };
-    seedBuiltInGraph(upstream, sql, preseed);
     const stub = new SyncDO(state, {});
     return {
       stub,
@@ -139,6 +166,7 @@ export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream),
       },
     };
   } catch (error) {
+    db?.close();
     rmSync(dir, { recursive: true, force: true });
     throw error;
   }
@@ -511,6 +539,131 @@ function blankChecks(ctx) {
   ];
 }
 
+// getSyncStatus at 100,000 entities
+// =================================
+
+/** The graph getSyncStatus is benched on (spec section 8): 2,000 pages of 49 blocks, 100,000 entities. */
+export const SYNC_STATUS = { pages: 2000, blocksPerPage: 49 };
+
+/** A uuid for the n-th sync-status fixture entity (apart from preseedUuid's). */
+const syncStatusUuid = (n) => `00000000-0000-4000-9000-${n.toString(16).padStart(12, "0")}`;
+
+/**
+ * The sync-status fixture: {pages: [{uuid, title, private, recycled, blocks: [uuid]}], entities,
+ * counted: {pages, blocks}}. Every 10th page is tagged Private and every 20th (offset 5) is in the
+ * Recycle bin, so private-ids walks 300 subtrees; counted is what getSyncStatus must add for it.
+ */
+export function syncStatusFixture() {
+  let n = 0;
+  const pages = Array.from({ length: SYNC_STATUS.pages }, (_, i) => ({
+    uuid: syncStatusUuid(n++),
+    title: `Release sync status ${i}`,
+    private: i % 10 === 0,
+    recycled: i % 20 === 5,
+    blocks: Array.from({ length: SYNC_STATUS.blocksPerPage }, () => syncStatusUuid(n++)),
+  }));
+  const counted = pages.filter((p) => !p.private && !p.recycled);
+  return {
+    pages,
+    entities: n,
+    counted: { pages: counted.length, blocks: counted.length * SYNC_STATUS.blocksPerPage },
+  };
+}
+
+const PRIVATE_TAG = ":user.class/Private-release";
+
+/** The Private tag, transacted into both graphs the sync-status check compares. */
+function privateTagTx() {
+  return [
+    `[{:db/ident ${PRIVATE_TAG} :block/uuid #uuid ${JSON.stringify(syncStatusUuid(0xffffff))} :block/title "Private" :block/name "private" :block/tags #{:logseq.class/Tag} :logseq.property.class/extends #{:logseq.class/Root} :block/created-at 1 :block/updated-at 1}]`,
+  ];
+}
+
+/** EDN transactions writing the sync-status fixture, one per page with its blocks. */
+function syncStatusTx(fixture) {
+  const str = JSON.stringify;
+  return fixture.pages.map((p) => {
+    const tags = p.private ? `#{:logseq.class/Page ${PRIVATE_TAG}}` : "#{:logseq.class/Page}";
+    const page = `{:block/uuid #uuid ${str(p.uuid)} :block/title ${str(p.title)} :block/name ${str(p.title.toLowerCase())} :block/tags ${tags} :block/created-at 1 :block/updated-at 1${p.recycled ? " :logseq.property/deleted-at 2" : ""}}`;
+    const blocks = p.blocks.map(
+      (b, i) =>
+        `{:block/uuid #uuid ${str(b)} :block/title ${str(`${p.title} block ${i}`)} :block/page [:block/uuid #uuid ${str(p.uuid)}] :block/parent [:block/uuid #uuid ${str(p.uuid)}] :block/order ${str(`a${i.toString(36)}`)} :block/created-at 1 :block/updated-at 1}`,
+    );
+    return `[${page} ${blocks.join(" ")}]`;
+  });
+}
+
+/**
+ * getSyncStatus on a graph of 100,000 entities must answer within this many ms (the median of three
+ * warm runs): about twice the 383 ms measured on a developer machine, about 1.2 s of Durable Object
+ * CPU at the 1.65 runner-to-Cloudflare ratio, far inside its 30 s limit. Most of it is list-pages,
+ * which listPages pays on every call too: the check times a listPages call on the same graph beside it.
+ */
+export const SYNC_STATUS_MS = 750;
+
+/**
+ * Sends getSyncStatus four times: each must answer 200 with page-count and block-count `added`
+ * ({pages, blocks}) above `baseline` (the same graph without the fixture), and the median of the
+ * last three within `limitMs`. Returns the timings as a note.
+ */
+export async function checkSyncStatus(stub, baseline, added, limitMs = SYNC_STATUS_MS) {
+  const runs = await timed(() => call(stub, "GET", "/semantic/sync-status"), 4);
+  const expected = { "page-count": baseline["page-count"] + added.pages, "block-count": baseline["block-count"] + added.blocks };
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    for (const [field, value] of Object.entries(expected)) {
+      if (res.json[field] !== value) throw new Error(`${field} ${res.json[field]}, expected ${value}`);
+    }
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > limitMs) throw new Error(`answered after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
+/**
+ * Seeds the sync-status check's two graphs: `baseline` holds only the built-in graph and the Private
+ * tag, `full` also holds the fixture, written by the dev build as the stale projects are. Call it
+ * before any release bundle runs (seededDatabase). Returns {fixture, baseline, full, seededMs}.
+ */
+export function seedSyncStatus(upstream) {
+  const fixture = syncStatusFixture();
+  const baseline = seededDatabase(upstream, privateTagTx());
+  const start = performance.now();
+  const full = seededDatabase(upstream, [...privateTagTx(), ...syncStatusTx(fixture)]);
+  return { fixture, baseline, full, seededMs: Math.round(performance.now() - start) };
+}
+
+/**
+ * The sync-status check on the graphs seedSyncStatus made: the baseline's counts, then
+ * checkSyncStatus on the full graph. Returns [{name, ok, error?, note?}].
+ */
+export async function syncStatusChecks(upstream, bundle, { fixture, baseline, full, seededMs }) {
+  const name = `at 100,000 entities: getSyncStatus counts ${fixture.counted.pages} pages and ${fixture.counted.blocks} blocks, leaving out Private and recycled ones, within ${SYNC_STATUS_MS} ms`;
+  try {
+    const bare = await loadReleaseSyncDO(upstream, bundle, { database: baseline });
+    let counts;
+    try {
+      const res = await call(bare.stub, "GET", "/semantic/sync-status");
+      if (res.status !== 200) throw new Error(`the baseline graph: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+      counts = res.json;
+    } finally {
+      bare.close();
+    }
+    const loaded = await loadReleaseSyncDO(upstream, bundle, { database: full });
+    try {
+      const note = await checkSyncStatus(loaded.stub, counts, fixture.counted);
+      const pages = (await timed(() => call(loaded.stub, "GET", "/semantic/pages?limit=1"), 4)).slice(1).map((r) => r.ms);
+      const median = [...pages].sort((a, b) => a - b)[1];
+      return [{ name, ok: true, note: `${fixture.entities} entities seeded in ${seededMs} ms; ${note}; listPages limit 1 on the same graph ${pages.join(", ")} ms (median ${median} ms)` }];
+    } finally {
+      loaded.close();
+    }
+  } catch (error) {
+    return [{ name, ok: false, error: error.message }];
+  }
+}
+
 /**
  * Calls `fn` with console.error, warn, log and info replaced by recorders, and puts each back when
  * it settles (or throws). Resolves to {value, calls: [{level, args}]}.
@@ -828,7 +981,11 @@ export function assertRows(actual, expected) {
 /** Creates the fixture and runs every check. Returns [{name, ok, error?}]. */
 export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
   const fixture = scaleFixture(Date.now());
-  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { preseed: staleTx(fixture) });
+  // Every graph is seeded before the first release bundle runs (seededDatabase).
+  const database = seededDatabase(upstream, staleTx(fixture));
+  const syncStatus = seedSyncStatus(upstream);
+  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database });
+  const results = [];
   try {
     const ctx = { stub, fixture };
     for (const [path, body] of [
@@ -841,7 +998,6 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
       if (path === "/semantic/pages") ctx.pageUuid = res.json?.uuid;
     }
     if (!ctx.pageUuid) throw new Error("setup /semantic/pages: no uuid in the response");
-    const results = [];
     for (const [name, fn] of checks(ctx)) {
       try {
         const note = await fn();
@@ -850,10 +1006,11 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
         results.push({ name, ok: false, error: error.message });
       }
     }
-    return results;
   } finally {
     close();
   }
+  results.push(...(await syncStatusChecks(upstream, bundle, syncStatus)));
+  return results;
 }
 
 async function main() {

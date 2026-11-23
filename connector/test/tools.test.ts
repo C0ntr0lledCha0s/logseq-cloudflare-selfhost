@@ -427,6 +427,7 @@ describe("delete_blank_blocks and get_sync_status contract (plan 2026-11-22 stag
       "an empty Task or tagged block, a heading, a block with a property, a Code, Math or Quote block, a property value block, a choice and a pre-block are kept and not reported",
       "A blank block with children is kept, its children never lifted",
       "listed under kept with its reason (has children, referenced or being edited)",
+      "a blank block something references (a link, an embed, a property value, a comment thread, a reaction or a view)",
       `up to ${BLANK_BLOCK_CAPS.keptExamples} examples per page`,
       // Private and E2EE
       "Blank blocks on or under Private content are only counted, per page in skipped-private",

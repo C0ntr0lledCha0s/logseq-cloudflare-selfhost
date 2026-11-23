@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 2895632..471af4a 100644
+index 2895632..1436ce8 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5035,6 +5035,282 @@
+@@ -5035,6 +5035,310 @@
                       (nil? existing) (assoc :page (insert-page-title db page)))))
                 (map vector entries resolved)))
  
@@ -109,12 +109,34 @@ index 2895632..471af4a 100644
 +                       (map-indexed vector pages))]
 +    (when (map? result) result)))
 +
++(def ^:private internal-block-reference-properties
++  "Logseq's own properties whose value can be a block (built-in type :node or :entity), such as a
++  range comment's :logseq.property.comments/blocks, :logseq.property.reaction/target,
++  :logseq.property/view-for and :logseq.property.history/block. reference-attributes leaves internal
++  properties out, but a blank block one of them targets isn't free to delete: outliner delete-blocks!
++  deletes a Comments area whose targets all go, with the comments under it."
++  (into [] (keep (fn [[ident {:keys [schema]}]]
++                   (when (#{:node :entity} (:type schema)) ident)))
++        db-property/built-in-properties))
++
 +(defn- blank-reference-attributes
 +  "reference-attributes once each, without :block/parent and :block/page: blank-candidate judges a
 +  child by its own clause first, and only a page is ever a block's page. referrer-ids runs for every
 +  blank leaf (5,000 at the caps), so each attribute left out saves that many index reads."
 +  [db]
 +  (into [] (comp (remove #{:block/parent :block/page}) (distinct)) (reference-attributes db)))
++
++(defn- internal-reference-targets
++  "{:attributes :targets}: the internal-block-reference-properties the graph's schema holds as refs
++  (an older graph may lack one, and Datascript refuses an :avet read of an attribute it doesn't
++  index), and every entity id one of them points at, read once a call from :aevt datoms. A blank
++  leaf among the targets is judged by referrer-ids over those attributes; any other leaf needs no
++  more index reads, which keeps a dry run at the caps from paying one read per attribute per leaf."
++  [db]
++  (let [attributes (filterv #(= :db.type/ref (get-in (:schema db) [% :db/valueType]))
++                            internal-block-reference-properties)]
++    {:attributes attributes
++     :targets (into #{} (comp (mapcat #(d/datoms db :aevt %)) (map :v)) attributes)}))
 +
 +(defn- blank-title? [title]
 +  (or (nil? title) (and (string? title) (string/blank? title))))
@@ -130,15 +152,19 @@ index 2895632..471af4a 100644
 +  whitespace (string/blank?: spaces, tabs, U+00A0) is blank; a zero-width space is not. Attributes
 +  are read from :eavt datoms, so an uploaded graph's stored cardinality can't change the answer.
 +  `context` holds what a call reads once: :private (datalog/private-ids), :editing
-+  (presence/editing-block-uuids) and :attributes (blank-reference-attributes)."
-+  [db entity {:keys [private editing attributes]}]
++  (presence/editing-block-uuids), :attributes (blank-reference-attributes) and :internal
++  (internal-reference-targets): a block a comment thread, reaction, view or history entry targets
++  is referenced too."
++  [db entity {:keys [private editing attributes internal]}]
 +  (let [id (:db/id entity)]
 +    (cond
 +      (not (blank-title? (:v (first (d/datoms db :eavt id :block/title))))) :has-text
 +      (some #(not (contains? blank-attribute-allow-list (:a %))) (d/datoms db :eavt id)) :not-plain
 +      (contains? private id) (if (entity-util/hidden? entity) :hidden :private)
 +      (seq (d/datoms db :avet :block/parent id)) :has-children
-+      (seq (referrer-ids db entity attributes)) :referenced
++      (or (seq (referrer-ids db entity attributes))
++          (and (contains? (:targets internal) id) (seq (referrer-ids db entity (:attributes internal)))))
++      :referenced
 +      (contains? editing (:block/uuid entity)) :being-edited)))
 +
 +(defn- blank-note [total listed]
@@ -242,7 +268,8 @@ index 2895632..471af4a 100644
 +                                 (let [db @tx-conn
 +                                       context {:private (datalog/private-ids db)
 +                                                :editing (presence/editing-block-uuids self)
-+                                                :attributes (blank-reference-attributes db)}
++                                                :attributes (blank-reference-attributes db)
++                                                :internal (internal-reference-targets db)}
 +                                       blocks (mapv #(d/entity db [:block/uuid (uuid %)]) ids)]
 +                                   (when-let [refusal (some (fn [[i id]] (apply-refusal db page-eids context i id))
 +                                                            (map-indexed vector ids))]
@@ -276,7 +303,8 @@ index 2895632..471af4a 100644
 +          (http/json-response nil (blank-dry-run db (storage/get-t (.-sql self)) (:pages resolved)
 +                                                 {:private private
 +                                                  :editing (presence/editing-block-uuids self)
-+                                                  :attributes (blank-reference-attributes db)}))
++                                                  :attributes (blank-reference-attributes db)
++                                                  :internal (internal-reference-targets db)}))
 +          :else
 +          (rejecting
 +           #(http/json-response nil (apply-blank-deletes! self conn creator (:pages resolved)
@@ -285,7 +313,7 @@ index 2895632..471af4a 100644
  (defn- bulk-write-response
    "The response to a bulk write: `body`, flagged as a dry run, which answers 200 rather than `status`."
    [body dry-run? status]
-@@ -5044,6 +5320,8 @@
+@@ -5044,6 +5348,8 @@
  
  (defn- handle-bulk [{:keys [^js self request ^js url conn db handler e2ee? creator]}]
    (case handler
@@ -294,7 +322,7 @@ index 2895632..471af4a 100644
      :semantic/blocks-get-many
      (let [ids (parse-ids (.get (.-searchParams url) "ids"))
            view (or (.get (.-searchParams url) "view") "summary")
-@@ -5852,7 +6130,7 @@
+@@ -5852,7 +6158,7 @@
  
  (def ^:private bulk-handlers
    #{:semantic/blocks-get-many :semantic/blocks-delete-many :semantic/blocks-batch-move
@@ -304,7 +332,7 @@ index 2895632..471af4a 100644
  (def ^:private property-and-search-handlers
    #{:semantic/properties-list :semantic/properties-create :semantic/properties-get
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 88a506e..44fb408 100644
+index 88a506e..25d08b2 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -42,6 +42,8 @@
@@ -324,7 +352,7 @@ index 88a506e..44fb408 100644
 +                        (str "Deletes the plain blank leaf blocks on 1 to 20 pages, in two steps: a dry run (dry-run true) lists them, and an apply (dry-run false) takes the block-ids the dry run listed. dry-run defaults to false, and an apply without block-ids is refused with 400."
 +                             " page-ids are page UUIDs, titles or YYYY-MM-DD journal dates; journals are allowed, today's included. The whole call is refused, naming page-ids[i] and writing nothing, when a page isn't found (a hidden page or one in the Recycle bin reads as not found; 404), a title names several pages (409, with candidates), two entries name the same page, or a page is a whiteboard, a tag, a property, not a page, or Private (400). E2EE graphs are refused with 409: a blank title can't be told from ciphertext."
 +                             " A block is blank when its title is empty or only whitespace (spaces, tabs, no-break spaces; a zero-width space is text) and it holds nothing but its place, its creator and Claude's edit stamps: an empty Task or tagged block, a block with a property, a heading, a Code, Math or Quote block, a property value block, a choice and a pre-block are kept and not reported."
-+                             " A blank block is kept and counted under kept, with up to 20 examples per page, when it has children (they are never lifted), when something references it (a link, an embed, a property value) or when a connected app reports it as the block being edited. Blank blocks on or under Private content are counted per page in skipped-private and never named."
++                             " A blank block is kept and counted under kept, with up to 20 examples per page, when it has children (they are never lifted), when something references it (a link, an embed, a property value, a comment thread, a reaction or a view) or when a connected app reports it as the block being edited. Blank blocks on or under Private content are counted per page in skipped-private and never named."
 +                             " The dry run writes nothing and lists at most 100 blocks across the call, page by page in request order, under would-delete with each one's parent; total counts them all, listed counts those listed, and note says to run the dry run again after the apply when some weren't listed."
 +                             " A page with more than 2000 blocks, or pages with more than 10000 together, are refused with 422 naming the page where the bound was passed. A page may end with no blocks; the app may add an empty block back when it is opened."
 +                             " An apply takes 1 to 100 block-ids (UUIDs, each once, ignoring case) and refuses the whole call, naming block-ids[i] and writing nothing: 400 for an entry that isn't a UUID or repeats an earlier one, 404 for one that names no block (or one in the Recycle bin), and 409 when, judged again inside the write's transaction, the block is no longer blank (it has text), has children, is referenced, is being edited in the app, is not on a listed page, is not a plain block or is Private. So only blocks that are still plain blank leaves on the named pages are deleted, never a block that changed since the dry run."
@@ -416,10 +444,10 @@ index 88a506e..44fb408 100644
                                         :total-removed {:type "integer" :description "Those blocks and all their descendants."}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
 new file mode 100644
-index 0000000..4136a72
+index 0000000..df235b0
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_delete_blank_blocks_test.cljs
-@@ -0,0 +1,983 @@
+@@ -0,0 +1,1070 @@
 +(ns logseq.db-sync.semantic-delete-blank-blocks-test
 +  "deleteBlankBlocks (patch 0056): page resolution, the blank predicate, the dry run and the apply.
 +  A call names 1 to 20 pages; any page that doesn't resolve to one visible, plain, non-Private page
@@ -1403,6 +1431,93 @@ index 0000000..4136a72
 +          (is (= pages (map :uuid (get-in together [:body :pages]))) "in request order")
 +          (is (= 3 (get-in together [:body :total])))
 +          (is (= 200 (:status not-e2ee)) (pr-str not-e2ee)))))))
++
++;; ---------------------------------------------------------------------------------------------
++;; References held in Logseq's own (internal) properties
++
++(deftest internal-references-test
++  ;; A blank leaf that an internal ref property targets is referenced, as a link or a property value
++  ;; is: a range comment over two blank leaves (the app puts its Comments area beside the last
++  ;; target, holding :logseq.property.comments/blocks #{a b}, so neither gets a child), a reaction
++  ;; (:logseq.property.reaction/target), a view (:logseq.property/view-for) and a property history
++  ;; entry (:logseq.property.history/block). The dry run keeps them under kept.referenced and lists
++  ;; only the plain blank leaf; an apply that names one refuses the whole call; and an apply of the
++  ;; listed leaf leaves the comment thread in place. Before the fix the dry run listed all six, and
++  ;; deleting a and b deleted the Comments area and the comment under it (outliner delete-blocks'
++  ;; orphaned-range-comments-areas).
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                _ (opened! self)
++                page (page! self "Example")
++                [a b reacted viewed historied plain] (ids 6)
++                _ (insert! self page [{:uuid a :title " "} {:uuid b :title " "} {:uuid reacted :title " "}
++                                      {:uuid viewed :title " "} {:uuid historied :title " "} {:uuid plain :title " "}])
++                conn (.-conn self)
++                eid #(:db/id (d/entity @conn [:block/uuid (uuid %)]))
++                page-eid (eid page)
++                [area comment reaction view history] (ids 5)
++                _ (d/transact! conn [{:block/uuid (uuid area) :block/title "Comments" :block/parent page-eid
++                                      :block/page page-eid :block/order (db-order/gen-key) :block/created-at 1
++                                      :block/updated-at 1 :block/tags #{:logseq.class/Comments}
++                                      :logseq.property.comments/blocks #{(eid a) (eid b)}}
++                                     {:block/uuid (uuid reaction) :block/created-at 1
++                                      :logseq.property.reaction/emoji-id "+1"
++                                      :logseq.property.reaction/target (eid reacted)}
++                                     {:block/uuid (uuid view) :block/created-at 1
++                                      :logseq.property/view-for (eid viewed)}
++                                     {:block/uuid (uuid history) :block/created-at 1
++                                      :logseq.property.history/block (eid historied)
++                                      :logseq.property.history/property :logseq.property/status}])
++                _ (outliner-insert! self area [{:block/uuid (uuid comment) :block/title "fill these two in before Friday"}])
++                response (ok! (dry-run! self [page]) 200)
++                entry (get-in response [:body :pages 0])
++                before (written-state sql self)
++                refusals (p/all (map #(apply! self [page] [plain %]) [a b reacted viewed historied]))
++                after (written-state sql self)
++                applied (apply! self [page] [plain])]
++          (is (= [plain] (map :uuid (:would-delete entry))) (pr-str entry))
++          (is (= {:has-children 0 :referenced 5 :being-edited 0} (dissoc (:kept entry) :examples)))
++          (is (= (set (map #(hash-map :uuid % :reason "referenced") [a b reacted viewed historied]))
++                 (set (get-in entry [:kept :examples]))))
++          (doseq [[label response] (map vector ["a range comment's first target" "a range comment's last target"
++                                                "a reaction's target" "a view's block" "a history entry's block"]
++                                        refusals)]
++            (testing label
++              (is (refused? response 409 "block-ids[1]: referenced") (pr-str response))))
++          (is (= before after) "no refusal wrote anything")
++          (is (= 200 (:status applied)) (pr-str applied))
++          (is (not (live? @conn plain)))
++          (is (every? #(live? @conn %) [a b area comment reaction view history])
++              "the comment thread, the reaction, the view and the history entry are still there"))))))
++
++(deftest internal-reference-missing-from-schema-test
++  ;; A graph from an app older than one of those properties (reactions came in schema 65.22) has no
++  ;; schema entry for it, and Datascript refuses an :avet read of an attribute it doesn't index, even
++  ;; when a datom of it, stored as a plain value, holds the blank block's id. The dry run and the
++  ;; apply read only the ones the graph's schema holds as refs, so they still answer.
++  (async done
++    (run done
++      (fn []
++        (p/let [{:keys [self sql]} (server-graph)
++                _ (opened! self)
++                page (page! self "Example")
++                [blank] (ids 1)
++                _ (insert! self page [{:uuid blank :title " "}])
++                conn (.-conn self)
++                _ (d/reset-conn! conn (d/init-db (d/datoms @conn :eavt)
++                                                 (dissoc (d/schema @conn) :logseq.property.reaction/target)
++                                                 {:storage (storage/new-sqlite-storage sql)}))
++                _ (assert (nil? (get (d/schema @conn) :logseq.property.reaction/target)))
++                _ (d/transact! conn [{:block/uuid (random-uuid)
++                                      :logseq.property.reaction/target
++                                      (:db/id (d/entity @conn [:block/uuid (uuid blank)]))}])
++                response (dry-run! self [page])
++                applied (apply! self [page] [blank])]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (= [blank] (map :uuid (get-in response [:body :pages 0 :would-delete]))))
++          (is (= 200 (:status applied)) (pr-str applied)))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 index f06a606..7b82ba0 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
