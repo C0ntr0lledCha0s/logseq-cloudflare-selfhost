@@ -47,11 +47,24 @@
 // and by UUID it must answer exactly the full run's rows of that client and echo {title, uuid}; a
 // title a tag and a block share must answer the 400 naming each; and with each of its bounds
 // lowered (namedQueryBounds on the Durable Object) the 422 must name the client, which it can only
-// do if the bundle kept the :client ex-data key. It prints each timing under its check. Node on a developer machine
-// guides the numbers; it does not measure the Durable Object on Cloudflare.
+// do if the bundle kept the :client ex-data key.
+// Then it seeds deleteBlankBlocks' caps (blankFixture: 5 pages of 2,000
+// blocks, 10,000 in all, half of them blank leaves) and checks that a dry run over all five lists
+// 100 of the 5,000 blank leaves, in request order, within BLANK_MS (500 ms, the median of three
+// warm runs), then that three applies, each of the 100 ids a fresh dry run listed (in reverse order,
+// none adjacent), delete exactly those from the first page within BLANK_APPLY_MS (15,000 ms, half
+// the Durable Object's CPU limit, the median). Last, on two graphs of its own, it checks getSyncStatus
+// at 100,000 entities (syncStatusFixture: 2,000 pages of 49 blocks, 300 of the pages Private or in the
+// Recycle bin, written by the dev build before the bundle loads): its counts must grow by exactly the
+// fixture's counted pages and blocks over the same graph without it, within SYNC_STATUS_MS (750 ms,
+// the median of three warm runs). Then, on a graph of 100,000 plain blocks (BLANK_LARGE, also written
+// by the dev build), a one-page deleteBlankBlocks dry run must list its 10 blank leaves within
+// BLANK_LARGE_MS (25 ms, the median of three warm runs), so the predicate's cost follows the page,
+// not the graph. It prints each timing under its check. Node on a developer machine guides the
+// numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
-// missing. Seeding takes about 100 s.
+// missing. Seeding takes about 220 s, 50 s of it the sync-status graph and 60 s the BLANK_LARGE one.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -65,6 +78,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** A named query at scale must answer within this many ms, and an F1 shape's width-cap 422 within F1_MS. */
 export const NAMED_MS = 300;
 export const F1_MS = 100;
+/** A deleteBlankBlocks dry run at its caps (10,000 blocks scanned) must answer within this many ms. */
+export const BLANK_MS = 500;
+/**
+ * A deleteBlankBlocks apply of 100 ids on the same pages within this many ms: half the Durable
+ * Object's 30 s CPU limit. Nearly all of it is the outliner's delete-blocks! of 100 non-adjacent
+ * blocks in one call (deleteBlocks' 100-block delete costs the same): about 4.5 s on a developer
+ * machine.
+ */
+export const BLANK_APPLY_MS = 15000;
 
 export const PAGE_TITLE = "Release Check Page";
 export const TAG_TITLE = "Release Check Tag";
@@ -98,6 +120,13 @@ function stubs(dbSync) {
   ];
 }
 
+/** The dev build, loaded once per process: a second load into the same globals breaks its protocols. */
+const devBuilds = new Map();
+function devBuild(build) {
+  if (!devBuilds.has(build.entry)) devBuilds.set(build.entry, loadBuild(build));
+  return devBuilds.get(build.entry);
+}
+
 /**
  * Stores the built-in graph (what a client's first upload holds) in the kvs table, with the dev
  * build, after transacting `preseed` (EDN transaction strings) into it.
@@ -105,11 +134,24 @@ function stubs(dbSync) {
 function seedBuiltInGraph(upstream, sql, preseed = []) {
   const build = findBuild(upstream);
   if (build.missing) throw new Error(build.missing);
-  const { cljs, d, logseq, reader } = loadBuild(build);
+  const { cljs, d, logseq, reader } = devBuild(build);
   sql.exec("create table if not exists kvs (addr INTEGER primary key, content TEXT, addresses JSON)");
   const conn = logseq.db.sqlite.export$.create_conn();
   for (const tx of preseed) d.transact_BANG_.cljs$core$IFn$_invoke$arity$2(conn, reader.read_string.cljs$core$IFn$_invoke$arity$1(tx));
   d.store.cljs$core$IFn$_invoke$arity$2(cljs.deref(conn), logseq.db_sync.storage.new_sqlite_storage(sql));
+}
+
+/**
+ * An in-memory SQLite (better-sqlite3) holding the built-in graph and `preseed`, written by the dev
+ * build: {db, sql}. Seed every graph a run needs before the first release bundle runs: the dev
+ * build fails to transact once a release bundle has run in the same process.
+ */
+export function seededDatabase(upstream, preseed = []) {
+  const Database = createRequire(join(upstream, "deps", "db-sync", "package.json"))("better-sqlite3");
+  const db = new Database(":memory:");
+  const { sql } = durableObjectState(db);
+  seedBuiltInGraph(upstream, sql, preseed);
+  return { db, sql };
 }
 
 /**
@@ -151,15 +193,16 @@ export function durableObjectState(db) {
 }
 
 /**
- * Loads the release SyncDO over an in-memory SQLite holding a new graph, with `env` as the Worker's
- * variables. Call close() when done.
+ * Loads the release SyncDO over an in-memory SQLite holding a new graph (`database`, from
+ * seededDatabase, or one seeded here with `preseed`), with `env` as the Worker's variables. Call
+ * close() when done.
  */
-export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [], env = {} } = {}) {
+export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream), { preseed = [], database, env = {} } = {}) {
   const release = await importReleaseBundle(upstream, bundle);
+  let db;
   try {
-    const db = new release.Database(":memory:");
-    const { sql, state } = durableObjectState(db);
-    seedBuiltInGraph(upstream, sql, preseed);
+    db = (database ?? seededDatabase(upstream, preseed)).db;
+    const { state } = durableObjectState(db);
     const stub = new release.SyncDO(state, env);
     return {
       stub,
@@ -169,6 +212,7 @@ export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream),
       },
     };
   } catch (error) {
+    db?.close();
     release.close();
     throw error;
   }
@@ -802,6 +846,350 @@ function staleTx(fixture) {
   return txs;
 }
 
+// deleteBlankBlocks at its caps
+// =============================
+
+/** deleteBlankBlocks' bounds: 2,000 blocks a page (max-outline-blocks), 10,000 a call (max-blank-scan). */
+export const BLANK = { pages: 5, blocksPerPage: 2000 };
+
+/** The pages a dry run at the caps reads: [{title, blocks}], every block a leaf, every other one blank. */
+export function blankFixture() {
+  return Array.from({ length: BLANK.pages }, (_, p) => ({
+    title: `Release blank ${p}`,
+    blocks: Array.from({ length: BLANK.blocksPerPage }, (_, i) => ({ title: i % 2 === 0 ? " " : `Release blank ${p} text ${i}` })),
+  }));
+}
+
+/** Creates the blank-blocks pages through SyncDO.fetch, one insert per page; returns their uuids in order. */
+async function seedBlank(stub) {
+  const ids = [];
+  for (const { title, blocks } of blankFixture()) {
+    const page = await call(stub, "POST", "/semantic/pages", { title });
+    if (page.status !== 201) throw new Error(`create ${title}: HTTP ${page.status}: ${page.text.slice(0, 300)}`);
+    const insert = await call(stub, "POST", "/semantic/block-trees", { "target-id": page.json.uuid, blocks, verbose: false });
+    if (insert.status !== 201) throw new Error(`insert into ${title}: HTTP ${insert.status}: ${insert.text.slice(0, 300)}`);
+    ids.push(page.json.uuid);
+  }
+  return ids;
+}
+
+/**
+ * Sends a deleteBlankBlocks dry run over `pageIds` four times: each must answer 200 with the
+ * fixture's counts (5,000 blank leaves, 100 listed, all on the first page, the pages in request
+ * order), and the median of the last three within BLANK_MS. Returns the timings as a note.
+ */
+export async function checkBlankDryRun(stub, pageIds) {
+  const expected = (BLANK.pages * BLANK.blocksPerPage) / 2;
+  const runs = await timed(() => call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "dry-run": true }), 4);
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.total !== expected) throw new Error(`total ${body.total}, expected ${expected}`);
+    if (body.listed !== 100) throw new Error(`listed ${body.listed}, expected 100`);
+    const order = (body.pages ?? []).map((p) => p.uuid);
+    if (JSON.stringify(order) !== JSON.stringify(pageIds)) throw new Error(`pages in the order ${JSON.stringify(order)}, expected ${JSON.stringify(pageIds)}`);
+    const listed = body.pages.map((p) => p["would-delete"].length);
+    if (listed[0] !== 100 || listed.slice(1).some((n) => n !== 0)) throw new Error(`would-delete holds ${listed.join(", ")} per page, expected 100 on the first`);
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > BLANK_MS) throw new Error(`answered after ${note}, expected under ${BLANK_MS} ms`);
+  return note;
+}
+
+/**
+ * Three rounds over `pageIds` (after checkBlankDryRun, which leaves them whole): a dry run, which must
+ * list 100 ids, then an apply of those ids in reverse order, which must answer 200 deleting exactly
+ * 100, all from the first page, with the pages in request order and the first page 100 blocks fewer
+ * each round. A last dry run must count 300 fewer blank leaves. The median apply must answer within
+ * `limitMs` (BLANK_APPLY_MS; a test passes a smaller one). Returns the timings as a note.
+ */
+export async function checkBlankApply(stub, pageIds, limitMs = BLANK_APPLY_MS) {
+  const total = (BLANK.pages * BLANK.blocksPerPage) / 2;
+  const dryRun = async (label) => {
+    const res = await call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "dry-run": true });
+    if (res.status !== 200) throw new Error(`${label}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json;
+  };
+  const timings = [];
+  for (let round = 1; round <= 3; round++) {
+    const dry = await dryRun(`dry run ${round}`);
+    if (dry.listed !== 100) throw new Error(`dry run ${round}: listed ${dry.listed}, expected 100`);
+    const ids = dry.pages.flatMap((p) => p["would-delete"].map((w) => w.uuid)).reverse();
+    const start = performance.now();
+    const res = await call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": pageIds, "block-ids": ids });
+    timings.push(Math.round(performance.now() - start));
+    const label = `apply ${round}`;
+    if (res.status !== 200) throw new Error(`${label}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.deleted !== 100) throw new Error(`${label}: deleted ${body.deleted}, expected 100`);
+    const pages = body.pages ?? [];
+    const order = pages.map((p) => p.uuid);
+    if (JSON.stringify(order) !== JSON.stringify(pageIds)) throw new Error(`${label}: pages in the order ${JSON.stringify(order)}, expected ${JSON.stringify(pageIds)}`);
+    const deleted = pages.map((p) => p.deleted);
+    if (deleted[0] !== 100 || deleted.slice(1).some((n) => n !== 0)) throw new Error(`${label}: deleted ${deleted.join(", ")} per page, expected 100 on the first`);
+    const remaining = pages.map((p) => p["remaining-blocks"]);
+    const expected = pageIds.map((_, i) => (i === 0 ? BLANK.blocksPerPage - 100 * round : BLANK.blocksPerPage));
+    if (JSON.stringify(remaining) !== JSON.stringify(expected)) throw new Error(`${label}: remaining-blocks ${remaining.join(", ")}, expected ${expected.join(", ")}`);
+  }
+  const after = await dryRun("the dry run after the applies");
+  if (after.total !== total - 300) throw new Error(`the dry run after the applies counts ${after.total}, expected ${total - 300}`);
+  const median = [...timings].sort((a, b) => a - b)[1];
+  const note = `${timings.join(", ")} ms (median ${median} ms)`;
+  if (median > limitMs) throw new Error(`applied after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
+/** The blank-blocks checks, run after the scale checks on the same graph. */
+function blankChecks(ctx) {
+  const { stub } = ctx;
+  return [
+    [
+      "seed deleteBlankBlocks' caps: 5 pages of 2000 blocks through SyncDO.fetch",
+      async () => {
+        const start = performance.now();
+        ctx.blankPages = await seedBlank(stub);
+        return `${BLANK.pages * BLANK.blocksPerPage} blocks in ${Math.round(performance.now() - start)} ms`;
+      },
+    ],
+    [
+      `at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within ${BLANK_MS} ms`,
+      async () => {
+        if (!ctx.blankPages) throw new Error("the blank-blocks pages were not seeded");
+        return checkBlankDryRun(stub, ctx.blankPages);
+      },
+    ],
+    [
+      `at the caps: a deleteBlankBlocks apply of 100 listed ids over 10000 blocks deletes them within ${BLANK_APPLY_MS} ms`,
+      async () => {
+        if (!ctx.blankPages) throw new Error("the blank-blocks pages were not seeded");
+        return checkBlankApply(stub, ctx.blankPages);
+      },
+    ],
+  ];
+}
+
+// getSyncStatus at 100,000 entities
+// =================================
+
+/** The graph getSyncStatus is benched on (spec section 8): 2,000 pages of 49 blocks, 100,000 entities. */
+export const SYNC_STATUS = { pages: 2000, blocksPerPage: 49 };
+
+/** A uuid for the n-th sync-status fixture entity (apart from preseedUuid's). */
+const syncStatusUuid = (n) => `00000000-0000-4000-9000-${n.toString(16).padStart(12, "0")}`;
+
+/**
+ * The sync-status fixture: {pages: [{uuid, title, private, recycled, blocks: [uuid]}], entities,
+ * counted: {pages, blocks}}. Every 10th page is tagged Private and every 20th (offset 5) is in the
+ * Recycle bin, so private-ids walks 300 subtrees; counted is what getSyncStatus must add for it.
+ */
+export function syncStatusFixture() {
+  let n = 0;
+  const pages = Array.from({ length: SYNC_STATUS.pages }, (_, i) => ({
+    uuid: syncStatusUuid(n++),
+    title: `Release sync status ${i}`,
+    private: i % 10 === 0,
+    recycled: i % 20 === 5,
+    blocks: Array.from({ length: SYNC_STATUS.blocksPerPage }, () => syncStatusUuid(n++)),
+  }));
+  const counted = pages.filter((p) => !p.private && !p.recycled);
+  return {
+    pages,
+    entities: n,
+    counted: { pages: counted.length, blocks: counted.length * SYNC_STATUS.blocksPerPage },
+  };
+}
+
+const PRIVATE_TAG = ":user.class/Private-release";
+
+/** The Private tag, transacted into both graphs the sync-status check compares. */
+function privateTagTx() {
+  return [
+    `[{:db/ident ${PRIVATE_TAG} :block/uuid #uuid ${JSON.stringify(syncStatusUuid(0xffffff))} :block/title "Private" :block/name "private" :block/tags #{:logseq.class/Tag} :logseq.property.class/extends #{:logseq.class/Root} :block/created-at 1 :block/updated-at 1}]`,
+  ];
+}
+
+/** EDN transactions writing the sync-status fixture, one per page with its blocks. */
+function syncStatusTx(fixture) {
+  const str = JSON.stringify;
+  return fixture.pages.map((p) => {
+    const tags = p.private ? `#{:logseq.class/Page ${PRIVATE_TAG}}` : "#{:logseq.class/Page}";
+    const page = `{:block/uuid #uuid ${str(p.uuid)} :block/title ${str(p.title)} :block/name ${str(p.title.toLowerCase())} :block/tags ${tags} :block/created-at 1 :block/updated-at 1${p.recycled ? " :logseq.property/deleted-at 2" : ""}}`;
+    const blocks = p.blocks.map(
+      (b, i) =>
+        `{:block/uuid #uuid ${str(b)} :block/title ${str(`${p.title} block ${i}`)} :block/page [:block/uuid #uuid ${str(p.uuid)}] :block/parent [:block/uuid #uuid ${str(p.uuid)}] :block/order ${str(`a${i.toString(36)}`)} :block/created-at 1 :block/updated-at 1}`,
+    );
+    return `[${page} ${blocks.join(" ")}]`;
+  });
+}
+
+/**
+ * getSyncStatus on a graph of 100,000 entities must answer within this many ms (the median of three
+ * warm runs): about twice the 383 ms measured on a developer machine, about 1.2 s of Durable Object
+ * CPU at the 1.65 runner-to-Cloudflare ratio, far inside its 30 s limit. Most of it is list-pages,
+ * which listPages pays on every call too: the check times a listPages call on the same graph beside it.
+ */
+export const SYNC_STATUS_MS = 750;
+
+/**
+ * Sends getSyncStatus four times: each must answer 200 with page-count and block-count `added`
+ * ({pages, blocks}) above `baseline` (the same graph without the fixture), and the median of the
+ * last three within `limitMs`. Returns the timings as a note.
+ */
+export async function checkSyncStatus(stub, baseline, added, limitMs = SYNC_STATUS_MS) {
+  const runs = await timed(() => call(stub, "GET", "/semantic/sync-status"), 4);
+  const expected = { "page-count": baseline["page-count"] + added.pages, "block-count": baseline["block-count"] + added.blocks };
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    for (const [field, value] of Object.entries(expected)) {
+      if (res.json[field] !== value) throw new Error(`${field} ${res.json[field]}, expected ${value}`);
+    }
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > limitMs) throw new Error(`answered after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
+/**
+ * Seeds the sync-status check's two graphs: `baseline` holds only the built-in graph and the Private
+ * tag, `full` also holds the fixture, written by the dev build as the stale projects are. Call it
+ * before any release bundle runs (seededDatabase). Returns {fixture, baseline, full, seededMs}.
+ */
+export function seedSyncStatus(upstream) {
+  const fixture = syncStatusFixture();
+  const baseline = seededDatabase(upstream, privateTagTx());
+  const start = performance.now();
+  const full = seededDatabase(upstream, [...privateTagTx(), ...syncStatusTx(fixture)]);
+  return { fixture, baseline, full, seededMs: Math.round(performance.now() - start) };
+}
+
+/**
+ * The sync-status check on the graphs seedSyncStatus made: the baseline's counts, then
+ * checkSyncStatus on the full graph. Returns [{name, ok, error?, note?}].
+ */
+export async function syncStatusChecks(upstream, bundle, { fixture, baseline, full, seededMs }) {
+  const name = `at 100,000 entities: getSyncStatus counts ${fixture.counted.pages} pages and ${fixture.counted.blocks} blocks, leaving out Private and recycled ones, within ${SYNC_STATUS_MS} ms`;
+  try {
+    const bare = await loadReleaseSyncDO(upstream, bundle, { database: baseline });
+    let counts;
+    try {
+      const res = await call(bare.stub, "GET", "/semantic/sync-status");
+      if (res.status !== 200) throw new Error(`the baseline graph: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+      counts = res.json;
+    } finally {
+      bare.close();
+    }
+    const loaded = await loadReleaseSyncDO(upstream, bundle, { database: full });
+    try {
+      const note = await checkSyncStatus(loaded.stub, counts, fixture.counted);
+      const pages = (await timed(() => call(loaded.stub, "GET", "/semantic/pages?limit=1"), 4)).slice(1).map((r) => r.ms);
+      const median = [...pages].sort((a, b) => a - b)[1];
+      return [{ name, ok: true, note: `${fixture.entities} entities seeded in ${seededMs} ms; ${note}; listPages limit 1 on the same graph ${pages.join(", ")} ms (median ${median} ms)` }];
+    } finally {
+      loaded.close();
+    }
+  } catch (error) {
+    return [{ name, ok: false, error: error.message }];
+  }
+}
+
+// deleteBlankBlocks on one page of a large graph
+// ===============================================
+
+/**
+ * A one-page dry run on a graph of its own: BLANK_LARGE.pages pages of BLANK_LARGE.blocksPerPage
+ * plain blocks (100,000 blocks besides the page, none Private or recycled, so the time is the
+ * predicate's and not datalog/private-ids'), written by the dev build as the sync-status graph is,
+ * and a page of BLANK_LARGE.pageBlocks blocks made through the API, every other one blank. Before
+ * review round 2 every call read every :block/parent, :block/page, created-by-ref and other internal
+ * reference datom in the graph, so its time followed the graph; now it follows the candidates.
+ */
+export const BLANK_LARGE = { pages: 2000, blocksPerPage: 50, pageBlocks: 20 };
+
+/**
+ * The one-page dry run beside 100,000 other blocks must answer within this many ms (the median of
+ * three warm runs): about three times the 7 to 8 ms measured on a developer machine, and well under
+ * the 59 to 74 ms the graph-wide reference scan took before review round 2.
+ */
+export const BLANK_LARGE_MS = 25;
+
+/** A uuid for the n-th BLANK_LARGE fixture entity (apart from preseedUuid's and syncStatusUuid's). */
+const blankLargeUuid = (n) => `00000000-0000-4000-a000-${n.toString(16).padStart(12, "0")}`;
+
+/**
+ * EDN transactions writing the BLANK_LARGE filler: a user page, then one transaction per page with
+ * its blocks, each created by that user (:logseq.property/created-by-ref), as the app's blocks are.
+ */
+export function blankLargeTx() {
+  const str = JSON.stringify;
+  const user = blankLargeUuid(0xffffff);
+  let n = 0;
+  const pages = Array.from({ length: BLANK_LARGE.pages }, (_, i) => {
+    const uuid = blankLargeUuid(n++);
+    const title = `Release blank filler ${i}`;
+    const page = `{:block/uuid #uuid ${str(uuid)} :block/title ${str(title)} :block/name ${str(title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}`;
+    const blocks = Array.from(
+      { length: BLANK_LARGE.blocksPerPage },
+      (_, b) =>
+        `{:block/uuid #uuid ${str(blankLargeUuid(n++))} :block/title ${str(`${title} block ${b}`)} :block/page [:block/uuid #uuid ${str(uuid)}] :block/parent [:block/uuid #uuid ${str(uuid)}] :block/order ${str(`a${b.toString(36)}`)} :logseq.property/created-by-ref [:block/uuid #uuid ${str(user)}] :block/created-at 1 :block/updated-at 1}`,
+    );
+    return `[${page} ${blocks.join(" ")}]`;
+  });
+  return [`[{:block/uuid #uuid ${str(user)} :block/title "Release user" :block/name "release user" :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}]`, ...pages];
+}
+
+/**
+ * Sends a one-page deleteBlankBlocks dry run four times: each must answer 200 listing the page's
+ * BLANK_LARGE.pageBlocks / 2 blank leaves, and the median of the last three within `limitMs`.
+ * Returns the timings as a note.
+ */
+export async function checkBlankOnLargeGraph(stub, pageId, limitMs = BLANK_LARGE_MS) {
+  const expected = BLANK_LARGE.pageBlocks / 2;
+  const runs = await timed(() => call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": [pageId], "dry-run": true }), 4);
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.total !== expected) throw new Error(`total ${body.total}, expected ${expected}`);
+    const listed = (body.pages ?? []).map((p) => [p.uuid, p["would-delete"].length]);
+    if (JSON.stringify(listed) !== JSON.stringify([[pageId, expected]])) throw new Error(`would-delete holds ${JSON.stringify(listed)}, expected ${expected} on ${pageId}`);
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > limitMs) throw new Error(`answered after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
+/** Seeds the BLANK_LARGE graph with the dev build: call it before any release bundle runs. Returns {database, seededMs}. */
+export function seedBlankLarge(upstream) {
+  const start = performance.now();
+  const database = seededDatabase(upstream, blankLargeTx());
+  return { database, seededMs: Math.round(performance.now() - start) };
+}
+
+/** The one-page dry run on the graph seedBlankLarge made. Returns [{name, ok, error?, note?}]. */
+export async function blankLargeChecks(upstream, bundle, { database, seededMs }) {
+  const other = (BLANK_LARGE.pages * BLANK_LARGE.blocksPerPage).toLocaleString("en-GB");
+  const name = `beside ${other} other blocks: a one-page deleteBlankBlocks dry run lists ${BLANK_LARGE.pageBlocks / 2} blank leaves within ${BLANK_LARGE_MS} ms`;
+  try {
+    const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database });
+    try {
+      const title = "Release blank one page";
+      const page = await call(stub, "POST", "/semantic/pages", { title });
+      if (page.status !== 201) throw new Error(`create ${title}: HTTP ${page.status}: ${page.text.slice(0, 300)}`);
+      const blocks = Array.from({ length: BLANK_LARGE.pageBlocks }, (_, i) => ({ title: i % 2 === 0 ? " " : `${title} text ${i}` }));
+      const insert = await call(stub, "POST", "/semantic/block-trees", { "target-id": page.json.uuid, blocks, verbose: false });
+      if (insert.status !== 201) throw new Error(`insert into ${title}: HTTP ${insert.status}: ${insert.text.slice(0, 300)}`);
+      const note = await checkBlankOnLargeGraph(stub, page.json.uuid);
+      return [{ name, ok: true, note: `${other} blocks seeded in ${seededMs} ms; ${note}` }];
+    } finally {
+      close();
+    }
+  } catch (error) {
+    return [{ name, ok: false, error: error.message }];
+  }
+}
+
 /**
  * Calls `fn` with console.error, warn, log and info replaced by recorders, and puts each back when
  * it settles (or throws). Resolves to {value, calls: [{level, args}]}.
@@ -1203,6 +1591,7 @@ export function checks(ctx) {
     ...queryBlockChecks(ctx),
     ...insightChecks(ctx),
     ...scaleChecks(ctx),
+    ...blankChecks(ctx),
   ];
 }
 
@@ -1259,7 +1648,12 @@ export function assertRows(actual, expected) {
 /** Creates the fixture and runs every check. Returns [{name, ok, error?}]. */
 export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
   const fixture = scaleFixture(Date.now());
-  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { preseed: staleTx(fixture), env: insightEnv() });
+  // Every graph is seeded before the first release bundle runs (seededDatabase).
+  const database = seededDatabase(upstream, staleTx(fixture));
+  const syncStatus = seedSyncStatus(upstream);
+  const blankLarge = seedBlankLarge(upstream);
+  const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database, env: insightEnv() });
+  const results = [];
   try {
     const ctx = { stub, fixture };
     for (const [path, body] of [
@@ -1272,7 +1666,6 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
       if (path === "/semantic/pages") ctx.pageUuid = res.json?.uuid;
     }
     if (!ctx.pageUuid) throw new Error("setup /semantic/pages: no uuid in the response");
-    const results = [];
     for (const [name, fn] of checks(ctx)) {
       try {
         const note = await fn();
@@ -1281,10 +1674,12 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
         results.push({ name, ok: false, error: error.message });
       }
     }
-    return results;
   } finally {
     close();
   }
+  results.push(...(await syncStatusChecks(upstream, bundle, syncStatus)));
+  results.push(...(await blankLargeChecks(upstream, bundle, blankLarge)));
+  return results;
 }
 
 async function main() {

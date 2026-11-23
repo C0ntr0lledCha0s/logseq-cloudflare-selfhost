@@ -39,6 +39,24 @@ skip() {
 }
 
 [ -d node_modules ] || npm ci --silent
+# With --upstream, upstream's suite runs first: scripts/build.sh deletes worker/dist/worker-test.js
+# and this suite rebuilds it, so the scripts tests that need it (bench, release bundle) run
+# rather than skip themselves.
+if [ "$upstream" = 1 ]; then
+  if [ -d .upstream/deps/db-sync ]; then
+    run "upstream db-sync tests" bash -c 'cd .upstream/deps/db-sync && pnpm test'
+    # Queries the release bundle deploy ships (its Datascript seeds from the test build just
+    # compiled). It tests the bundle as last built: rebuild with scripts/build.sh after a patch change.
+    if [ -f .upstream/deps/db-sync/worker/dist/worker/main.js ]; then
+      run "release bundle query check" node scripts/release-query-check.mjs .upstream
+    else
+      skip "release bundle query check" "release bundle missing: scripts/build.sh .upstream"
+    fi
+  else
+    skip "upstream db-sync tests" ".upstream missing: scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream"
+  fi
+fi
+
 # The scripts' tests print TAP here (stdout is a pipe), so a test that skipped itself, for
 # example because the last build removed what it needs, can be named in the summary.
 tests_log="$(mktemp)"
@@ -57,21 +75,6 @@ if [ -f connector/vendor/openapi.json ] && [ -f connector/vendor/semantic_api_to
 else
   skip "connector tests, typecheck, tools manifest" \
     "connector/vendor missing: scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream && scripts/vendor-upstream-api.sh .upstream"
-fi
-
-if [ "$upstream" = 1 ]; then
-  if [ -d .upstream/deps/db-sync ]; then
-    run "upstream db-sync tests" bash -c 'cd .upstream/deps/db-sync && pnpm test'
-    # Queries the release bundle deploy ships (its Datascript seeds from the test build just
-    # compiled). It tests the bundle as last built: rebuild with scripts/build.sh after a patch change.
-    if [ -f .upstream/deps/db-sync/worker/dist/worker/main.js ]; then
-      run "release bundle query check" node scripts/release-query-check.mjs .upstream
-    else
-      skip "release bundle query check" "release bundle missing: scripts/build.sh .upstream"
-    fi
-  else
-    skip "upstream db-sync tests" ".upstream missing: scripts/fetch-upstream.sh .upstream && scripts/build.sh .upstream"
-  fi
 fi
 
 if command -v tofu >/dev/null 2>&1; then

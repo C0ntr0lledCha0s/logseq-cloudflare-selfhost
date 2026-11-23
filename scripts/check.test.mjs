@@ -10,7 +10,7 @@ const script = join(resolve(dirname(fileURLToPath(import.meta.url)), ".."), "scr
 
 // A fake repository root plus stub npm/node/pnpm/tofu that log their arguments and exit with
 // the status named in STUB_FAIL_<tool> (0 when unset), after printing STUB_OUT_<tool> when set.
-function setup({ vendor = false, upstream = false, releaseBundle = false, nodeModules = true } = {}) {
+function setup({ vendor = false, upstream = false, releaseBundle = false, nodeModules = true, stubs = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "check-"));
   const root = join(dir, "repo");
   const bin = join(dir, "bin");
@@ -35,7 +35,7 @@ function setup({ vendor = false, upstream = false, releaseBundle = false, nodeMo
     const stub = join(bin, tool);
     writeFileSync(
       stub,
-      `#!/usr/bin/env bash\necho "${tool} $*" >> "${log}"\n[ -n "\${STUB_OUT_${tool}:-}" ] && printf '%s\\n' "\${STUB_OUT_${tool}}"\nexit "\${STUB_FAIL_${tool}:-0}"\n`,
+      `#!/usr/bin/env bash\necho "${tool} $*" >> "${log}"\n${stubs[tool] ?? ""}\n[ -n "\${STUB_OUT_${tool}:-}" ] && printf '%s\\n' "\${STUB_OUT_${tool}}"\nexit "\${STUB_FAIL_${tool}:-0}"\n`,
     );
     chmodSync(stub, 0o755);
   }
@@ -182,6 +182,35 @@ test("prints no WARNING when no scripts test was skipped", () => {
     const r = run([], { STUB_OUT_npm: "TAP version 13\nok 1 - parses the durations\n# skipped 0" });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.doesNotMatch(r.stdout, /WARNING/);
+  } finally {
+    cleanup();
+  }
+});
+
+// scripts/build.sh deletes worker-test.js and upstream's suite rebuilds it, so with --upstream the
+// gate runs that suite before the scripts tests that need it (CLAUDE.md gotcha; finding s-stage-1-2).
+test("--upstream runs upstream's suite before the scripts tests, so a fresh build leaves no skipped test", () => {
+  const workerTest = ".upstream/deps/db-sync/worker/dist/worker-test.js";
+  const { run, cleanup } = setup({
+    upstream: true,
+    releaseBundle: true,
+    stubs: {
+      pnpm: `[ "$1" = test ] && mkdir -p "$(dirname "$CHECK_ROOT/${workerTest}")" && touch "$CHECK_ROOT/${workerTest}"`,
+      npm: `if [ "$1" = test ]; then echo "TAP version 13"; if [ -f "$CHECK_ROOT/${workerTest}" ]; then echo "ok 1 - bench --json"; else echo "ok 1 - bench --json # SKIP worker-test.js missing"; fi; exit 0; fi`,
+    },
+  });
+  try {
+    const r = run(["--upstream"]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout, /WARNING/, r.stdout);
+    const calls = r.calls.split("\n");
+    const upstreamAt = calls.indexOf("pnpm test");
+    const scriptsAt = calls.indexOf("npm test");
+    assert.ok(upstreamAt >= 0 && scriptsAt >= 0, r.calls);
+    assert.ok(upstreamAt < scriptsAt, `upstream suite ran after the scripts tests:\n${r.calls}`);
+    assert.match(r.stdout, /ok +upstream db-sync tests/);
+    assert.match(r.stdout, /ok +release bundle query check/);
+    assert.match(r.stdout, /ok +scripts unit tests/);
   } finally {
     cleanup();
   }

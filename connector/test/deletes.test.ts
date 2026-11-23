@@ -40,6 +40,8 @@ const DESTRUCTIVE_KINDS: Record<string, "always" | "when" | "never"> = {
   delete_block: "always",
   delete_block_property: "always",
   delete_blocks: "always",
+  // Patch 0056: an apply deletes the blank leaves it names; only dry-run === true in the body is exempt.
+  delete_blank_blocks: "when",
   delete_page: "always",
   delete_property: "always",
   delete_tag: "always",
@@ -358,6 +360,48 @@ describe("set_page_favorite (patch 0038)", () => {
   });
 });
 
+describe("delete_blank_blocks (patch 0056)", () => {
+  const args = (body: unknown) => ({ graph: "notes", body, reason: "tidy empty bullets" });
+  const DELETES = "deletes blank blocks";
+
+  it("is not a delete only with dry-run: true in the body (a dry run lists, never deletes)", () => {
+    expect(deleteReason("delete_blank_blocks", args({ "page-ids": ["Plans"], "dry-run": true }))).toBeNull();
+    expect(deleteReason("delete_blank_blocks", args({ "dry-run": true }))).toBeNull();
+  });
+
+  it("is a delete with dry-run false, missing, not the boolean true, outside the body, or no body at all (review focus 16)", () => {
+    const ids = ["8d1c2b6e-4f0a-4c51-9a77-1f0e3b2c4d01"];
+    for (const body of [
+      { "page-ids": ["Plans"], "dry-run": false, "block-ids": ids },
+      { "page-ids": ["Plans"], "block-ids": ids },
+      { "page-ids": ["Plans"] },
+      { "page-ids": ["Plans"], "dry-run": "true", "block-ids": ids },
+      { "page-ids": ["Plans"], "dry-run": 1 },
+      { "page-ids": ["Plans"], "dry-run": null },
+      {},
+      undefined,
+      null,
+      [{ "dry-run": true }],
+      "dry-run",
+    ]) {
+      expect(deleteReason("delete_blank_blocks", args(body)), JSON.stringify(body)).toBe(DELETES);
+    }
+    expect(deleteReason("delete_blank_blocks", { graph: "notes" })).toBe(DELETES);
+    expect(deleteReason("delete_blank_blocks", {})).toBe(DELETES);
+    expect(deleteReason("delete_blank_blocks", { graph: "notes", "dry-run": true, body: { "page-ids": ["Plans"] } })).toBe(DELETES);
+  });
+
+  it("declares its dry run in the body, so the audit row and a no-delete token see the same dry run", () => {
+    expect(declaredDryRun("delete_blank_blocks", args({ "page-ids": ["Plans"], "dry-run": true }))).toBe(true);
+    expect(declaredDryRun("delete_blank_blocks", { ...args({ "page-ids": ["Plans"] }), "dry-run": true })).toBe(false);
+    expect(declaredDryRun("delete_blank_blocks", args({ "page-ids": ["Plans"], "dry-run": "true" }))).toBe(false);
+  });
+
+  it("is destructive and idempotent in ANNOTATIONS, as the rule's tool must be", () => {
+    expect(ANNOTATIONS.delete_blank_blocks).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+  });
+});
+
 describe("dry runs", () => {
   /** The write operations that declare `dry-run`, by where, read from the vendored openapi. */
   function declared(): Record<string, "query" | "body"> {
@@ -395,6 +439,8 @@ describe("dry runs", () => {
       // Patch 0038: a favourite's remove is a delete, so a no-delete token can still dry-run it.
       set_page_favorite: "body",
       reorder_favorites: "body",
+      // Patch 0056: a no-delete token may dry-run delete_blank_blocks, never apply it.
+      delete_blank_blocks: "body",
     });
     expect(Object.isFrozen(DRY_RUN_TOOLS)).toBe(true);
   });

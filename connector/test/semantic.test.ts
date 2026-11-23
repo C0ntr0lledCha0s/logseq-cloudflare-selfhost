@@ -714,6 +714,42 @@ async function callTool(e: Env, name: string, args: Record<string, unknown>) {
   return { isError: result.isError === true, text: result.content.map((c: { text: string }) => c.text).join("\n") };
 }
 
+/** semantic_index_status's text for seedTwo on the fakes, captured before the stage 2 refactor. */
+const SEMANTIC_INDEX_STATUS_PIN = {
+  notStarted: `{
+  "graph": "work",
+  "status": "not started",
+  "indexed-blocks": 0,
+  "listing-in-progress": null,
+  "indexed-at": null,
+  "error": null,
+  "index": {
+    "model": "@cf/baai/bge-small-en-v1.5",
+    "dimensions": 384,
+    "expected-dimensions": 384,
+    "vectors": 0,
+    "stored-blocks": 0,
+    "max-vectors": 5000
+  }
+}`,
+  ready: `{
+  "graph": "work",
+  "status": "ready",
+  "indexed-blocks": 2,
+  "listing-in-progress": null,
+  "indexed-at": "<indexed-at>",
+  "error": null,
+  "index": {
+    "model": "@cf/baai/bge-small-en-v1.5",
+    "dimensions": 384,
+    "expected-dimensions": 384,
+    "vectors": 2,
+    "stored-blocks": 2,
+    "max-vectors": 5000
+  }
+}`,
+};
+
 describe("tools", () => {
   it("are listed only when semantic search is configured, with help to match", async () => {
     const off = (await rpc(testEnv(), "tools/list", {})).tools.map((t: { name: string }) => t.name).sort();
@@ -812,6 +848,22 @@ describe("tools", () => {
       index: { model: "@cf/baai/bge-small-en-v1.5", dimensions: 384, "expected-dimensions": 384, vectors: 2, "stored-blocks": 2, "max-vectors": 5000 },
     });
     expect(typeof status["indexed-at"]).toBe("string");
+  });
+
+  // Plan 2026-11-22 stage 2 step 1: captured on the tree before semanticStatusPart moved into
+  // src/semantic/status.ts. The text must stay byte-identical (key order and indentation too); only
+  // indexed-at, a clock reading, is replaced before comparing.
+  it("semantic_index_status output is unchanged (pin captured before the status refactor)", async () => {
+    seedTwo();
+    // Before any run there is no state row: every field takes its fallback.
+    const before = await callTool(semanticEnv("5000"), "semantic_index_status", { graph: "work" });
+    expect(before).toEqual({ isError: false, text: SEMANTIC_INDEX_STATUS_PIN.notStarted });
+    await runUntilReady();
+    const result = await callTool(semanticEnv("5000"), "semantic_index_status", { graph: "work" });
+    expect(result.isError).toBe(false);
+    const indexedAt = JSON.parse(result.text)["indexed-at"];
+    expect(indexedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
+    expect(result.text.replace(indexedAt, "<indexed-at>")).toBe(SEMANTIC_INDEX_STATUS_PIN.ready);
   });
 
   function seedTwo() {
