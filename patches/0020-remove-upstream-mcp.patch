@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/worker/entry.mjs b/deps/db-sync/worker/entry.mjs
-index 1ea6416..293b471 100644
+index cb0c8ba33..293b4718f 100644
 --- a/deps/db-sync/worker/entry.mjs
 +++ b/deps/db-sync/worker/entry.mjs
-@@ -1,193 +1,8 @@
+@@ -1,194 +1,8 @@
 -import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 -import { openApiMcpServer } from "@cloudflare/codemode/mcp";
 -import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -21,6 +21,7 @@ index 1ea6416..293b471 100644
 -import { ensureMcpAcceptHeader } from "./mcp_request.mjs";
  import { openAiAppsChallengeResponse } from "./openai_app_challenge.mjs";
 -import { registerSemanticApiTools } from "./semantic_api_tools.mjs";
+-import { r2AssetUploadSigner } from "./r2_asset_upload.mjs";
 -import { semanticRequestBody, semanticRequestUrl } from "./semantic_request.mjs";
  import apiDocsHtml from "./dist/api-docs.generated.mjs";
  import worker, { SyncDO } from "./dist/worker/main.js";
@@ -196,7 +197,7 @@ index 1ea6416..293b471 100644
  export default {
    async fetch(request, env, ctx) {
      const path = new URL(request.url).pathname;
-@@ -195,19 +10,6 @@ export default {
+@@ -196,22 +10,6 @@ export default {
      if (challengeResponse) return challengeResponse;
      const docsResponse = apiDocsResponse(path, apiDocsHtml);
      if (docsResponse) return docsResponse;
@@ -212,6 +213,9 @@ index 1ea6416..293b471 100644
 -        return new Response("Method Not Allowed", { status: 405, headers: { Allow: "POST" } });
 -      }
 -      return handleMcp(ensureMcpAcceptHeader(request), env, ctx);
+-    }
+-    if (request.method === "POST" && path.startsWith("/assets/")) {
+-      return worker.fetch(request, { ...env, SIGN_R2_ASSET_UPLOAD: r2AssetUploadSigner(env) }, ctx);
 -    }
      return worker.fetch(request, env, ctx);
    },
