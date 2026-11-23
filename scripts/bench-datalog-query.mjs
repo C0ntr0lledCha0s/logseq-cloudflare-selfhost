@@ -20,7 +20,11 @@
 // handler does after resolving params) under default-bounds, or the values --bounds gives, and
 // reports the work each bound counted. Every Bench Project page is older than 30 days, so
 // projects-untouched reads every block on them; open-tasks-by-client reads each task's
-// :block/refs as its clients, which walks as a node property does. --width runs the F1 shapes
+// :block/refs as its clients, which walks as a node property does. After the four, it runs
+// open-tasks-by-client with params.client (patch 0054) at the cap, on the same graph with the
+// client pages added (makeFixture's clients): client-page, a client held by one page of
+// CLIENT_PAGE_BLOCKS blocks, which stops on the tasks bound; and client-tasks, a client held by
+// CLIENT_TASKS open tasks, which stops on the open-tasks or reads bound. --width runs the F1 shapes
 // (many function bindings over one page's blocks; more than 12, so the width cap refuses them
 // before they run) and the 3-binding query over 2,500 blocks through run-query under the width
 // cap, or --width-cap, and reports the width charged.
@@ -129,6 +133,13 @@ export const TAGS = ["Private", "Bench Project", "Bench Topic", "Bench Chain"];
 export const NAMED_TAGS = ["Bench Meeting", "Bench Decision"];
 const TASK_STATUSES = ["todo", "doing", "done", "canceled"];
 
+/** open-tasks-by-client's client runs at the cap (patch 0054), in output order. */
+export const CLIENT_RUNS = ["client-page", "client-tasks"];
+/** Blocks on the one page holding client-page's client: past the tasks bound (10,000). */
+export const CLIENT_PAGE_BLOCKS = 10_500;
+/** Open tasks each holding client-tasks' client, 100 a page: past the open-tasks bound (2,000). */
+export const CLIENT_TASKS = 2_500;
+
 /** The pages a width shape counts over: one page of `blocks` blocks each. */
 export const WIDTH_SHAPES = [
   { shape: "f1-identity-175", blocks: 100, clauses: () => identityClauses(175) },
@@ -163,7 +174,7 @@ export function widthQuery(spec, title) {
  * children, and about one block in four refs another page; one in twenty is tagged Bench Topic.
  * `chain` is CHAIN_DEPTH nested blocks on the first page, each tagged Bench Chain.
  */
-export function makeFixture(pages, seed = 1, { width = false } = {}) {
+export function makeFixture(pages, seed = 1, { width = false, clients = false } = {}) {
   const rand = prng(seed);
   const tags = TAGS.map((title) => ({ title, uuid: uuid(rand) }));
   const out = [];
@@ -214,7 +225,33 @@ export function makeFixture(pages, seed = 1, { width = false } = {}) {
         title: `Bench Width ${blocks}`,
         blocks: Array.from({ length: blocks }, (_, i) => ({ uuid: uuid(extra), title: `Bench Width ${blocks} block ${i}` })),
       }));
-  return { tags, pages: out, chain, width: widthPages };
+  return { tags, pages: out, chain, width: widthPages, clients: clients ? clientFixture(seed) : [] };
+}
+
+/**
+ * The client runs' material, from its own stream (so the rest of the fixture is unchanged), as
+ * [{run, client: {uuid, title}, pages: [{uuid, title, refs, blocks}]}] in CLIENT_RUNS order: for
+ * client-page, one page whose :block/refs holds the client, with CLIENT_PAGE_BLOCKS blocks (one in
+ * four an open task) that hold no client of their own; for client-tasks, pages of 100 open tasks,
+ * CLIENT_TASKS in all, each holding the client itself.
+ */
+function clientFixture(seed) {
+  const rand = prng(seed ^ 0xc11e);
+  const page = (title, blocks) => ({ uuid: uuid(rand), title, refs: [], blocks });
+  const block = (title, task, refs = []) => ({ uuid: uuid(rand), title, refs, tags: [], children: [], ...(task ? { task } : {}) });
+  const big = { uuid: uuid(rand), title: "Bench Client Big" };
+  const bigPage = page("Bench Client Big Work", Array.from({ length: CLIENT_PAGE_BLOCKS }, (_, i) => block(`big step ${i}`, i % 4 === 0 ? "todo" : undefined)));
+  bigPage.refs = [big.uuid];
+  const busy = { uuid: uuid(rand), title: "Bench Client Busy" };
+  const busyPages = [];
+  for (let i = 0; i < CLIENT_TASKS; i += 100) {
+    const n = Math.min(100, CLIENT_TASKS - i);
+    busyPages.push(page(`Bench Client Busy Work ${i / 100}`, Array.from({ length: n }, (_, k) => block(`busy task ${i + k}`, (i + k) % 2 ? "doing" : "todo", [busy.uuid]))));
+  }
+  return [
+    { run: "client-page", client: big, pages: [bigPage] },
+    { run: "client-tasks", client: busy, pages: busyPages },
+  ];
 }
 
 // Loading the build
@@ -309,6 +346,14 @@ export function fixtureTx(fixture, now) {
   for (const c of fixture.chain) {
     chunks.push(block({ ...c, refs: [], tags: ["Bench Chain"] }, first, parent));
     parent = c.uuid;
+  }
+  for (const { client, pages: clientPages } of fixture.clients ?? []) {
+    chunks.push(`{:block/uuid #uuid ${str(client.uuid)} :block/title ${str(client.title)} :block/name ${str(client.title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at ${now} :block/updated-at ${now}}`);
+    for (const p of clientPages) {
+      const refs = p.refs.length ? ` :block/refs #{${p.refs.map((r) => `[:block/uuid #uuid ${str(r)}]`).join(" ")}}` : "";
+      chunks.push(`{:block/uuid #uuid ${str(p.uuid)} :block/title ${str(p.title)} :block/name ${str(p.title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at ${now} :block/updated-at ${now}${refs}}`);
+      for (let i = 0; i < p.blocks.length; i += 2000) chunks.push(p.blocks.slice(i, i + 2000).map((b) => block(b, p.uuid, p.uuid)).join(" "));
+    }
   }
   for (const p of fixture.width ?? []) {
     chunks.push(`{:block/uuid #uuid ${str(p.uuid)} :block/title ${str(p.title)} :block/name ${str(p.title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at ${now} :block/updated-at ${now}}`);
@@ -434,8 +479,14 @@ const DAY_MS = 86_400_000;
  * last 3,650 days (the fixture's fixed date is within it) with Bench Decisions; Tasks with their
  * :block/refs as clients; Bench Project pages with no Description.
  */
-function namedInputs(ns, db, query) {
+function namedInputs(ns, db, query, client) {
   const { cljs, d } = ns;
+  if (client) {
+    // As resolve-client-param resolves params.client: the entity's db id, echoed as {title, uuid}.
+    const eid = d.entid(db, ns.reader.read_string.cljs$core$IFn$_invoke$arity$1(`[:block/uuid #uuid ${JSON.stringify(client.uuid)}]`));
+    if (eid == null) throw new Error(`no client ${client.title} in the graph`);
+    return `{:inputs {:client_property :block/refs :client ${eid}} :params {"client_property" {:title "Refs"} "client" {:title ${JSON.stringify(client.title)} :uuid ${JSON.stringify(client.uuid)}}}}`;
+  }
   const tag = (title) => d.entid(db, cljs.keyword("user.class", `${title.replace(/\s+/g, "")}-bench`));
   const now = Date.now();
   const echo = (title) => `{:title ${JSON.stringify(title)} :includes []}`;
@@ -452,12 +503,15 @@ function namedInputs(ns, db, query) {
   throw new Error(`no named query ${query}`);
 }
 
-/** One run of named query `query` on `db` under `bounds` (EDN): {ms, outcome, rows, work, bound?}. */
-export function runNamed(ns, query, db, bounds) {
+/**
+ * One run of named query `query` on `db` under `bounds` (EDN), with params.client `client`
+ * ({uuid, title}) when given: {ms, outcome, rows, work, bound?}.
+ */
+export function runNamed(ns, query, db, bounds, client) {
   const { cljs, reader } = ns;
   const named = ns.logseq.db_sync.worker.named_queries;
   const read = (edn) => reader.read_string.cljs$core$IFn$_invoke$arity$1(edn);
-  const resolved = read(namedInputs(ns, db, query));
+  const resolved = read(namedInputs(ns, db, query, client));
   const work = cljs.volatile_BANG_(cljs.PersistentArrayMap.EMPTY);
   const t0 = performance.now();
   try {
@@ -485,30 +539,38 @@ export async function benchNamed({ pages = DEFAULT_PAGES, runs = DEFAULT_RUNS, b
   const ns = loadBuild(build);
   const given = { ...ns.cljs.clj__GT_js(ns.logseq.db_sync.worker.named_queries.default_bounds), ...bounds };
   const records = [];
+  const measure = (graph, query, size, run, client) => {
+    const own = NAMED[query];
+    const edn = boundsEdn(Object.fromEntries(own.map((b) => [b, given[b]])));
+    const db = restore(ns, graph);
+    const cold = runNamed(ns, query, db, edn, client);
+    const warm = [];
+    let last = cold;
+    for (let i = 0; i < runs; i++) {
+      last = runNamed(ns, query, db, edn, client);
+      warm.push(last.ms);
+    }
+    records.push({
+      query,
+      run,
+      ...(client ? { client: client.title } : {}),
+      pages: size,
+      datoms: graph.datoms,
+      cold_ms: round(cold.ms),
+      warm_ms: round(median(warm)),
+      outcome: last.outcome,
+      rows: last.rows,
+      work: Object.fromEntries(own.map((b) => [b, last.work[b] ?? 0])),
+      ...(last.bound ? { bound: last.bound, error: last.error } : {}),
+    });
+  };
   for (const size of pages) {
     const graph = storeGraph(ns, size, seed);
-    for (const [query, own] of Object.entries(NAMED)) {
-      const edn = boundsEdn(Object.fromEntries(own.map((b) => [b, given[b]])));
-      const db = restore(ns, graph);
-      const cold = runNamed(ns, query, db, edn);
-      const warm = [];
-      let last = cold;
-      for (let i = 0; i < runs; i++) {
-        last = runNamed(ns, query, db, edn);
-        warm.push(last.ms);
-      }
-      records.push({
-        query,
-        pages: size,
-        datoms: graph.datoms,
-        cold_ms: round(cold.ms),
-        warm_ms: round(median(warm)),
-        outcome: last.outcome,
-        rows: last.rows,
-        work: Object.fromEntries(own.map((b) => [b, last.work[b] ?? 0])),
-        ...(last.bound ? { bound: last.bound, error: last.error } : {}),
-      });
-    }
+    for (const query of Object.keys(NAMED)) measure(graph, query, size, "full");
+    // The client runs on the same graph with the client pages added: the full run would stop on
+    // them, so they are a graph of their own.
+    const withClients = storeGraph(ns, size, seed, { clients: true });
+    for (const { run, client } of makeFixture(size, seed, { clients: true }).clients) measure(withClients, "open-tasks-by-client", size, run, client);
   }
   return { mode: "named", bounds: given, runs, node: process.version, records };
 }
@@ -788,16 +850,17 @@ async function main() {
   else if (r.skipped) console.log(`skipped: ${r.skipped}`);
   else if (r.mode === "named") {
     console.log(`named queries bench: bounds ${Object.entries(r.bounds).map(([k, v]) => `${k} ${fmt(v)}`).join(", ")}; warm median of ${r.runs} runs, Node ${r.node}`);
-    console.log("query                       pages    datoms  cold_ms  warm_ms  outcome   rows  work");
+    console.log("query                      run            pages    datoms  cold_ms  warm_ms  outcome      rows  work");
     for (const x of r.records) {
       console.log(
         [
           x.query.padEnd(26),
+          x.run.padEnd(13),
           String(x.pages).padStart(6),
           String(x.datoms).padStart(9),
           x.cold_ms.toFixed(1).padStart(8),
           x.warm_ms.toFixed(1).padStart(8),
-          (x.bound ? `${x.bound}!` : x.outcome).padEnd(8),
+          (x.bound ? `${x.bound}!` : x.outcome).padEnd(11),
           String(x.rows).padStart(6),
           Object.entries(x.work).map(([k, v]) => `${k} ${v}`).join(", "),
         ].join(" "),

@@ -7,6 +7,7 @@ seen:
   - 2026-11-06 – item 25, review rounds 2 and 3 (r2-correctness-1, r3-correctness-1, r3-integrity-1): the fix's own title ranking repeated the class
   - 2026-11-06 – item 23, patch 0022, review round 3 (r3-correctness-1): a bare JSON integer is still read as a db id for node and text properties
   - 2026-11-19 – item 36, patch 0046: the `:block/tags` branch that 0021 split out kept upstream's `first`, so Tags "Review" stored the oldest of two classes
+  - 2026-11-22 – item 52, patch 0054: the new `client` param resolves a title among all entities. The owner ruled that, when exactly one candidate is a page (a journal counts), it wins; otherwise every candidate is refused with its kind and UUID, oldest first, and a private decoy is neither listed nor counted. See also `api/a-title-resolver-must-drop-built-in-hidden-pages-private-does-not-cover-them.md`
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
