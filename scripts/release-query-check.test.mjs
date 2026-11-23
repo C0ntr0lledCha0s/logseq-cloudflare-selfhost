@@ -200,6 +200,20 @@ test("checkSyncStatus passes quick counts that grew by the fixture's, and fails 
   await assert.rejects(checkSyncStatus(slow, baseline, added, 50), /expected under 50 ms/);
 });
 
+test("checkSyncStatus bounds the median of the three warm runs, not the fastest or the slowest", async () => {
+  const { checkSyncStatus } = await import(script);
+  const baseline = { "page-count": 7, "block-count": 30 };
+  const added = { pages: 1700, blocks: 83_300 };
+  const good = { t: 4, "page-count": 1707, "block-count": 83_330, clients: { connected: 0 } };
+  // The first call is the cold run and is not bounded; the next three are the warm runs.
+  const twoSlow = fakeStub({ status: 200, body: good, delay: [0, 5, 90, 90] });
+  await assert.rejects(checkSyncStatus(twoSlow, baseline, added, 50), /expected under 50 ms/, "two of three warm runs over the bound fail");
+  const oneSlow = fakeStub({ status: 200, body: good, delay: [0, 90, 5, 5] });
+  assert.match(await checkSyncStatus(oneSlow, baseline, added, 50), /median \d+ ms/, "one slow warm run of three passes");
+  const coldSlow = fakeStub({ status: 200, body: good, delay: [90, 5, 5, 90] });
+  assert.match(await checkSyncStatus(coldSlow, baseline, added, 50), /median \d+ ms/, "a slow cold run is not bounded");
+});
+
 test("the scale fixture is about 20,000 blocks of meetings, decisions, tasks, tagged pages and stale projects, the same on every build", async () => {
   const { scaleFixture, SCALE } = await import(script);
   const now = 1_762_646_400_000;
@@ -278,15 +292,21 @@ test("assertRows compares the rows' cells, not their count", async () => {
   assert.throws(() => assertRows([["b"], ["a"]], [["a"], ["b"]]), /expected/, "order counts");
 });
 
-// A stand-in for the SyncDO that answers every fetch with `status` and `body`, after `delay` ms,
-// calling `log` first; the checks below only read the response, so each can be shown to fail.
-const fakeStub = ({ status, body, delay = 0, log } = {}) => ({
-  async fetch() {
-    log?.();
-    if (delay) await new Promise((r) => setTimeout(r, delay));
-    return new Response(JSON.stringify(body), { status });
-  },
-});
+// A stand-in for the SyncDO that answers every fetch with `status` and `body`, after `delay` ms
+// (a number for every call, or an array of per-call delays, the last repeating), calling `log`
+// first; the checks below only read the response, so each can be shown to fail.
+const fakeStub = ({ status, body, delay = 0, log } = {}) => {
+  let calls = 0;
+  return {
+    async fetch() {
+      log?.();
+      const ms = Array.isArray(delay) ? delay[Math.min(calls, delay.length - 1)] : delay;
+      calls += 1;
+      if (ms) await new Promise((r) => setTimeout(r, ms));
+      return new Response(JSON.stringify(body), { status });
+    },
+  };
+};
 const WIDTH_422 = { error: "query stopped after function bindings copied 100,000 values (the width cap): each function binding copies every column" };
 const BINDINGS_422 = { error: "query has 176 function bindings, more than the 12 the width cap allows: each function binding copies every column" };
 const SCAN_422 = { error: "query stopped after scanning 20,000 datoms (the scan cap); narrow it" };
