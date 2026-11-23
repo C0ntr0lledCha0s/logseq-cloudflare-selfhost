@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-index a682bda..ccbbbba 100644
+index 61f8d81..6d2e34d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 @@ -44,11 +44,13 @@
@@ -16,7 +16,7 @@ index a682bda..ccbbbba 100644
              [promesa.core :as p]))
  
  (def scan-cap
-@@ -1268,32 +1270,108 @@
+@@ -1347,32 +1349,108 @@
        {:input (- now (* value day-ms)) :echo value}
        {:error (str "params." param-name ": must be " lo "-" hi)})))
  
@@ -363,10 +363,10 @@ index 7cac252..8353a2d 100644
           rows (run ctx inputs)]
       {:rows rows :work @work :plan (plan-text query-name params bounds)})))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..4ab0b4e 100644
+index 5ec45fe..eecfcb6 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -215,7 +215,9 @@
+@@ -234,7 +234,9 @@
                      (str "Runs one of four read-only queries as server code, not Datalog, by name, with params resolved against the graph, and returns rows as datalog_query does. name is one of:"
                           " projects-untouched (params tag, default Project, and days, default 30): pages tagged tag, or a tag extending it, whose own updated-at is older than days and with no block on the page updated since; columns updated-at (ms) and page. It reads each stale page's blocks, and stops with 422 after 2,500 tagged pages and blocks (its tagged bound) or after reading 10,000 blocks on pages not updated within days (its page-blocks bound): give a narrower tag or a larger days."
                           " meetings-without-decision (params meeting_tag, default Business Meeting, decision_tag, default Decision, and days, default 90): pages or blocks tagged meeting_tag created within days with no block or page below them tagged decision_tag, a decision at any depth, on a page nested under the meeting page included; columns created-at (ms) and meeting. It walks up once from each decision_tag block or page that isn't private, through its blocks, its page and any page that page sits under (a namespace child sits under its parent page), sharing the ancestors walks have already reached, and stops with 422 after 2,000 meetings created within days (its meetings bound), 10,000 blocks tagged decision_tag (its decisions bound) or 10,000 steps up from blocks tagged decision_tag (its ancestor-steps bound): give a smaller days or a narrower meeting_tag or decision_tag."
@@ -377,10 +377,10 @@ index 39eccae..4ab0b4e 100644
                           " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
                           " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
                           " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
-@@ -719,10 +721,10 @@
-           "429" {:description "Rate limit exceeded"}}
-          (case operation-id
-            "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
+@@ -771,10 +773,10 @@
+            "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
+                                "422" {:description "More than 2,500 changes in the window; pass a later since or an until"}
+                                "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
 -           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
 +           "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name> (params.client: a client that isn't a string, is unknown, or whose title several entities share with no single page among them), an unknown param, or a body field the call doesn't take"}
                              "404" {:description "No named query has that name; the error lists the names"}
