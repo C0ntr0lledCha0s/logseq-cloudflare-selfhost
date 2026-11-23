@@ -2914,3 +2914,187 @@ describe("queries help", () => {
     for (const phrase of phrases) expect(tool.description, phrase).toContain(phrase);
   });
 });
+
+// Patch 0051 stage 1: every get_graph_health check leaves out Private and Recycle-bin content.
+describe("get_graph_health and Private content", () => {
+  it("connector_help says Private content and the Recycle bin are left out of get_graph_health", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("get_graph_health leaves out Private content and the Recycle bin");
+  });
+
+  it("get_graph_health's vendored description says Private content and the bin are left out, and Private usage counts", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description).toContain("Private content and the Recycle bin are left out of every check");
+    expect(tool.description).toContain("a tag or property used only by Private objects is in use");
+  });
+});
+
+// Patch 0051 stage 2: get_graph_health reports broken refs.
+describe("get_graph_health and broken refs", () => {
+  it("connector_help names the broken-refs check, its reasons and the Private-target rule", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "broken refs (broken-refs: a block or page whose text links, as [[uuid]] or ((uuid)), a uuid with no entity, reason missing, or one in the Recycle bin, reason in-recycle-bin; a property value's link is reported as the block holding it, a link to Private content isn't listed, and code isn't scanned: a code or math block, an inline code span and a fenced block hold no links)",
+    );
+  });
+
+  it("get_graph_health's first line names broken refs", () => {
+    expect(FIRST_LINES.get_graph_health).toContain("broken refs");
+  });
+
+  it("get_graph_health's vendored description and checks parameter carry broken-refs", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_health)).toBe(true);
+    for (const phrase of ["broken-refs (blocks and pages whose title refers", "reason missing", "reason in-recycle-bin", "target-uuid"]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(JSON.stringify(tool.inputSchema)).toContain("orphan-choices, broken-refs");
+  });
+});
+
+// Patch 0051 stage 3: get_graph_health reports missing expected tag properties.
+describe("get_graph_health and missing tag properties", () => {
+  it("connector_help names the check, tag-properties, the stored default and the no-pairs note", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    for (const phrase of [
+      "missing tag properties (missing-tag-properties: objects tagged with a tag, or with a tag extending it, that hold no value, or only the empty placeholder, for one of that tag's expected properties)",
+      'pass tag-properties, a JSON array of {"tag": …, "property": …}',
+      "config/settings.json health.expectedTagProperties",
+      "with no pairs it lists nothing and its note says so",
+      "is refused naming the entry",
+      // Review r1-light-1 and r1-integrity-1: where the stored pairs live, and that they serve every graph.
+      "the HEALTH_TAG_PROPERTIES GitHub secret",
+      "a stored pair that doesn't resolve in this graph is skipped and named under skipped",
+    ]) {
+      expect(help, phrase).toContain(phrase);
+    }
+  });
+
+  it("get_graph_health's first line names missing tag values", () => {
+    expect(FIRST_LINES.get_graph_health).toBe(
+      "Tidy-up report: unused tags and properties, duplicates, page gaps, broken refs, missing tag values.",
+    );
+  });
+
+  it("get_graph_health's vendored description, checks and tag-properties parameter carry the check", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_health)).toBe(true);
+    for (const phrase of [
+      "missing-tag-properties (objects tagged with a tag, or with a tag that extends it",
+      "HEALTH_TAG_PROPERTIES",
+      "health.expectedTagProperties",
+      "pairs-from: input, settings or none",
+      "tag-properties without the missing-tag-properties check is refused",
+      "the HEALTH_TAG_PROPERTIES GitHub secret",
+      "a stored pair that doesn't resolve in this graph is skipped",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to orphan-tags");
+    const param = tool.inputSchema.properties["tag-properties"];
+    expect(param?.type).toBe("string");
+    expect(param.description).toContain("JSON array of 1 to 50 pairs");
+  });
+});
+// Review s-stage-6-2: five checks each cost over 1 s of Durable Object CPU at 20,000 pages, so the
+// default call leaves them out and a call runs them only when it names them.
+describe("get_graph_health's default check set", () => {
+  it("connector_help names the default four and says the other five run only when named, one per call on a large graph", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks, and on a large graph name one of them per call.",
+    );
+  });
+
+  it("the vendored description and checks parameter name the default four and say the others run only when named", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_health");
+    expect(tool.description).toContain(
+      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks",
+    );
+    expect(tool.inputSchema.properties.checks.description).toContain(
+      "Defaults to orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; the others run only when named",
+    );
+  });
+});
+
+// Patch 0052: list_changes_since lists what changed in a window, grouped by page.
+describe("list_changes_since", () => {
+  it("is offered read-only, under exactly that name", async () => {
+    const tool = (await listTools()).find((t) => t.name === "list_changes_since");
+    expect(tool, "list_changes_since is listed").toBeDefined();
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(committedManifest).toHaveLength(59);
+  });
+
+  it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
+    expect(FIRST_LINES.list_changes_since).toBe("What changed in the graph since a time, grouped by page; for digests and reviews.");
+    const tool = (await listTools()).find((t) => t.name === "list_changes_since");
+    expect(tool.description.startsWith(FIRST_LINES.list_changes_since)).toBe(true);
+    for (const phrase of [
+      "an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE",
+      "store this call's until and pass it as the next since",
+      // Review r1-correctness-2, r1-integrity-2 and r1-light-2: stamps come from the editing device.
+      "An edit's updated-at is set by the device that made it",
+      "overlap the windows",
+      "An edit synced after a run with an earlier stamp",
+      // Review r1-correctness-1: a block on a built-in page is listed unless the page is hidden.
+      "a user's block on a built-in page such as Contents is listed",
+      "next-cursor pages through them and is null on the last page",
+      "A move shows as page-changed on both pages",
+      "of the connector's write tools, set_page_favorite",
+      "Permanent deletes leave nothing to read",
+      "Unavailable for E2EE graphs",
+      // Review s-stage-6-2: the change cap is 2,500, the most that keep a call under 1 s at 5,000 pages.
+      "A window of more than 2,500 changes is refused with 422",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(tool.inputSchema.required).toContain("since");
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(expect.arrayContaining(["since", "until", "limit", "blocks-per-page", "cursor"]));
+  });
+
+  it("connector_help says when to use it and how to chain runs", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "For what changed since a time (a daily digest or weekly review), call list_changes_since with since set to the previous run's until less a margin (a day), skipping blocks already reported with the same uuid and updated-at (an ISO date such as 2026-11-16 works for a first run), and keep this call's until for the next: an edit's updated-at comes from the device that made it, so an edit made offline can sync after a run with a stamp before that run's until; a move shows only as page-changed on both pages.",
+    );
+  });
+});
+// Patch 0053: get_graph_schema lists every tag and property with usage counts in one call.
+describe("get_graph_schema", () => {
+  it("is offered read-only, under exactly that name", async () => {
+    const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
+    expect(tool, "get_graph_schema is listed").toBeDefined();
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    expect(committedManifest).toHaveLength(59);
+    expect(committedManifest.map((t) => t.name)).toContain("get_graph_schema");
+  });
+
+  it("starts with its routing line and says what each count counts", async () => {
+    expect(FIRST_LINES.get_graph_schema).toBe("Every tag and property with types, choices and usage counts, in one call.");
+    const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
+    expect(tool.description.startsWith(FIRST_LINES.get_graph_schema)).toBe(true);
+    for (const phrase of [
+      "object-count (the objects tagged with it directly",
+      "usage-count: how many values are that choice, counted by the choice's id",
+      "value-count (its values",
+      "used-by-tags (the tags that list it as a tag property)",
+      "Private content and the Recycle bin are left out of every item and every count",
+      "hidden unless built-in=true",
+      "pass that section alone in sections with its next-cursor",
+      "Unavailable for E2EE graphs",
+    ]) {
+      expect(tool.description, phrase).toContain(phrase);
+    }
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(expect.arrayContaining(["sections", "built-in", "limit", "cursor"]));
+    expect(tool.inputSchema.required ?? []).not.toContain("sections");
+  });
+
+  it("connector_help sends a schema review to it", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain(
+      "For a schema or drift review, call get_graph_schema: one call lists every tag (extends, properties, object-count) and property (type, choices with usage-count, value-count, used-by-tags), instead of list_tags plus get_tag per tag; Private content and the Recycle bin are left out of every count.",
+    );
+  });
+});
+
