@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 4e4be65541..de822c008e 100644
+index 4e4be6554..de822c008 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -177,12 +177,12 @@
@@ -106,19 +106,19 @@ index 4e4be65541..de822c008e 100644
  (def ^:private page-handlers
    #{:semantic/pages-list :semantic/pages-create :semantic/pages-blocks :semantic/pages-outline
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index e3f3a43395..2d13a988fa 100644
+index 8dfd70f46..9a28dc785 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -122,7 +122,7 @@
+@@ -123,7 +123,7 @@
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
-    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+    "createAsset" ["Upload an asset" "Streams a file of at most 200 MiB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
 -   "searchGraph" ["Search graph resources" "Searches blocks, tags, properties, and assets by title and returns cursor-paginated results."]
 +   "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
     "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
     "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
-@@ -272,7 +272,8 @@
+@@ -273,7 +273,8 @@
              :description "Exact graph name, matched case-insensitively."}])
      (= "searchGraph" operation-id)
      (into [{:name "q" :in "query" :required true :schema {:type "string"}}
@@ -128,7 +128,7 @@ index e3f3a43395..2d13a988fa 100644
      (= "listTasks" operation-id)
      (into [{:name "status" :in "query" :schema {:$ref "#/components/schemas/TaskStatusSelector"}}
             {:name "priority" :in "query" :schema {:$ref "#/components/schemas/TaskPrioritySelector"}}
-@@ -388,7 +389,7 @@
+@@ -389,7 +390,7 @@
                :SearchResultResponse {:type "object" :required ["uuid" "title" "resource"]
                                       :properties {:uuid {:type "string"}
                                                    :title {:type "string"}
@@ -138,7 +138,7 @@ index e3f3a43395..2d13a988fa 100644
                                 :description "An existing entity UUID, qualified ident, or exact title."}
                :TaskStatusSelector
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
-index 35a3dce179..3400998db7 100644
+index 7d1338eac..cecf4d62d 100644
 --- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 @@ -554,7 +554,55 @@

@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 5566d8b..9aac442 100644
+index 5566d8b2e..9aac44271 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -826,14 +826,15 @@
@@ -78,10 +78,10 @@ index 5566d8b..9aac442 100644
            {:error (cond
                      (= property-ident :block/tags)
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index f551a38..02e797c 100644
+index c2fb5af7d..9b9cb6a3d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -120,8 +120,9 @@
+@@ -121,8 +121,9 @@
    "How the property-writing operations resolve a value and what they refuse. One copy, shared by
    every operation that sets properties, so the descriptions can't drift apart."
    (str "A property with choices (such as Status) takes only one of its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number; any other value is refused with the valid choices listed."
@@ -92,7 +92,7 @@ index f551a38..02e797c 100644
         " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
  
  (def ^:private display-type-note
-@@ -191,9 +192,9 @@
+@@ -192,9 +193,9 @@
     "updateTag" ["Update a tag" "Updates one tag, identified by UUID or ident: its title, the tags it extends, and its tag properties; give at least one. extends replaces the tags it extends (at least one); a tag can't extend itself, a tag that already extends it (the error names the path) or a built-in tag the app hides from its extends picker (Tag, Page, Journal, Property, Query, Template and the like). properties takes exactly one of add or remove, which change only the properties listed and keep the tag's others, or set, which replaces the tag's own properties and keeps built-in ones; a built-in property can't be removed. Each entry is a tag or a visible property by UUID, ident or title. All changes apply in one transaction, or none when any entry is refused (the error names it). Returns the tag with what it extends and its properties."]
     "deleteTag" ["Delete a tag" "Deletes one tag through Logseq's page deletion rules: the nodes holding it lose it, its child tags extend Root instead, and links to it become plain text. Refuses with 409 and deletes nothing while it has holders, child tags or other references, unless the matching acknowledge-holders, acknowledge-child-tags and acknowledge-references flags are true; the error gives each count and the flags still needed. Pass dry-run=true to get the counts without deleting."]
     "listProperties" ["List property definitions" "Returns a cursor-paginated list of property definitions in the graph."]
@@ -103,8 +103,8 @@ index f551a38..02e797c 100644
 +   "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles; set and add refuse Root Tag (logseq.class/Root), and remove takes it off a property that holds it. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID or ident that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
-    "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
-@@ -1232,7 +1233,7 @@
+    "createAsset" ["Upload an asset" (str "Streams a file of at most 200 MiB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+@@ -1233,7 +1234,7 @@
                                                 :properties {:page-id {:type "string"}
                                                              :page-title {:type "string"}}}]}
                 :PropertyValue
@@ -114,7 +114,7 @@ index f551a38..02e797c 100644
                          {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
                write-guard-schemas)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
-index b4b696f..ce28cdb 100644
+index b4b696fcf..ce28cdb9c 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_class_check_test.cljs
 @@ -1,7 +1,8 @@
@@ -193,7 +193,7 @@ index b4b696f..ce28cdb 100644
             (p/let [{:keys [conn self blocks acme fc for-client]} (graph!)
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs
 new file mode 100644
-index 0000000..bff8b6f
+index 000000000..bff8b6f71
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_json_number_value_test.cljs
 @@ -0,0 +1,263 @@
@@ -461,7 +461,7 @@ index 0000000..bff8b6f
 +              (is (string/includes? (str error) "choices (150, 7), got 999") (pr-str error))
 +              (is unchanged? "nothing is written"))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
-index c759955..b75daa7 100644
+index c759955cf..b75daa711 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_promote_page_to_tag_test.cljs
 @@ -104,7 +104,6 @@
@@ -492,7 +492,7 @@ index c759955..b75daa7 100644
  ;; Before the fix: 500 "Can't set tag with built-in #Tag", the same as the empty page.
  (deftest set-tags-to-tag-on-page-with-blocks-test
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index b96bb34..91a5dfc 100644
+index b96bb34fa..91a5dfcdb 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -34,6 +34,7 @@
