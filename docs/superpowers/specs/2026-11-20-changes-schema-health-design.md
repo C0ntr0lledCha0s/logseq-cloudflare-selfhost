@@ -290,3 +290,58 @@ The owner answered section 11 on PR 73. These replace the open questions; the bu
 5. **`since`:** accepts epoch milliseconds and also an ISO date (`2026-11-16`) or datetime, a date read in the Worker's `TIMEZONE`. An unreadable value is refused, naming `since`.
 6. **Patch numbers:** 0051 to 0053, assuming item 49 (PR 72) takes 0050; renumber if that changes.
 7. **File name:** shortened to `2026-11-20-changes-schema-health-design.md`.
+
+## 13. As built
+
+Where the result differs from the design above (section 12 already overrode sections 6, 7, 10 and 11). Patches 0051 to 0053 landed as numbered. If PR 72 is dropped or reordered they become 0050 to 0052.
+
+**Expected pairs (section 12, decision 2).**
+
+- **Input and stored default.** Both exist, with no D1 table. `getGraphHealth` takes `tag-properties`, a JSON array of 1 to 50 `{"tag", "property"}` objects, each a UUID, ident or title. Given, it replaces the stored pairs for that call, and without the `missing-tag-properties` check it is refused. The result names the `pairs` it used and `pairs-from` (`input`, `settings` or `none`).
+- **The stored pairs are a Worker secret, not a variable.** The plan put them in a `HEALTH_TAG_PROPERTIES` variable written from `config/settings.json`. Review found that `wrangler deploy` prints each variable's value in the public deploy log, so the owner's tag names would leak. As built, `render-wrangler.mjs` takes the pairs from the `HEALTH_TAG_PROPERTIES` GitHub Actions secret when it is set and not blank, otherwise from `health.expectedTagProperties` in `config/settings.json` (committed as `[]`), and writes them to a `--secrets-out` file that `deploy.sh` merges into the secrets file for `wrangler deploy --secrets-file`. It is always sent, as `[]` for none, so a deploy replaces whatever the Worker held. Both sources are checked for shape (an array of at most 50 objects with two non-empty strings) and a bad one stops the deploy naming the entry.
+- **A stored pair that doesn't resolve is skipped, an input pair is refused.** The design refused any unknown pair. One Worker serves every graph, so a stored pair whose tag or property is unknown or built-in in a graph, or whose property the tag doesn't list or has a default value, is skipped and named under `skipped` (`HEALTH_TAG_PROPERTIES[N]` and a reason), and the other pairs run. The same pair in `tag-properties` refuses the call with 400 naming `tag-properties[N]`, and so does a malformed stored value.
+- **No pairs** gives `count: 0`, no items and a `note` saying why, as decided.
+
+**Private and Recycle bin in every check (decision 4).** An entity in `private-ids` is never an item and never counts toward a duplicate-title group, and a group that drops below two members is not reported. Usage by a Private object still counts, so `orphan-tags` doesn't list a tag only Private objects carry. `mismatched-choice-values` drops a Private holder and `orphan-choices` drops a Private choice.
+
+**`broken-refs`.**
+
+- **Targets.** A link to Private content isn't listed, because `missing` would be false for it. The design only skipped Private holders.
+- **Code is not scanned.** A `[[uuid]]` or `((uuid))` in a code or math block, an inline code span or a fenced block is not a link. A quote block, text after a closed span and text after an unclosed backtick are still scanned.
+- **Pattern.** The regex is built from `common-util/uuid-pattern` with both forms, case-insensitive, because `db-content/id-ref-pattern` covers only a lower-case `[[uuid]]`. A property value block's link is reported as its owner block.
+- `deleteBlock` retracts the block, so a `((uuid))` to it reads `missing`, not `in-recycle-bin`. `deletePage` rewrites `[[uuid]]` links to the page as plain text.
+
+**`list_changes_since`.**
+
+- **`since` and `until`** take epoch ms, an ISO date (local midnight in `TIMEZONE`) or an ISO datetime (with `Z` or an offset, or local time in `TIMEZONE`), per decision 5. A date that doesn't exist is refused by round trip. A local time in a daylight-saving gap moves on by the gap (02:30 becomes 03:30), and one that occurs twice takes the first. One `Intl.DateTimeFormat` is made per request, and only when a local form needs it. An invalid `TIMEZONE` answers 500 only then. The response adds `time-zone`. The window is open at `since`.
+- **The cursor** holds `[since until latest page-uuid]`, not `[until, last-key]`, so a cursor given with another `since` is also refused (`cursor belongs to another since`).
+- **The 422** reads `too many changes in that window (more than 20,000); pass a later since or an until`. The handler takes at most 20,001 datoms from the index and stops there, so it never names the exact count above the cap.
+- **`recycled`** reads the `deleted-at` datoms in the window from `:aevt` and subtracts the Private set alone (`private-ids` gained a `{:recycle-bin? false}` arity).
+- **Which blocks are left out.** A block is left out only when it or its owner is Private, binned, hidden or built-in. A page check as well dropped every block on the built-in Contents page, so it was removed.
+- **Late syncs.** `:block/updated-at` is set by the editing device and kept by sync, so an offline edit can arrive with a stamp before the last `until`. The tool text and `connector_help` tell callers to start at the last `until` less a margin (a day) and skip blocks already reported with the same `uuid` and `updated-at`.
+- **Stamps.** A test records which stamp each connector write tool bumps (block, page, listed). Only `set_page_favorite` is invisible (it writes the hidden favourites page). `set_block_property` and `batch_set_block_property` (including a tag or heading) bump the block only. `delete_block_property`, `move_blocks`, `batch_move_blocks` and `insert_block_children` bump the page only. `update_block` bumps both. The tool text's list of blind spots is built from that test.
+
+**`get_graph_schema`.** As designed. `value-count` and each choice's `usage-count` don't count Logseq's empty placeholder, a choice is counted by its id, not its title (another property's same-titled choice doesn't count), and `object-count` and the counts leave out Private and binned holders. Private, binned and hidden tags and properties are not items. `built-in` must be `true` or `false` (`invalid built-in: give true or false`). `sections` de-duplicates (`tags,tags` is one section).
+
+**Caps in tool text** come from the handler's constants (`max-changes`, `max-blocks-per-page`, `default-blocks-per-page`), and upstream tests assert the OpenAPI description holds each value. `connector_help` names no caps and points at the tool.
+
+**Connector.** No hand-written tool code. `get_graph_schema` and `list_changes_since` are generated with read-only annotations and the first lines in `FIRST_LINES`. The first line of `get_graph_health` changed too. `tools-manifest.json` went from 57 to 59 tools.
+
+**Bench and the stop condition.** `scripts/bench-graph-insights.mjs` times each shape on the release bundle at 5,000 and 20,000 pages and at the 20,000-change cap, and `scripts/release-query-check.mjs` checks all five shapes on the bundle. Figures in ms, release bundle, Node 22, with the x1.65 Cloudflare factor applied (first call / warm median, ranges over three runs):
+
+| Shape | Pages | Cold | Warm |
+|---|---|---|---|
+| default health | 5,000 | 2,924 to 2,991 | 1,484 to 1,551 |
+| `broken-refs` | 5,000 | 1,275 to 1,418 | 480 to 522 |
+| `missing-tag-properties` | 5,000 | 595 to 646 | 201 to 223 |
+| `list_changes_since` (20,000 changes) | 5,000 | 2,392 to 2,395 | 976 to 1,004 |
+| `get_graph_schema` | 5,000 | 172 to 250 | 73 to 80 |
+| default health | 20,000 | 11,759 to 12,424 | 6,446 to 6,679 |
+| `broken-refs` | 20,000 | 5,756 to 6,150 | 2,197 to 2,317 |
+| `missing-tag-properties` | 20,000 | 2,281 to 2,453 | 776 to 791 |
+| `list_changes_since` (20,000 changes) | 20,000 | 4,187 to 4,581 | 1,438 to 1,604 |
+| `get_graph_schema` | 20,000 | 547 to 642 | 257 to 275 |
+
+These are far above the design's estimates in section 5 (under 300 ms for the default health call at 5,000 pages). Seven shapes pass one second, and only the schema export stays under it at both sizes. The plan's stop condition applies: no cap was changed, and the choice (lower the caps, run a cheaper default set of checks, or index the title scan, then bench again) is held for the owner. The README Backlog lists it (item 32). The per-call cost is otherwise as designed: 2 Worker requests, no D1 rows beyond the connector's auth lookup, none written, no neurons and no Vectorize.
+
+**Still to do once deployed** (section 9 items 2, 3 and 5): the owner's run of `get_graph_health` with `checks=broken-refs,missing-tag-properties` on their graph, their comparison of `list_changes_since` for a week against what they remember editing (including a move and a property change), and the measured Durable Object CPU of a default health call from Workers analytics.
