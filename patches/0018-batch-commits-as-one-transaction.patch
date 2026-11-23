@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/test/logseq/db_sync/normalize_test.cljs b/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
-index 8cc241e21c..d267e479b4 100644
+index 8cc241e2..d267e479 100644
 --- a/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/normalize_test.cljs
 @@ -412,3 +412,36 @@
@@ -40,7 +40,7 @@ index 8cc241e21c..d267e479b4 100644
 +      (is (= [#{org} #{org}] (extends db-after)))
 +      (is (= (extends db-after) (extends replayed))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
-index fe61eef73b..76208b0671 100644
+index fe61eef7..76208b06 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 @@ -11,6 +11,7 @@
@@ -87,22 +87,3 @@ index fe61eef73b..76208b0671 100644
 +          (is (= 200 (:status response)))
 +          (is (= [#{"Org"} #{"Org"}] (extends @conn)))
 +          (is (= (extends @conn) (extends @client))))))))
-diff --git a/deps/db/src/logseq/db.cljs b/deps/db/src/logseq/db.cljs
-index c23ffc7ca2..de19a9c6fa 100644
---- a/deps/db/src/logseq/db.cljs
-+++ b/deps/db/src/logseq/db.cljs
-@@ -297,8 +297,12 @@
-       (vreset! *complete? true)
-       (let [tx-data @*batch-tx-data]
-         (when (and @*complete? (seq tx-data))
--          ;; transact tx-data to `conn` and validate db
--          (transact! conn tx-data (transform-tx-meta tx-meta))))
-+          ;; transact tx-data to `conn` and validate db. The temp conn's datoms carry its own tx
-+          ;; ids; replay them as plain ops so the batch is one transaction with one tx id, as
-+          ;; sync's normalize-tx-data expects of a tx report.
-+          (transact! conn
-+                     (mapv (fn [d] [(if (:added d) :db/add :db/retract) (:e d) (:a d) (:v d)]) tx-data)
-+                     (transform-tx-meta tx-meta))))
-       (finally
-         (d/unlisten! temp-conn ::temp-conn-batch-tx)
-         (reset! temp-conn nil)

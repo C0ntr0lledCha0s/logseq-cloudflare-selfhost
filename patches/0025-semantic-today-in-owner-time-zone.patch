@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index fb155e0..5dc3e7d 100644
+index fb155e04..5dc3e7d8 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -609,12 +609,34 @@
@@ -174,10 +174,10 @@ index fb155e0..5dc3e7d 100644
                                   (p/let [_ (.delete bucket key)]
                                     (throw error)))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index fed0673..c64cc9f 100644
+index e7b26801..76f1c8f0 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -111,6 +111,9 @@
+@@ -112,6 +112,9 @@
         " A number property given a number (or numeric text) stores that number, never the entity whose db id it matches."
         " A value the property doesn't take is refused, naming the property: a page for a text property, a page that isn't a journal for a date property, an entity that isn't one of a text, URL or number property's own values, or anything but epoch milliseconds for a datetime property such as Deadline or Scheduled."))
  
@@ -187,7 +187,7 @@ index fed0673..c64cc9f 100644
  (def ^:private heading-note
    "How a written block title's markdown heading is stored, shared by every operation that writes one."
    (str "A title starting with # to ###### and whitespace (## Section) is stored as the app stores a heading: the title without the prefix, and the level in logseq.property/heading, which getBlock and getBlocks show as a property and getPageOutline shows as the ## prefix (listPageBlocks titles don't show it)."
-@@ -128,7 +131,7 @@
+@@ -129,7 +132,7 @@
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total) and when it was created and last updated. Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
@@ -196,7 +196,7 @@ index fed0673..c64cc9f 100644
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs)."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting."]
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. dry-run checks and applies the moves to a throwaway copy of the graph without changing it."]
-@@ -144,9 +147,9 @@
+@@ -145,9 +148,9 @@
     "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
     "batchSetBlockProperty" ["Set block properties in a batch" (str "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax. " value-notes " Tags an earlier entry gives a block count for the later entries for that block; with isResetExistingValues a list of tags replaces the block's tags and a single tag adds to them. A URL property given a URL stores it in a value block of the block's own, as the editor does, never another block's value block or a block whose text is the link.")]
     "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
@@ -208,17 +208,17 @@ index fed0673..c64cc9f 100644
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
     "createTag" ["Create a tag" "Creates a Logseq tag with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names (so #Movie and #movie are the same title); the error names each one's kind, title and UUID, so there is no need to search before creating. An existing page is not converted into a tag. Not checked on E2EE graphs, whose names are ciphertext."]
     "getTag" ["Get a tag" "Returns one tag by UUID."]
-@@ -159,7 +162,7 @@
+@@ -160,7 +163,7 @@
     "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph. Never use legacy file-graph key:: value syntax."]
     "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
--   "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
-+   "createAsset" ["Upload an asset" (str "Streams a file of at most 100MB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+-   "createAsset" ["Upload an asset" "Streams a file of at most 200 MiB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
++   "createAsset" ["Upload an asset" (str "Streams a file of at most 200 MiB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
-@@ -220,7 +223,7 @@
-     :schema {:type "integer" :minimum 0 :maximum 104857600}}
+@@ -221,7 +224,7 @@
+     :schema {:type "integer" :minimum 0 :maximum common-config/max-asset-size}}
     {:name "title" :in "query" :schema {:type "string"}}
     {:name "page-id" :in "query"
 -    :description "Destination page UUID. Omit to append to today's journal."
@@ -226,7 +226,7 @@ index fed0673..c64cc9f 100644
      :schema {:type "string"}}
     {:name "checksum" :in "query" :required true
      :description "Lowercase or uppercase SHA-256 hex digest of the file."
-@@ -323,7 +326,7 @@
+@@ -324,7 +327,7 @@
      "createTask" {:required ["title"]
                    :properties {:title {:type "string"}
                                 :page-id {:type "string"
@@ -235,7 +235,7 @@ index fed0673..c64cc9f 100644
                                 :status {:$ref "#/components/schemas/TaskStatusSelector"}
                                 :priority {:$ref "#/components/schemas/TaskPrioritySelector"}
                                 :scheduled {:type "integer" :description "Scheduled date/time as a Unix timestamp in milliseconds."}
-@@ -484,9 +487,9 @@
+@@ -485,9 +488,9 @@
              "409" (entity-response "DeleteRefusal" "The delete would lose something not acknowledged; nothing was deleted")}
             "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
             "createTask"
@@ -247,7 +247,7 @@ index fed0673..c64cc9f 100644
             {})))
  
  ;; createPage, createTag and the guarded deletes answer with these bodies.
-@@ -529,7 +532,8 @@
+@@ -530,7 +533,8 @@
     :InsertedBlocksResponse {:type "object" :required ["blocks" "count"]
                              :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/InsertedBlock"}}
                                           :count {:type "integer" :description "Blocks inserted or reused, nested ones included."}
@@ -257,7 +257,7 @@ index fed0673..c64cc9f 100644
     :BatchInsertResponse {:type "object" :required ["entries" "count"]
                           :properties {:entries {:type "array"
                                                  :items {:type "object" :required ["target-id" "blocks"]
-@@ -707,6 +711,13 @@
+@@ -708,6 +712,13 @@
                                                      :priority {:$ref "#/components/schemas/PropertyChoice"}
                                                      :scheduled {:type "integer"}
                                                      :deadline {:type "integer"}}}]}
@@ -272,7 +272,7 @@ index fed0673..c64cc9f 100644
                 {:description "For ref properties, pass an existing entity by UUID, ident, or title. A title never resolves to another property's choice or value block: pages come before blocks, an exact title before one differing in case, and a title several pages share is refused with their UUIDs. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH. A property with choices takes only its own choices that the block's tags allow, by UUID, ident, title (ignoring case) or number. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
                  :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
-index 76208b0..3a6e4ef 100644
+index 76208b06..3a6e4efc 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 @@ -196,7 +196,7 @@
@@ -286,7 +286,7 @@ index 76208b0..3a6e4ef 100644
  
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 new file mode 100644
-index 0000000..c922306
+index 00000000..c9223067
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_today_tz_test.cljs
 @@ -0,0 +1,267 @@
@@ -558,7 +558,7 @@ index 0000000..c922306
 +        (p/catch #(is false (str %)))
 +        (p/finally done))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 6011943..4d9e7d2 100644
+index 60119432..4d9e7d23 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -17,6 +17,7 @@
@@ -570,7 +570,7 @@ index 6011943..4d9e7d2 100644
              [logseq.db-sync.tx-sanitize-test]
              [logseq.db-sync.worker-allowed-users-test]
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
-index fcfe554..36b315e 100644
+index fcfe5543..36b315e2 100644
 --- a/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/worker_dispatch_test.cljs
 @@ -173,9 +173,12 @@
@@ -602,7 +602,7 @@ index fcfe554..36b315e 100644
                                        ["/api/v1/graphs/{graph-id}/properties/{property-id}" :patch]
                                        ["/api/v1/graphs/{graph-id}/blocks/{block-id}/properties/{property-id}" :put]
 diff --git a/deps/outliner/src/logseq/outliner/page.cljs b/deps/outliner/src/logseq/outliner/page.cljs
-index 4c0c84c..15186e4 100644
+index 4c0c84c2..15186e4f 100644
 --- a/deps/outliner/src/logseq/outliner/page.cljs
 +++ b/deps/outliner/src/logseq/outliner/page.cljs
 @@ -106,15 +106,16 @@

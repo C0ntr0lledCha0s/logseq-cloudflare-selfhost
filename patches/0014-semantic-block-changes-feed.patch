@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/storage.cljs b/deps/db-sync/src/logseq/db_sync/storage.cljs
-index d68a98d9f4..d5aef35d4f 100644
+index d68a98d9..d5aef35d 100644
 --- a/deps/db-sync/src/logseq/db_sync/storage.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/storage.cljs
 @@ -139,6 +139,9 @@
@@ -13,7 +13,7 @@ index d68a98d9f4..d5aef35d4f 100644
    (doseq [item data]
      (common/sql-exec sql
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 2b6b8b3c1c..c092ce3492 100644
+index 2b6b8b3c..c092ce34 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -1887,6 +1887,175 @@
@@ -201,10 +201,10 @@ index 2b6b8b3c1c..c092ce3492 100644
  
  (defn handle [{:keys [^js self route ^js url] :as context}]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 8793fd72de..43b3ad2fc7 100644
+index 8aea8601..dbe6083f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -92,6 +92,8 @@
+@@ -93,6 +93,8 @@
      :handler :semantic/assets-get :operation-id "getAsset" :scope "logseq/read" :rate-class :read}
     {:method "GET" :path "/api/v1/graphs/:graph-id/search" :internal-path "/semantic/search"
      :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
@@ -213,15 +213,15 @@ index 8793fd72de..43b3ad2fc7 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/e2ee/public-keys" :internal-path "/e2ee/public-keys"
      :handler :semantic/e2ee-public-keys :operation-id "getE2eePublicKeys" :scope "logseq/read" :rate-class :read :edge? true}
     {:method "POST" :path "/api/v1/graphs/:graph-id/e2ee/encrypt" :internal-path "/e2ee/encrypt"
-@@ -144,6 +146,7 @@
-    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+@@ -145,6 +147,7 @@
+    "createAsset" ["Upload an asset" "Streams a file of at most 200 MiB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
 +   "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
     "getE2eePublicKeys" ["List graph members' public keys" "Returns the RSA-OAEP public keys of every member of an E2EE graph for wrapping the shared graph AES key. Only available on E2EE-encrypted graphs."]
     "encryptE2eeText" ["Encrypt text for an E2EE graph" "Encrypts each supplied string into the canonical Transit [iv ciphertext] package accepted by E2EE title and name fields. Requires 'key': the base64 raw 32-byte graph AES key, obtained from GET /e2ee/graphs/:id/aes-key and unwrapped with the user's RSA private key. Encrypt normalized, lowercase names separately from display titles."]
     "decryptE2eeText" ["Decrypt text from an E2EE graph" "Decrypts each supplied canonical encrypted package back to plaintext. Requires 'key': the base64 raw 32-byte AES-GCM-256 graph key. Only available on E2EE-encrypted graphs."]})
-@@ -357,6 +360,14 @@
+@@ -358,6 +361,14 @@
                    [{:name "exclude-tags" :in "query" :schema {:type "string"}
                      :description "Comma-separated tag titles, matched ignoring case. Pages tagged with one, or with a tag that extends one, are left out."}
                     summary-prefix-parameter]))
@@ -236,7 +236,7 @@ index 8793fd72de..43b3ad2fc7 100644
      (= "listGraphs" operation-id)
      (into [{:name "name" :in "query" :schema {:type "string"}
              :description "Exact graph name, matched case-insensitively."}])
-@@ -418,6 +429,7 @@
+@@ -419,6 +430,7 @@
                    "getGraphHealth" (entity-response "GraphHealthResponse" "Counts and items for each check run")
                    "listKnowledgeIndex"
                    (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
@@ -244,7 +244,7 @@ index 8793fd72de..43b3ad2fc7 100644
                    "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
                    "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
                    "updatePage" (entity-response "PageResponse" "The updated page")
-@@ -438,6 +450,7 @@
+@@ -439,6 +451,7 @@
            "409" {:description "Unavailable for E2EE graphs"}
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
@@ -252,7 +252,7 @@ index 8793fd72de..43b3ad2fc7 100644
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             "insertBlockChildren" {"201" (entity-response "InsertedBlocksResponse" "The inserted block trees")}
-@@ -614,6 +627,24 @@
+@@ -615,6 +628,24 @@
                                        :properties {:uuid {:type "string"}
                                                     :title {:type "string"}
                                                     :resource {:enum ["pages" "blocks" "tags" "properties" "assets"]}}}
@@ -279,7 +279,7 @@ index 8793fd72de..43b3ad2fc7 100644
                 :TaskStatusSelector
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs
 new file mode 100644
-index 0000000000..c0537bb414
+index 00000000..c0537bb4
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_block_changes_test.cljs
 @@ -0,0 +1,241 @@
@@ -525,7 +525,7 @@ index 0000000000..c0537bb414
 +                (is (= "block changes are unavailable for E2EE graphs" (:error body)))
 +                (is (nil? (storage/get-meta sql :semantic-feed-epoch)) "a refused request writes nothing")))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index bfc8d782c5..52e8c469e6 100644
+index bfc8d782..52e8c469 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -13,6 +13,7 @@

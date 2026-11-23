@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index dc22ab5a7a..d98166ef10 100644
+index dc22ab5a..d98166ef 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -754,15 +754,139 @@
@@ -241,10 +241,10 @@ index dc22ab5a7a..d98166ef10 100644
  
      :semantic/search
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 018a10dac0..2e278cf3f9 100644
+index cb9b5d69..8704a2ca 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -88,16 +88,16 @@
+@@ -89,16 +89,16 @@
  (def ^:private operation-docs
    {"listGraphs" ["List available graphs" "Returns cursor-paginated graphs available to the authenticated user, including E2EE-encrypted graphs flagged with graph-e2ee. Use the optional exact name filter to resolve a graph name to its UUID."]
     "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
@@ -264,7 +264,7 @@ index 018a10dac0..2e278cf3f9 100644
     "moveBlocks" ["Move blocks" "Moves one or more blocks together before, after, into the first-child position, or into the last-child position of a target block. Logseq preserves the blocks' outliner order."]
     "insertBlockChildren" ["Insert child block trees" "Appends or prepends one or more recursive block trees as children of the addressed block."]
     "insertBlockTree" ["Insert block trees" "Inserts one or more recursive block trees relative to an explicit target block."]
-@@ -109,16 +109,16 @@
+@@ -110,16 +110,16 @@
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
@@ -282,9 +282,9 @@ index 018a10dac0..2e278cf3f9 100644
 -   "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules."]
 +   "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
     "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
-    "createAsset" ["Upload an asset" "Streams a file of at most 100MB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
+    "createAsset" ["Upload an asset" "Streams a file of at most 200 MiB to R2 and creates its Asset-class block. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file."]
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
-@@ -189,6 +189,24 @@
+@@ -190,6 +190,24 @@
      :description "Use base64 when the caller cannot transfer raw bytes. The server decodes this transport as a stream before writing to R2. On E2EE graphs, base64-encode the complete encrypted Transit package; size and checksum still describe the plaintext file."
      :schema {:type "string" :enum ["base64"]}}])
  
@@ -309,7 +309,7 @@ index 018a10dac0..2e278cf3f9 100644
  (def ^:private encrypted-name-schema
    {:type "string"
     :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
-@@ -267,6 +285,8 @@
+@@ -268,6 +286,8 @@
      (into time-filter-parameters)
      (= "createAsset" operation-id)
      (into asset-upload-parameters)
@@ -318,7 +318,7 @@ index 018a10dac0..2e278cf3f9 100644
      (= "listGraphs" operation-id)
      (into [{:name "name" :in "query" :schema {:type "string"}
              :description "Exact graph name, matched case-insensitively."}])
-@@ -333,10 +353,16 @@
+@@ -334,10 +354,16 @@
            "409" {:description "Unavailable for E2EE graphs"}
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
@@ -337,7 +337,7 @@ index 018a10dac0..2e278cf3f9 100644
             "createProperty" {"201" (entity-response "PropertyResponse" "The created property definition")}
             "createTask"
             {"201" (entity-response "TaskResponse" "The created DB Task object")}
-@@ -344,12 +370,39 @@
+@@ -345,12 +371,39 @@
             {"201" (entity-response "AssetResponse" "The created asset block")}
             {})))
  
@@ -378,7 +378,7 @@ index 018a10dac0..2e278cf3f9 100644
                :BlockTree {:type "object" :required ["title"]
                            :properties {:uuid {:type "string" :format "uuid"
                                                :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
-@@ -436,6 +489,7 @@
+@@ -437,6 +490,7 @@
                {:description "For ref properties, pass an existing entity by UUID, ident, or title. Status and Priority also accept case-insensitive built-in aliases such as TODO, DONE, and HIGH; user-defined choices use UUID, ident, or exact title. Class properties such as Tags accept a class UUID, ident, or title, or an array of those selectors. On unencrypted graphs, URL properties also accept URL strings and arrays of URL strings, creating native URL values. Text (default-type) properties without fixed choices take plain text or arrays of text, stored as value blocks as in the editor; text is never looked up by title, and a UUID references an existing value. Encrypted graphs require existing entity selectors for URL and text properties. Scalar properties accept their JSON scalar value."
                 :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
                         {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
@@ -388,7 +388,7 @@ index 018a10dac0..2e278cf3f9 100644
               :flows {:authorizationCode
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 new file mode 100644
-index 0000000000..607b864da7
+index 00000000..607b864d
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_write_guards_test.cljs
 @@ -0,0 +1,307 @@
@@ -700,7 +700,7 @@ index 0000000000..607b864da7
 +    (is (string/includes? (get-in paths ["/api/v1/graphs/{graph-id}/pages" :post :description])
 +                          "no need to search before creating"))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 14f862b95d..57d9b57c02 100644
+index 14f862b9..57d9b57c 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -10,6 +10,7 @@
@@ -712,7 +712,7 @@ index 14f862b95d..57d9b57c02 100644
              [logseq.db-sync.tx-sanitize-test]
              [logseq.db-sync.worker-auth-test]
 diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
-index 48d7fcf428..68dc00aead 100644
+index c0587885..13359b5b 100644
 --- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
 @@ -348,6 +348,7 @@

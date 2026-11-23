@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d98166ef10..92f563ae0e 100644
+index d98166ef..92f563ae 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -340,13 +340,13 @@
@@ -569,10 +569,10 @@ index d98166ef10..92f563ae0e 100644
  
  (defn handle [{:keys [^js self route ^js url] :as context}]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 2e278cf3f9..8503a71785 100644
+index 8704a2ca..ec5ec21a 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -22,6 +22,10 @@
+@@ -23,6 +23,10 @@
      :handler :semantic/pages-get :operation-id "getPage" :scope "logseq/read" :rate-class :read}
     {:method "PATCH" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
      :handler :semantic/pages-update :operation-id "updatePage" :scope "logseq/write" :rate-class :write}
@@ -583,7 +583,7 @@ index 2e278cf3f9..8503a71785 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
      :handler :semantic/blocks-get :operation-id "getBlock" :scope "logseq/read" :rate-class :read}
     {:method "PATCH" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
-@@ -30,10 +34,14 @@
+@@ -31,10 +35,14 @@
      :handler :semantic/blocks-delete :operation-id "deleteBlock" :scope "logseq/write" :rate-class :write}
     {:method "POST" :path "/api/v1/graphs/:graph-id/block-moves" :internal-path "/semantic/block-moves"
      :handler :semantic/blocks-move :operation-id "moveBlocks" :scope "logseq/write" :rate-class :write}
@@ -598,7 +598,7 @@ index 2e278cf3f9..8503a71785 100644
     {:method "PUT" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
      :handler :semantic/blocks-set-property :operation-id "setBlockProperty" :scope "logseq/write" :rate-class :write}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
-@@ -95,17 +103,21 @@
+@@ -96,17 +104,21 @@
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and user and library property values, without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID."]
     "deletePage" ["Delete a page" "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting."]
@@ -623,7 +623,7 @@ index 2e278cf3f9..8503a71785 100644
     "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
     "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
     "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
-@@ -211,6 +223,10 @@
+@@ -212,6 +224,10 @@
    {:type "string"
     :description "On E2EE graphs, required whenever renaming a page, tag, or property: separately encrypt the normalized lowercase plaintext name with the graph AES key. Omit on plain graphs."})
  
@@ -634,7 +634,7 @@ index 2e278cf3f9..8503a71785 100644
  (defn- request-schema [operation-id]
    (case operation-id
      "createPage" {:required ["title"] :properties {:title {:type "string"} :name encrypted-name-schema}}
-@@ -221,6 +237,30 @@
+@@ -222,6 +238,30 @@
                                             :items {:type "string"}}
                                 :target-id {:type "string"}
                                 :position {:enum ["before" "after" "first-child" "last-child"]}}}
@@ -665,7 +665,7 @@ index 2e278cf3f9..8503a71785 100644
      "insertBlockChildren" {:required ["position" "blocks"]
                             :properties {:position {:enum ["append" "prepend"]}
                                          :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
-@@ -294,6 +334,14 @@
+@@ -295,6 +335,14 @@
      (into [{:name "q" :in "query" :required true :schema {:type "string"}}
             {:name "types" :in "query" :schema {:type "string"}
              :description "Comma-separated result types to include: pages, blocks, tags, properties, assets. Defaults to all; any other value is rejected."}])
@@ -680,7 +680,7 @@ index 2e278cf3f9..8503a71785 100644
      (= "listTasks" operation-id)
      (into [{:name "status" :in "query" :schema {:$ref "#/components/schemas/TaskStatusSelector"}}
             {:name "priority" :in "query" :schema {:$ref "#/components/schemas/TaskPrioritySelector"}}
-@@ -340,6 +388,9 @@
+@@ -341,6 +389,9 @@
                    "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
                    "updatePage" (entity-response "PageResponse" "The updated page")
                    "getBlock" (entity-response "BlockDetailResponse" "A block with its tags and property values")
@@ -690,7 +690,7 @@ index 2e278cf3f9..8503a71785 100644
                    "updateBlock" (entity-response "BlockResponse" "The updated block")
                    "getTag" (entity-response "TagResponse" "A tag")
                    "updateTag" (entity-response "TagResponse" "The updated tag")
-@@ -355,8 +406,11 @@
+@@ -356,8 +407,11 @@
           (case operation-id
             "createPage" {"201" (entity-response "PageResponse" "The created page")
                           "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
@@ -704,7 +704,7 @@ index 2e278cf3f9..8503a71785 100644
             "createTag" {"201" (entity-response "TagResponse" "The created tag")
                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
             ("deletePage" "deleteTag" "deleteProperty")
-@@ -397,99 +451,136 @@
+@@ -398,99 +452,136 @@
                             {:type "object" :required ["error"]
                              :properties {:error {:type "string"}}}]}))
  
@@ -889,7 +889,7 @@ index 2e278cf3f9..8503a71785 100644
 -                              :properties {:uuid {:type "string"}
 -                                           :title {:type "string"}
 -                                           :type {:type "string"}
--                                           :size {:type "integer" :minimum 0 :maximum 104857600}
+-                                           :size {:type "integer" :minimum 0 :maximum common-config/max-asset-size}
 -                                           :checksum {:type "string" :pattern "^[0-9a-f]{64}$"}
 -                                           :url {:type "string" :format "uri"}
 -                                           :expires-at {:type "integer"}}}
@@ -905,7 +905,7 @@ index 2e278cf3f9..8503a71785 100644
 -               :oneOf [{:type "string"} {:type "number"} {:type "boolean"}
 -                       {:type "array" :items {:oneOf [{:type "string"} {:type "number"}]}}]})
 +                                            :type {:type "string"}
-+                                            :size {:type "integer" :minimum 0 :maximum 104857600}
++                                            :size {:type "integer" :minimum 0 :maximum common-config/max-asset-size}
 +                                            :checksum {:type "string" :pattern "^[0-9a-f]{64}$"}
 +                                            :url {:type "string" :format "uri"}
 +                                            :expires-at {:type "integer"}}}
@@ -927,7 +927,7 @@ index 2e278cf3f9..8503a71785 100644
               :flows {:authorizationCode
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 new file mode 100644
-index 0000000000..9eb913f2e3
+index 00000000..9eb913f2
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_bulk_test.cljs
 @@ -0,0 +1,453 @@
@@ -1385,7 +1385,7 @@ index 0000000000..9eb913f2e3
 +        (p/catch #(is false (str %)))
 +        (p/finally done))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 57d9b57c02..e488116458 100644
+index 57d9b57c..e4881164 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -9,6 +9,7 @@
