@@ -303,7 +303,7 @@ if (!spec) {
 // ---------- plan ----------
 phase('Plan')
 const plan = await agent(
-  `Write the implementation plan for the approved spec at ${spec.path} to docs/superpowers/plans/${TODAY}-${brief.slug}.md, following the existing plans. Split it into 2-6 ordered stages. Each stage must leave the gate green, start with its tests, and be reviewable alone. Commit it as "docs(plan): ${brief.slug}".${TRAILER}\nFeature:\n${BRIEF}`,
+  `Write the implementation plan for the approved spec at ${spec.path} to docs/superpowers/plans/${TODAY}-${brief.slug}.md, following the existing plans. Split it into 2-6 ordered stages. Each stage must leave the gate green, start with its tests, and be reviewable alone. Each stage is one commit; stage agents don't push (the lane pushes at closeout), so no stage's done_when may require a push. Commit it as "docs(plan): ${brief.slug}".${TRAILER}\nFeature:\n${BRIEF}`,
   { ...M('plan'), label: 'plan', schema: PLAN_SCHEMA },
 )
 if (!plan || !plan.stages.length) return { status: 'blocked', stage: 'plan', brief, spec }
@@ -322,7 +322,7 @@ for (const stage of plan.stages) {
   const prevHead = built.length ? built[built.length - 1].change.head_sha : BASE
   // The quick tier skips per-stage checks: its one review pass covers the whole change.
   const check = !T.stage_check ? null : await agent(
-    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? If the stage changed patches/, rebuild the release bundle with scripts/build.sh .upstream and run scripts/check.sh --upstream on the committed HEAD yourself, and quote the SHA: a red gate, a WARNING naming a skipped test, or a stage commit that isn't pushed is a major finding. Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
+    `Adversarial check of stage ${stage.id} only: the commits ${prevHead}..HEAD. Does it meet "${stage.done_when}"? Was each new test seen to fail first? If the stage changed patches/, rebuild the release bundle with scripts/build.sh .upstream and run scripts/check.sh --upstream on the committed HEAD yourself, and quote the SHA: a red gate or a WARNING naming a skipped test is a major finding. Stage agents commit and don't push (the lane pushes at closeout and checks the remote then), so don't raise an unpushed stage commit as a finding. Report only security, blocker or major findings, each with a concrete failure scenario and evidence.\nStage:\n${J(stage)}\nBuilder's report:\n${J(change)}`,
     { ...M('stage_check'), label: `check:${stage.id}`, phase: 'Build', agentType: 'adversarial-reviewer', schema: FINDINGS_SCHEMA, effort: 'medium' },
   )
   const serious = ((check && check.findings) || []).filter(f => ['security', 'blocker', 'major'].includes(f.severity)).map((f, i) => ({ ...f, id: `s-${stage.id}-${i + 1}` }))
