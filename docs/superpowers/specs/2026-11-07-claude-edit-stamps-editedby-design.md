@@ -209,6 +209,19 @@ Each test is first run against the code without the change and seen to fail; the
 5. **Conflicts.** Refuse every write with a 409 when an `editedBy` property that isn't the stamp property exists (this design), or skip stamping and say so in the result?
 6. **Activity page title taken.** Skip the page quietly when you already have a "Claude Activity" page (this design), or refuse the first stamped write until the title is free?
 
+### Owner answers (2026-11-23)
+
+The owner kept every default as built:
+
+1. **Default.** On for every graph after deploy.
+2. **Hidden or compact.** Hidden. The Claude Activity page uses an advanced query.
+3. **Stamp after your edits.** Kept. `claudeEditedAt` means when Claude last changed the block, not who changed it last.
+4. **Where the contract text lives.** In each stamping tool's description and in `connector_help`, as built.
+5. **Conflicts.** Refuse every write with a 409. Skipping the stamp would be a silent success.
+6. **Activity page title taken.** Skip the page quietly.
+
+The 2026-11-08 defaults from PR 39 (stamping on everywhere, the 2,000-block delete cap, the 90-day token expiry) are confirmed too.
+
 ## 12. As built
 
 Notes from the build, newest stage last. Each says what was checked and how.
@@ -296,7 +309,7 @@ The choice is matched by its fixed UUID, never its title. `:remove-block-childre
 
 **Measured, per write tool, stamps on against off** (`edit stamps header` in `test/tools.test.ts`): the same sync requests in the same order (so the same Worker requests and rate-limited writes), the same D1 statements with the same `rows_read` and `rows_written`, and the same audit row apart from `id` and `at`. `resolve()` is one statement reading one row. No neurons: nothing here calls Workers AI.
 
-**Contract.** Spec §4's sentence is on the 13 generated stamping tools (through `STAMPING_TOOLS` in `semantic.ts`) and on `save_document` and `save_file_from_url`, and on no other tool. `CONNECTOR_HELP` holds the section, with Stage 2's refusal sentence folded into its end. Question 4 (section 11) is still open; if the owner answers "help only", `STAMPING_TOOLS` and `STAMP_HINT` go.
+**Contract.** Spec §4's sentence is on the 13 generated stamping tools (through `STAMPING_TOOLS` in `semantic.ts`) and on `save_document` and `save_file_from_url`, and on no other tool. `CONNECTOR_HELP` holds the section, with Stage 2's refusal sentence folded into its end. The owner kept this on 2026-11-23 (section 11, question 4), so `STAMPING_TOOLS` and `STAMP_HINT` stay.
 
 ### Stage 5: the owner's switch
 
