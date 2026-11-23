@@ -40,7 +40,7 @@ The sync server is upstream `logseq/logseq` at the commit in `UPSTREAM_REF`. `sc
 
 ## Rules
 
-- **Shipped patches are history.** Amend a patch only before its PR merges. After that, fix forward with a new patch.
+- **Shipped patches are history.** Amend a patch only before its PR merges. After that, fix forward with a new patch. PR 41 is the one exception: it amended patch 0034 the day after it merged, to repair edit stamps on app-uploaded graphs, because the fix rewrote code 0034 had only just added and was shipped as a quick hotfix. Don't repeat it: the next fix to a shipped patch, however recent, is a new patch.
 - **One concern per patch.** A patch is the unit an upstream PR would take. Note in the PR body if the fix belongs upstream, since the owner keeps a fork for upstream PRs.
 - **Don't edit `.upstream` and forget it.** It's gitignored, so only `patches/` carries the change.
 - **Name the allowed set for every lookup.** A title or ident lookup resolves only inside a named set: the property's choices, its classes, its own value blocks, or pages. Don't rely on the outliner to check closed values on server writes. Tests need a decoy created first, and a value that is legitimately duplicated (a URL held by two blocks, a journal title). See `docs/solutions/api/title-resolves-outside-allowed-values.md`.
