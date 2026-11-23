@@ -964,7 +964,7 @@ describe("matchLinks: cost is bounded by the draft's word pairs (r1-light-1)", (
 
 // The tool through the MCP server, as kb-index.test.ts drives kb_index: real KV, real D1, the real
 // matcher and kb-index cache. Only the SYNC binding is faked, at HTTP level, answering
-// listKnowledgeIndex and getBlocks view=signals as patches 0013, 0035 and 0036 do.
+// listKnowledgeIndex and getBlocks as patches 0012, 0013, 0035 and 0036 do.
 describe("suggest_links tool", () => {
   const ORIGIN = "https://mcp.example.com";
   const WORK_ID = "11111111-1111-1111-1111-111111111111";
@@ -989,6 +989,8 @@ describe("suggest_links tool", () => {
   type SyncHandler = (request: Request) => Response | Promise<Response>;
   let requests: Request[];
   let stale: Set<string>;
+  /** Pages renamed in the app since the index was built: uuid to current title. */
+  let renamed: Map<string, string>;
   let indexHandler: SyncHandler;
   let blocksHandler: SyncHandler;
   let kvCounts: { get: number; put: number; keysPut: string[] };
@@ -1017,12 +1019,27 @@ describe("suggest_links tool", () => {
     const next = start + 200;
     return Response.json({ pages: pages.slice(start, next), ...(next < pages.length ? { "next-cursor": String(next) } : {}) });
   };
-  const serveSignals: SyncHandler = (request) => {
+  /**
+   * getBlocks as patches 0012 and 0035 answer it: each live page with its current title (the
+   * summary view; `renamed` holds titles changed in the app since the index was built) and the
+   * signals fields, whichever view was asked, so a test fails on what verify does with them.
+   */
+  const serveBlocks: SyncHandler = (request) => {
     const ids = (new URL(request.url).searchParams.get("ids") ?? "").split(",");
+    const titleOf = new Map(INDEX.map((p) => [p.entry.uuid, p.entry.title]));
     return Response.json({
       blocks: ids
         .filter((id) => !stale.has(id))
-        .map((uuid) => ({ uuid, "updated-at": 1, "reference-count": 1, status: null, "property-values": null })),
+        .map((uuid) => ({
+          uuid,
+          kind: "page",
+          title: renamed.get(uuid) ?? titleOf.get(uuid),
+          properties: [],
+          "updated-at": 1,
+          "reference-count": 1,
+          status: null,
+          "property-values": null,
+        })),
       missing: ids.filter((id) => stale.has(id)),
     });
   };
@@ -1148,8 +1165,9 @@ describe("suggest_links tool", () => {
     aiFails = null;
     vectors = new RecordingIndex();
     stale = new Set();
+    renamed = new Map();
     indexHandler = serveIndex;
-    blocksHandler = serveSignals;
+    blocksHandler = serveBlocks;
     reset();
     spies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m));
   });
@@ -1168,7 +1186,7 @@ describe("suggest_links tool", () => {
     expect(body.linked_text).toBe("A note about the weather.");
   });
 
-  it("warm cache, suggestions: exactly 1 getBlocks view=signals call, and every spec 3.7 key", async () => {
+  it("warm cache, suggestions: exactly 1 getBlocks view=summary call, and every spec 3.7 key", async () => {
     await warm();
     const text = "Notes on Workflow Intelligence.\nAsk OI and [[Head of Sales]] about workflow intelligence.";
     const { summary, body } = await suggestOk({ text });
@@ -1177,7 +1195,8 @@ describe("suggest_links tool", () => {
     const url = new URL(call.url);
     expect(call.method).toBe("GET");
     expect(url.pathname).toBe(`/api/v1/graphs/${WORK_ID}/blocks`);
-    expect(url.searchParams.get("view")).toBe("signals");
+    // The summary view, so verify sees each page's current title (item 63b); still one request.
+    expect(url.searchParams.get("view")).toBe("summary");
     expect(idsOf(call)).toEqual([WI, OPS]);
     expect(kvCounts).toEqual({ get: 2, put: 0, keysPut: [] });
 
@@ -1304,6 +1323,108 @@ describe("suggest_links tool", () => {
     expect(body.suggestions.map((s: any) => s.page.uuid)).toEqual([WI]);
     expect(body.dropped_stale).toEqual([]);
     expect(summary).toMatch(/; not verified \(verify: false\): the UUIDs come from the index built just now$/);
+  });
+
+  // Item 63b (spec risk 6): a page renamed in the app since the index was built. verify's one
+  // getBlocks read carries each page's current title, and a title match is kept only while the
+  // span still matches that title by the matcher's own rules, because Logseq shows a [[UUID]] link
+  // as the page's current title and so would rewrite the draft's words.
+  describe("verify: pages renamed since the index was built (item 63b)", () => {
+    it("drops a title match whose new title no longer matches the span, into dropped_stale with renamed_to", async () => {
+      await warm();
+      renamed = new Map([[WI, "Process Intelligence"]]);
+      stale = new Set([MH]);
+      const text = "Workflow Intelligence met Head of Sales and Māori Health.";
+      const { summary, body } = await suggestOk({ text });
+      expect(blockCalls()).toHaveLength(1);
+      expect(body.suggestions.map((s: any) => s.page)).toEqual([{ uuid: HOS, title: "Head of Sales" }]);
+      expect(body.dropped_stale).toEqual([
+        { uuid: WI, title: "Workflow Intelligence", renamed_to: "Process Intelligence" },
+        { uuid: MH, title: "Māori Health" },
+      ]);
+      expect(body.linked_text).toBe(`Workflow Intelligence met ${ln(HOS)} and Māori Health.`);
+      expect(summary).toMatch(/; 2 dropped as stale \(1 renamed\)$/);
+    });
+
+    it("keeps a title match whose new title differs only in case or joiners, with the current title and renamed_from", async () => {
+      await warm();
+      renamed = new Map([
+        [WI, "workflow intelligence"],
+        [HOS, "Head-of-Sales"],
+      ]);
+      const text = "Workflow Intelligence met Head of Sales.";
+      const { summary, body } = await suggestOk({ text });
+      expect(body.suggestions.map((s: any) => [s.page, s.reason, s.link])).toEqual([
+        [{ uuid: WI, title: "workflow intelligence", renamed_from: "Workflow Intelligence" }, "title", ln(WI)],
+        [{ uuid: HOS, title: "Head-of-Sales", renamed_from: "Head of Sales" }, "title", ln(HOS)],
+      ]);
+      expect(body.dropped_stale).toEqual([]);
+      expect(body.linked_text).toBe(`${ln(WI)} met ${ln(HOS)}.`);
+      expect(summary).toMatch(/; 0 dropped as stale; 2 renamed since the index was built, shown by their current titles$/);
+    });
+
+    it("drops a title match whose new title adds punctuation, a word or a different letter the span does not have", async () => {
+      await warm();
+      renamed = new Map([
+        [WI, "Workflow Intelligence."], // a suffix the span lacks
+        [HOS, "Head of Sales Ltd"], // a word more
+        [MH, "Maori Health"], // a different letter
+        [IST, "İstanbul.Office"], // its own punctuation between words
+      ]);
+      const text = "Workflow Intelligence, Head of Sales, Māori Health and İstanbul Office.";
+      const { body } = await suggestOk({ text });
+      expect(body.suggestions).toEqual([]);
+      expect(body.dropped_stale).toEqual([
+        { uuid: WI, title: "Workflow Intelligence", renamed_to: "Workflow Intelligence." },
+        { uuid: HOS, title: "Head of Sales", renamed_to: "Head of Sales Ltd" },
+        { uuid: MH, title: "Māori Health", renamed_to: "Maori Health" },
+        { uuid: IST, title: "İstanbul Office", renamed_to: "İstanbul.Office" },
+      ]);
+      expect(body.linked_text).toBe(text);
+    });
+
+    it("drops a title match whose new title matches only part of the span, at its start or its end", async () => {
+      await warm();
+      renamed = new Map([
+        [WI, "Workflow"], // the span's first word only
+        [HOS, "Sales"], // the span's last word only
+      ]);
+      const text = "Workflow Intelligence met Head of Sales.";
+      const { body } = await suggestOk({ text });
+      expect(body.suggestions).toEqual([]);
+      expect(body.dropped_stale).toEqual([
+        { uuid: WI, title: "Workflow Intelligence", renamed_to: "Workflow" },
+        { uuid: HOS, title: "Head of Sales", renamed_to: "Sales" },
+      ]);
+      expect(body.linked_text).toBe(text);
+    });
+
+    it("keeps an alias match when its page is renamed, naming the current title in reason and page", async () => {
+      await warm();
+      renamed = new Map([[OPS, "Operations Intelligence"]]);
+      const { summary, body } = await suggestOk({ text: "Ask OI." });
+      expect(body.suggestions.map((s: any) => [s.page, s.reason])).toEqual([
+        [
+          { uuid: OPS, title: "Operations Intelligence", renamed_from: "Operational Intelligence" },
+          "alias ‘OI’ of Operations Intelligence",
+        ],
+      ]);
+      expect(body.dropped_stale).toEqual([]);
+      expect(body.linked_text).toBe(`Ask ${ln(OPS)}.`);
+      expect(summary).toMatch(/; 1 renamed since the index was built, shown by its current title$/);
+    });
+
+    it("a read-back with no title keeps the suggestion as the index has it", async () => {
+      await warm();
+      blocksHandler = (request) => {
+        const ids = (new URL(request.url).searchParams.get("ids") ?? "").split(",");
+        return Response.json({ blocks: ids.map((uuid) => ({ uuid, kind: "page" })), missing: [] });
+      };
+      const { summary, body } = await suggestOk({ text: "Workflow Intelligence." });
+      expect(body.suggestions.map((s: any) => s.page)).toEqual([{ uuid: WI, title: "Workflow Intelligence" }]);
+      expect(body.dropped_stale).toEqual([]);
+      expect(summary).toMatch(/; 0 dropped as stale$/);
+    });
   });
 
   it("never suggests a page tagged private, which the index leaves out", async () => {
@@ -1593,6 +1714,21 @@ describe("suggest_links tool", () => {
       expect(relatedOf(body)).toEqual([["Head of Sales", 0.9]]);
       expect(body.dropped_stale).toEqual([{ uuid: MH, title: "Māori Health" }]);
       expect(body.linked_text).toBe(`Notes on ${ln(WI)}.`);
+    });
+
+    it("keeps a related page renamed since the index was built, with its current title and renamed_from (item 63b)", async () => {
+      await indexed(HOS, 0.9);
+      await indexed(MH, 0.8);
+      await warm();
+      renamed = new Map([[HOS, "Head of Revenue"]]);
+      const { summary, body } = await suggestOk({ text: "A note about hiring.", related: true });
+      expect(blockCalls()).toHaveLength(1);
+      expect(body.related).toEqual([
+        { page: { uuid: HOS, title: "Head of Revenue", renamed_from: "Head of Sales" }, similarity: 0.9, reason: "related by meaning" },
+        { page: { uuid: MH, title: "Māori Health" }, similarity: 0.8, reason: "related by meaning" },
+      ]);
+      expect(body.dropped_stale).toEqual([]);
+      expect(summary).toMatch(/; 2 related; 1 renamed since the index was built, shown by its current title$/);
     });
 
     it("verifies related pages when there is no suggestion, and verify: false reads nothing back", async () => {
