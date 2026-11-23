@@ -321,6 +321,168 @@ test("the Query-block refusal check fails when a refused call stored a block, or
   await assert.rejects((await queryCheck(refusal, queryStub({ log: () => console.error("x") })))(), /:rules: the refusal logged 1 time\(s\)/);
 });
 
+// Graph insights (patches 0051 to 0053, plan 2026-11-22 Stage 6)
+// =============================================================
+
+// What the release bundle answers for the insights fixture, as the checks read it.
+const INS = {
+  tagUuid: "00000000-0000-4000-8000-0000000000b1",
+  propertyIdent: "user.property/release-insight-author-Ab12",
+  page: "00000000-0000-4000-8000-0000000000b2",
+  broken: "00000000-0000-4000-8000-0000000000b3",
+  bare: "00000000-0000-4000-8000-0000000000b4",
+  authored: "00000000-0000-4000-8000-0000000000b5",
+  ghost: "00000000-0000-4000-8000-0000000000b6",
+  since: 1_763_000_000_000,
+};
+const ALL_CHECKS = [
+  "orphan-tags",
+  "orphan-properties",
+  "duplicate-titles",
+  "pages-without-summary",
+  "pages-without-tags",
+  "mismatched-choice-values",
+  "orphan-choices",
+  "broken-refs",
+  "missing-tag-properties",
+];
+const goodHealth = (from, checks = ["broken-refs", "missing-tag-properties"]) => {
+  const out = {};
+  for (const c of checks) out[c] = { count: 0, items: [] };
+  out["broken-refs"] = {
+    count: 1,
+    items: [{ uuid: INS.broken, kind: "block", title: `Release insight broken [[${INS.ghost}]]`, "page-id": INS.page, "page-title": "Release Insight Page", "target-uuid": INS.ghost, reason: "missing" }],
+  };
+  out["missing-tag-properties"] = {
+    count: 1,
+    items: [{ uuid: INS.bare, kind: "block", title: "Release insight bare book", "page-id": INS.page, tag: { uuid: INS.tagUuid, title: "Release Insight Book" }, missing: [{ ident: INS.propertyIdent, title: "release-insight-author" }] }],
+    pairs: [{ tag: { uuid: INS.tagUuid, title: "Release Insight Book" }, property: { ident: INS.propertyIdent, title: "release-insight-author" } }],
+    "pairs-from": from,
+  };
+  return { checks: out };
+};
+
+test("the insights fixture's names, the nine health checks, the default four and the env deploy would give the Worker", async () => {
+  const { INSIGHT, HEALTH_CHECKS, DEFAULT_HEALTH_CHECKS, insightEnv } = await import(script);
+  assert.deepEqual(INSIGHT, { tag: "Release Insight Book", property: "release-insight-author", page: "Release Insight Page" });
+  assert.deepEqual(HEALTH_CHECKS, ALL_CHECKS);
+  // Review s-stage-6-2: a call without checks runs only these four.
+  assert.deepEqual(DEFAULT_HEALTH_CHECKS, ["orphan-tags", "orphan-properties", "mismatched-choice-values", "orphan-choices"]);
+  const env = insightEnv();
+  assert.deepEqual(JSON.parse(env.HEALTH_TAG_PROPERTIES), [{ tag: "Release Insight Book", property: "release-insight-author" }]);
+  assert.equal(env.TIMEZONE, "UTC");
+});
+
+test("healthInsightErrors passes the broken ref and the bare book, and names each gap", async () => {
+  const { healthInsightErrors } = await import(script);
+  assert.deepEqual(healthInsightErrors(goodHealth("input"), INS, { from: "input", checks: ["broken-refs", "missing-tag-properties"] }), []);
+  assert.deepEqual(healthInsightErrors(goodHealth("settings", ALL_CHECKS), INS, { from: "settings", checks: ALL_CHECKS }), []);
+  assert.deepEqual(healthInsightErrors(goodHealth("settings", [...ALL_CHECKS].reverse()), INS, { from: "settings", checks: ALL_CHECKS }), [], "a map's keys come in any order");
+  const mutate = (f) => {
+    const b = goodHealth("input");
+    f(b.checks);
+    return healthInsightErrors(b, INS, { from: "input", checks: ["broken-refs", "missing-tag-properties"] });
+  };
+  const cases = [
+    [(c) => delete c["broken-refs"], /checks are \["missing-tag-properties"\], expected \["broken-refs","missing-tag-properties"\]/],
+    [(c) => (c.extra = { count: 0, items: [] }), /checks are .*"extra"/],
+    [(c) => (c["orphan-tags"] = { count: 0, items: [] }), /checks are \["broken-refs","missing-tag-properties","orphan-tags"\]/],
+    [(c) => (c["broken-refs"].items[0].reason = "in-recycle-bin"), /broken-refs: no item for .*b3 -> .*b6 \(missing\)/],
+    [(c) => (c["broken-refs"].items[0]["target-uuid"] = INS.bare), /broken-refs: no item for/],
+    [(c) => (c["broken-refs"].count = 2), /broken-refs: count 2 with 1 items/],
+    [(c) => (c["missing-tag-properties"].items[0].uuid = INS.authored), /missing-tag-properties: items .*b5.*, expected only .*b4/],
+    [(c) => (c["missing-tag-properties"].items[0].missing = []), /missing-tag-properties: .*b4 misses \[\], expected \["release-insight-author"\]/],
+    [(c) => (c["missing-tag-properties"].items[0].tag.title = "Other"), /missing-tag-properties: .*b4 under tag "Other"/],
+    [(c) => (c["missing-tag-properties"]["pairs-from"] = "none"), /pairs-from "none", expected "input"/],
+    [(c) => (c["missing-tag-properties"].pairs = []), /pairs \[\], expected one pair/],
+    [(c) => (c["missing-tag-properties"].count = 0), /missing-tag-properties: count 0 with 1 items/],
+  ];
+  for (const [f, error] of cases) {
+    const errors = mutate(f);
+    assert.ok(errors.length >= 1, `${f}: no error`);
+    assert.match(errors.join("; "), error, String(f));
+  }
+  assert.match(healthInsightErrors(undefined, INS, { from: "input", checks: ALL_CHECKS }).join(), /no checks in the answer/);
+});
+
+const goodChanges = () => ({
+  since: INS.since,
+  until: INS.since + 600_000,
+  "time-zone": "UTC",
+  pages: [
+    {
+      page: { uuid: INS.page, title: "Release Insight Page", kind: "page" },
+      "latest-updated-at": INS.since + 500,
+      "page-changed": true,
+      created: 3,
+      updated: 0,
+      blocks: [INS.authored, INS.bare, INS.broken].map((uuid, i) => ({ uuid, change: "created", "updated-at": INS.since + 500 - i, snippet: "x" })),
+    },
+  ],
+  recycled: 0,
+  "next-cursor": null,
+});
+
+test("changesInsightErrors passes the page with its three new blocks from an ISO local since, and names each gap", async () => {
+  const { changesInsightErrors } = await import(script);
+  assert.deepEqual(changesInsightErrors(goodChanges(), INS), []);
+  const cases = [
+    [(b) => (b.since = INS.since + 60_000), /since \d+, expected 1763000000000 \(the ISO local time in UTC\)/],
+    [(b) => (b["time-zone"] = "Pacific/Auckland"), /time-zone "Pacific\/Auckland", expected "UTC"/],
+    [(b) => delete b["next-cursor"], /next-cursor undefined, expected null on the last page/],
+    [(b) => (b.pages = []), /no page .*b2 among \[\]/],
+    [(b) => (b.pages[0].created = 2), /created 2, expected 3/],
+    [(b) => (b.pages[0].blocks = b.pages[0].blocks.slice(1)), /blocks \[.*\], expected .*b3.*b4.*b5/],
+    [(b) => (b.pages[0].blocks[0].change = "updated"), /change "updated" for .*b5, expected "created"/],
+    [(b) => (b.recycled = "0"), /recycled "0", expected a count/],
+  ];
+  for (const [f, error] of cases) {
+    const b = goodChanges();
+    f(b);
+    assert.match(changesInsightErrors(b, INS).join("; "), error, String(f));
+  }
+});
+
+const goodSchema = () => ({
+  tags: {
+    count: 2,
+    items: [
+      { uuid: INS.tagUuid, title: "Release Insight Book", extends: [], properties: [{ uuid: "p", ident: INS.propertyIdent, title: "release-insight-author" }], "object-count": 2 },
+      { uuid: "t", title: "Release Check Tag", extends: [], properties: [], "object-count": 0 },
+    ],
+  },
+  properties: {
+    count: 1,
+    items: [{ uuid: "p", ident: INS.propertyIdent, title: "release-insight-author", type: "default", cardinality: "one", choices: [], "value-count": 1, "used-by-tags": [{ uuid: INS.tagUuid, title: "Release Insight Book" }] }],
+  },
+});
+
+test("schemaInsightErrors passes the tag with its property and two objects and the property with one value, and names each gap", async () => {
+  const { schemaInsightErrors } = await import(script);
+  assert.deepEqual(schemaInsightErrors(goodSchema(), INS), []);
+  const cases = [
+    [(b) => delete b.properties, /properties: no section/],
+    [(b) => (b.tags.items = b.tags.items.slice(1)), /tags: no item titled "Release Insight Book"/],
+    [(b) => (b.tags.items[0]["object-count"] = 3), /object-count 3, expected 2/],
+    [(b) => (b.tags.items[0].properties = []), /tag properties \[\], expected \["release-insight-author"\]/],
+    [(b) => (b.properties.items[0]["value-count"] = 0), /value-count 0, expected 1/],
+    [(b) => (b.properties.items[0]["used-by-tags"] = []), /used-by-tags \[\], expected \["Release Insight Book"\]/],
+    [(b) => (b.properties.items[0].type = undefined), /type undefined, expected "default"/],
+    [(b) => (b.tags.count = "2"), /tags: count "2"/],
+  ];
+  for (const [f, error] of cases) {
+    const b = goodSchema();
+    f(b);
+    assert.match(schemaInsightErrors(b, INS).join("; "), error, String(f));
+  }
+});
+
+test("isoLocalMinute writes a UTC minute with no offset, a minute before the time given, and its epoch ms", async () => {
+  const { isoLocalMinute } = await import(script);
+  assert.deepEqual(isoLocalMinute(Date.UTC(2026, 10, 22, 9, 30, 45, 123)), { iso: "2026-11-22T09:29", ms: Date.UTC(2026, 10, 22, 9, 29) });
+  assert.deepEqual(isoLocalMinute(Date.UTC(2026, 0, 1, 0, 0, 5)), { iso: "2025-12-31T23:59", ms: Date.UTC(2025, 11, 31, 23, 59) });
+});
+
 test("exits 2 naming the missing bundle", () => {
   const dir = mkdtempSync(join(tmpdir(), "rqc-test-"));
   try {
@@ -332,7 +494,7 @@ test("exits 2 naming the missing bundle", () => {
   }
 });
 
-test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, answers a decision 180 levels down, at scale answers every named query and stops every F1 shape in time without logging a scan-cap refusal, and makes, reads back and refuses Query blocks", { skip, timeout: 600_000 }, () => {
+test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, answers a decision 180 levels down, at scale answers every named query and stops every F1 shape in time without logging a scan-cap refusal, makes, reads back and refuses Query blocks, and answers the health, change-feed and schema reads", { skip, timeout: 600_000 }, () => {
   const before = leftovers();
   const r = spawnSync(process.execPath, [script, upstream], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -356,6 +518,12 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "Query blocks: the Book fence and a query field insert through the release bundle, logging nothing",
     "Query blocks: both read back with the Query tag, the query text, :code, clojure and the marker",
     "Query blocks: a :rules query and a rule call are refused naming the node, store nothing and log nothing",
+    "graph insights: seed a tag with an expected property, two tagged blocks and a broken ref through SyncDO.fetch",
+    "graph insights: checks=broken-refs,missing-tag-properties with tag-properties answers the broken ref and the bare book",
+    "graph insights: the default health call runs the four cheap checks",
+    "graph insights: missing-tag-properties named alone checks the stored HEALTH_TAG_PROPERTIES pairs",
+    "graph insights: list_changes_since from an ISO local time lists the page's three new blocks",
+    "graph insights: get_graph_schema lists the tag with its property and objects, and the property with its value",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }

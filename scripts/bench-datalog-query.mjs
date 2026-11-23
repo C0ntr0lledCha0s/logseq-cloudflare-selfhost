@@ -102,7 +102,7 @@ export const BODIES = {
 };
 
 /** A small seeded PRNG (mulberry32), so the fixture is the same on every run. */
-function prng(seed) {
+export function prng(seed) {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
