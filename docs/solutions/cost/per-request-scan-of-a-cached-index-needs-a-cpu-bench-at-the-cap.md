@@ -5,6 +5,7 @@ tags: [cpu, 10ms, worker, cold-start, kb-index, suggest_links, bench, json-parse
 seen:
   - 2026-11-08 – item 22 (suggest_links), review rounds 1 and 2 (r1-light-1, still open at the end, left to the backlog)
   - 2026-11-09 – item 40 (datalog_query), stages 3 and 4: the bench at 5,000 pages showed a join-fan-out shape (7,034 datoms scanned) costing more than one that scanned the full 20,000, and a named query hit the scan cap only with thousands of filler blocks; see api/a-scan-cap-alone-does-not-bound-a-caller-supplied-query.md
+  - 2026-11-23 – item 50 (health, changes and schema reads): the spec estimated under 300 ms for default health at 5,000 pages; the bench, run only in the last build stage, showed 1.5 to 2.9 s at 5,000 and 6.4 to 12.4 s at 20,000 (x1.65 applied), and seven of ten figures passed 1 s
 promoted_to: ["REVIEW.md"]
 ---
 
@@ -33,3 +34,6 @@ Review round 1 made the matcher rule titles out by hashed first-word and first-t
 - Treat the first call in a fresh isolate as its own number. A warm median hides it.
 - Prefer moving work to the cron (pre-tokenise, pre-group) over trimming the request path.
 - Tool text must state the limits the bench supports (input size, page count), not the ones the code merely allows.
+- Put the bench in the first build stage, on the first handler, not the last stage after all three routes are built. In item 50 the caps and the estimate were fixed in the spec, three patches were built on them, and the bench then failed the stop condition with no cheap way back. A spec estimate of a scan's CPU is a guess until a bench has run (it was 20 to 40 times low).
+- Item 50 figures to size against: a default `get_graph_health` (every check scans titles and datoms) cost about 12 s cold and 6.6 s warm at 20,000 pages, `broken-refs` about 6 s, a 20,000-change `list_changes_since` about 4.5 s, and `get_graph_schema` stayed under 650 ms. All sit under the Durable Object's roughly 30 s limit (`durable-object-cpu-limit-on-free.md`) but far above 1 s. The cap, the default check set or an index is a decision for the owner, and it was held open (README Backlog item 32).
+- When a stage's done_when says to stop if a figure passes a line, the stage does not commit as done. The stage checker caught this one (s-stage-6-2), and it stayed open through every review round because it needs the owner.
