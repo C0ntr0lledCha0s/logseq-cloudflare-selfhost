@@ -198,10 +198,11 @@ test("the Deploy step passes DB_SYNC_ALLOWED_USERS and no other step does", () =
   assert.equal(others.length, 1, others.join("\n"));
 });
 
-// Review r1-light-1: the owner's expected tag-property pairs live in a GitHub variable, not in the
-// committed settings.json, so the merge-triggered deploy must hand it to render-wrangler.
-test("the Deploy step passes the HEALTH_TAG_PROPERTIES variable and no other step does", () => {
-  const line = "          HEALTH_TAG_PROPERTIES: ${{ vars.HEALTH_TAG_PROPERTIES }}";
+// Review r1-light-1: the owner's expected tag-property pairs live in GitHub, not in the committed
+// settings.json, so the merge-triggered deploy must hand them to render-wrangler. Reviews r2-light-1
+// and r2-correctness-1: a secret, not a variable, so Actions masks it in the run log.
+test("the Deploy step passes the HEALTH_TAG_PROPERTIES secret and no other step does", () => {
+  const line = "          HEALTH_TAG_PROPERTIES: ${{ secrets.HEALTH_TAG_PROPERTIES }}";
   assert.ok(step("Deploy").includes(line));
   assert.equal(workflow.split("\n").filter((l) => l.includes("HEALTH_TAG_PROPERTIES")).length, 1);
 });

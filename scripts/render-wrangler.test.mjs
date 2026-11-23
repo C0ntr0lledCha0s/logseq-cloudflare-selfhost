@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "smol-toml";
-import { renderWrangler } from "./render-wrangler.mjs";
+import { healthTagPropertiesSecret, renderWrangler } from "./render-wrangler.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const fixture = readFileSync(
@@ -110,36 +110,44 @@ test("an unknown or blank timeZone throws", () => {
   }
 });
 
-test("health.expectedTagProperties becomes the HEALTH_TAG_PROPERTIES var, JSON-encoded", () => {
-  assert.equal(render().vars.HEALTH_TAG_PROPERTIES, "[]", "the committed default: no pairs");
-  const pairs = [{ tag: "zz Book", property: "zz author" }, { tag: "zz Book", property: "user.property/rating" }];
-  const rendered = render({ settings: { ...settings, health: { expectedTagProperties: pairs } } }).vars;
-  assert.deepEqual(JSON.parse(rendered.HEALTH_TAG_PROPERTIES), pairs);
-  assert.equal(rendered.TIMEZONE, "Pacific/Auckland", "the other vars are kept");
-  const fifty = Array.from({ length: 50 }, (_, i) => ({ tag: "zz Book", property: `zz p${i}` }));
+// Reviews r2-tests-3, r2-correctness-1 and r2-light-1: wrangler deploy prints every [vars] value in
+// the public run log, so the pairs are a Worker secret (healthTagPropertiesSecret), never a var.
+test("HEALTH_TAG_PROPERTIES is never a [vars] entry", () => {
+  const pairs = [{ tag: "zz Book", property: "zz author" }];
+  assert.equal("HEALTH_TAG_PROPERTIES" in render().vars, false, "the committed settings");
   assert.equal(
-    JSON.parse(render({ settings: { ...settings, health: { expectedTagProperties: fifty } } }).vars.HEALTH_TAG_PROPERTIES).length,
-    50,
-    "50 pairs is the cap, and allowed",
+    "HEALTH_TAG_PROPERTIES" in render({ settings: { ...settings, health: { expectedTagProperties: pairs } } }).vars,
+    false,
+    "settings.json pairs",
   );
   assert.equal(
-    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings }).vars.HEALTH_TAG_PROPERTIES,
-    "[]",
-    "upstream with no [vars] table still gets it",
+    "HEALTH_TAG_PROPERTIES" in render({ upstreamToml: withVar(`HEALTH_TAG_PROPERTIES = '${JSON.stringify(pairs)}'`) }).vars,
+    false,
+    "nor one carried over from upstream",
   );
+  assert.equal(render().vars.TIMEZONE, "Pacific/Auckland", "the other vars are kept");
 });
 
-test("an absent health.expectedTagProperties writes no HEALTH_TAG_PROPERTIES var", () => {
+function secret(over = {}) {
+  return JSON.parse(healthTagPropertiesSecret({ settings, ...over }));
+}
+
+test("health.expectedTagProperties becomes the HEALTH_TAG_PROPERTIES secret, JSON-encoded", () => {
+  assert.deepEqual(secret(), [], "the committed default: no pairs");
+  const pairs = [{ tag: "zz Book", property: "zz author" }, { tag: "zz Book", property: "user.property/rating" }];
+  assert.deepEqual(secret({ settings: { ...settings, health: { expectedTagProperties: pairs } } }), pairs);
+  const fifty = Array.from({ length: 50 }, (_, i) => ({ tag: "zz Book", property: `zz p${i}` }));
+  assert.equal(secret({ settings: { ...settings, health: { expectedTagProperties: fifty } } }).length, 50,
+    "50 pairs is the cap, and allowed");
+  const extra = [{ tag: "zz Book", property: "zz author", note: "dropped" }];
+  assert.deepEqual(secret({ settings: { ...settings, health: { expectedTagProperties: extra } } }),
+    [{ tag: "zz Book", property: "zz author" }], "only tag and property are kept");
+});
+
+test("an absent health.expectedTagProperties sends [] so a deploy clears the Worker's old pairs", () => {
   const { health: _omit, ...withoutHealth } = settings;
-  assert.equal("HEALTH_TAG_PROPERTIES" in render({ settings: withoutHealth }).vars, false, "no health key");
-  assert.equal("HEALTH_TAG_PROPERTIES" in render({ settings: { ...withoutHealth, health: {} } }).vars, false,
-    "health without expectedTagProperties");
-  const { timeZone: _zone, ...bare } = withoutHealth;
-  assert.equal(
-    render({ upstreamToml: fixture.replace(/\[vars\][^[]*/, ""), settings: bare }).vars,
-    undefined,
-    "absent adds no [vars] table",
-  );
+  assert.deepEqual(secret({ settings: withoutHealth }), [], "no health key");
+  assert.deepEqual(secret({ settings: { ...withoutHealth, health: {} } }), [], "health without expectedTagProperties");
 });
 
 test("a malformed health.expectedTagProperties throws naming the entry", () => {
@@ -158,40 +166,35 @@ test("a malformed health.expectedTagProperties throws naming the entry", () => {
   ];
   for (const [expectedTagProperties, message] of cases) {
     assert.throws(
-      () => render({ settings: { ...settings, health: { expectedTagProperties } } }),
+      () => secret({ settings: { ...settings, health: { expectedTagProperties } } }),
       (error) => error.message === message,
       `${JSON.stringify(expectedTagProperties).slice(0, 60)} -> ${message}`,
     );
   }
-  assert.throws(() => render({ settings: { ...settings, health: [] } }), /settings\.health must be an object/);
+  assert.throws(() => secret({ settings: { ...settings, health: [] } }), /settings\.health must be an object/);
 });
 
 // Review r1-light-1: CI renders from the committed settings.json, whose default must stay [] in a
-// public repo, so the owner's pairs come from the HEALTH_TAG_PROPERTIES GitHub variable instead.
-test("a HEALTH_TAG_PROPERTIES variable replaces settings.health.expectedTagProperties", () => {
+// public repo, so the owner's pairs come from the HEALTH_TAG_PROPERTIES GitHub secret instead.
+test("a HEALTH_TAG_PROPERTIES GitHub secret replaces settings.health.expectedTagProperties", () => {
   const pairs = [{ tag: "zz Book", property: "zz author" }];
-  const fromVariable = render({ healthTagProperties: JSON.stringify(pairs) }).vars;
-  assert.deepEqual(JSON.parse(fromVariable.HEALTH_TAG_PROPERTIES), pairs, "over the committed []");
+  assert.deepEqual(secret({ healthTagProperties: JSON.stringify(pairs) }), pairs, "over the committed []");
   const { health: _omit, ...withoutHealth } = settings;
-  assert.deepEqual(
-    JSON.parse(render({ settings: withoutHealth, healthTagProperties: JSON.stringify(pairs) }).vars.HEALTH_TAG_PROPERTIES),
-    pairs,
-    "and with no health key at all",
-  );
-  assert.equal(render({ healthTagProperties: "[]" }).vars.HEALTH_TAG_PROPERTIES, "[]", "[] is a value: no pairs");
+  assert.deepEqual(secret({ settings: withoutHealth, healthTagProperties: JSON.stringify(pairs) }), pairs,
+    "and with no health key at all");
+  assert.deepEqual(secret({ healthTagProperties: "[]" }), [], "[] is a value: no pairs");
   for (const unset of [undefined, "", "  "]) {
     const settingsPairs = [{ tag: "zz Novel", property: "zz series" }];
     assert.deepEqual(
-      JSON.parse(render({ settings: { ...settings, health: { expectedTagProperties: settingsPairs } }, healthTagProperties: unset })
-        .vars.HEALTH_TAG_PROPERTIES),
+      secret({ settings: { ...settings, health: { expectedTagProperties: settingsPairs } }, healthTagProperties: unset }),
       settingsPairs,
-      `an unset or blank variable (${JSON.stringify(unset)}) leaves settings.json in charge`,
+      `an unset or blank secret (${JSON.stringify(unset)}) leaves settings.json in charge`,
     );
   }
 });
 
-test("a malformed HEALTH_TAG_PROPERTIES variable throws naming it and the entry", () => {
-  const key = "the HEALTH_TAG_PROPERTIES variable";
+test("a malformed HEALTH_TAG_PROPERTIES secret throws naming it and the entry", () => {
+  const key = "the HEALTH_TAG_PROPERTIES secret";
   const cases = [
     ["not json", `${key} is not JSON`],
     [JSON.stringify({ tag: "zz Book", property: "zz author" }), `${key} must be an array`],
@@ -200,7 +203,7 @@ test("a malformed HEALTH_TAG_PROPERTIES variable throws naming it and the entry"
     [JSON.stringify([{ tag: "zz Book", property: "zz author" }, "zz Book/zz author"]), `${key}[1] must be an object with tag and property`],
   ];
   for (const [healthTagProperties, message] of cases) {
-    assert.throws(() => render({ healthTagProperties }), (error) => error.message === message, message);
+    assert.throws(() => secret({ healthTagProperties }), (error) => error.message === message, message);
   }
 });
 

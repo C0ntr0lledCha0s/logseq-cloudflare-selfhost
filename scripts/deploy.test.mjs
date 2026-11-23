@@ -6,6 +6,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse } from "smol-toml";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const script = join(root, "scripts", "deploy.sh");
@@ -48,6 +49,7 @@ async function runDeploy(env, { apiBase = "http://127.0.0.1:1", users = [] } = {
     copyFileSync(join(root, "scripts", "fixtures", "upstream-wrangler.toml"), join(upstream, "deps", "db-sync", "worker", "wrangler.toml"));
     const log = join(dir, "wrangler.log");
     const secrets = join(dir, "secrets.json");
+    const renderedToml = join(dir, "rendered.toml");
 
     const wrangler = join(upstream, "deps", "db-sync", "node_modules", ".bin", "wrangler");
     writeFileSync(
@@ -59,6 +61,7 @@ if [ "$1" = deploy ]; then
     [ "$1" = --secrets-file ] && cp "$2" "$WRANGLER_SECRETS"
     shift
   done
+  cp wrangler.toml "$WRANGLER_TOML"
 fi
 `,
     );
@@ -86,6 +89,8 @@ fi
           ALLOWED_USERS_API_BASE: apiBase,
           WRANGLER_LOG: log,
           WRANGLER_SECRETS: secrets,
+          WRANGLER_TOML: renderedToml,
+          HEALTH_TAG_PROPERTIES: "",
           ...env,
         },
       });
@@ -100,6 +105,7 @@ fi
       ...result,
       calls: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : null,
       secrets: existsSync(secrets) ? JSON.parse(readFileSync(secrets, "utf8")) : null,
+      toml: existsSync(renderedToml) ? parse(readFileSync(renderedToml, "utf8")) : null,
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -121,14 +127,42 @@ test("refuses an empty list", { timeout: 60000 }, async () => {
   assert.equal(r.calls, null);
 });
 
-test("deploys code and all three secrets together", { timeout: 60000 }, async () => {
+test("deploys code and all the secrets together", { timeout: 60000 }, async () => {
   await withApiStub([{ id: A, email: null, username: null, graphs: 1 }], async (apiBase) => {
     const r = await runDeploy({ DB_SYNC_ALLOWED_USERS: `  ${A}\n` }, { apiBase });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.deepEqual(r.calls, ["d1 migrations apply logseq-sync-index --remote", "deploy --secrets-file <path>"]);
-    assert.deepEqual(r.secrets, { ASSET_LINK_SECRET: "asset-secret", DB_SYNC_ADMIN_TOKEN: "admin-token", DB_SYNC_ALLOWED_USERS: A });
+    assert.deepEqual(r.secrets, {
+      ASSET_LINK_SECRET: "asset-secret", DB_SYNC_ADMIN_TOKEN: "admin-token", DB_SYNC_ALLOWED_USERS: A,
+      HEALTH_TAG_PROPERTIES: "[]",
+    }, "with no HEALTH_TAG_PROPERTIES secret, the committed settings.json pairs ([]) go up as the secret");
     assert.ok(!r.calls.some((call) => call.includes("secret bulk")));
     assert.ok(!existsSync(join(root, "tofu-output.json")));
+  });
+});
+
+// Reviews r2-tests-1, r2-tests-3, r2-correctness-1 and r2-light-1: the owner's tag-property pairs
+// reach the Worker only through deploy.sh's environment, and wrangler deploy prints every [vars] value
+// (the first 37 characters) in the public run log, so they go up in the secrets file, which it lists
+// as "(hidden)", and never in [vars].
+test("HEALTH_TAG_PROPERTIES goes up in the secrets file, never as a [vars] entry", { timeout: 60000 }, async () => {
+  const pairs = [{ tag: "zz Medical", property: "zz doctor" }, { tag: "zz Book", property: "zz author" }];
+  await withApiStub([{ id: A, email: null, username: null, graphs: 1 }], async (apiBase) => {
+    const set = await runDeploy({ HEALTH_TAG_PROPERTIES: JSON.stringify(pairs) }, { apiBase });
+    assert.equal(set.status, 0, set.stdout + set.stderr);
+    assert.deepEqual(JSON.parse(set.secrets.HEALTH_TAG_PROPERTIES), pairs, "the environment's pairs, over settings.json's []");
+    assert.equal("HEALTH_TAG_PROPERTIES" in (set.toml.vars ?? {}), false, "not a plain-text var");
+    assert.ok(!(set.stdout + set.stderr).includes("zz Medical"), "the tag name is not printed");
+
+    const unset = await runDeploy({}, { apiBase });
+    assert.equal(unset.status, 0, unset.stdout + unset.stderr);
+    assert.equal(unset.secrets.HEALTH_TAG_PROPERTIES, "[]", "settings.json's pairs when the environment has none");
+    assert.equal("HEALTH_TAG_PROPERTIES" in (unset.toml.vars ?? {}), false);
+
+    const malformed = await runDeploy({ HEALTH_TAG_PROPERTIES: "not json" }, { apiBase });
+    assert.notEqual(malformed.status, 0);
+    assert.match(malformed.stderr, /the HEALTH_TAG_PROPERTIES secret is not JSON/);
+    assert.equal(malformed.calls, null, "refused before any wrangler call");
   });
 });
 

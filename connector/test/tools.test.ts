@@ -2894,7 +2894,7 @@ describe("get_graph_health and broken refs", () => {
   it("connector_help names the broken-refs check, its reasons and the Private-target rule", async () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      "broken refs (broken-refs: a block or page whose text links, as [[uuid]] or ((uuid)), a uuid with no entity, reason missing, or one in the Recycle bin, reason in-recycle-bin; a property value's link is reported as the block holding it, and a link to Private content isn't listed)",
+      "broken refs (broken-refs: a block or page whose text links, as [[uuid]] or ((uuid)), a uuid with no entity, reason missing, or one in the Recycle bin, reason in-recycle-bin; a property value's link is reported as the block holding it, a link to Private content isn't listed, and code isn't scanned: a code or math block, an inline code span and a fenced block hold no links)",
     );
   });
 
@@ -2923,7 +2923,7 @@ describe("get_graph_health and missing tag properties", () => {
       "with no pairs it lists nothing and its note says so",
       "is refused naming the entry",
       // Review r1-light-1 and r1-integrity-1: where the stored pairs live, and that they serve every graph.
-      "the HEALTH_TAG_PROPERTIES GitHub variable",
+      "the HEALTH_TAG_PROPERTIES GitHub secret",
       "a stored pair that doesn't resolve in this graph is skipped and named under skipped",
     ]) {
       expect(help, phrase).toContain(phrase);
@@ -2945,7 +2945,7 @@ describe("get_graph_health and missing tag properties", () => {
       "health.expectedTagProperties",
       "pairs-from: input, settings or none",
       "tag-properties without the missing-tag-properties check is refused",
-      "the HEALTH_TAG_PROPERTIES GitHub variable",
+      "the HEALTH_TAG_PROPERTIES GitHub secret",
       "a stored pair that doesn't resolve in this graph is skipped",
     ]) {
       expect(tool.description, phrase).toContain(phrase);

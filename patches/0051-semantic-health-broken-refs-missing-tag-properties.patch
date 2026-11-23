@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
-index 7ed17ad..2719701 100644
+index 7ed17ad..5caba9c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/graph_insights.cljs
 @@ -9,6 +9,7 @@
@@ -10,7 +10,7 @@ index 7ed17ad..2719701 100644
              [logseq.db.frontend.class :as db-class]
              [logseq.db.frontend.entity-util :as entity-util]
              [logseq.db.frontend.property :as db-property]))
-@@ -280,3 +281,93 @@
+@@ -280,3 +281,110 @@
                                         :property (d/entity db property-id)
                                         :value (d/entity db (:v datom))
                                         :reason reason})))))))))))
@@ -20,6 +20,22 @@ index 7ed17ad..2719701 100644
 +  holds) or ((uuid)) (a block ref, stored as typed), in any case. Group 1 or 2 is the uuid."
 +  (re-pattern (str "(?i)\\[\\[(" common-util/uuid-pattern ")\\]\\]"
 +                   "|\\(\\((" common-util/uuid-pattern ")\\)\\)")))
++
++(def ^:private code-span-pattern
++  "Code in a title: a run of backticks to the next run of the same length (an inline span, or a fenced
++  block in a text block), as markdown reads it. An unclosed run is text."
++  #"(`+)[\s\S]*?\1")
++
++(def ^:private code-display-types
++  "Display types whose title is code, not text: the app resolves no refs in them."
++  #{:code :math})
++
++(defn- ref-text
++  "The part of a title that can hold refs: nothing for a code or math block, else the title without
++  its code spans."
++  [db e title]
++  (when-not (contains? code-display-types (attr-value db e :logseq.property.node/display-type))
++    (string/replace title code-span-pattern " ")))
 +
 +(defn- recycled-id?
 +  "The entity or one of its parents is in the Recycle bin."
@@ -36,13 +52,14 @@ index 7ed17ad..2719701 100644
 +  itself or through a parent (\"in-recycle-bin\"), as {:holder :target-uuid :reason}, one per holder
 +  and target. A property value block's ref belongs to its owner. Holders in `private`
 +  (datalog/private-ids), hidden or built-in are not scanned, and a target in `private` that isn't in
-+  the bin is not listed: it exists, so it isn't missing. Titles are matched first, so only titles that
-+  hold a ref cost an entity walk."
++  the bin is not listed: it exists, so it isn't missing. Code holds no refs: a code or math block's
++  title and the code spans in other titles are not scanned (ref-text). Titles are matched first, so
++  only titles that hold a ref cost an entity walk."
 +  [db private]
 +  (->> (d/datoms db :aevt :block/title)
 +       (mapcat (fn [{:keys [e v]}]
 +                 (when (string? v)
-+                   (when-let [targets (seq (re-seq ref-pattern v))]
++                   (when-let [targets (and (re-find ref-pattern v) (some->> (ref-text db e v) (re-seq ref-pattern) seq))]
 +                     (let [holder (if (value-block-property db e) (attr-value db e :block/parent) e)]
 +                       (when-not (or (nil? holder) (contains? private holder)
 +                                     (built-in-id? db holder) (hidden-id? db holder))
@@ -105,7 +122,7 @@ index 7ed17ad..2719701 100644
 +                                  (when-let [missing (seq (filter #(missing? object-id (:db/ident %)) properties))]
 +                                    {:holder (d/entity db object-id) :tag tag :missing (vec missing)}))))))))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index d22c921..6d8c121 100644
+index d22c921..85edf44 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -5504,7 +5504,125 @@
@@ -120,28 +137,28 @@ index d22c921..6d8c121 100644
 +  50)
 +
 +;; missing-tag-properties checks only the tag-property pairs the owner expects to be filled: the
-+;; tag-properties input, else the Worker's HEALTH_TAG_PROPERTIES variable, which render-wrangler.mjs
-+;; writes from the HEALTH_TAG_PROPERTIES GitHub variable or config/settings.json
++;; tag-properties input, else the Worker's HEALTH_TAG_PROPERTIES secret, which deploy.sh sends from
++;; the HEALTH_TAG_PROPERTIES GitHub secret or config/settings.json
 +;; health.expectedTagProperties. Each pair is resolved before any check runs. A bad input pair
 +;; refuses the call naming its entry. The stored pairs serve every graph on the Worker, so a stored
 +;; pair that doesn't resolve in this graph is skipped and named under skipped instead; a malformed
-+;; variable still refuses.
++;; stored value still refuses.
 +
 +(def ^:private tag-property-sources
 +  {:input {:name "tag-properties" :min 1}
 +   :settings {:name "HEALTH_TAG_PROPERTIES"
-+              :source "(set from a GitHub variable or config/settings.json health.expectedTagProperties)"
++              :source "(set from a GitHub secret or config/settings.json health.expectedTagProperties)"
 +              :min 0}})
 +
 +(def ^:private no-tag-property-pairs-note
-+  (str "no expected tag-property pairs: pass tag-properties, or set the HEALTH_TAG_PROPERTIES GitHub variable"
++  (str "no expected tag-property pairs: pass tag-properties, or set the HEALTH_TAG_PROPERTIES GitHub secret"
 +       " or health.expectedTagProperties in config/settings.json"))
 +
 +(def ^:private all-stored-pairs-skipped-note
 +  "no stored tag-property pair applies to this graph (see skipped): pass tag-properties for this graph")
 +
 +(defn- tag-property-label
-+  "`tag-properties`, `tag-properties[1]`, or the stored variable's name with the setting it comes from."
++  "`tag-properties`, `tag-properties[1]`, or the stored secret's name with the setting it comes from."
 +  [{:keys [source] :as label} index]
 +  (str (:name label) (when index (str "[" index "]")) (when source (str " " source))))
 +
@@ -324,7 +341,7 @@ index d22c921..6d8c121 100644
 -            (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor}]
 -              (http/json-response nil {:checks (into {} (map (fn [check] [check (health-check db check options)]))
 -                                                     checks)}))))
-+            ;; The pairs are read only when their check runs, so a malformed stored variable doesn't
++            ;; The pairs are read only when their check runs, so a malformed stored value doesn't
 +            ;; stop the other checks.
 +            (let [tag-properties (when (some #{"missing-tag-properties"} checks)
 +                                   (expected-tag-properties self url db))]
@@ -338,7 +355,7 @@ index d22c921..6d8c121 100644
          :semantic/knowledge-index
          (let [excluded (set (map string/lower-case (comma-list url "exclude-tags")))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index cbf0844..e1acfcf 100644
+index cbf0844..eb0f05f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -167,7 +167,7 @@
@@ -346,7 +363,7 @@ index cbf0844..e1acfcf 100644
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
 -   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
-+   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists) and missing-tag-properties (objects tagged with a tag, or with a tag that extends it, that hold no value for one of that tag's expected properties or hold Logseq's empty placeholder for it, in holder order; each item names the holder, its page, the tag and the missing properties by ident and title, one per object and tag). missing-tag-properties checks only the expected tag-property pairs: tag-properties, a JSON array of 1 to 50 pairs {\"tag\": …, \"property\": …} (each a UUID, ident or title), or, when it is not given, the stored pairs in the Worker's HEALTH_TAG_PROPERTIES variable, set from the HEALTH_TAG_PROPERTIES GitHub variable or config/settings.json health.expectedTagProperties. Each pair's tag must be a user tag and its property a user property that the tag, or a tag it extends, lists and that has no default value; any other tag-properties pair is refused with 400 naming its entry (tag-properties[N]) and the reason, and nothing is checked. The stored pairs serve every graph on the Worker, so a stored pair that doesn't resolve in this graph is skipped, not refused: skipped names each one by its entry (HEALTH_TAG_PROPERTIES[N]) and reason, and the other pairs are checked. A malformed stored variable is refused with 400. The stored pairs are read only when the check runs. With no pairs the check lists nothing and answers a note saying how to give them. Its result names the pairs it checked (pairs, each tag's uuid and title and the property's ident and title) and where they came from (pairs-from: input, settings or none). tag-properties without the missing-tag-properties check is refused. Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
++   "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed) and broken-refs (blocks and pages whose title refers, as [[uuid]], #[[uuid]] or ((uuid)), to a uuid with no entity, reason missing, or to one in the Recycle bin itself or through its page, reason in-recycle-bin, in holder order; each item names the holder, its page, target-uuid and reason, one per holder and target, and a property value's ref is reported as the block that holds the value; a ref to Private content is not listed, since its target exists, and code holds no refs: a code or math block, an inline code span and a fenced block are not scanned) and missing-tag-properties (objects tagged with a tag, or with a tag that extends it, that hold no value for one of that tag's expected properties or hold Logseq's empty placeholder for it, in holder order; each item names the holder, its page, the tag and the missing properties by ident and title, one per object and tag). missing-tag-properties checks only the expected tag-property pairs: tag-properties, a JSON array of 1 to 50 pairs {\"tag\": …, \"property\": …} (each a UUID, ident or title), or, when it is not given, the stored pairs in the Worker's HEALTH_TAG_PROPERTIES secret, set from the HEALTH_TAG_PROPERTIES GitHub secret or config/settings.json health.expectedTagProperties. Each pair's tag must be a user tag and its property a user property that the tag, or a tag it extends, lists and that has no default value; any other tag-properties pair is refused with 400 naming its entry (tag-properties[N]) and the reason, and nothing is checked. The stored pairs serve every graph on the Worker, so a stored pair that doesn't resolve in this graph is skipped, not refused: skipped names each one by its entry (HEALTH_TAG_PROPERTIES[N]) and reason, and the other pairs are checked. A malformed stored value is refused with 400. The stored pairs are read only when the check runs. With no pairs the check lists nothing and answers a note saying how to give them. Its result names the pairs it checked (pairs, each tag's uuid and title and the property's ident and title) and where they came from (pairs-from: input, settings or none). tag-properties without the missing-tag-properties check is refused. Private content and the Recycle bin are left out of every check; a tag or property used only by Private objects is in use. created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
@@ -794,10 +811,10 @@ index 0000000..0a63ce9
 +          (p/finally done)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
 new file mode 100644
-index 0000000..0692ba1
+index 0000000..3b17a23
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_refs_test.cljs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,343 @@
 +(ns logseq.db-sync.semantic-graph-health-refs-test
 +  "getGraphHealth's broken-refs check (patch 0051): every visible block or page whose stored title
 +  refers to a uuid, as [[uuid]] (which a #[[uuid]] tag holds) or ((uuid)), that has no entity
@@ -1038,6 +1055,40 @@ index 0000000..0692ba1
 +          (is (= expected found) "exactly the expected items")
 +          (is (= (count expected) (:count check) (count (:items check)))))))))
 +
++;; Review r2-integrity-1: code text holds no refs (the app resolves none from it), so a [[uuid]] or
++;; ((uuid)) quoted in a code or math block, an inline code span or a fenced block is not listed. The
++;; same forms outside code (in a quote block, after a closed span, after an unclosed backtick) are.
++(deftest broken-refs-code-text-test
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                {:keys [page! insert!]} (writer self)
++                page (page! "zz Code")
++                [ghost ghost-quote ghost-after ghost-stray] (repeatedly 4 random-uuid)
++                [code-block math-block inline-block double-block fenced-block quote-block after-block stray-block]
++                (insert! page [{:title (str "(page " (ref ghost) ")") :display-type "code" :lang "clojure"}
++                               {:title (str "\\text{" (block-ref ghost) "}") :display-type "math"}
++                               {:title (str "zz inline `" (block-ref ghost) "` example")}
++                               {:title (str "zz double ``" (ref ghost) " with ` inside`` span")}
++                               {:title (str "zz fenced\n```clojure\n(page " (ref ghost) ")\n```")}
++                               {:title (str "zz quoted " (ref ghost-quote)) :display-type "quote"}
++                               {:title (str "zz after `code` then " (ref ghost-after))}
++                               {:title (str "zz stray ` then " (block-ref ghost-stray))}])
++                check (check! self)]
++          (is (= :code (:logseq.property.node/display-type (d/entity @conn [:block/uuid code-block]))))
++          (is (= :math (:logseq.property.node/display-type (d/entity @conn [:block/uuid math-block]))))
++          (doseq [[holder label] [[code-block "a code block"] [math-block "a math block"]
++                                  [inline-block "an inline code span"] [double-block "a double-backtick span"]
++                                  [fenced-block "a fenced block in a text block"]]]
++            (is (not (contains? (holders check) (str holder))) (str label " holds no ref")))
++          (is (= #{[quote-block ghost-quote "missing"] [after-block ghost-after "missing"]
++                   [stray-block ghost-stray "missing"]}
++                 (triples check))
++              "a quote block's text, text after a closed span and after an unclosed backtick are scanned")
++          (is (= 3 (:count check))))
++        (p/catch #(is false (str % "\n" (.-stack %))))
++        (p/finally done))))
++
 +(deftest broken-refs-paging-test
 +  (async done
 +    (-> (p/let [conn (sqlite-export/create-conn)
@@ -1104,18 +1155,20 @@ index 0000000..0692ba1
 +        checks (first (filter #(= "checks" (:name %)) (:parameters operation)))]
 +    (is (string/includes? (:description operation) "broken-refs (blocks and pages whose title refers"))
 +    (is (every? #(string/includes? (:description operation) %) ["reason missing" "reason in-recycle-bin" "target-uuid"]))
++    (is (string/includes? (:description operation) "code holds no refs: a code or math block, an inline code span and a fenced block are not scanned")
++        "review r2-integrity-1")
 +    (is (string/includes? (:description checks) "orphan-choices, broken-refs, missing-tag-properties. Defaults to all"))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_health_tag_properties_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_tag_properties_test.cljs
 new file mode 100644
-index 0000000..6124c5d
+index 0000000..3601022
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_health_tag_properties_test.cljs
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,552 @@
 +(ns logseq.db-sync.semantic-graph-health-tag-properties-test
 +  "getGraphHealth's missing-tag-properties check (patch 0051): the visible objects tagged with a tag,
 +  or with a tag that extends it, that lack an expected property of it, for the expected tag-property
 +  pairs only. The pairs come from the tag-properties input (a JSON array of {tag, property}) or, when
-+  a call gives none, from the Worker's HEALTH_TAG_PROPERTIES variable (config/settings.json
++  a call gives none, from the Worker's HEALTH_TAG_PROPERTIES secret (config/settings.json
 +  health.expectedTagProperties). Every pair is resolved before the scan, and a bad one refuses the call
 +  with 400 naming the entry and where it came from. With no pairs the check lists nothing and says why.
 +
@@ -1174,7 +1227,7 @@ index 0000000..6124c5d
 +                (mapv #(uuid (:uuid %)) (get-in r [:body :blocks]))))})
 +
 +(def ^:private stored-label "HEALTH_TAG_PROPERTIES")
-+(def ^:private stored-source "(set from a GitHub variable or config/settings.json health.expectedTagProperties)")
++(def ^:private stored-source "(set from a GitHub secret or config/settings.json health.expectedTagProperties)")
 +
 +(defn- pairs-json [pairs] (js/JSON.stringify (clj->js pairs)))
 +
@@ -1408,7 +1461,7 @@ index 0000000..6124c5d
 +              "with input given, the stored pairs aren't read, so a broken one doesn't refuse"))))))
 +
 +(def ^:private no-pairs-note
-+  (str "no expected tag-property pairs: pass tag-properties, or set the HEALTH_TAG_PROPERTIES GitHub variable"
++  (str "no expected tag-property pairs: pass tag-properties, or set the HEALTH_TAG_PROPERTIES GitHub secret"
 +       " or health.expectedTagProperties in config/settings.json"))
 +
 +(def ^:private all-skipped-note
@@ -1496,7 +1549,7 @@ index 0000000..6124c5d
 +          (is (= before after) "nothing written"))))))
 +
 +(deftest missing-tag-properties-stored-pair-not-read-test
-+  ;; Review focus 10: a malformed stored variable refuses only calls that run the check. Review
++  ;; Review focus 10: a malformed stored value refuses only calls that run the check. Review
 +  ;; r1-integrity-1: a stored pair whose tag isn't in this graph (renamed, or another graph's) is
 +  ;; skipped, so the default call still runs every check.
 +  (async done
@@ -1529,6 +1582,22 @@ index 0000000..6124c5d
 +                  {:entry (str stored-label "[2]") :reason "property \"zz nope\" not found"}]
 +                 (:skipped mixed)))
 +          (is (not (contains? mixed :note))))))))
++
++;; Review r2-tests-2: the stored pairs are de-duplicated as the input's are. The secret is hand-edited
++;; JSON, so the same pair twice, or once by title and once by UUID or ident, is checked once.
++(deftest missing-tag-properties-stored-duplicates-test
++  (async done
++    (with-graph done
++      (fn [{:keys [self ids tags properties]}]
++        (p/let [{:keys [author rating]} properties
++                _ (set-stored! self (concat book-pairs book-pairs
++                                            [{:tag (str (:book tags)) :property (:ident author)}
++                                             {:tag "zz book" :property (str (:uuid rating))}]))
++                stored (check! self "")]
++          (is (= "settings" (:pairs-from stored)))
++          (is (= 2 (count (:pairs stored))) "six stored entries, two pairs")
++          (is (= (book-expected ids) (found stored)) "each missing property listed once per object and tag")
++          (is (empty? (:skipped stored)) "none skipped"))))))
 +
 +(deftest missing-tag-properties-second-graph-test
 +  ;; Review r1-integrity-1: one Worker, one HEALTH_TAG_PROPERTIES, two graphs. The pairs written for
@@ -1648,7 +1717,7 @@ index 0000000..6124c5d
 +    (is (string/includes? (:description (param "tag-properties")) (str "1 to " cap " pairs")))
 +    (is (string/includes? (:description operation) (str "1 to " cap " pairs")))))
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
-index f285538..4e5c16b 100644
+index f285538..b56ae4b 100644
 --- a/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_index_health_test.cljs
 @@ -167,8 +167,14 @@
@@ -1661,7 +1730,7 @@ index f285538..4e5c16b 100644
 +                     (is (= {:count 0 :items []} (:broken-refs checks)) "every [[uuid]] in the fixture resolves")
 +                     (is (= {:count 0 :items [] :pairs [] :pairs-from "none"
 +                             :note (str "no expected tag-property pairs: pass tag-properties, or set the HEALTH_TAG_PROPERTIES"
-+                                        " GitHub variable or health.expectedTagProperties in config/settings.json")}
++                                        " GitHub secret or health.expectedTagProperties in config/settings.json")}
 +                            (:missing-tag-properties checks))
 +                         "with no pairs given or stored, the check lists nothing and says why")
                       (is (= #{"Dormant"} (titles (get-in checks [:orphan-tags :items])))

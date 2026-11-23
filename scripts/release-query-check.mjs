@@ -28,7 +28,7 @@
 // it then makes a tag that lists an expected property, two blocks tagged with it (one holding the
 // property) and a block linking a uuid nothing has, and sends one call to each read through
 // SyncDO.fetch: checks=broken-refs,missing-tag-properties with tag-properties, the default health
-// call with the pair stored in the Worker's HEALTH_TAG_PROPERTIES variable (the SyncDO gets the env
+// call with the pair stored in the Worker's HEALTH_TAG_PROPERTIES secret (the SyncDO gets the env
 // insightEnv gives, with TIMEZONE UTC), list_changes_since from an ISO local time (the Intl zone
 // code) and get_graph_schema with both sections. Each check reads the counts and items back.
 //
@@ -350,7 +350,7 @@ function queryBlockChecks(ctx) {
 // ==============
 //
 // Patches 0051 to 0053: the health checks broken-refs and missing-tag-properties (with pairs given
-// as tag-properties and as the stored HEALTH_TAG_PROPERTIES variable, which reads the Worker's env),
+// as tag-properties and as the stored HEALTH_TAG_PROPERTIES secret, which reads the Worker's env),
 // list_changes_since (from an ISO local time, which runs the Intl zone code) and get_graph_schema.
 // Every one of them builds datalog.cljs's private set, which Closure renaming broke before.
 

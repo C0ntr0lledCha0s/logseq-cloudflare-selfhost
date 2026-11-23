@@ -25,7 +25,7 @@ function exactlyOne(list, binding, table) {
   return list[0];
 }
 
-export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname, healthTagProperties }) {
+export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }) {
   const cfg = parse(upstreamToml);
   delete cfg.env;
   for (const key of FORBIDDEN_TOP_LEVEL) {
@@ -98,17 +98,10 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname, 
     cfg.vars = { ...(cfg.vars ?? {}), TIMEZONE: timeZone(settings.timeZone) };
   }
 
-  // The tag-property pairs getGraphHealth's missing-tag-properties check uses when a call gives
-  // none (patch 0051). Tag names are the owner's data and the committed settings.json keeps [], so
-  // the HEALTH_TAG_PROPERTIES GitHub variable (healthTagProperties), when set, replaces it: CI
-  // deploys from the committed file on every merge. The server skips a pair that doesn't resolve in
-  // a graph, since one Worker serves every graph.
-  const pairs = typeof healthTagProperties === "string" && healthTagProperties.trim() !== ""
-    ? variableTagProperties(healthTagProperties)
-    : expectedTagProperties(settings.health);
-  if (pairs !== undefined) {
-    cfg.vars = { ...(cfg.vars ?? {}), HEALTH_TAG_PROPERTIES: JSON.stringify(pairs) };
-  }
+  // HEALTH_TAG_PROPERTIES (patch 0051) is never a [vars] entry: wrangler deploy prints each var's
+  // value in its bindings table, and the deploy log is public. healthTagPropertiesSecret gives the
+  // value deploy.sh sends in its secrets file instead.
+  if (cfg.vars) delete cfg.vars.HEALTH_TAG_PROPERTIES;
 
   return stringify(cfg);
 }
@@ -120,6 +113,21 @@ function timeZone(value) {
     throw new Error(`settings.timeZone is not an IANA time zone: ${JSON.stringify(value)}`);
   }
   return value;
+}
+
+/**
+ * The tag-property pairs getGraphHealth's missing-tag-properties check uses when a call gives none
+ * (patch 0051), as the JSON string deploy.sh sends as the HEALTH_TAG_PROPERTIES Worker secret. Tag
+ * names are the owner's data and the committed settings.json keeps [], so the HEALTH_TAG_PROPERTIES
+ * GitHub secret (`healthTagProperties`), when set, replaces it: CI deploys from the committed file on
+ * every merge. Always a value ("[]" for none), so a deploy replaces whatever the Worker held. The
+ * server skips a pair that doesn't resolve in a graph, since one Worker serves every graph.
+ */
+export function healthTagPropertiesSecret({ settings, healthTagProperties }) {
+  const pairs = typeof healthTagProperties === "string" && healthTagProperties.trim() !== ""
+    ? secretTagProperties(healthTagProperties)
+    : expectedTagProperties(settings.health);
+  return JSON.stringify(pairs ?? []);
 }
 
 // The handler's own cap (max-tag-property-pairs in patch 0051).
@@ -135,8 +143,8 @@ function expectedTagProperties(health) {
   return checkedTagProperties(pairs, "settings.health.expectedTagProperties");
 }
 
-function variableTagProperties(raw) {
-  const key = "the HEALTH_TAG_PROPERTIES variable";
+function secretTagProperties(raw) {
+  const key = "the HEALTH_TAG_PROPERTIES secret";
   let pairs;
   try {
     pairs = JSON.parse(raw);
@@ -173,12 +181,13 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       out: { type: "string" },
       plan: { type: "string" },
       hostname: { type: "string" },
+      "secrets-out": { type: "string" },
     },
   });
-  for (const k of ["upstream", "settings", "tofu-outputs", "out", "hostname"]) {
+  for (const k of ["upstream", "settings", "tofu-outputs", "out", "hostname", "secrets-out"]) {
     if (!values[k]) {
       console.error(
-        "usage: render-wrangler.mjs --upstream <toml> --settings <json> --tofu-outputs <json> --out <path> --hostname <host> [--plan free|paid]",
+        "usage: render-wrangler.mjs --upstream <toml> --settings <json> --tofu-outputs <json> --out <path> --hostname <host> --secrets-out <json> [--plan free|paid]",
       );
       process.exit(2);
     }
@@ -191,7 +200,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     settings,
     tofuOutputs: { d1_database_id: tofu.d1_database_id?.value },
     hostname: values.hostname,
-    healthTagProperties: process.env.HEALTH_TAG_PROPERTIES,
   });
+  // The Worker secrets this render decides, for deploy.sh's --secrets-file; owner-only, like it.
+  const secrets = {
+    HEALTH_TAG_PROPERTIES: healthTagPropertiesSecret({ settings, healthTagProperties: process.env.HEALTH_TAG_PROPERTIES }),
+  };
   writeFileSync(values.out, toml);
+  writeFileSync(values["secrets-out"], JSON.stringify(secrets), { mode: 0o600 });
 }

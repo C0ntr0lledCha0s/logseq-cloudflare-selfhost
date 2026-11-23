@@ -63,7 +63,7 @@ index f98b81a..61f8d81 100644
  (def ^:private join-limit
    "The join cap while run-query's d/q runs, else nil: join-tuples counts only then."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 6d8c121..e9d649b 100644
+index 85edf44..9b1c707 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -5945,6 +5945,232 @@
@@ -308,7 +308,7 @@ index 6d8c121..e9d649b 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index e1acfcf..b827362 100644
+index eb0f05f..712fe76 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,8 @@
