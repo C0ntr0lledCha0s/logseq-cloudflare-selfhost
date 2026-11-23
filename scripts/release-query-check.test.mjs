@@ -430,3 +430,41 @@ test("fails, naming each check, on a bundle whose Datom field v is renamed", { s
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the one-page dry-run graph holds 100,000 plain blocks on 2,000 pages, each created by one user, the same on every build", async () => {
+  const { blankLargeTx, BLANK_LARGE } = await import(script);
+  const txs = blankLargeTx();
+  assert.deepEqual(blankLargeTx(), txs, "the same on every build");
+  assert.deepEqual(BLANK_LARGE, { pages: 2000, blocksPerPage: 50, pageBlocks: 20 });
+  assert.equal(BLANK_LARGE.pages * BLANK_LARGE.blocksPerPage, 100_000, "100,000 blocks besides the page");
+  assert.equal(txs.length, 1 + BLANK_LARGE.pages, "the user page, then one transaction per page");
+  const blocks = txs.slice(1).flatMap((tx) => tx.match(/:block\/parent/g) ?? []);
+  assert.equal(blocks.length, 100_000);
+  const created = txs.slice(1).flatMap((tx) => tx.match(/:logseq\.property\/created-by-ref/g) ?? []);
+  assert.equal(created.length, 100_000, "every block carries created-by-ref, as the app's blocks do");
+  assert.ok(!txs.some((tx) => /deleted-at|Private/.test(tx)), "nothing Private or recycled: the time is the predicate's");
+  const own = txs.flatMap((tx) => [...tx.matchAll(/\{:block\/uuid #uuid "([^"]+)"/g)].map((m) => m[1]));
+  assert.equal(own.length, 102_001, "the user, 2,000 pages and 100,000 blocks");
+  assert.equal(new Set(own).size, own.length, "every uuid once");
+});
+
+test("the one-page dry-run bound beside 100,000 other blocks is 25 ms", async () => {
+  const { BLANK_LARGE_MS } = await import(script);
+  assert.equal(BLANK_LARGE_MS, 25);
+});
+
+test("checkBlankOnLargeGraph passes a quick answer listing the page's 10 blank leaves, and fails a refusal, a wrong count, another page or a slow answer", async () => {
+  const { checkBlankOnLargeGraph, BLANK_LARGE_MS } = await import(script);
+  const entry = (uuid, n) => ({ page: "Release blank one page", uuid, "would-delete": Array.from({ length: n }, (_, i) => ({ uuid: `b-${i}`, parent: uuid })), kept: { "has-children": 0, referenced: 0, "in-template": 0, "being-edited": 0, examples: [] }, "skipped-private": 0 });
+  const good = { "dry-run": true, t: 3, total: 10, listed: 10, pages: [entry("p1", 10)], note: "…" };
+  assert.match(await checkBlankOnLargeGraph(fakeStub({ status: 200, body: good }), "p1"), /median \d+ ms/);
+  await assert.rejects(checkBlankOnLargeGraph(fakeStub({ status: 404, body: { error: "page-ids[0]: page not found" } }), "p1"), /HTTP 404/);
+  await assert.rejects(checkBlankOnLargeGraph(fakeStub({ status: 200, body: { ...good, total: 9 } }), "p1"), /total 9, expected 10/);
+  await assert.rejects(checkBlankOnLargeGraph(fakeStub({ status: 200, body: { ...good, pages: [entry("p1", 9)] } }), "p1"), /would-delete holds/);
+  await assert.rejects(checkBlankOnLargeGraph(fakeStub({ status: 200, body: { ...good, pages: [entry("p2", 10)] } }), "p1"), /would-delete holds/);
+  await assert.rejects(checkBlankOnLargeGraph(fakeStub({ status: 200, body: good, delay: BLANK_LARGE_MS + 20 }), "p1"), /expected under 25 ms/);
+  const twoSlow = fakeStub({ status: 200, body: good, delay: [0, 5, 60, 60] });
+  await assert.rejects(checkBlankOnLargeGraph(twoSlow, "p1", 40), /expected under 40 ms/, "the median of the warm runs is bounded");
+  const coldSlow = fakeStub({ status: 200, body: good, delay: [90, 0, 0, 0] });
+  assert.match(await checkBlankOnLargeGraph(coldSlow, "p1", 40), /median \d+ ms/, "a slow cold run is not bounded");
+});

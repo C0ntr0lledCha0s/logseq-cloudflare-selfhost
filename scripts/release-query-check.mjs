@@ -36,11 +36,14 @@
 // at 100,000 entities (syncStatusFixture: 2,000 pages of 49 blocks, 300 of the pages Private or in the
 // Recycle bin, written by the dev build before the bundle loads): its counts must grow by exactly the
 // fixture's counted pages and blocks over the same graph without it, within SYNC_STATUS_MS (750 ms,
-// the median of three warm runs). It prints each timing under its check. Node on a developer machine
-// guides the numbers; it does not measure the Durable Object on Cloudflare.
+// the median of three warm runs). Then, on a graph of 100,000 plain blocks (BLANK_LARGE, also written
+// by the dev build), a one-page deleteBlankBlocks dry run must list its 10 blank leaves within
+// BLANK_LARGE_MS (25 ms, the median of three warm runs), so the predicate's cost follows the page,
+// not the graph. It prints each timing under its check. Node on a developer machine guides the
+// numbers; it does not measure the Durable Object on Cloudflare.
 //
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
-// missing. Seeding takes about 150 s, 50 s of it the sync-status graph.
+// missing. Seeding takes about 220 s, 50 s of it the sync-status graph and 60 s the BLANK_LARGE one.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -664,6 +667,102 @@ export async function syncStatusChecks(upstream, bundle, { fixture, baseline, fu
   }
 }
 
+// deleteBlankBlocks on one page of a large graph
+// ===============================================
+
+/**
+ * A one-page dry run on a graph of its own: BLANK_LARGE.pages pages of BLANK_LARGE.blocksPerPage
+ * plain blocks (100,000 blocks besides the page, none Private or recycled, so the time is the
+ * predicate's and not datalog/private-ids'), written by the dev build as the sync-status graph is,
+ * and a page of BLANK_LARGE.pageBlocks blocks made through the API, every other one blank. Before
+ * review round 2 every call read every :block/parent, :block/page, created-by-ref and other internal
+ * reference datom in the graph, so its time followed the graph; now it follows the candidates.
+ */
+export const BLANK_LARGE = { pages: 2000, blocksPerPage: 50, pageBlocks: 20 };
+
+/**
+ * The one-page dry run beside 100,000 other blocks must answer within this many ms (the median of
+ * three warm runs): about three times the 7 to 8 ms measured on a developer machine, and well under
+ * the 59 to 74 ms the graph-wide reference scan took before review round 2.
+ */
+export const BLANK_LARGE_MS = 25;
+
+/** A uuid for the n-th BLANK_LARGE fixture entity (apart from preseedUuid's and syncStatusUuid's). */
+const blankLargeUuid = (n) => `00000000-0000-4000-a000-${n.toString(16).padStart(12, "0")}`;
+
+/**
+ * EDN transactions writing the BLANK_LARGE filler: a user page, then one transaction per page with
+ * its blocks, each created by that user (:logseq.property/created-by-ref), as the app's blocks are.
+ */
+export function blankLargeTx() {
+  const str = JSON.stringify;
+  const user = blankLargeUuid(0xffffff);
+  let n = 0;
+  const pages = Array.from({ length: BLANK_LARGE.pages }, (_, i) => {
+    const uuid = blankLargeUuid(n++);
+    const title = `Release blank filler ${i}`;
+    const page = `{:block/uuid #uuid ${str(uuid)} :block/title ${str(title)} :block/name ${str(title.toLowerCase())} :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}`;
+    const blocks = Array.from(
+      { length: BLANK_LARGE.blocksPerPage },
+      (_, b) =>
+        `{:block/uuid #uuid ${str(blankLargeUuid(n++))} :block/title ${str(`${title} block ${b}`)} :block/page [:block/uuid #uuid ${str(uuid)}] :block/parent [:block/uuid #uuid ${str(uuid)}] :block/order ${str(`a${b.toString(36)}`)} :logseq.property/created-by-ref [:block/uuid #uuid ${str(user)}] :block/created-at 1 :block/updated-at 1}`,
+    );
+    return `[${page} ${blocks.join(" ")}]`;
+  });
+  return [`[{:block/uuid #uuid ${str(user)} :block/title "Release user" :block/name "release user" :block/tags #{:logseq.class/Page} :block/created-at 1 :block/updated-at 1}]`, ...pages];
+}
+
+/**
+ * Sends a one-page deleteBlankBlocks dry run four times: each must answer 200 listing the page's
+ * BLANK_LARGE.pageBlocks / 2 blank leaves, and the median of the last three within `limitMs`.
+ * Returns the timings as a note.
+ */
+export async function checkBlankOnLargeGraph(stub, pageId, limitMs = BLANK_LARGE_MS) {
+  const expected = BLANK_LARGE.pageBlocks / 2;
+  const runs = await timed(() => call(stub, "POST", "/semantic/blank-blocks/delete", { "page-ids": [pageId], "dry-run": true }), 4);
+  for (const { res } of runs) {
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    const body = res.json;
+    if (body.total !== expected) throw new Error(`total ${body.total}, expected ${expected}`);
+    const listed = (body.pages ?? []).map((p) => [p.uuid, p["would-delete"].length]);
+    if (JSON.stringify(listed) !== JSON.stringify([[pageId, expected]])) throw new Error(`would-delete holds ${JSON.stringify(listed)}, expected ${expected} on ${pageId}`);
+  }
+  const warm = runs.slice(1).map((r) => r.ms).sort((a, b) => a - b)[1];
+  const note = `${runs[0].ms} ms, then ${runs.slice(1).map((r) => r.ms).join(", ")} ms (median ${warm} ms)`;
+  if (warm > limitMs) throw new Error(`answered after ${note}, expected under ${limitMs} ms`);
+  return note;
+}
+
+/** Seeds the BLANK_LARGE graph with the dev build: call it before any release bundle runs. Returns {database, seededMs}. */
+export function seedBlankLarge(upstream) {
+  const start = performance.now();
+  const database = seededDatabase(upstream, blankLargeTx());
+  return { database, seededMs: Math.round(performance.now() - start) };
+}
+
+/** The one-page dry run on the graph seedBlankLarge made. Returns [{name, ok, error?, note?}]. */
+export async function blankLargeChecks(upstream, bundle, { database, seededMs }) {
+  const other = (BLANK_LARGE.pages * BLANK_LARGE.blocksPerPage).toLocaleString("en-GB");
+  const name = `beside ${other} other blocks: a one-page deleteBlankBlocks dry run lists ${BLANK_LARGE.pageBlocks / 2} blank leaves within ${BLANK_LARGE_MS} ms`;
+  try {
+    const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database });
+    try {
+      const title = "Release blank one page";
+      const page = await call(stub, "POST", "/semantic/pages", { title });
+      if (page.status !== 201) throw new Error(`create ${title}: HTTP ${page.status}: ${page.text.slice(0, 300)}`);
+      const blocks = Array.from({ length: BLANK_LARGE.pageBlocks }, (_, i) => ({ title: i % 2 === 0 ? " " : `${title} text ${i}` }));
+      const insert = await call(stub, "POST", "/semantic/block-trees", { "target-id": page.json.uuid, blocks, verbose: false });
+      if (insert.status !== 201) throw new Error(`insert into ${title}: HTTP ${insert.status}: ${insert.text.slice(0, 300)}`);
+      const note = await checkBlankOnLargeGraph(stub, page.json.uuid);
+      return [{ name, ok: true, note: `${other} blocks seeded in ${seededMs} ms; ${note}` }];
+    } finally {
+      close();
+    }
+  } catch (error) {
+    return [{ name, ok: false, error: error.message }];
+  }
+}
+
 /**
  * Calls `fn` with console.error, warn, log and info replaced by recorders, and puts each back when
  * it settles (or throws). Resolves to {value, calls: [{level, args}]}.
@@ -984,6 +1083,7 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
   // Every graph is seeded before the first release bundle runs (seededDatabase).
   const database = seededDatabase(upstream, staleTx(fixture));
   const syncStatus = seedSyncStatus(upstream);
+  const blankLarge = seedBlankLarge(upstream);
   const { stub, close } = await loadReleaseSyncDO(upstream, bundle, { database });
   const results = [];
   try {
@@ -1010,6 +1110,7 @@ export async function runReleaseQueryCheck(upstream, { bundle } = {}) {
     close();
   }
   results.push(...(await syncStatusChecks(upstream, bundle, syncStatus)));
+  results.push(...(await blankLargeChecks(upstream, bundle, blankLarge)));
   return results;
 }
 

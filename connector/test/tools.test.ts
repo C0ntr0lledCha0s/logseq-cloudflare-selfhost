@@ -426,8 +426,9 @@ describe("delete_blank_blocks and get_sync_status contract (plan 2026-11-22 stag
       "Only plain blank leaves are deleted",
       "an empty Task or tagged block, a heading, a block with a property, a Code, Math or Quote block, a property value block, a choice and a pre-block are kept and not reported",
       "A blank block with children is kept, its children never lifted",
-      "listed under kept with its reason (has children, referenced or being edited)",
-      "a blank block something references (a link, an embed, a property value, a comment thread, a reaction or a view)",
+      "listed under kept with its reason (has children, referenced, in a template or being edited)",
+      "a blank block something references (a link, an embed, a property value, a comment thread, a reaction, a view or a history entry, even one hidden or in the Recycle bin)",
+      "a slot in a template (a blank block under a block or page tagged Template, or a tag that extends it)",
       `up to ${BLANK_BLOCK_CAPS.keptExamples} examples per page`,
       // Private and E2EE
       "Blank blocks on or under Private content are only counted, per page in skipped-private",
@@ -444,6 +445,19 @@ describe("delete_blank_blocks and get_sync_status contract (plan 2026-11-22 stag
       "A write-no-delete token can dry-run it but not apply it",
     ];
     for (const phrase of phrases) expect(BLANK_BLOCKS_HELP, phrase).toContain(phrase);
+  });
+
+  it("every kept reason the vendored schema names is in the description and connector_help (review r2-correctness-1)", async () => {
+    const kept = (openapi as any).components.schemas.BlankBlocksDryRunResponse.properties.pages.items.properties.kept;
+    const reasons: string[] = kept.properties.examples.items.properties.reason.enum;
+    expect(reasons).toEqual(["has children", "referenced", "in a template", "being edited"]);
+    expect(kept.required).toEqual(["has-children", "referenced", "in-template", "being-edited", "examples"]);
+    const tool = (await listTools()).find((t) => t.name === "delete_blank_blocks");
+    for (const reason of reasons) {
+      expect(tool.description as string, reason).toContain(reason);
+      expect(BLANK_BLOCKS_HELP, reason).toContain(reason);
+    }
+    expect(tool.description as string).toContain("hidden or in the Recycle bin");
   });
 
   it("the write-no-delete list names delete_blank_blocks: the apply refused, the dry run allowed", () => {

@@ -4,7 +4,7 @@ area: connector
 tags: [contract, tool-description, connector_help, reference-count, docs-drift, readme]
 seen:
   - 2026-11-08 – semantic-search recency and importance ranking, review round 1 and 2 (should-fix, deferred)
-  - 2026-11-22 – blank-blocks-sync-status, review (should-fix, deferred): `get_sync_status` says `block-count` is what `list_page_blocks` shows, but the route also counts property value blocks, which `list_page_blocks` leaves out; the spec said only that it matched the other reads, and the as-built note records the difference
+  - 2026-11-22 – blank-blocks-sync-status, review (should-fix, deferred): `get_sync_status` says `block-count` is what `list_page_blocks` shows, but the route also counts property value blocks, which `list_page_blocks` leaves out; the spec said only that it matched the other reads, and the as-built note records the difference. Fixed 2026-11-23 (r1-light-2): the description, `connector_help`, README §11.8 and the 0055 route now say `block-count` counts the blocks on those pages, property value blocks included, so it can be higher than `list_page_blocks` shows, and a test pins that sentence in the description and the help
 promoted_to: ["REVIEW.md"]
 ---
 

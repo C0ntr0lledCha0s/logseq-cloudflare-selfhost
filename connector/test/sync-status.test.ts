@@ -357,6 +357,16 @@ describe("get_sync_status in the contract", () => {
     expect(SYNC_STATUS_HELP).toMatch(/negative/);
   });
 
+  it("says block-count takes in property value blocks, so it can be above what list_page_blocks shows (review r1-light-2)", async () => {
+    const claim = "block-count counts the blocks on those pages, property value blocks included, so it can be higher than list_page_blocks shows; no hidden pages, Recycle bin or Private content";
+    const tool = (await rpc(plainEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "get_sync_status");
+    for (const [where, text] of [["connector_help", SYNC_STATUS_HELP], ["description", tool.description as string]]) {
+      expect(text, where).toContain(claim);
+      expect(text, where).toContain("page-count (the pages list_pages shows)");
+      expect(text, where).not.toMatch(/as list_pages and list_page_blocks show|what list_pages and list_page_blocks show/);
+    }
+  });
+
   it("its description says behind-by and a negative value, and that clients are counts", async () => {
     const tool = (await rpc(plainEnv(), "tools/list", {})).tools.find((t: { name: string }) => t.name === "get_sync_status");
     expect(tool.description.split("\n")[0]).toBe((FIRST_LINES as Record<string, string>).get_sync_status);
