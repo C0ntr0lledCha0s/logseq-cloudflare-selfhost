@@ -5,7 +5,7 @@ tags: [skip, release-bundle, bench, build.sh, gate, stale-bundle, scripts-test]
 seen:
   - 2026-11-17 – item 40, patch 0039, stage 2 (s-2-1, s-2-2)
   - 2026-11-22 – blank-blocks-sync-status, stage 1 (s-stage-1-2)
-promoted_to: []
+promoted_to: ["CLAUDE.md Gotchas"]
 ---
 
 ## Symptom
