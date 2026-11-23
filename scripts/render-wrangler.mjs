@@ -25,7 +25,7 @@ function exactlyOne(list, binding, table) {
   return list[0];
 }
 
-export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }) {
+export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname, healthTagProperties }) {
   const cfg = parse(upstreamToml);
   delete cfg.env;
   for (const key of FORBIDDEN_TOP_LEVEL) {
@@ -99,8 +99,13 @@ export function renderWrangler({ upstreamToml, settings, tofuOutputs, hostname }
   }
 
   // The tag-property pairs getGraphHealth's missing-tag-properties check uses when a call gives
-  // none (patch 0051). The server resolves each pair and refuses the check naming a bad one.
-  const pairs = expectedTagProperties(settings.health);
+  // none (patch 0051). Tag names are the owner's data and the committed settings.json keeps [], so
+  // the HEALTH_TAG_PROPERTIES GitHub variable (healthTagProperties), when set, replaces it: CI
+  // deploys from the committed file on every merge. The server skips a pair that doesn't resolve in
+  // a graph, since one Worker serves every graph.
+  const pairs = typeof healthTagProperties === "string" && healthTagProperties.trim() !== ""
+    ? variableTagProperties(healthTagProperties)
+    : expectedTagProperties(settings.health);
   if (pairs !== undefined) {
     cfg.vars = { ...(cfg.vars ?? {}), HEALTH_TAG_PROPERTIES: JSON.stringify(pairs) };
   }
@@ -127,7 +132,21 @@ function expectedTagProperties(health) {
   }
   const pairs = health.expectedTagProperties;
   if (pairs === undefined) return undefined;
-  const key = "settings.health.expectedTagProperties";
+  return checkedTagProperties(pairs, "settings.health.expectedTagProperties");
+}
+
+function variableTagProperties(raw) {
+  const key = "the HEALTH_TAG_PROPERTIES variable";
+  let pairs;
+  try {
+    pairs = JSON.parse(raw);
+  } catch {
+    throw new Error(`${key} is not JSON`);
+  }
+  return checkedTagProperties(pairs, key);
+}
+
+function checkedTagProperties(pairs, key) {
   if (!Array.isArray(pairs)) throw new Error(`${key} must be an array`);
   if (pairs.length > MAX_TAG_PROPERTY_PAIRS) {
     throw new Error(`${key} must hold at most ${MAX_TAG_PROPERTY_PAIRS} pairs (got ${pairs.length})`);
@@ -172,6 +191,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     settings,
     tofuOutputs: { d1_database_id: tofu.d1_database_id?.value },
     hostname: values.hostname,
+    healthTagProperties: process.env.HEALTH_TAG_PROPERTIES,
   });
   writeFileSync(values.out, toml);
 }

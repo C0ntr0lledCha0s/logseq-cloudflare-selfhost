@@ -63,10 +63,10 @@ index f98b81a..61f8d81 100644
  (def ^:private join-limit
    "The join cap while run-query's d/q runs, else nil: join-tuples counts only then."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 76273cc..1d3e9be 100644
+index 6d8c121..e9d649b 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5923,6 +5923,233 @@
+@@ -5945,6 +5945,232 @@
            (http/json-response nil (assoc feed :epoch epoch :t t))
            (http/error-response "changes since that point are no longer available; list again without since" 410))))))
  
@@ -188,19 +188,18 @@ index 76273cc..1d3e9be 100644
 +(defn- changed-pages
 +  "The window's `datoms` grouped by page, as {page-id {:latest ms :page-changed true :blocks {id ms}}}:
 +  a block's change (its own, or its value block's) goes under its page; a page's, tag's, property's or
-+  journal's own change marks it page-changed. Entities `excluded?` names are left out, and so is a
-+  block whose page is."
++  journal's own change marks it page-changed. Entities `excluded?` names are left out. A block on a
++  Private, binned or hidden page is in those sets itself; a user's block on a page that is only
++  built-in (Contents) is listed."
 +  [db datoms excluded?]
 +  (reduce (fn [groups {:keys [e v]}]
 +            (let [owner (change-owner db e)
 +                  page (datom-value db owner :block/page)]
 +              (cond
 +                (or (excluded? e) (excluded? owner)) groups
-+                page (if (excluded? page)
-+                       groups
-+                       (-> groups
-+                           (update-in [page :blocks owner] (fnil max 0) v)
-+                           (update-in [page :latest] (fnil max 0) v)))
++                page (-> groups
++                         (update-in [page :blocks owner] (fnil max 0) v)
++                         (update-in [page :latest] (fnil max 0) v))
 +                (datom-value db owner :block/name) (-> groups
 +                                                       (assoc-in [owner :page-changed] true)
 +                                                       (update-in [owner :latest] (fnil max 0) v))
@@ -300,7 +299,7 @@ index 76273cc..1d3e9be 100644
  ;; Page favourites (patch 0038). The sidebar's Favorites list is the hidden page $$$favorites, whose
  ;; children each link one favourite with :block/link (ldb/build-favorite-tx); sibling order is the
  ;; list's order. The app's db worker reads and writes it, and deps/db-sync has no copy of that code,
-@@ -6312,6 +6539,7 @@
+@@ -6334,6 +6560,7 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -309,7 +308,7 @@ index 76273cc..1d3e9be 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 44ea748..ee1ae2c 100644
+index e1acfcf..b827362 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -104,6 +104,8 @@
@@ -326,7 +325,7 @@ index 44ea748..ee1ae2c 100644
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
 +   "listChangesSince" ["List what changed since a time"
-+                       "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To get everything since the last run, store this call's until and pass it as the next since. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
++                       "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
     "datalogQuery" ["Run a read-only Datalog query"
                     (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
                          " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
@@ -336,7 +335,7 @@ index 44ea748..ee1ae2c 100644
                    :schema {:type "string"}}]))
 +    (= "listChangesSince" operation-id)
 +    (into [{:name "since" :in "query" :required true :schema {:type "string"}
-+            :description "Start of the window, exclusive: epoch ms (1763251200000), an ISO date (2026-11-16, local midnight in TIMEZONE) or an ISO datetime (2026-11-16T09:00 local, or with Z or +13:00). Pass the previous call's until to continue from it."}
++            :description "Start of the window, exclusive: epoch ms (1763251200000), an ISO date (2026-11-16, local midnight in TIMEZONE) or an ISO datetime (2026-11-16T09:00 local, or with Z or +13:00). Pass the previous call's until, less a margin, to continue from it: edits synced late keep the device's earlier stamp."}
 +           {:name "until" :in "query" :schema {:type "string"}
 +            :description "End of the window, inclusive, in the same forms as since. Defaults to now, or with cursor to the cursor's until."}
 +           {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
@@ -366,7 +365,7 @@ index 44ea748..ee1ae2c 100644
             "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
                              "404" {:description "No named query has that name; the error lists the names"}
                              "409" {:description "The graph is E2EE"}
-@@ -1168,6 +1187,30 @@
+@@ -1172,6 +1191,30 @@
                                            :tags {:type "array" :items {:type "string"}
                                                   :description "Titles of the tags on the block, its ancestors and its page."}
                                            :updated-at {:type "integer"}}}
@@ -399,10 +398,10 @@ index 44ea748..ee1ae2c 100644
                                        :properties {:epoch {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
 new file mode 100644
-index 0000000..67e1117
+index 0000000..8321dad
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,768 @@
 +(ns logseq.db-sync.semantic-changes-since-test
 +  "listChangesSince (patch 0052): GET /semantic/changes lists the pages changed in a window
 +  (since, until], newest first, read from the :block/updated-at index. Each page carries
@@ -938,6 +937,90 @@ index 0000000..67e1117
 +          (is (not (contains? kinds task)) "a built-in tag is never listed")
 +          (is (not (contains? kinds status)) "nor a built-in property"))))))
 +
++(defn- built-in-page
++  "The uuid of the built-in page titled `title` (Contents, Quick add or Library)."
++  [conn title]
++  (some (fn [d] (let [e (d/entity @conn (:e d))]
++                  (when (and (= title (:v d)) (:logseq.property/built-in? e) (nil? (:block/page e)))
++                    (:block/uuid e))))
++        (d/datoms @conn :aevt :block/title)))
++
++(deftest changes-built-in-page-blocks-test
++  ;; Review r1-tests-1 / r1-correctness-1: a user block on a built-in page is not a built-in entity.
++  ;; Contents is built-in and visible, so its blocks are listed; Quick add is built-in and hidden, so
++  ;; its blocks are left out with the rest of what the app hides. The other pages whose blocks are left
++  ;; out: a Private page (changes-private-and-bin-test) and a page in the Recycle bin (below).
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a1]} ids
++                {:keys [insert! edit! page! delete-page!]} (writer self)
++                contents (built-in-page conn "Contents")
++                quick-add (built-in-page conn "Quick add")
++                [on-contents] (insert! contents [{:title "zz on contents"}])
++                [on-quick-add] (insert! quick-add [{:title "zz on quick add"}])
++                doomed (page! "zz Doomed")
++                [on-doomed] (insert! doomed [{:title "zz on doomed"}])
++                _ (age! conn)
++                _ (edit! on-contents "zz on contents edited")
++                _ (edit! on-quick-add "zz on quick add edited")
++                _ (edit! on-doomed "zz on doomed edited")
++                _ (delete-page! doomed)
++                _ (edit! a1 "zz a1 edited")
++                [new-on-contents] (insert! contents [{:title "zz new on contents"}])
++                body (feed! self (since-old))
++                g (group body contents)]
++          (is (some? contents))
++          (is (some? quick-add))
++          (is (= #{on-contents new-on-contents} (set (block-ids g)))
++              "a block edited, and one created, on the built-in Contents page are listed")
++          (is (= [1 1] [(:created g) (:updated g)]))
++          (is (= "Contents" (get-in g [:page :title])))
++          (is (not (contains? (listed-ids body) on-quick-add)) "Quick add is hidden, so its blocks are not")
++          (is (nil? (group body quick-add)))
++          (is (not (contains? (listed-ids body) on-doomed)) "nor a block edited on a page then recycled")
++          (is (nil? (group body doomed)))
++          (is (contains? (listed-ids body) a1)))))))
++
++(deftest changes-recycled-until-test
++  ;; Review r1-tests-2: recycled counts only deletes inside (since, until].
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids]}]
++        (p/let [{:keys [a2 b1]} ids
++                _ (age! conn)
++                _ (recycle-block! conn a2 5000)
++                _ (recycle-block! conn b1 7000)
++                before (feed! self (since-old "&until=4999"))
++                at (feed! self (since-old "&until=5000"))
++                between (feed! self (since-old "&until=6999"))
++                after (feed! self "since=5000&until=8000")
++                all (feed! self (since-old "&until=8000"))]
++          (is (= 0 (:recycled before)) "a recycle after until is not counted")
++          (is (= 1 (:recycled at)) "until is included")
++          (is (= 1 (:recycled between)))
++          (is (= 1 (:recycled after)) "since is excluded, so consecutive windows count each delete once")
++          (is (= 2 (:recycled all))))))))
++
++(deftest changes-built-in-owner-test
++  ;; Review r1-tests-3: a user property's value on a built-in tag is owned by that tag, which is
++  ;; never listed.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self ids note]}]
++        (p/let [{:keys [a1]} ids
++                {:keys [put! edit!]} (writer self)
++                task (:block/uuid (d/entity @conn :logseq.class/Task))
++                _ (age! conn)
++                _ (put! task (:ident note) "zz a note on Task")
++                _ (edit! a1 "zz a1 edited")
++                body (feed! self (since-old))
++                pages (set (map #(get-in % [:page :uuid]) (:pages body)))]
++          (is (some? (:logseq.property/built-in? (d/entity @conn :logseq.class/Task))))
++          (is (> (stamp-of conn task) old) "the value write did move a stamp in the window")
++          (is (not (contains? pages (str task))) "a built-in tag is not listed for a value set on it")
++          (is (contains? (listed-ids body) a1)))))))
++
 +(defn- favorites-page-id [conn]
 +  (some (fn [d] (when (= "$$$favorites" (:v d)) (:e d))) (d/datoms @conn :aevt :block/title)))
 +
@@ -1056,6 +1139,10 @@ index 0000000..67e1117
 +    (is (string/includes? description "2026-11-16"))
 +    (is (string/includes? description "TIMEZONE"))
 +    (is (string/includes? description "store this call's until and pass it as the next since"))
++    ;; Review r1-correctness-2 / r1-integrity-2 / r1-light-2: stamps are the editing device's clock.
++    (is (string/includes? description "An edit's updated-at is set by the device that made it"))
++    (is (string/includes? description "overlap the windows"))
++    (is (string/includes? description "a block on a hidden page such as Quick add is left out"))
 +    (is (string/includes? description "A move shows as page-changed on both pages"))
 +    (is (string/includes? description "Permanent deletes"))
 +    (is (= "ChangesSinceResponse" (last (string/split (get-in operation [:responses "200" :content "application/json" :schema :$ref]) #"/"))))

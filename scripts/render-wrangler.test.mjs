@@ -166,6 +166,44 @@ test("a malformed health.expectedTagProperties throws naming the entry", () => {
   assert.throws(() => render({ settings: { ...settings, health: [] } }), /settings\.health must be an object/);
 });
 
+// Review r1-light-1: CI renders from the committed settings.json, whose default must stay [] in a
+// public repo, so the owner's pairs come from the HEALTH_TAG_PROPERTIES GitHub variable instead.
+test("a HEALTH_TAG_PROPERTIES variable replaces settings.health.expectedTagProperties", () => {
+  const pairs = [{ tag: "zz Book", property: "zz author" }];
+  const fromVariable = render({ healthTagProperties: JSON.stringify(pairs) }).vars;
+  assert.deepEqual(JSON.parse(fromVariable.HEALTH_TAG_PROPERTIES), pairs, "over the committed []");
+  const { health: _omit, ...withoutHealth } = settings;
+  assert.deepEqual(
+    JSON.parse(render({ settings: withoutHealth, healthTagProperties: JSON.stringify(pairs) }).vars.HEALTH_TAG_PROPERTIES),
+    pairs,
+    "and with no health key at all",
+  );
+  assert.equal(render({ healthTagProperties: "[]" }).vars.HEALTH_TAG_PROPERTIES, "[]", "[] is a value: no pairs");
+  for (const unset of [undefined, "", "  "]) {
+    const settingsPairs = [{ tag: "zz Novel", property: "zz series" }];
+    assert.deepEqual(
+      JSON.parse(render({ settings: { ...settings, health: { expectedTagProperties: settingsPairs } }, healthTagProperties: unset })
+        .vars.HEALTH_TAG_PROPERTIES),
+      settingsPairs,
+      `an unset or blank variable (${JSON.stringify(unset)}) leaves settings.json in charge`,
+    );
+  }
+});
+
+test("a malformed HEALTH_TAG_PROPERTIES variable throws naming it and the entry", () => {
+  const key = "the HEALTH_TAG_PROPERTIES variable";
+  const cases = [
+    ["not json", `${key} is not JSON`],
+    [JSON.stringify({ tag: "zz Book", property: "zz author" }), `${key} must be an array`],
+    [JSON.stringify(Array.from({ length: 51 }, () => ({ tag: "zz Book", property: "zz author" }))), `${key} must hold at most 50 pairs (got 51)`],
+    [JSON.stringify([{ tag: "zz Book" }]), `${key}[0].property must be a non-empty string`],
+    [JSON.stringify([{ tag: "zz Book", property: "zz author" }, "zz Book/zz author"]), `${key}[1] must be an object with tag and property`],
+  ];
+  for (const [healthTagProperties, message] of cases) {
+    assert.throws(() => render({ healthTagProperties }), (error) => error.message === message, message);
+  }
+});
+
 test("unknown plan throws", () => {
   assert.throws(() => render({ settings: { ...settings, plan: "pro" } }), /plan/);
 });

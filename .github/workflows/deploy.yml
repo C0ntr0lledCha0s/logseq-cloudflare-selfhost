@@ -169,6 +169,8 @@ jobs:
           DB_SYNC_ALLOWED_USERS: ${{ secrets.DB_SYNC_ALLOWED_USERS }}
           SYNC_HOSTNAME: ${{ secrets.SYNC_HOSTNAME }}
           SMOKE_PAT: ${{ secrets.SMOKE_PAT }}
+          # The owner's expected tag-property pairs (a JSON array); tag names stay out of the repo.
+          HEALTH_TAG_PROPERTIES: ${{ vars.HEALTH_TAG_PROPERTIES }}
         run: scripts/with-r2-credentials.sh scripts/deploy.sh
 
       - name: Prepare connector

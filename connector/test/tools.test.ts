@@ -2922,6 +2922,9 @@ describe("get_graph_health and missing tag properties", () => {
       "config/settings.json health.expectedTagProperties",
       "with no pairs it lists nothing and its note says so",
       "is refused naming the entry",
+      // Review r1-light-1 and r1-integrity-1: where the stored pairs live, and that they serve every graph.
+      "the HEALTH_TAG_PROPERTIES GitHub variable",
+      "a stored pair that doesn't resolve in this graph is skipped and named under skipped",
     ]) {
       expect(help, phrase).toContain(phrase);
     }
@@ -2942,6 +2945,8 @@ describe("get_graph_health and missing tag properties", () => {
       "health.expectedTagProperties",
       "pairs-from: input, settings or none",
       "tag-properties without the missing-tag-properties check is refused",
+      "the HEALTH_TAG_PROPERTIES GitHub variable",
+      "a stored pair that doesn't resolve in this graph is skipped",
     ]) {
       expect(tool.description, phrase).toContain(phrase);
     }
@@ -2967,6 +2972,12 @@ describe("list_changes_since", () => {
     for (const phrase of [
       "an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE",
       "store this call's until and pass it as the next since",
+      // Review r1-correctness-2, r1-integrity-2 and r1-light-2: stamps come from the editing device.
+      "An edit's updated-at is set by the device that made it",
+      "overlap the windows",
+      "An edit synced after a run with an earlier stamp",
+      // Review r1-correctness-1: a block on a built-in page is listed unless the page is hidden.
+      "a user's block on a built-in page such as Contents is listed",
       "next-cursor pages through them and is null on the last page",
       "A move shows as page-changed on both pages",
       "of the connector's write tools, set_page_favorite",
@@ -2982,7 +2993,7 @@ describe("list_changes_since", () => {
   it("connector_help says when to use it and how to chain runs", async () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      "For what changed since a time (a daily digest or weekly review), call list_changes_since with since set to the previous run's until (an ISO date such as 2026-11-16 works for a first run) and keep this call's until for the next; a move shows only as page-changed on both pages.",
+      "For what changed since a time (a daily digest or weekly review), call list_changes_since with since set to the previous run's until less a margin (a day), skipping blocks already reported with the same uuid and updated-at (an ISO date such as 2026-11-16 works for a first run), and keep this call's until for the next: an edit's updated-at comes from the device that made it, so an edit made offline can sync after a run with a stamp before that run's until; a move shows only as page-changed on both pages.",
     );
   });
 });

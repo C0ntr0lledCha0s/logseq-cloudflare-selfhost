@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 1d3e9be..a0fe825 100644
+index e9d649b..3963d14 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -5767,6 +5767,92 @@
+@@ -5789,6 +5789,92 @@
  (def ^:private insight-handlers
    #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
  
@@ -95,7 +95,7 @@ index 1d3e9be..a0fe825 100644
  ;; listBlockChanges feeds an external search index. Without `since` it lists every content block
  ;; in UUID order; with `since` (a graph t from an earlier response) and that response's `epoch`, it
  ;; lists the blocks whose indexed text may have changed since then, read from the tx log, plus the
-@@ -6540,6 +6626,7 @@
+@@ -6561,6 +6647,7 @@
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
      (= :semantic/changes-since handler) (handle-changes-since context)
@@ -104,7 +104,7 @@ index 1d3e9be..a0fe825 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index ee1ae2c..3071092 100644
+index b827362..dd5bba8 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -106,6 +106,8 @@
@@ -119,7 +119,7 @@ index ee1ae2c..3071092 100644
 @@ -219,6 +221,8 @@
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
     "listChangesSince" ["List what changed since a time"
-                        "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To get everything since the last run, store this call's until and pass it as the next since. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
+                        "Lists what changed in the graph in a window, grouped by page, for a digest or review. since (required) and until (default now) each take epoch ms, an ISO date such as 2026-11-16 (local midnight in the Worker's TIMEZONE, UTC when it is unset) or an ISO datetime such as 2026-11-16T09:00 (local time in TIMEZONE), 2026-11-16T09:00:00Z or 2026-11-16T09:00+13:00; the window runs from after since up to and including until, and the response gives both as epoch ms with time-zone. A date or time that doesn't exist is refused; a local time that clocks skip as they go forward is moved on by the gap, and one that occurs twice as they go back is the first. Changes are read from each block's and page's updated-at. Each page has page (uuid, title, kind: page, journal, tag or property), latest-updated-at, page-changed (the page's own stamp moved: a title edit, a block moved into or out of it, a property set on the page), complete created and updated counts of its changed blocks (created: created after since) and at most blocks-per-page blocks (1 to 50, default 10), newest first, each with uuid, change (created or updated), updated-at and snippet (its first line, links shown as titles). A property value's change is reported as the block or page holding it. Pages come newest first, limit per call (1 to 200, default 50); next-cursor pages through them and is null on the last page. The cursor keeps since and until: pass the same since, and the same until or none (another since or until is refused). To chain runs, store this call's until and pass it as the next since, but overlap the windows. An edit's updated-at is set by the device that made it, so an edit made offline, or on a device whose clock runs behind, can reach the server after a run with a stamp at or before that run's until, and the next window then never sees it; pass a since earlier than the last until by a margin (a day covers most offline edits) and skip blocks already reported with the same uuid and updated-at. recycled counts the blocks and pages moved to the Recycle bin in the window. Private content, the Recycle bin, and hidden and built-in entities are left out; a user's block on a built-in page such as Contents is listed, and a block on a hidden page such as Quick add is left out. A window of more than 20,000 changes is refused with 422: pass a later since or an until. What it can't see: An edit synced after a run with an earlier stamp, unless the windows overlap (above). Permanent deletes leave nothing to read (get_activity_log lists the connector's own deletes). A move shows as page-changed on both pages, not as a change to the moved block. A write that moves neither stamp is not seen: of the connector's write tools, set_page_favorite (the favourites list is a hidden page). Each refusal names its parameter. Unavailable for E2EE graphs."]
 +   "getGraphSchema" ["Get the graph's schema"
 +                     "Lists every user tag and property with its details and usage counts in one call, for a schema or drift review, instead of list_tags and get_tag per tag. sections is tags, properties or both (the default, comma-separated); any other value is refused. Each tag has uuid, ident, title, extends (the tags it extends), properties (its own tag properties, built-in ones included) and object-count (the objects tagged with it directly; a tag that extends it counts its own). Each property has uuid, ident, title, type, cardinality, choices (in the editor's order, each with usage-count: how many values are that choice, counted by the choice's id), classes for a node property, value-count (its values, one per value of a many property; Logseq's empty placeholder is not a value) and used-by-tags (the tags that list it as a tag property). Private content and the Recycle bin are left out of every item and every count: a tag, property or object tagged Private (or with a tag that extends Private), on or under such a page or block, or in the Recycle bin is neither listed nor counted, so a choice held only by Private blocks has usage-count 0. Built-in tags and properties (Task, Status and the like) are hidden unless built-in=true. Each section is in title order with a complete count and at most limit items (1 to 200, default 50); to page through one section, pass that section alone in sections with its next-cursor. Each refusal names its parameter. Unavailable for E2EE graphs."]
     "datalogQuery" ["Run a read-only Datalog query"
@@ -157,7 +157,7 @@ index ee1ae2c..3071092 100644
             "listChangesSince" {"400" {:description "A parameter that can't be read, named: since, until, limit, blocks-per-page or cursor"}
                                 "422" {:description "More than 20,000 changes in the window; pass a later since or an until"}
                                 "500" {:description "since or until is a date or local time and the Worker's TIMEZONE setting is invalid"}}
-@@ -1187,6 +1202,34 @@
+@@ -1191,6 +1206,34 @@
                                            :tags {:type "array" :items {:type "string"}
                                                   :description "Titles of the tags on the block, its ancestors and its page."}
                                            :updated-at {:type "integer"}}}
@@ -194,10 +194,10 @@ index ee1ae2c..3071092 100644
                  :properties {:since {:type "integer" :description "The window's start, exclusive, as epoch ms."}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs
 new file mode 100644
-index 0000000..fb6871c
+index 0000000..6b0590b
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_graph_schema_test.cljs
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,435 @@
 +(ns logseq.db-sync.semantic-graph-schema-test
 +  "getGraphSchema (patch 0053): the graph's tags and properties in one call, for a drift review. Tags
 +  carry extends, properties and object-count; properties carry type, cardinality, choices (each with
@@ -444,6 +444,60 @@ index 0000000..fb6871c
 +          (is (> (get-in on [:body :tags :count]) (get-in default [:body :tags :count])))
 +          (is (every? #(contains? (titles on :properties) %) (titles default :properties))
 +              "built-in=true adds to the user items"))))))
++
++(deftest schema-private-and-binned-tags-test
++  ;; Review r1-tests-4: a tag tagged Private, or in the Recycle bin, that lists a property is neither
++  ;; listed nor counted in that property's used-by-tags.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self tags properties]}]
++        (p/let [{:keys [tag! put!]} (writer self)
++                private-tag (tag! "zz Private tag" {:properties ["zz colour"]})
++                _ (put! private-tag "block/tags" ["Private"])
++                binned-two (tag! "zz Binned two" {:properties ["zz colour"]})
++                _ (d/transact! conn [[:db/add (eid conn binned-two) :logseq.property/deleted-at 1]])
++                response (schema! self "")
++                tag-titles (set (map :title (get-in response [:body :tags :items])))
++                colour ((by-title (get-in response [:body :properties])) "zz colour")]
++          (is (= 200 (:status response)) (pr-str response))
++          (is (contains? (set (map :v (d/datoms @conn :eavt (eid conn private-tag) :logseq.property.class/properties)))
++                         (d/entid @conn (keyword (:ident (:colour properties)))))
++              "fixture: the Private tag does list zz colour")
++          (is (not (contains? tag-titles "zz Private tag")))
++          (is (not (contains? tag-titles "zz Binned two")))
++          (is (= [{:uuid (str (:book tags)) :title "zz Book"}] (:used-by-tags colour))
++              "only the visible tag that lists zz colour"))))))
++
++(deftest schema-hidden-test
++  ;; Review r1-tests-5: hidden entities are never listed. With built-in=true, Logseq's hidden built-in
++  ;; properties (such as created-from-property) stay out; a hidden user tag is never listed.
++  (async done
++    (with-graph done
++      (fn [{:keys [conn self]}]
++        (p/let [{:keys [tag!]} (writer self)
++                hidden-tag (tag! "zz Hidden tag")
++                _ (d/transact! conn [[:db/add (eid conn hidden-tag) :logseq.property/hide? true]])
++                pages (p/loop [cursor nil acc []]
++                        (p/let [r (schema! self (str "sections=properties&built-in=true&limit=200"
++                                                     (when cursor (str "&cursor=" (js/encodeURIComponent cursor)))))
++                                acc (into acc (get-in r [:body :properties :items]))
++                                next-cursor (get-in r [:body :properties :next-cursor])]
++                          (if next-cursor (p/recur next-cursor acc) acc)))
++                idents (set (keep :ident pages))
++                tags-on (schema! self "sections=tags&built-in=true&limit=200")
++                tags-off (schema! self "sections=tags")
++                hidden-property-idents (set (for [d (d/datoms @conn :aevt :logseq.property/hide?)
++                                                  :when (true? (:v d))
++                                                  :let [e (d/entity @conn (:e d))]
++                                                  :when (some? (:db/ident e))]
++                                              (str (namespace (:db/ident e)) "/" (name (:db/ident e)))))]
++          (is (contains? hidden-property-idents "logseq.property/created-from-property")
++              "fixture: Logseq marks created-from-property hidden")
++          (is (contains? idents "logseq.property/status") "built-in=true does list a visible built-in")
++          (is (empty? (filter hidden-property-idents idents))
++              (str "no hidden property is listed: " (pr-str (filter hidden-property-idents idents))))
++          (is (not (contains? (set (map :title (get-in tags-on [:body :tags :items]))) "zz Hidden tag")))
++          (is (not (contains? (set (map :title (get-in tags-off [:body :tags :items]))) "zz Hidden tag"))))))))
 +
 +(deftest schema-paging-test
 +  ;; limit pages one section through its cursor, with a complete count on every page; a cursor needs
