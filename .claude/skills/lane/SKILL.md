@@ -1,7 +1,7 @@
 ---
 name: lane
-description: Run staged work on this repo through a lane, either a bug fix, a feature or a spike, from an item on the owner's Logseq Connector Issues page or a described problem. Routes to the lane-bug, lane-feature, lane-spike or lane-review workflow, handles the approval gates, commits and pushes, and offers the Logseq write-back. Use when asked to "work on item 23", "fix connector #25", "investigate this bug", "build the suggest_links tool", "spike the CLI replica" or "review this branch".
-argument-hint: "<item number | description> [bug|feature|spike|review]"
+description: Run staged work on this repo through a lane, either a bug fix, a feature or a spike, from an item on the owner's Logseq Connector Issues page or a described problem. Routes to the lane-bug, lane-feature, lane-spike or lane-review workflow, handles the approval gates, commits and pushes, and offers the Logseq write-back. Use when asked to "work on item 23", "work on LC-104", "fix connector #25", "investigate this bug", "build the suggest_links tool", "spike the CLI replica" or "review this branch".
+argument-hint: "<item number (N or LC-N) | description> [bug|feature|spike|review]"
 ---
 
 # Run a lane
@@ -12,13 +12,16 @@ The lanes are described in `docs/lanes/README.md`, and `CLAUDE.md` has the repo 
 
 1. Get today's date in the owner's time zone with `TZ=Pacific/Auckland date +%F`.
 2. Read the tracker settings from `.claude/lanes.local.json` (`{"graph": "<alias>", "page": "<issues page title>"}`). The file is untracked, so it keeps the graph's name out of the repo. If it's missing, call `list_graphs`: if exactly one graph is connected, use it with the page **Logseq Connector Issues**. Otherwise ask the owner, and offer to write the file. Never put the graph name or page UUIDs in a committed file, commit message or PR body.
-3. If the argument is an item number, read that item's section on the issues page. Use `get_page_outline` on the page found by title, or `search_graph` for "Connector #N" if the outline is truncated. Read only.
-   - If the task is already Done or Canceled, say so and stop unless the owner insists.
-   - If it depends on an item that isn't done, say so and ask before continuing.
-4. Pick the lane, unless the owner named one:
-   - `bug` for Labels *bug*, or a described defect
-   - `feature` for Labels *enhancement*
-   - `spike` for Labels *spike*, or a question to answer
+3. If the argument is an item number (`N` or `LC-N`), find the item and read it. Read only.
+   - Each item is one heading task whose title starts `LC-N:`. Find it with `search_graph` for `LC-N`, then read it with `get_blocks` (`view: "outline"`): its tags, its properties (Status, Priority, phase, component, dependsOn, foundIn, branch, pr-url) and the notes under it, which end in a **Log** block of dated entries.
+   - Finished items are on the page's archive (the page title plus ` Archive`). If the task is Done or Canceled, say so and stop unless the owner insists.
+   - If its `dependsOn` names an item that isn't Done, say so and ask before continuing.
+   - Old references such as `64d` or `Connector #58` are mapped to new numbers in the **Renumbered** notes under the page's Summary.
+4. Pick the lane from the item's type tag, unless the owner named one:
+   - `bug` for **Bug**, or a described defect
+   - `feature` for **Feature** or **Improvement**
+   - `spike` for **Spike**, or a question to answer
+   - **Chore** items (housekeeping, docs, lane process) and **Epic** items (a group that ships as one PR, with child items) usually need no lane: say so and ask how to proceed
    - `review` to review the current branch only
 5. If the description is ambiguous between bug and feature, ask. Otherwise proceed.
 
@@ -60,18 +63,19 @@ Read `status` first.
   1. Check the work yourself: `git status --porcelain` (it should be empty), `git log --oneline origin/main..HEAD`, and `scripts/check.sh` (add `--upstream` if patches changed). Never report a check as passing that you didn't see pass. Confirm that `closeout.head_sha` matches HEAD.
   2. Push to the branch, then confirm that `git ls-remote origin <branch>` gives HEAD. Stage agents only commit, so this is the one check that the lane's work is on the remote.
   3. Report the result: what changed, the regression tests with their fail-before evidence, the review rounds (closed, refuted, open), the docs updated, the learnings recorded and promoted, and the live verification steps.
-  4. List any open findings under "for your call", and the lane's `backlog` (pre-existing defects that skeptics confirmed) as proposed backlog items. Add them to the issues page or README *Backlog* only on the owner's yes.
+  4. List any open findings under "for your call", and the lane's `backlog` (pre-existing defects that skeptics confirmed) as proposed backlog items. Add them to the issues page or README *Backlog* only on the owner's yes. Each one becomes its own item: the next free number (one more than the highest `itemNumber` on the page and its archive), a type tag, and `foundIn` set to this lane's PR. Never add one as a child of the current item or reuse its number.
   5. Show the **retro proposals** (`compound.retro_proposals`). These are changes to the lanes themselves, each with its evidence. Apply only the ones the owner approves, in a separate `chore(lanes): …` commit.
   6. Offer to open a PR with `closeout.pr_title` and `closeout.pr_body`. Don't open one unless the owner says yes.
   7. Stop any warm compiler the lane left running: `scripts/upstream-test.sh .upstream --stop`. Lane agents run upstream tests one namespace at a time through it while they iterate; the gate (`scripts/check.sh --upstream`) still runs the full suite.
 
 ## 5. Logseq write-back (always ask)
 
-Show `closeout.logseq_update` (or the spike's `logseq_update_hint`). Ask once: "Write this to item N on the issues page and set its task to In Review?" Only on yes, follow the Logseq skill's writing rules:
+Show `closeout.logseq_update` (or the spike's `logseq_update_hint`) and the property changes below. Ask once: "Write this to LC-N's Log and set it to In Review?" Only on yes, follow the Logseq skill's writing rules:
 
-- Find the item's `## N.` block, and insert the draft as its children with one `insert_block_children` call.
-- Set the task's Status with `set_block_property`.
-- For a feature still in spec, add only a "**Spec <date>**" block with a link to the file.
+- Find the item's task (`search_graph` for `LC-N`) and its **Log** child block. Insert the draft entry as the Log's last child with one `insert_block_children` call. If the item has no Log block, add one as the task's last child, with the entry under it.
+- Set the facts as properties, never as text, with one `batch_set_block_property` on the task: Status In Review, phase `review`, `branch`, and `pr-url` (it holds several PRs, so a follow-up PR is added, not replaced). After merge and deploy: Status Done. Then move a Done item to the archive page, after the archive's last item.
+- For a feature still in spec, add only a "**Spec <date>**" entry to the Log with a link to the file, and set phase `plan`.
+- Proposed new items from the closeout are created only on the owner's yes, each as its own numbered item (see section 4).
 - Read back once to confirm, and report in one line.
 
 Also pass on `compound.skill_suggestions` and `docs.skill_note`. They are changes for the owner's own Logseq skill, which lives outside this repo. Offer them as suggestions; don't apply them.
