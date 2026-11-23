@@ -361,6 +361,128 @@ test("checkScanCapQuiet passes a silent scan-cap 422 and fails one that logs, at
   await assert.rejects(checkScanCapQuiet(fakeStub({ status: 200, body: { rows: [] } })), /expected the scan-cap 422, got HTTP 200/);
 });
 
+// Query blocks (patch 0050, spec 2026-11-20 §8 *Release bundle*)
+// =============================================================
+
+test("the Query-block fixture is the spec's Book fence and the same map as a query field", async () => {
+  const { BOOK_QUERY, BOOK_FENCE, queryBlockNodes, QUERY_REFUSALS } = await import(script);
+  assert.equal(BOOK_QUERY, '{:query [:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title "Book"]]}');
+  assert.equal(BOOK_FENCE, "```query\n" + BOOK_QUERY + "\n```");
+  const nodes = queryBlockNodes();
+  assert.deepEqual(nodes.map((n) => n.from), ["fence", "field"]);
+  assert.deepEqual(nodes[0].node, { uuid: nodes[0].node.uuid, title: BOOK_FENCE });
+  assert.deepEqual(nodes[1].node, { uuid: nodes[1].node.uuid, title: "Release Query Caption", query: BOOK_QUERY });
+  assert.deepEqual(nodes.map((n) => n.caption), ["", "Release Query Caption"]);
+  assert.notEqual(nodes[0].node.uuid, nodes[1].node.uuid);
+  // The class of refusal the release bundle must keep: rules given as a key, and a rule called in :where.
+  assert.deepEqual(QUERY_REFUSALS.map((r) => r.label), [":rules", "a rule call"]);
+  assert.match(QUERY_REFUSALS[0].query, /:rules \[\[/);
+  assert.match(QUERY_REFUSALS[0].reason, /^query: :rules is not accepted; datalog_query takes no rules/);
+  assert.match(QUERY_REFUSALS[1].reason, /^query: where \d+: \(task …\) calls a rule; datalog_query takes no rules/);
+});
+
+// What the release bundle stores for the spec's Book query, as queryBlockReadBack returns it.
+const goodBlock = (caption = "") => ({
+  tags: ["logseq.class/Query"],
+  caption,
+  text: '{:query [:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title "Book"]]}',
+  displayType: "code",
+  lang: "clojure",
+  marker: true,
+  valueMarker: false,
+});
+
+test("queryBlockReadBackErrors passes a stored Query block and names each gap: tag, caption, text, :code, clojure, the marker and a marker on the value block", async () => {
+  const { queryBlockReadBackErrors, BOOK_QUERY } = await import(script);
+  const want = { caption: "", text: BOOK_QUERY };
+  assert.deepEqual(queryBlockReadBackErrors(goodBlock(), want), []);
+  assert.deepEqual(queryBlockReadBackErrors({ ...goodBlock(), tags: ["logseq.class/Query", "user.class/Other"] }, want), [], "another tag beside Query is allowed");
+  const cases = [
+    [{ tags: [] }, /tags \[\] lack logseq\.class\/Query/],
+    [{ caption: "x" }, /caption "x", expected ""/],
+    [{ text: "{:query [:find ?b]}" }, /query text "\{:query \[:find \?b\]\}", expected/],
+    [{ text: null }, /query text null/],
+    [{ displayType: "none" }, /display type "none", expected "code"/],
+    [{ lang: "" }, /lang "", expected "clojure"/],
+    [{ marker: false }, /claudeQueryBlock false on the Query block, expected true/],
+    [{ valueMarker: true }, /claudeQueryBlock true on the value block, expected none/],
+  ];
+  for (const [change, error] of cases) {
+    const errors = queryBlockReadBackErrors({ ...goodBlock(), ...change }, want);
+    assert.equal(errors.length, 1, `${JSON.stringify(change)}: ${JSON.stringify(errors)}`);
+    assert.match(errors[0], error);
+  }
+  assert.deepEqual(queryBlockReadBackErrors(undefined, want), ["no Query block read back (no logseq.property/query value block)"]);
+});
+
+test("queryRefusalError passes a 400 naming the node and the reason with nothing stored, and fails another status, another reason, a bare 400 or a stored block", async () => {
+  const { queryRefusalError } = await import(script);
+  const reason = "query: :rules is not accepted; datalog_query takes no rules, because …";
+  const want = { path: "blocks[0]", reason };
+  const res = (status, body) => ({ status, json: body, text: JSON.stringify(body) });
+  assert.equal(queryRefusalError(res(400, { error: `blocks[0]: ${reason}` }), want, { stored: false }), null);
+  assert.match(queryRefusalError(res(201, { blocks: [] }), want, { stored: false }), /HTTP 201/);
+  assert.match(queryRefusalError(res(500, { error: `blocks[0]: ${reason}` }), want, { stored: false }), /HTTP 500/);
+  assert.match(queryRefusalError(res(400, { error: "blocks[0]: query: at most 4,000 characters (got 4,001)" }), want, { stored: false }), /error "blocks\[0\]: query: at most/);
+  assert.match(queryRefusalError(res(400, {}), want, { stored: false }), /error undefined/, "a 400 with no reason fails");
+  assert.match(queryRefusalError(res(400, { error: `blocks[1]: ${reason}` }), want, { stored: false }), /expected "blocks\[0\]: query: :rules/, "the wrong node fails");
+  assert.match(queryRefusalError(res(400, { error: `blocks[0]: ${reason}` }), want, { stored: true }), /the refused block was stored/);
+});
+
+// A stand-in SyncDO for the Query-block checks: an insert answers 201 echoing each node (converted
+// "query" for a fence) unless a node's query has :rules or calls (task …), which answers 400 naming
+// it; a block read answers `read` (404 by default). `log` runs on every request.
+const queryStub = ({ read = 404, log } = {}) => ({
+  async fetch(request) {
+    log?.();
+    const url = new URL(request.url);
+    if (request.method === "GET") return new Response(JSON.stringify({ uuid: url.pathname.split("/").pop() }), { status: read });
+    const { blocks } = await request.json();
+    const bad = blocks.findIndex((b) => /:rules|\(task /.test(b.query ?? ""));
+    if (bad >= 0) {
+      const reason = /:rules/.test(blocks[bad].query)
+        ? "query: :rules is not accepted; datalog_query takes no rules, because a tree of rules expands without reading data and can run for seconds before any cap stops it; …"
+        : "query: where 2: (task …) calls a rule; datalog_query takes no rules, because a tree of rules expands without reading data and can run for seconds before any cap stops it; …";
+      return new Response(JSON.stringify({ error: `blocks[${bad}]: ${reason}` }), { status: 400 });
+    }
+    const echo = blocks.map((b) => {
+      const fence = b.title.startsWith("```query\n");
+      return { uuid: b.uuid, title: fence ? "" : b.title, query: b.query ?? b.title.slice(9, -4), ...(fence ? { converted: "query" } : {}) };
+    });
+    return new Response(JSON.stringify({ blocks: echo }), { status: 201 });
+  },
+});
+const queryCheck = async (name, stub) => {
+  const { checks } = await import(script);
+  const found = checks({ stub, pageUuid: "00000000-0000-4000-8000-0000000000aa" }).find(([n]) => n.startsWith(name));
+  assert.ok(found, name);
+  return found[1];
+};
+
+test("the Query-block insert check fails when the insert logs to the console, or answers without converted on the fence", async () => {
+  const insert = "Query blocks: the Book fence and a query field insert";
+  await (await queryCheck(insert, queryStub()))();
+  for (const level of ["error", "warn", "log", "info"]) {
+    await assert.rejects((await queryCheck(insert, queryStub({ log: () => console[level]("sentry stub:", "boom") })))(), new RegExp(`the insert logged \\d+ time\\(s\\): console\\.${level}\\(sentry stub: boom\\)`));
+  }
+  const noConvert = queryStub();
+  const fetch = noConvert.fetch;
+  noConvert.fetch = async (req) => {
+    const res = await fetch(req);
+    const body = await res.json();
+    for (const b of body.blocks) delete b.converted;
+    return new Response(JSON.stringify(body), { status: res.status });
+  };
+  await assert.rejects((await queryCheck(insert, noConvert))(), /blocks\[0\] \(fence\): converted undefined, expected "query"/);
+});
+
+test("the Query-block refusal check fails when a refused call stored a block, or logged", async () => {
+  const refusal = "Query blocks: a :rules query and a rule call are refused";
+  await (await queryCheck(refusal, queryStub()))();
+  await assert.rejects((await queryCheck(refusal, queryStub({ read: 200 })))(), /:rules: the refused block was stored/);
+  await assert.rejects((await queryCheck(refusal, queryStub({ log: () => console.error("x") })))(), /:rules: the refusal logged 1 time\(s\)/);
+});
+
 test("exits 2 naming the missing bundle", () => {
   const dir = mkdtempSync(join(tmpdir(), "rqc-test-"));
   try {
@@ -372,7 +494,7 @@ test("exits 2 naming the missing bundle", () => {
   }
 });
 
-test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, answers a decision 180 levels down, and at scale answers every named query and stops every F1 shape in time without logging a scan-cap refusal", { skip, timeout: 600_000 }, () => {
+test("the release bundle returns the values data patterns bind, in datalog_query and run_named_query, answers a decision 180 levels down, at scale answers every named query and stops every F1 shape in time without logging a scan-cap refusal, and makes, reads back and refuses Query blocks", { skip, timeout: 600_000 }, () => {
   const before = leftovers();
   const r = spawnSync(process.execPath, [script, upstream], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -397,6 +519,9 @@ test("the release bundle returns the values data patterns bind, in datalog_query
     "at the caps: a deleteBlankBlocks dry run over 10000 blocks lists 100 of 5000 within 500 ms",
     "at the caps: a deleteBlankBlocks apply of 100 listed ids over 10000 blocks deletes them within 15000 ms",
     "at 100,000 entities: getSyncStatus counts 1700 pages and 83300 blocks, leaving out Private and recycled ones, within 750 ms",
+    "Query blocks: the Book fence and a query field insert through the release bundle, logging nothing",
+    "Query blocks: both read back with the Query tag, the query text, :code, clojure and the marker",
+    "Query blocks: a :rules query and a rule call are refused naming the node, store nothing and log nothing",
   ]) {
     assert.match(r.stdout, new RegExp(`^ok +${name.replace(/[()?/]/g, "\\$&")}$`, "m"));
   }

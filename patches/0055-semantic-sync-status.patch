@@ -23,7 +23,7 @@ index e7f58a7..e2ca584 100644
    Object
    (fetch [this request]
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 3704114..2895632 100644
+index d22c921..6a5841e 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -18,6 +18,7 @@
@@ -34,7 +34,7 @@ index 3704114..2895632 100644
              [logseq.db-sync.worker.ws :as ws]
              [logseq.db.frontend.asset :as db-asset]
              [logseq.db.frontend.class :as db-class]
-@@ -5326,6 +5327,54 @@
+@@ -5630,6 +5631,54 @@
  
  (def ^:private insight-handlers
    #{:semantic/pages-backlinks :semantic/graph-health :semantic/knowledge-index})
@@ -89,7 +89,7 @@ index 3704114..2895632 100644
  
  ;; listBlockChanges feeds an external search index. Without `since` it lists every content block
  ;; in UUID order; with `since` (a graph t from an earlier response) and that response's `epoch`, it
-@@ -5872,6 +5921,8 @@
+@@ -6176,6 +6225,8 @@
      (contains? bulk-handlers handler) (handle-bulk context)
      (contains? insight-handlers handler) (handle-insights context)
      (= :semantic/block-changes handler) (handle-block-changes context)
@@ -148,7 +148,7 @@ index cca6a94..3aa96b9 100644
 +                (when (string? editing-block-uuid) (parse-uuid editing-block-uuid))))
 +        (vals @(presence* self))))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 39eccae..e450f58 100644
+index cbf0844..a247b24 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -20,6 +20,8 @@
@@ -160,7 +160,7 @@ index 39eccae..e450f58 100644
     {:method "GET" :path "/api/v1/graphs/:graph-id/knowledge-index" :internal-path "/semantic/knowledge-index"
      :handler :semantic/knowledge-index :operation-id "listKnowledgeIndex" :scope "logseq/read" :rate-class :read}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/pages/:page-id" :internal-path "/semantic/pages/:page-id"
-@@ -158,6 +160,7 @@
+@@ -167,6 +169,7 @@
     "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
@@ -168,7 +168,7 @@ index 39eccae..e450f58 100644
     "getGraphHealth" ["Check graph health" "Runs graph-health checks for a periodic review and returns, per check, a complete count and the first limit items in title order (mismatched-choice-values in holder order): orphan-tags (user tags nothing is tagged with and no tag extends), orphan-properties (user properties without any value), duplicate-titles (pages, journals, tags and properties whose titles are equal ignoring case), pages-without-summary (non-journal user pages whose first top-level block does not start with summary-prefix), pages-without-tags (non-journal user pages with no tag) and mismatched-choice-values (values that are not one of their property's own choices: another property's choice with the same title, on a property with choices or on a user property without them, such as a node property, reason another-propertys-choice; something other than a choice, reason not-a-choice; or the property's own choice that the holder's tags do not allow, reason out-of-scope. Values cleared to Logseq's empty placeholder are left out; each item names the holder, the property, the value, the property the value's choice belongs to and the reason) and orphan-choices (choices whose property is gone or has neither an ident nor a title, in value order; each item gives the choice's uuid, value and reason owner-deleted or owner-unnamed; a choice that has lost every reference to its property, as a delete of the property with :db/retractEntity leaves it, can't be told from a block and isn't listed). created-after and updated-after narrow the two page checks. To page through one check, pass it alone in checks with its next-cursor. Unavailable for E2EE graphs."]
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
-@@ -662,7 +665,10 @@
+@@ -678,7 +681,10 @@
      (or (contains? label-checked-operations operation-id)
          (contains? #{"batchInsertBlockTrees" "batchMoveBlocks" "batchSetBlockProperty" "batchDeleteBlockProperty"
                       "deleteBlocks"} operation-id))
@@ -180,7 +180,7 @@ index 39eccae..e450f58 100644
  
  (defn- operation-responses* [operation-id]
    (merge {"200" (case operation-id
-@@ -680,6 +686,7 @@
+@@ -696,6 +702,7 @@
                    "searchGraph" (list-response :results "SearchResultResponse" "A cursor page of search results")
                    "getPageBacklinks" (entity-response "PageBacklinksResponse" "A page's usage grouped by relation")
                    "getGraphHealth" (entity-response "GraphHealthResponse" "Counts and items for each check run")
@@ -188,7 +188,7 @@ index 39eccae..e450f58 100644
                    "listKnowledgeIndex"
                    (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
                    "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
-@@ -1087,6 +1094,29 @@
+@@ -1106,6 +1113,29 @@
                                                                  :description "The whole list after the call, in sidebar order, as listFavorites returns it."
                                                                  :items {:$ref "#/components/schemas/Favorite"}}
                                                      :dry-run {:type "boolean" :description "With dry-run=true: true; nothing was written."}}}
@@ -716,13 +716,13 @@ index 0000000..d4b0b6b
 +            (is (= (:user-id user-a) (get actor "sub")) "the actor is the PAT's user, the owner")
 +            (is (= expected-clients (:clients body)) (pr-str body))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 1a146f3..f06a606 100644
+index 90c1ced..48e9fc7 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -39,6 +39,7 @@
-             [logseq.db-sync.semantic-tags-title-scoped-test]
+@@ -40,6 +40,7 @@
              [logseq.db-sync.semantic-value-block-by-uuid-test]
              [logseq.db-sync.semantic-page-title-heading-test]
+             [logseq.db-sync.semantic-query-block-test]
 +            [logseq.db-sync.semantic-sync-status-test]
              [logseq.db-sync.storage-test]
              [logseq.db-sync.tx-sanitize-test]

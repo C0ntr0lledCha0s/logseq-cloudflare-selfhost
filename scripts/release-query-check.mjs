@@ -16,6 +16,14 @@
 // both answer, quickly, with the meeting decided (the Datalog it replaced stopped the deep one at a
 // rule cap), and each answer carries plan and work.
 //
+// Query blocks (patch 0050) call datalog.cljs's reader and validator on the write path, so it also
+// inserts the spec's Book query as a fence and as a query field through POST /semantic/block-trees,
+// reads both back through datalog_query from their datoms (the Query tag, the value block's text,
+// display type :code, lang "clojure", and the claudeQueryBlock marker on the Query block only), and
+// sends a :rules query and a rule call beside a valid node: each must answer 400 naming the node and
+// the reason, with neither node stored. The inserts and the refusals run with the console captured,
+// and fail if anything was logged.
+//
 // It then seeds a graph at scale (scaleFixture, about 20,000 blocks) through SyncDO.fetch, in
 // POST /semantic/block-trees/batch calls of 100 entries: 2,400 pages tagged Release Topic, 300
 // meetings with decisions under them (30 of them 40 levels down) or beside them, 400 tasks across
@@ -45,6 +53,7 @@
 // Exits 0 when every check passes, 1 when one fails (naming it), and 2 when either build is
 // missing. Seeding takes about 220 s, 50 s of it the sync-status graph and 60 s the BLANK_LARGE one.
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -175,7 +184,8 @@ export async function loadReleaseSyncDO(upstream, bundle = bundlePath(upstream),
   }
 }
 
-async function call(stub, method, path, body) {
+/** Sends one request to the SyncDO: {status, text, json}. */
+export async function call(stub, method, path, body) {
   const url = `http://localhost${path}${path.includes("?") ? "&" : "?"}graph-id=release-check`;
   const res = await stub.fetch(
     new Request(url, {
@@ -192,6 +202,162 @@ async function call(stub, method, path, body) {
     json = undefined;
   }
   return { status: res.status, text, json };
+}
+
+// Query blocks
+// ============
+
+/** The spec's Book query (2026-11-20 §8a), as a fence and as a query field. */
+export const BOOK_QUERY = '{:query [:find (pull ?b [*]) :where [?b :block/tags ?t] [?t :block/title "Book"]]}';
+export const BOOK_FENCE = "```query\n" + BOOK_QUERY + "\n```";
+
+/** The two Query-block nodes the check inserts: [{from, caption, node}], each with its own uuid. */
+export function queryBlockNodes() {
+  return [
+    { from: "fence", caption: "", node: { uuid: randomUUID(), title: BOOK_FENCE } },
+    { from: "field", caption: "Release Query Caption", node: { uuid: randomUUID(), title: "Release Query Caption", query: BOOK_QUERY } },
+  ];
+}
+
+const NO_RULES =
+  "datalog_query takes no rules, because a tree of rules expands without reading data and can run for seconds before any cap stops it";
+
+/** Queries a Query block must refuse, each with the start of its reason: rules as a key, and a rule called in :where. */
+export const QUERY_REFUSALS = [
+  {
+    label: ":rules",
+    query: "{:query [:find ?b :where [?b :block/title]] :rules [[(r ?b) [?b :block/title]]]}",
+    reason: `query: :rules is not accepted; ${NO_RULES}`,
+  },
+  {
+    label: "a rule call",
+    query: '{:query [:find ?b :where [?b :block/title] (task ?b #{"todo"})]}',
+    reason: `query: where 2: (task …) calls a rule; ${NO_RULES}`,
+  },
+];
+
+/**
+ * Reads Query block `uuid` back through datalog_query on the release bundle, from its datoms:
+ * {tags, caption, text, displayType, lang, marker, valueMarker}, or undefined when it holds no
+ * logseq.property/query value block.
+ */
+export async function queryBlockReadBack(stub, uuid) {
+  const inputs = `[#uuid ${JSON.stringify(uuid)}]`;
+  const ask = async (query) => {
+    const res = await call(stub, "POST", "/semantic/query", { query, inputs });
+    if (res.status !== 200) throw new Error(`read back ${uuid}: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+    return res.json.rows;
+  };
+  const [row] = await ask(
+    "[:find ?caption ?text ?dt ?lang ?m ?vm :in $ ?u :where [?b :block/uuid ?u] [(get-else $ ?b :block/title \"\") ?caption]" +
+      " [?b :logseq.property/query ?v] [(get-else $ ?v :block/title \"\") ?text]" +
+      " [(get-else $ ?v :logseq.property.node/display-type :none) ?dt] [(get-else $ ?v :logseq.property.code/lang \"\") ?lang]" +
+      " [(get-else $ ?b :user.property/claude-queryBlock false) ?m] [(get-else $ ?v :user.property/claude-queryBlock false) ?vm]]",
+  );
+  if (!row) return undefined;
+  const tags = (await ask("[:find ?tag :in $ ?u :where [?b :block/uuid ?u] [?b :block/tags ?t] [?t :db/ident ?tag]]")).map((r) => r[0]);
+  const [caption, text, displayType, lang, marker, valueMarker] = row;
+  return { tags, caption, text, displayType, lang, marker, valueMarker };
+}
+
+/** Each way `got` (queryBlockReadBack's answer) differs from a stored Query block of `caption` and `text`. */
+export function queryBlockReadBackErrors(got, { caption, text }) {
+  if (!got) return ["no Query block read back (no logseq.property/query value block)"];
+  const str = JSON.stringify;
+  const errors = [];
+  if (!got.tags?.includes("logseq.class/Query")) errors.push(`tags ${str(got.tags)} lack logseq.class/Query`);
+  if (got.caption !== caption) errors.push(`caption ${str(got.caption)}, expected ${str(caption)}`);
+  if (got.text !== text) errors.push(`query text ${str(got.text)}, expected ${str(text)}`);
+  if (got.displayType !== "code") errors.push(`display type ${str(got.displayType)}, expected "code"`);
+  if (got.lang !== "clojure") errors.push(`lang ${str(got.lang)}, expected "clojure"`);
+  if (got.marker !== true) errors.push(`claudeQueryBlock ${str(got.marker)} on the Query block, expected true`);
+  if (got.valueMarker !== false) errors.push(`claudeQueryBlock ${str(got.valueMarker)} on the value block, expected none`);
+  return errors;
+}
+
+/**
+ * Why `res` is not the refusal of node `path` with `reason` (a 400 whose error is `<path>: <reason>…`),
+ * or null when it is; `stored` says whether the refused node's uuid reads back as a block.
+ */
+export function queryRefusalError(res, { path, reason }, { stored }) {
+  const want = `${path}: ${reason}`;
+  if (res.status !== 400) return `HTTP ${res.status}, expected 400: ${res.text.slice(0, 300)}`;
+  const error = res.json?.error;
+  if (typeof error !== "string" || !error.startsWith(want)) return `error ${JSON.stringify(error)}, expected ${JSON.stringify(want)}…`;
+  if (stored) return "the refused block was stored";
+  return null;
+}
+
+/** Throws naming each console call recorded while `step` ran. */
+function assertQuiet(step, calls) {
+  if (calls.length) {
+    throw new Error(`${step} logged ${calls.length} time(s): ${calls.map((c) => `console.${c.level}(${c.args.map(String).join(" ").slice(0, 200)})`).join("; ")}`);
+  }
+}
+
+/** The Query-block checks: insert the fence and the field, read both back, refuse the rules class. */
+function queryBlockChecks(ctx) {
+  const { stub } = ctx;
+  const inserted = () => {
+    if (!ctx.queryBlocks) throw new Error("the Query blocks were not inserted");
+    return ctx.queryBlocks;
+  };
+  return [
+    [
+      "Query blocks: the Book fence and a query field insert through the release bundle, logging nothing",
+      async () => {
+        const nodes = queryBlockNodes();
+        const { value: res, calls } = await captureConsole(() =>
+          call(stub, "POST", "/semantic/block-trees", { "target-id": ctx.pageUuid, blocks: nodes.map((n) => n.node) }),
+        );
+        if (res.status !== 201) throw new Error(`insert: HTTP ${res.status}: ${res.text.slice(0, 300)}`);
+        assertQuiet("the insert", calls);
+        const blocks = res.json?.blocks ?? [];
+        for (const [i, { from, node }] of nodes.entries()) {
+          const b = blocks[i] ?? {};
+          if (b.uuid !== node.uuid || b.query !== BOOK_QUERY) throw new Error(`blocks[${i}] (${from}): answered ${JSON.stringify(b).slice(0, 300)}`);
+          const converted = from === "fence" ? "query" : undefined;
+          if (b.converted !== converted) throw new Error(`blocks[${i}] (${from}): converted ${JSON.stringify(b.converted)}, expected ${JSON.stringify(converted)}`);
+        }
+        ctx.queryBlocks = nodes;
+      },
+    ],
+    [
+      "Query blocks: both read back with the Query tag, the query text, :code, clojure and the marker",
+      async () => {
+        for (const { from, caption, node } of inserted()) {
+          const errors = queryBlockReadBackErrors(await queryBlockReadBack(stub, node.uuid), { caption, text: BOOK_QUERY });
+          if (errors.length) throw new Error(`the ${from} block: ${errors.join("; ")}`);
+        }
+      },
+    ],
+    [
+      "Query blocks: a :rules query and a rule call are refused naming the node, store nothing and log nothing",
+      async () => {
+        for (const { label, query, reason } of QUERY_REFUSALS) {
+          const [valid, refused] = [randomUUID(), randomUUID()];
+          const { value: res, calls } = await captureConsole(() =>
+            call(stub, "POST", "/semantic/block-trees", {
+              "target-id": ctx.pageUuid,
+              blocks: [
+                { uuid: valid, title: "Release Query Valid", query: BOOK_QUERY },
+                { uuid: refused, title: "Release Query Refused", query },
+              ],
+            }),
+          );
+          // Refused up front: neither the refused node nor the valid one before it is stored.
+          let stored = false;
+          for (const uuid of [valid, refused]) {
+            const got = await call(stub, "GET", `/semantic/blocks/${uuid}`);
+            if (got.status !== 404) stored = true;
+          }
+          const error = queryRefusalError(res, { path: "blocks[1]", reason }, { stored });
+          if (error) throw new Error(`${label}: ${error}`);
+          assertQuiet(`${label}: the refusal`, calls);
+        }
+      },
+    ],
+  ];
 }
 
 // The graph at scale
@@ -1022,6 +1188,7 @@ export function checks(ctx) {
         if (ms > 500) throw new Error(`answered after ${ms} ms, expected under 500 ms`);
       },
     ],
+    ...queryBlockChecks(ctx),
     ...scaleChecks(ctx),
     ...blankChecks(ctx),
   ];

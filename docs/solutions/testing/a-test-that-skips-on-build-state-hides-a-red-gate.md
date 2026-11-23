@@ -5,6 +5,7 @@ tags: [skip, release-bundle, bench, build.sh, gate, stale-bundle, scripts-test]
 seen:
   - 2026-11-17 – item 40, patch 0039, stage 2 (s-2-1, s-2-2)
   - 2026-11-22 – blank-blocks-sync-status, stage 1 (s-stage-1-2)
+  - 2026-11-22 – item 49, patch 0050, stage 4 (s-4-2): `scripts/build.sh` then `scripts/check.sh --upstream` exited 0 with a WARNING naming 9 skipped tests (7 bench, 2 release-bundle), because build.sh had deleted `worker/dist/worker-test.js`. The builder's 389 passed, 0 skipped came from a separate rebuild, not from the gate
 promoted_to: ["CLAUDE.md Gotchas"]
 ---
 
@@ -27,3 +28,5 @@ It recurred on 2026-11-22: after `scripts/build.sh`, `scripts/check.sh --upstrea
 - When a stage changes what a bench or release check exercises, run both build modes in turn and read the output for "skipped". A skip is not a pass; `scripts/check.sh` already names skipped checks, so repeat them in the stage report.
 - Rebuild with `scripts/build.sh` on the committed HEAD before quoting a release-bundle result, and quote the SHA. Do not infer freshness from file times.
 - A stage is done when the gate is green on a pushed HEAD, not before.
+
+- Second sighting (item 49): the gate's exit code stays 0 with skips. A stage quotes the gate only when its output has no WARNING line, with the SHA. After `build.sh`, run `scripts/upstream-test.sh .upstream <regex>` to rebuild `worker-test.js` before the gate.
