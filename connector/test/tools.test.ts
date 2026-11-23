@@ -3232,7 +3232,7 @@ describe("list_changes_since", () => {
     const tool = (await listTools()).find((t) => t.name === "list_changes_since");
     expect(tool, "list_changes_since is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(59);
+    expect(committedManifest).toHaveLength(61);
   });
 
   it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
@@ -3275,7 +3275,7 @@ describe("get_graph_schema", () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
     expect(tool, "get_graph_schema is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(59);
+    expect(committedManifest).toHaveLength(61);
     expect(committedManifest.map((t) => t.name)).toContain("get_graph_schema");
   });
 
