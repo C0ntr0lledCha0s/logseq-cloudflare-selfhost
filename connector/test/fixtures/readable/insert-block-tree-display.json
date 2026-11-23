@@ -31,14 +31,14 @@
       },
       {
         "uuid": "79a730e1-6476-47c0-a9d5-15fc8d652fb5",
-        "title": "```query\n{{query todo}}\n```"
+        "title": "```query\n(task todo)\n```"
       }
     ],
     "count": 5,
     "kept": [
       {
         "path": "blocks[3]",
-        "reason": "query fences stay text; a Query block is not supported yet"
+        "reason": "only an advanced query ({:query [...]}) becomes a Query block; a simple query stays text"
       }
     ],
     "target": {
