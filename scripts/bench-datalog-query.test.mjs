@@ -153,6 +153,8 @@ const NAMED_BOUNDS = {
   "open-tasks-by-client": ["tasks", "open-tasks", "reads"],
   "pages-missing-property": ["tagged", "reads"],
 };
+/** open-tasks-by-client with params.client at the cap (patch 0054), after the full runs at each size. */
+const CLIENT_RUNS = ["client-page", "client-tasks"];
 const WIDTH = ["f1-identity-175", "f1-identity-99", "f1-includes-20", "three-bindings"];
 
 test("the fixture carries meetings, decisions under them, tasks with statuses and, when asked, the width pages, the same on every run", async () => {
@@ -203,9 +205,13 @@ test("--named --json gives one record per named query and size, with work for ea
   assert.equal(out.mode, "named");
   assert.equal(out.runs, 2);
   assert.deepEqual(Object.keys(out.bounds).sort(), ["ancestor-steps", "decisions", "meetings", "open-tasks", "page-blocks", "reads", "tagged", "tasks"]);
-  assert.equal(out.records.length, NAMED.length * 2);
-  for (const pages of [150, 300]) assert.deepEqual(out.records.filter((r) => r.pages === pages).map((r) => r.query), NAMED);
-  for (const r of out.records) {
+  assert.equal(out.records.length, (NAMED.length + CLIENT_RUNS.length) * 2);
+  for (const pages of [150, 300]) {
+    const at = out.records.filter((r) => r.pages === pages);
+    assert.deepEqual(at.map((r) => r.query), [...NAMED, "open-tasks-by-client", "open-tasks-by-client"]);
+    assert.deepEqual(at.map((r) => r.run), [...NAMED.map(() => "full"), ...CLIENT_RUNS]);
+  }
+  for (const r of out.records.filter((x) => x.run === "full")) {
     const where = `${r.query} at ${r.pages}`;
     for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${where}: ${k}`);
     assert.equal(r.outcome, "rows", `${where}: ${r.error}`);
@@ -217,6 +223,67 @@ test("--named --json gives one record per named query and size, with work for ea
   // Every Bench Project page is older than 30 days, so the walk reads all of their blocks.
   assert.ok(at("projects-untouched", 300).work["page-blocks"] > at("projects-untouched", 150).work["page-blocks"]);
   assert.ok(at("meetings-without-decision", 300).work["ancestor-steps"] > 0);
+});
+
+// Patch 0054: open-tasks-by-client with params.client, at the cap
+// ===============================================================
+
+
+test("the client fixture is a page of more than 10,000 blocks holding one client and more than 2,000 open tasks holding another, the same on every run, leaving the rest alone", async () => {
+  const { makeFixture, CLIENT_RUNS: exported, CLIENT_PAGE_BLOCKS, CLIENT_TASKS } = await import(script);
+  assert.deepEqual(exported, CLIENT_RUNS);
+  assert.ok(CLIENT_PAGE_BLOCKS > 10_000, `${CLIENT_PAGE_BLOCKS} blocks: past the tasks bound`);
+  assert.ok(CLIENT_TASKS > 2_000, `${CLIENT_TASKS} tasks: past the open-tasks bound`);
+  const a = makeFixture(300, 1, { clients: true });
+  assert.deepEqual(makeFixture(300, 1, { clients: true }), a);
+  assert.deepEqual(makeFixture(300).clients, [], "no client pages unless asked");
+  const plain = makeFixture(300);
+  assert.deepEqual(a.pages, plain.pages, "the client pages leave the rest of the fixture alone");
+  assert.deepEqual(a.chain, plain.chain);
+  assert.deepEqual(a.tags, plain.tags);
+  assert.deepEqual(a.clients.map((c) => c.run), CLIENT_RUNS);
+  const uuids = new Set([...a.pages.map((p) => p.uuid), ...a.clients.flatMap((c) => [c.client.uuid, ...c.pages.map((p) => p.uuid)])]);
+  assert.equal(uuids.size, a.pages.length + a.clients.reduce((n, c) => n + 1 + c.pages.length, 0), "no uuid repeats");
+
+  const [onPage, held] = a.clients;
+  // client-page: one page holds the client, and the walk reaches its blocks, more than the tasks bound.
+  assert.equal(onPage.pages.length, 1);
+  assert.deepEqual(onPage.pages[0].refs, [onPage.client.uuid]);
+  assert.equal(onPage.pages[0].blocks.length, CLIENT_PAGE_BLOCKS);
+  assert.ok(onPage.pages[0].blocks.every((b) => b.refs.length === 0), "its blocks take the page's client");
+  assert.ok(onPage.pages[0].blocks.some((b) => b.task) && onPage.pages[0].blocks.some((b) => !b.task));
+  // client-tasks: open tasks that each hold the client, more than the open-tasks bound, on pages that don't.
+  const tasks = held.pages.flatMap((p) => p.blocks);
+  assert.equal(tasks.length, CLIENT_TASKS);
+  assert.ok(held.pages.every((p) => p.refs.length === 0));
+  assert.ok(tasks.every((t) => (t.task === "todo" || t.task === "doing") && t.refs.length === 1 && t.refs[0] === held.client.uuid));
+  assert.notEqual(onPage.client.title, held.client.title);
+});
+
+test("--named runs open-tasks-by-client with params.client at the cap: a client page past the tasks bound and a client held past the open-tasks or reads bound, each 422 naming the client", { skip, timeout: 300_000 }, () => {
+  const run = spawnSync(process.execPath, [script, "--named", "--pages", "150", "--runs", "1", "--json"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  const client = out.records.filter((r) => r.run !== "full");
+  assert.deepEqual(client.map((r) => r.run), CLIENT_RUNS);
+  const [onPage, held] = client;
+  for (const r of client) {
+    assert.equal(r.query, "open-tasks-by-client");
+    assert.equal(r.pages, 150);
+    assert.ok(Number.isInteger(r.datoms) && r.datoms > 0);
+    for (const k of ["cold_ms", "warm_ms"]) assert.ok(typeof r[k] === "number" && r[k] >= 0, `${r.run}: ${k}`);
+    assert.equal(typeof r.client, "string", `${r.run}: names its client`);
+    assert.deepEqual(Object.keys(r.work).sort(), ["open-tasks", "reads", "tasks"], `${r.run}: work names its bounds`);
+    assert.equal(r.outcome, "bound", `${r.run}: ${r.outcome}`);
+    assert.equal(r.rows, 0);
+  }
+  assert.equal(onPage.bound, "tasks");
+  assert.equal(onPage.work.tasks, out.bounds.tasks + 1, "stopped one past the tasks bound");
+  assert.equal(onPage.error, `open-tasks-by-client stopped after 10,000 blocks holding ${onPage.client} or on its pages (its tasks bound); list one of its pages' tasks with datalog_query`);
+  assert.ok(["open-tasks", "reads"].includes(held.bound), held.bound);
+  assert.ok(held.work[held.bound] === out.bounds[held.bound] + 1, `stopped one past the ${held.bound} bound: ${JSON.stringify(held.work)}`);
+  assert.match(held.error, new RegExp(`^open-tasks-by-client (found more than 2,000 open tasks of ${held.client} \\(its open-tasks bound\\)|stopped after 30,000 reads \\(its reads bound, the backstop over every read\\)); mark ${held.client}'s finished tasks`));
+  assert.notEqual(onPage.client, held.client);
 });
 
 test("--bounds stops a named query at the bound it names, and --bounds refuses an unknown bound", { skip, timeout: 300_000 }, () => {
@@ -289,7 +356,8 @@ test("--named and --width skip naming the missing build, and refuse being given 
 test("text output in --named and --width prints a row per query or shape", { skip, timeout: 300_000 }, () => {
   const named = spawnSync(process.execPath, [script, "--named", "--pages", "150", "--runs", "1"], { encoding: "utf8" });
   assert.equal(named.status, 0, named.stderr);
-  for (const q of NAMED) assert.match(named.stdout, new RegExp(`^${q}\\s+150\\s`, "m"));
+  for (const q of NAMED) assert.match(named.stdout, new RegExp(`^${q}\\s+full\\s+150\\s`, "m"));
+  for (const run of ["client-page", "client-tasks"]) assert.match(named.stdout, new RegExp(`^open-tasks-by-client\\s+${run}\\s+150\\s.*\\b(tasks|open-tasks|reads)!`, "m"));
   assert.match(named.stdout, /named queries bench: bounds .*reads 30,000/, "the bounds are read from the build");
   const width = spawnSync(process.execPath, [script, "--width", "--pages", "150", "--runs", "1"], { encoding: "utf8" });
   assert.equal(width.status, 0, width.stderr);

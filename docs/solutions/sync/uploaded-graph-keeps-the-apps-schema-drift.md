@@ -5,6 +5,7 @@ tags: [schema, cardinality, upload, snapshot, closed-value-property, edit-stamps
 seen:
   - 2026-11-08 – edit stamp 409 hotfix, patch 0034 amended
   - 2026-11-19 – item 27, the same 409 re-reported as an "orphaned claude choice"; already fixed on main, patch 0041 added
+  - 2026-11-22 – item 52, patch 0054: the risk that the new AVET holder read of a node property would miss on an uploaded graph was tested and did not hold (holders via :avet equal the :aevt scan, 3 and 3, on the opened connection and on one whose schema still drifts). Test a new index read on an upload-path graph anyway
 promoted_to: ["REVIEW.md", "CLAUDE.md Gotchas"]
 ---
 
