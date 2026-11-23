@@ -347,3 +347,13 @@ Deploy is by merge to main. On first use after deploy, each graph rebuilds its i
 5. **Single `$` math.** Should inline `$x$` be masked, at the cost of prices such as "$40 for Workflow" losing the match?
 6. **KV writes.** The titles key doubles the cron's KV writes to 48 a day per graph. Fine for your number of graphs?
 7. **Graph-wide mode.** Do you want it as a later item, and if so as a `get_graph_health` check or a separate tool?
+
+### Owner answers (2026-11-23)
+
+1. **`verify`.** On by default. One extra read per call is worth it.
+2. **`COMMON_TITLES`.** Keep the list in section 3.3. Pass `exclude` for a page that shouldn't be linked in a given draft.
+3. **Ambiguous titles.** Keep `ambiguous` and no link. Preferring the page with more references could link the wrong person without saying so.
+4. **Renamed pages (risk 6).** Catch them: verify already reads each suggested page back, so it compares the live title in that same read, at no extra sync cost (Connector item 63b).
+5. **Single `$` math.** Don't mask it. Prices such as "$40" are common in the owner's notes.
+6. **KV writes.** Fine at the owner's number of graphs.
+7. **Graph-wide mode.** Later, as a `get_graph_health` check, not a separate tool.
