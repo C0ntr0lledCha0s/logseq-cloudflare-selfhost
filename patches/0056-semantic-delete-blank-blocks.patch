@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 6a5841e..71326d9 100644
+index 1f5d922..6353470 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -5339,6 +5339,335 @@
@@ -347,7 +347,7 @@ index 6a5841e..71326d9 100644
      :semantic/blocks-get-many
      (let [ids (parse-ids (.get (.-searchParams url) "ids"))
            view (or (.get (.-searchParams url) "view") "summary")
-@@ -6156,7 +6487,7 @@
+@@ -6638,7 +6969,7 @@
  
  (def ^:private bulk-handlers
    #{:semantic/blocks-get-many :semantic/blocks-delete-many :semantic/blocks-batch-move
@@ -357,7 +357,7 @@ index 6a5841e..71326d9 100644
  (def ^:private property-and-search-handlers
    #{:semantic/properties-list :semantic/properties-create :semantic/properties-get
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index a247b24..a197422 100644
+index b806c62..de6d88d 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 @@ -42,6 +42,8 @@
@@ -369,7 +369,7 @@ index a247b24..a197422 100644
     {:method "POST" :path "/api/v1/graphs/:graph-id/refresh-refs" :internal-path "/semantic/refresh-refs"
      :handler :semantic/refresh-refs :operation-id "refreshRefs" :scope "logseq/write" :rate-class :write}
     {:method "GET" :path "/api/v1/graphs/:graph-id/blocks/:block-id" :internal-path "/semantic/blocks/:block-id"
-@@ -177,6 +179,15 @@
+@@ -181,6 +183,15 @@
     "deletePage" ["Delete a page" (str "Deletes one page through Logseq's page deletion rules, including its block tree: the page moves to the Recycle bin and links to it become plain text. Today's journal is the exception, as in the app: its blocks are deleted and the page is kept. " today-note " A journal is refused with 500 while the TIMEZONE setting names an unknown zone. Refuses with 409 and deletes nothing while other blocks or pages reference it (link to it, embed it, alias it or hold it as a property value), unless acknowledge-references is true; the error gives the count. Pass dry-run=true to get the counts without deleting, with the page under affected: its references, its block count (blocks) and the first line of its first three top-level blocks (roots). A delete answers 200 naming the page (affected); on today's journal it also answers truncated: true and the number of blocks deleted (cleared), and its dry run answers truncated: true. A page still there afterwards answers 500 naming it in the error and under not-removed.")]
     "getBlocks" ["Get several blocks" "Returns up to 100 blocks or pages by UUID in one call, in the order asked, each with its tags and property values (as getBlock returns them) but no block tree; UUIDs that don't exist are listed under missing. view=outline adds each one's descendants as a markdown outline, as getPageOutline does, sharing one 2000-block budget across the response (unavailable for E2EE graphs). view=signals returns instead, per entity, only what semantic search ranks by and no title or text (so it also answers on E2EE graphs): uuid; updated-at (the entity's own last edit in ms, or null); reference-count (visible entities outside the entity and its own blocks that link, embed, alias or hold it as a property value, as deletePage counts references, stopping at 1000); status (a task's status name such as done or canceled, or null); and property-values, null unless property is given, then that property's values as text on the entity, else on its page, else []. property takes view=signals only (400 property needs view=signals), and an ident, UUID or title that names no visible property answers 400 property not found: <property>."]
     "deleteBlocks" ["Delete several blocks" "Deletes up to 100 blocks, with their descendants, in one transaction: if any UUID is missing or names a page, tag or property, nothing is deleted. dry-run reports the counts without deleting, and gives each named block its references: how many blocks and pages the delete leaves would lose a link, embed or property value pointing into it or a block under it. Each named block's page, breadcrumb, snippet and descendant count are under affected, read before the delete; any block still there afterwards answers 500, naming it in the error and under not-removed."]
@@ -385,7 +385,7 @@ index a247b24..a197422 100644
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
     "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are refused on a Query block's query (the block holding its text), which stays Clojure code, and are otherwise judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
-@@ -432,6 +443,16 @@
+@@ -440,6 +451,16 @@
                                                              "target-label is on the single-block writes. A different length is refused "
                                                              "with 400. " target-label-description)}
                                   :dry-run dry-run-schema}}
@@ -402,7 +402,7 @@ index a247b24..a197422 100644
      "batchInsertBlockTrees"
      {:required ["entries"]
       :properties {:entries {:type "array" :minItems 1 :maxItems 100
-@@ -715,6 +736,10 @@
+@@ -747,6 +768,10 @@
                     :content {"application/json" {:schema {:anyOf [{:$ref "#/components/schemas/BlocksResponse"}
                                                                    {:$ref "#/components/schemas/SignalsResponse"}]}}}}
                    "deleteBlocks" (entity-response "DeleteBlocksResponse" "How many blocks were deleted, and each one named")
@@ -413,7 +413,7 @@ index a247b24..a197422 100644
                    "deleteBlock" (entity-response "DeleteBlocksResponse" "The deleted block, named")
                    "moveBlocks" (entity-response "MovedBlocksResponse" "The moved blocks, with where each was and is")
                    "batchMoveBlocks" (entity-response "MoveBlocksResponse" "How many blocks were moved, with where each was and is")
-@@ -771,6 +796,12 @@
+@@ -807,6 +832,12 @@
              "500" (entity-response "NotRemoved" "The page is still in the graph after the delete")}
             ("deleteBlock" "deleteBlocks")
             {"500" (entity-response "NotRemoved" "Blocks still in the graph after the delete")}
@@ -426,7 +426,7 @@ index a247b24..a197422 100644
             ("deleteTag" "deleteProperty")
             {"200" (entity-response "DeleteImpact" "With dry-run=true: what the delete would remove; nothing was deleted")
              "204" {:description "Deleted"}
-@@ -968,6 +999,41 @@
+@@ -1004,6 +1035,41 @@
                                                                  :property-values {:type ["array" "null"] :items {:type "string"}
                                                                                    :description "null without property; else the property's values as text on the entity, else on its page, else []."}}}}
                                    :missing {:type "array" :items {:type "string"}}}}
@@ -1677,10 +1677,10 @@ index 0000000..270e86a
 +          (is (= 200 (:status response)) (pr-str response))
 +          (is (= [{:page "Example" :uuid page :deleted 1 :remaining-blocks 2}] (get-in response [:body :pages]))))))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 48e9fc7..c81bd65 100644
+index 49d3f49..9be20ee 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -41,6 +41,7 @@
+@@ -46,6 +46,7 @@
              [logseq.db-sync.semantic-page-title-heading-test]
              [logseq.db-sync.semantic-query-block-test]
              [logseq.db-sync.semantic-sync-status-test]
