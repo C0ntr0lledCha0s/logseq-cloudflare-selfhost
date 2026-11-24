@@ -133,7 +133,7 @@ Run `/compound` to capture a lesson from work done outside a lane.
 
 The lanes read items from the owner's issues page and never write to it without asking. Each item there has the same shape:
 
-- **One block per item.** A heading task titled `LC-N: <summary>`, so a search for `LC-N` finds it. The number is also in the `itemNumber` property and is never shared or reused: a split-out or follow-up piece of work gets the next free number.
+- **One block per item.** A heading task titled `LC-N: <summary>`, so a search for `LC-N:`, colon included, finds it and only it (`LC-10` alone also matches LC-100 to LC-109). The number is also in the `itemNumber` property and is never shared or reused: a split-out or follow-up piece of work gets the next free number.
 - **A type tag.** Bug, Feature, Improvement, Spike or Chore. An Epic is a group that ships as one PR; its child items each have their own number and point at it with `parent-work`.
 - **Facts as properties.** Status, Priority, phase, component, dependsOn, branch, pr-url (one or more PRs that delivered it) and foundIn (the PR whose review raised it). Never as text in the title or body.
 - **Notes under the task.** Problem, Repro, Expected, Proposal, Acceptance criteria and Workaround, as in the graph's class templates, then a **Log** block holding dated entries (Built, Verified, Shipped).
