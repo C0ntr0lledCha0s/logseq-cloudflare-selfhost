@@ -1,0 +1,253 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/assets.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/assets.cljs
+index 5f92ccc..03c3a63 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/assets.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/assets.cljs
+@@ -9,7 +9,7 @@
+ 
+ (def max-asset-size common-config/max-asset-size)
+ 
+-(defn- encrypted-asset-size [size]
++(defn encrypted-asset-size [size]
+   ;; Transit framing and the base64-encoded ciphertext with its AES-GCM tag.
+   (+ 27 (* 4 (js/Math.ceil (/ (+ size 16) 3)))))
+ 
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 929a419..be17b7a 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -3980,6 +3980,15 @@
+                                         #(target-context @conn task e2ee?))
+                                   201))))))))
+ 
++(defn- upload-request-size
++  "The request body size, in bytes, that carries a file of plaintext `size`: its E2EE Transit
++  package on an E2EE graph, and base64-encoded when `encoding` is base64."
++  [size encoding e2ee?]
++  (let [upload-size (if e2ee? (assets-handler/encrypted-asset-size size) size)]
++    (if (= "base64" encoding)
++      (* 4 (js/Math.ceil (/ upload-size 3)))
++      upload-size)))
++
+ (defn- handle-assets
+   [{:keys [^js self request ^js url conn db handler path-params e2ee? creator]}]
+   (case handler
+@@ -3999,14 +4008,17 @@
+           page-id (.get (.-searchParams url) "page-id")
+           target (when page-id (find-entity db page-id))
+           time-zone (owner-time-zone self)
+-          ^js bucket (some-> (.-env self) (aget "LOGSEQ_SYNC_ASSETS"))]
++          ^js bucket (some-> (.-env self) (aget "LOGSEQ_SYNC_ASSETS"))
++          body-size (some-> size (upload-request-size encoding e2ee?))]
+       (cond
+         (or (not (seq file-name)) (not (seq asset-type))) (http/bad-request "invalid asset file-name")
+         (nil? size) (http/bad-request "invalid asset size")
+-        (> size assets-handler/max-asset-size) (http/error-response "asset too large" 413)
+         (not (and (string? checksum) (re-matches #"[0-9a-f]{64}" checksum)))
+         (http/bad-request "invalid asset checksum")
+         (and encoding (not= "base64" encoding)) (http/bad-request "invalid asset encoding")
++        (> body-size semantic-routes/max-upload-request-size)
++        (http/bad-request (str "size: a " size "-byte file is sent as a " body-size "-byte request body, over the "
++                               semantic-routes/max-upload-request-size "-byte (100 MB) limit on one upload request"))
+         (and page-id (not (page? target))) (http/bad-request "invalid asset page-id")
+         (and (nil? page-id) (nil? time-zone)) (invalid-time-zone-response self)
+         (nil? bucket) (http/error-response "missing assets bucket" 500)
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 866a778..b2a3995 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -11,6 +11,19 @@
+   5.4 s."
+   2500)
+ 
++(def max-upload-request-size
++  "The largest request body, in bytes, that Cloudflare passes to a Worker on the Free and Pro plans
++  (100 MB). This deployment wires no presigned direct uploads, so a file reaches R2 in one request
++  through the Worker, and createAsset's file in its transfer form must fit in it. Upstream's
++  common-config/max-asset-size (200 MiB) needs the direct uploads."
++  100000000)
++
++(def ^:private upload-cap-note
++  (str "One upload request carries at most " max-upload-request-size " bytes (100 MB, Cloudflare's"
++       " request-body limit for a Worker), so the largest file is " max-upload-request-size
++       " bytes sent raw, " (* 3 (quot max-upload-request-size 4)) " with encoding=base64, and less"
++       " for an E2EE package; a larger one is refused with 400 naming its size and the limit."))
++
+ (defn- format-count
+   "`n` with commas between thousands (2,500), as datalog/format-count."
+   [n]
+@@ -242,7 +255,7 @@
+    "updateProperty" ["Update a property definition" "Updates the name, value type, or cardinality of one typed property definition in a DB graph, a text, number or url property's choices, and a node property's classes. choices takes add (new choices, after the existing ones), update (a choice's title, icon or description; icon null clears it) and order (every choice once, including ones added in the same call, each by the title the call leaves it with); a choice is named by its UUID, ident or title, and only the property's own choices count. A rename may take a title another rename in the same call gives up, in any order; renames that pass titles round a cycle, such as a swap, are refused (rename one to a spare title in a separate call first). choices.retire removes choices (not built-in ones such as Status's): when blocks hold one it is refused with 409 naming each choice and its holder count, unless acknowledge-holders=true, which removes the value from those blocks first; a choice that is the property's default value is refused the same way (default: true), since retiring it clears the default that blocks relying on it show; order then lists only the surviving choices. convert_values: true turns a default (text) property's free-text values into its choices: each distinct text is matched to a choice the call leaves (after its add, update and retire), exactly, then ignoring case, both on the trimmed text; every holder then holds that choice (once, on a many property) and the old text value blocks are deleted. When other blocks or pages refer to any of those value blocks (a link or block ref, an embed or another property's value; a holder's own value doesn't count), the call is refused with 409 naming the property, the count and the referring blocks or pages (a link inside another property's value names the block that holds it), unless acknowledge-references=true, since deleting them turns those links into plain text and drops the embeds and values. Text that matches no choice refuses the whole call, listing each such text, so add those under choices.add in the same call; a number, url or other property, a type change in the same call, a property with a default value, a text value with child blocks (named with its holder) and an E2EE graph are refused. Values cleared to the empty placeholder are left as they are. The response gives converted (value blocks, holders, deleted value blocks and how many of them are referenced elsewhere), and with dry-run=true the mapping from each text to its choice. dry-run=true answers what any update would store, with nothing stored. A title already a choice ignoring case, a number or url property's title that isn't a number or URL, and choices on an E2EE graph are refused. The response lists every choice with its UUID in editor order. classes takes exactly one of set (replaces them; set [] removes the limit), add or remove, each a list of tag UUIDs, idents or titles; set and add refuse Root Tag (logseq.class/Root), and remove takes it off a property that holds it. Choices and classes are judged on the type the call leaves the property with. Values given afterwards by title, UUID or ident that aren't objects of one of the classes are refused; values already held are kept, and out_of_class counts the holders whose value the classes would now refuse (a holder left empty isn't counted). A built-in property's classes, such as Assignee's, can't be changed. All changes apply in one transaction, or none when any entry is refused (the error names it). Never use legacy file-graph key:: value syntax."]
+    "deleteProperty" ["Delete a property definition" "Deletes one property definition through Logseq's property deletion rules, which remove its value from every node. Refuses with 409 and deletes nothing while nodes hold a value, unless acknowledge-values is true; the error gives the count. Pass dry-run=true to get the count without deleting. Built-in properties are refused with 400."]
+    "listAssets" ["List assets" "Returns a cursor-paginated list of asset blocks with optional creation and update time filters."]
+-   "createAsset" ["Upload an asset" (str "Streams a file of at most 200 MiB to R2 and creates its Asset-class block on page-id or else on today's journal. " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
++   "createAsset" ["Upload an asset" (str "Streams a file to R2 and creates its Asset-class block on page-id or else on today's journal. " upload-cap-note " " today-note " The response names the page with page-id and page-title. Requires a client-computed SHA-256 checksum. On E2EE graphs, title must be encrypted and the body must be the canonical Transit [iv ciphertext] package of AES-GCM-encrypted file bytes; size and checksum describe the plaintext file.")]
+    "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
+    "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
+    "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
+@@ -355,8 +368,10 @@
+ (def ^:private asset-upload-parameters
+   [{:name "file-name" :in "query" :required true :schema {:type "string"}}
+    {:name "size" :in "query" :required true
+-    :description "Exact plaintext file size in bytes, at most 200 MiB. For E2EE uploads this excludes the GCM tag and Transit framing; the server validates the encrypted stream against this size."
+-    :schema {:type "integer" :minimum 0 :maximum common-config/max-asset-size}}
++    :description (str "Exact plaintext file size in bytes. The request body (the file, its E2EE package, or either base64-encoded) must be at most "
++                      max-upload-request-size " bytes (100 MB), so this is at most " max-upload-request-size
++                      ", and less with encoding=base64 or on an E2EE graph. For E2EE uploads this excludes the GCM tag and Transit framing; the server validates the encrypted stream against this size.")
++    :schema {:type "integer" :minimum 0 :maximum max-upload-request-size}}
+    {:name "title" :in "query" :schema {:type "string"}}
+    {:name "page-id" :in "query"
+     :description "Destination page UUID. Omit to append to today's journal (see the operation's description for which time zone sets today)."
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_asset_request_cap_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_asset_request_cap_test.cljs
+new file mode 100644
+index 0000000..1e84862
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_asset_request_cap_test.cljs
+@@ -0,0 +1,121 @@
++(ns logseq.db-sync.semantic-asset-request-cap-test
++  "createAsset sends a file in one request through the Worker: this deployment wires no presigned
++  direct upload (patch 0020), and Cloudflare passes a Worker at most 100 MB of request body on the
++  Free and Pro plans. The route must refuse, up front and naming the size and the limit, a file
++  whose request body would be larger than that, and say so in its OpenAPI text, instead of
++  advertising upstream's 200 MiB. The body is the plaintext file, its E2EE Transit package, or
++  either of those base64-encoded, so each transfer form has its own largest file."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db :as ldb]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db-sync.worker.routes.semantic :as semantic-routes]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(def ^:private limit 100000000)
++
++(defn- make-self [conn puts]
++  (let [bucket #js {:put (fn [key payload _options]
++                           ;; Read the body as R2 would, so a decoding or validating stream runs.
++                           (p/let [_ (.arrayBuffer (js/Response. payload))]
++                             (swap! puts conj key)
++                             #js {}))
++                    :delete (fn [_key] (p/resolved nil))}]
++    #js {:conn conn :sql (test-sql/make-sql) :schema-ready true
++         :env #js {"LOGSEQ_SYNC_ASSETS" bucket "TIMEZONE" "UTC"}}))
++
++(def ^:private encrypted-title
++  "A title in the shape an E2EE graph requires (a Transit [iv ciphertext] package)."
++  (ldb/write-transit-str [(js/Uint8Array. 12) (js/Uint8Array. 16)]))
++
++(defn- upload!
++  "createAsset of a four-byte file that declares `size`, sent as `encoding` on a graph that is
++  E2EE when `e2ee?`."
++  [self page-id {:keys [size encoding e2ee? checksum-char]}]
++  (let [params (js/URLSearchParams.
++                (clj->js (cond-> {:graph-id "graph-1" :file-name "big.pdf" :page-id (str page-id)
++                                  :size (str size) :checksum (apply str (repeat 64 checksum-char))}
++                           encoding (assoc :encoding encoding)
++                           e2ee? (assoc :graph-e2ee "true" :title encrypted-title))))
++        body (if (= "base64" encoding) "AQIDBA==" (js/Uint8Array. #js [1 2 3 4]))]
++    (p/let [response (sync-handler/handle-http
++                      self
++                      (js/Request. (str "http://localhost/semantic/assets?" params)
++                                   #js {:method "POST"
++                                        :headers #js {"content-type" "application/octet-stream"}
++                                        :body (js/Blob. #js [body])}))
++            text (.text response)]
++      {:status (.-status response)
++       :error (some-> (not-empty text) js/JSON.parse (aget "error"))})))
++
++(defn- asset-count [conn]
++  (count (d/datoms @conn :avet :logseq.property.asset/type)))
++
++(def ^:private refused
++  "One file over the limit for each transfer form, with the request body size it needs: the
++  smallest such file, and one far over upstream's 200 MiB."
++  [{:label "raw bytes" :size (inc limit) :body (inc limit)}
++   {:label "raw bytes over upstream's 200 MiB" :size (* 300 1024 1024) :body (* 300 1024 1024)}
++   {:label "base64" :encoding "base64" :size 75000001 :body 100000004}
++   {:label "E2EE package" :e2ee? true :size 74999964 :body 100000003}
++   {:label "E2EE package, base64" :e2ee? true :encoding "base64" :size 56249964 :body 100000004}])
++
++(def ^:private accepted
++  "The largest file for each transfer form, whose request body is at most the limit, and what
++  createAsset answers once the size check passes (the E2EE ones then refuse the four-byte body,
++  which is not an encrypted package)."
++  [{:label "raw bytes" :size limit :status 201}
++   {:label "base64" :encoding "base64" :size 75000000 :status 201}
++   {:label "E2EE package" :e2ee? true :size 74999963 :status 400 :error "invalid encrypted asset body"}
++   {:label "E2EE package, base64" :e2ee? true :encoding "base64" :size 56249963
++    :status 400 :error "invalid encrypted asset body"}])
++
++(deftest create-asset-refuses-a-file-over-the-worker-request-cap-test
++  (async done
++         (-> (p/let [conn (sqlite-export/create-conn)
++                     [_ page-id] (outliner-page/create! conn "Uploads" {})
++                     puts (atom [])
++                     self (make-self conn puts)]
++               (p/loop [n 0]
++                 (when-let [{:keys [label size body] :as entry} (get refused n)]
++                   (p/let [response (upload! self page-id (assoc entry :checksum-char (str n)))]
++                     (testing label
++                       (is (= 400 (:status response)))
++                       (is (= (str "size: a " size "-byte file is sent as a " body "-byte request body"
++                                   ", over the " limit "-byte (100 MB) limit on one upload request")
++                              (:error response)))
++                       (is (empty? @puts) "nothing reached R2")
++                       (is (zero? (asset-count conn)) "no asset block was written"))
++                     (p/recur (inc n))))))
++             (p/catch #(is false (str %)))
++             (p/finally done))))
++
++(deftest create-asset-accepts-the-largest-file-for-each-transfer-form-test
++  (async done
++         (-> (p/let [conn (sqlite-export/create-conn)
++                     [_ page-id] (outliner-page/create! conn "Uploads" {})
++                     puts (atom [])
++                     self (make-self conn puts)]
++               (p/loop [n 0]
++                 (when-let [{:keys [label status error] :as entry} (get accepted n)]
++                   (p/let [response (upload! self page-id (assoc entry :checksum-char (str (+ 5 n))))]
++                     (testing label
++                       (is (= status (:status response)))
++                       (is (= error (:error response))))
++                     (p/recur (inc n))))))
++             (p/catch #(is false (str %)))
++             (p/finally done))))
++
++(deftest create-asset-documents-the-worker-request-cap-test
++  (let [document (semantic-routes/openapi-document "https://issuer.example")
++        operation (get-in document [:paths "/api/v1/graphs/{graph-id}/assets" :post])
++        size (first (filter #(= "size" (:name %)) (:parameters operation)))]
++    (is (= "createAsset" (:operationId operation)))
++    (is (= limit (get-in size [:schema :maximum])))
++    (doseq [text [(:description operation) (:description size)]]
++      (is (not (string/includes? text "200 MiB")))
++      (is (string/includes? text "100 MB")))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 9be20ee..643b286 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -25,6 +25,7 @@
+             [logseq.db-sync.semantic-headings-test]
+             [logseq.db-sync.semantic-node-value-read-test]
+             [logseq.db-sync.semantic-today-tz-test]
++            [logseq.db-sync.semantic-asset-request-cap-test]
+             [logseq.db-sync.semantic-property-schema-test]
+             [logseq.db-sync.semantic-property-classes-root-test]
+             [logseq.db-sync.semantic-promote-page-to-tag-test]
+diff --git a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+index f0986a7..8b950e9 100644
+--- a/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/worker_handler_sync_test.cljs
+@@ -1583,7 +1583,9 @@
+                      (is (= 500 (.-status failed-response)))
+                      (is (= 1 (count @deletes)))
+                      (is (some-> (first @deletes) (string/ends-with? ".pdf") true?))
+-                     (is (= 413 (.-status oversized-response)))
++                     ;; Patch 0057: a file over the Worker's 100 MB request cap answers 400
++                     ;; naming its size and the limit (semantic-asset-request-cap-test).
++                     (is (= 400 (.-status oversized-response)))
+                      (is (= 2 (count @puts))))
+                    (p/then (fn [] (done)))
+                    (p/catch (fn [error]
