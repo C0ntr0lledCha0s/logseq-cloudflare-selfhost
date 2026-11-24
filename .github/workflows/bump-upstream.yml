@@ -73,6 +73,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.repository.default_branch }}
+          # bump-branch.sh compares the bump branch with main and may merge main into it.
+          fetch-depth: 0
 
       - name: Fetch upstream history between the two SHAs
         run: |
@@ -83,9 +85,9 @@ jobs:
       - name: Write PR body
         run: scripts/bump-pr-body.sh "$OLD_SHA" "$NEW_SHA" "$CI_RESULT" "$RUNNER_TEMP/upstream" > "$RUNNER_TEMP/pr-body.md"
 
-      - name: Create or update the bump PR
+      - name: Update the bump branch
+        id: bump
         run: |
-          short="${NEW_SHA:0:10}"
           existing="$(gh pr list --state open --base "$BASE_BRANCH" --json number,headRefName \
             --jq '[.[] | select(.headRefName | startswith("bump/upstream-"))][0] // empty')"
           if [ -n "$existing" ]; then
@@ -93,26 +95,41 @@ jobs:
             branch="$(jq -r '.headRefName' <<< "$existing")"
           else
             number=""
-            branch="bump/upstream-$short"
+            branch="bump/upstream-${NEW_SHA:0:10}"
           fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          # Rebuilds and force-pushes the branch only when every commit on it is the bot's own;
+          # commits anyone else pushed (a patch refresh) are kept (scripts/bump-branch.sh).
+          scripts/bump-branch.sh "$branch" "$NEW_SHA" "$BASE_BRANCH" "$RUNNER_TEMP/bump-note.md"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git checkout -q -B "$branch"
-          printf '%s\n' "$NEW_SHA" > UPSTREAM_REF
-          git add UPSTREAM_REF
-          git commit -q -m "chore: bump upstream to $short"
-          git push --force origin "$branch"
-
-          title="chore: bump upstream to $short"
-          if [ -n "$number" ]; then
-            gh pr edit "$number" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+      - name: Create or update the bump PR
+        env:
+          NUMBER: ${{ steps.bump.outputs.number }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          MODE: ${{ steps.bump.outputs.mode }}
+        run: |
+          title="chore: bump upstream to ${NEW_SHA:0:10}"
+          note="$RUNNER_TEMP/bump-note.md"
+          if [ -n "$NUMBER" ]; then
+            # A skipped branch still pins its earlier upstream commit, so its title and body stay.
+            if [ "$MODE" != "skip" ]; then
+              gh pr edit "$NUMBER" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+            fi
+            pr="$NUMBER"
           else
-            gh pr create --base "$BASE_BRANCH" --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+            gh pr create --base "$BASE_BRANCH" --head "$BRANCH" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+            pr="$BRANCH"
+          fi
+          if [ -s "$note" ]; then
+            gh pr comment "$pr" --body-file "$note"
+            cat "$note" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # Runs started by the default token don't trigger pull_request CI
       # (it waits for approval), but workflow_dispatch is allowed. This puts
       # the required `check` status on the PR's head commit.
       - name: Run CI on the bump branch
-        run: gh workflow run ci.yml --ref "$(git branch --show-current)"
+        if: steps.bump.outputs.mode != 'skip'
+        env:
+          BRANCH: ${{ steps.bump.outputs.branch }}
+        run: gh workflow run ci.yml --ref "$BRANCH"
