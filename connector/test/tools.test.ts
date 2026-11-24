@@ -3222,7 +3222,7 @@ describe("get_graph_health and missing tag properties", () => {
     ]) {
       expect(tool.description, phrase).toContain(phrase);
     }
-    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to orphan-tags");
+    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties, duplicate-values, title-key-mismatch. Defaults to orphan-tags");
     const param = tool.inputSchema.properties["tag-properties"];
     expect(param?.type).toBe("string");
     expect(param.description).toContain("JSON array of 1 to 50 pairs");
@@ -3231,11 +3231,21 @@ describe("get_graph_health and missing tag properties", () => {
 // Review s-stage-6-2: five checks each cost over 1 s of Durable Object CPU at 20,000 pages, so the
 // default call leaves them out and a call runs them only when it names them.
 describe("get_graph_health's default check set", () => {
-  it("connector_help names the default four and says the other five run only when named, one per call on a large graph", async () => {
+  it("connector_help names the default four and says the other seven run only when named, one per call on a large graph", async () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks, and on a large graph name one of them per call.",
+      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs, missing-tag-properties, duplicate-values and title-key-mismatch run only when named in checks, and on a large graph name one of them per call.",
     );
+  });
+
+  // LC-139: an issue tracker's item numbers stay unique and in step with the titles that show them.
+  it("connector_help says how duplicate-values and title-key-mismatch keep item numbers right", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("duplicate-values with property itemNumber lists each number held by more than one item");
+    expect(help).toContain("title-key-mismatch with property itemNumber and key-prefix LC- lists the items whose title doesn't start with their key");
+    const props = (await listTools()).find((t) => t.name === "get_graph_health").inputSchema.properties;
+    expect(props.property.description).toContain("Needed by them and refused without them.");
+    expect(props["key-prefix"].description).toContain("LC-10 isn't LC-1");
   });
 
   it("connector_help says the page-check parameters are refused without their checks", async () => {
@@ -3257,7 +3267,7 @@ describe("get_graph_health's default check set", () => {
   it("the vendored description and checks parameter name the default four and say the others run only when named", async () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_health");
     expect(tool.description).toContain(
-      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks",
+      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs, missing-tag-properties, duplicate-values and title-key-mismatch run only when named in checks",
     );
     expect(tool.inputSchema.properties.checks.description).toContain(
       "Defaults to orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; the others run only when named",
