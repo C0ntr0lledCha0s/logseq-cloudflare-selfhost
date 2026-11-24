@@ -485,6 +485,8 @@ A write round trip has been verified on an unencrypted graph: `createPage` and `
 
 You can also run it from Actions → bump-upstream → Run workflow.
 
+**Fixes pushed to the bump branch are kept.** When upstream breaks a patch, push the refreshed patches to the open bump PR's branch. The next run (`scripts/bump-branch.sh`) rebuilds the branch from `main` and force-pushes it only when every commit on it was made by `github-actions[bot]`. If anyone else has committed to it, the run keeps those commits: it merges `main` into the branch if `main` has moved on (no rebase), sets `UPSTREAM_REF` to the new upstream commit in a new commit on top, and pushes without force. If that merge conflicts, or the push is refused, the run leaves the branch alone and its PR title and body as they were. Either way it posts a PR comment, and writes the same to the run summary, saying which it did and that the patches may need refreshing for the new upstream commit. GitHub may refuse the default token a push whose merge brings in changes to `.github/workflows/`; the run then leaves the branch alone as above, and you merge `main` into it yourself.
+
 **The PR body shows:**
 
 - the CI result. A failing bump still opens a PR, so you can see why it failed;
