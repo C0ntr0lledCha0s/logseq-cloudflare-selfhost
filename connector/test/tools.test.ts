@@ -28,6 +28,7 @@ import {
   checkManifest,
   firstLineFor,
   graphOperations,
+  OUTLINE_MAX_CHARS,
 } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
@@ -1101,6 +1102,24 @@ describe("routing", () => {
       expect(verbose.default, name).toBe(false);
       expect(verbose.description, name).toContain("Defaults to false here");
     }
+  });
+
+  // LC-135: a page over the 150,000-character result cap used to come back cut mid-JSON.
+  it("get_page_outline defaults to max-chars=100000, so the server ends a long outline with a next-cursor", async () => {
+    syncHandler = () => Response.json({ uuid: "p1", kind: "page", title: "P", markdown: "- a", "block-count": 1, truncated: false });
+    const plain = await callTool("get_page_outline", { graph: "work", "page-id": "P" });
+    expect(plain.isError, plain.text).toBe(false);
+    expect(new URL(syncRequests[0].url).searchParams.get("max-chars")).toBe(String(OUTLINE_MAX_CHARS));
+
+    syncRequests = [];
+    await callTool("get_page_outline", { graph: "work", "page-id": "P", "max-chars": 5000, depth: 1, uuids: true });
+    const sent = new URL(syncRequests[0].url).searchParams;
+    expect([sent.get("max-chars"), sent.get("depth"), sent.get("uuids")]).toEqual(["5000", "1", "true"]);
+
+    const maxChars = (await listTools()).find((t) => t.name === "get_page_outline").inputSchema.properties["max-chars"];
+    expect(maxChars.default).toBe(OUTLINE_MAX_CHARS);
+    expect(maxChars.description).toContain("next-cursor");
+    expect(OUTLINE_MAX_CHARS).toBeLessThan(RESULT_CHAR_LIMIT);
   });
 
   it("write tool on read-mode graph refused without sync call", async () => {
@@ -2686,7 +2705,7 @@ describe("edit stamps header", () => {
         if (key in args) continue;
         if (Array.isArray(schema.enum)) args[key] = schema.enum[0];
         else if (schema.type === "string") args[key] = "Meeting";
-        else if (schema.type === "integer" || schema.type === "number") args[key] = 5;
+        else if (schema.type === "integer" || schema.type === "number") args[key] = Math.max(5, schema.minimum ?? 5);
         else if (schema.type === "boolean") args[key] = true;
       }
       const run = await stampedRun(name, args, true);

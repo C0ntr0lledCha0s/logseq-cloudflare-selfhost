@@ -173,6 +173,30 @@ function compactByDefault(param) {
 }
 
 /**
+ * get_page_outline's `max-chars` default (LC-135). A result over RESULT_CHAR_LIMIT (150,000) used to be
+ * cut mid-JSON; with this default the server ends the outline at a block boundary well inside it
+ * (the JSON around the markdown adds tags, properties and escapes) and gives a next-cursor.
+ */
+export const OUTLINE_MAX_CHARS = 100_000;
+const OUTLINE_NOTE = `Defaults to ${OUTLINE_MAX_CHARS} here, so one result always fits; pass next-cursor as cursor for the rest.`;
+
+/**
+ * The connector's defaults for query parameters: verbose false on the inserts, max-chars on getPageOutline.
+ * @param {string} operationId
+ * @returns {(param: OpenApiParameter) => OpenApiParameter}
+ */
+function connectorDefaults(operationId) {
+  return (param) => {
+    if (operationId === "getPageOutline" && param.name === "max-chars" && param.in === "query") {
+      const schema = /** @type {Record<string, unknown>} */ (param.schema);
+      if (schema?.type !== "integer") throw new Error("getPageOutline's max-chars is not an integer");
+      return { ...param, schema: { ...schema, default: OUTLINE_MAX_CHARS }, description: [param.description, OUTLINE_NOTE].filter(Boolean).join(" ") };
+    }
+    return compactByDefault(param);
+  };
+}
+
+/**
  * `insertBlockTree` → `insert_block_tree`.
  * @param {string} operationId
  */
@@ -230,7 +254,7 @@ export function graphOperations(spec) {
 export function transformSpec(spec) {
   /** @type {Record<string, Record<string, OpenApiOperation>>} */
   const paths = {};
-  for (const { method, path, operation } of graphOperations(spec)) {
+  for (const { method, path, operation, operationId } of graphOperations(spec)) {
     const graphParam = {
       name: "graph",
       in: "path",
@@ -240,7 +264,7 @@ export function transformSpec(spec) {
     };
     const parameters = [
       graphParam,
-      ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id").map(compactByDefault),
+      ...(operation.parameters ?? []).filter((p) => p.name !== "graph-id").map(connectorDefaults(operationId)),
     ];
     const aliasPath = path.replace("{graph-id}", "{graph}");
     paths[aliasPath] = { ...paths[aliasPath], [method.toLowerCase()]: { ...operation, parameters } };
@@ -290,7 +314,7 @@ export const FIRST_LINES = Object.freeze({
   get_graph_schema: "Every tag and property with types, choices and usage counts, in one call.",
   get_page: "One page's tags and properties by UUID, title or date; get_page_outline reads its content.",
   get_page_backlinks: "How a page is used: links, tagged objects and property values pointing at it, with counts.",
-  get_page_outline: "Read a whole page as markdown with tags, properties and links resolved; the usual way to read.",
+  get_page_outline: "Read a page as markdown with links resolved; depth, root and cursor read a big one in parts.",
   get_property: "A property's type, choices and classes; check it before setting a choice or node value.",
   get_sync_status: "A graph's sync state: latest t, last write, block and page counts, clients online, index status.",
   get_tag: "A tag's properties, the tags it extends and the tags that extend it.",

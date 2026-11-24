@@ -1,0 +1,300 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index bd96f3d..4f65b44 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -418,11 +418,12 @@
+   (let [level (:logseq.property/heading entity)]
+     (when (and (integer? level) (<= 1 level 6)) level)))
+ 
+-(defn- outline-property-lines [db entity indent]
+-  (for [{:keys [ident title value]} (entity-properties-response db entity)
++(defn- outline-property-lines [db entity indent & [keep?]]
++  (for [{:keys [ident title value] :as property} (entity-properties-response db entity)
+         ;; A block's status is its line's [Status] marker, and its heading level its `## ` prefix.
+         :when (and (not= "logseq.property/status" ident)
+-                   (not (and (= "logseq.property/heading" ident) (outline-heading-level entity))))
++                   (not (and (= "logseq.property/heading" ident) (outline-heading-level entity)))
++                   (or (nil? keep?) (keep? property)))
+         :let [values (if (vector? value) value [value])
+               text (string/join ", " (map #(if (map? %) (page-ref/->page-ref (:title %)) (str %)) values))]]
+     (str indent "  " title ":: " text)))
+@@ -461,7 +462,7 @@
+   top-level block (or root child), and `cursor` resumes after the last one returned. A page of the
+   outline always holds at least one such block, so paging moves on however small max-chars is."
+   ([db page max-blocks] (page-outline db page max-blocks {}))
+-  ([db page max-blocks {:keys [depth root limit cursor max-chars]}]
++  ([db page max-blocks {:keys [depth root limit cursor max-chars uuids? keep-property? query-line?]}]
+    (let [n (volatile! 0)
+          omitted (volatile! 0)
+          truncated? (volatile! false)
+@@ -479,13 +480,23 @@
+                           children (outline-children db block)
+                           fold? (and (not line-only?) depth (seq children) (>= (+ level (if root 0 1)) depth))
+                           hidden (when fold? (outline-descendant-count db block))
++                          query? (and query-line? (some? (:logseq.property/query block)))
++                          ;; LC-136: uuids ends the line with the block's uuid; a folded block then
++                          ;; gives only its count, and otherwise names its uuid in the fold.
+                           line (str indent "- " (when status (str "[" status "] "))
+                                     (when heading (str (apply str (repeat heading "#")) " ")) (or typed title)
++                                    (when uuids? (str " ((" (:block/uuid block) "))"))
++                                    (when query? " (query)")
+                                     (when fold? (str " (+" hidden (if (= 1 hidden) " block" " blocks")
+-                                                     ": ((" (:block/uuid block) ")))")))]
++                                                     (when-not uuids? (str ": ((" (:block/uuid block) "))")) ")")))
++                          keep-line? (fn [property]
++                                       (and (or (nil? keep-property?) (keep-property? property))
++                                            ;; queries=line: the query text and Claude's marker for it go.
++                                            (not (and query? (contains? #{"logseq.property/query"} (:ident property))))
++                                            (not (and query? (= "claudeQueryBlock" (:title property))))))]
+                       (vswap! budget dec)
+                       (when fold? (vswap! omitted + hidden))
+-                      (let [lines (into (conj lines line) (outline-property-lines db block indent))]
++                      (let [lines (into (conj lines line) (outline-property-lines db block indent keep-line?))]
+                         (if (or fold? line-only?)
+                           lines
+                           (reduce (fn [lines child] (render lines child (inc level) budget)) lines children))))))
+@@ -524,38 +535,6 @@
+        depth (assoc :omitted-blocks @omitted)
+        (and (:more? result) (:last result)) (assoc :next-cursor (encode-cursor (outline-cursor-key (:last result))))))))
+ 
+-(defn- outline-int-param
+-  "The whole number query parameter `name` within [lo, hi], nil when absent, or ::invalid."
+-  [url name lo hi]
+-  (let [raw (.get (.-searchParams url) name)]
+-    (cond
+-      (nil? raw) nil
+-      (not (re-matches #"\d+" raw)) ::invalid
+-      :else (let [v (js/parseInt raw 10)] (if (<= lo v hi) v ::invalid)))))
+-
+-(defn- outline-options
+-  "getPageOutline's paging options from the query (LC-135), or {:error message} naming the parameter."
+-  [db page url]
+-  (let [params (.-searchParams url)
+-        depth (outline-int-param url "depth" 1 50)
+-        limit (outline-int-param url "limit" 1 200)
+-        max-chars (outline-int-param url "max-chars" 100 1000000)
+-        raw-cursor (.get params "cursor")
+-        cursor (decode-cursor raw-cursor)
+-        raw-root (.get params "root")
+-        root-uuid (when raw-root (parse-uuid raw-root))
+-        root (when root-uuid (d/entity db [:block/uuid root-uuid]))]
+-    (cond
+-      (= ::invalid depth) {:error "depth: must be a whole number from 1 to 50"}
+-      (= ::invalid limit) {:error "limit: must be a whole number from 1 to 200"}
+-      (= ::invalid max-chars) {:error "max-chars: must be a whole number from 100 to 1000000"}
+-      (and raw-cursor (nil? cursor)) {:error "cursor: not a cursor this outline gave; pass a next-cursor from the same page and root, or leave it out"}
+-      (and raw-root (nil? root-uuid)) {:error (str "root: not a block UUID: " raw-root)}
+-      (and raw-root (or (nil? root) (entity-util/hidden? root) (page? root)
+-                        (not= (:db/id page) (:db/id (:block/page root)))))
+-      {:error (str "root: no visible block " raw-root " on this page")}
+-      :else {:depth depth :limit limit :max-chars max-chars :cursor cursor :root root})))
+-
+ (defn- non-blank-string? [v]
+   (and (string? v) (seq v)))
+ 
+@@ -841,6 +820,65 @@
+       (when-not (entity-util/hidden? property)
+         property))))
+ 
++(defn- outline-int-param
++  "The whole number query parameter `name` within [lo, hi], nil when absent, or ::invalid."
++  [url name lo hi]
++  (let [raw (.get (.-searchParams url) name)]
++    (cond
++      (nil? raw) nil
++      (not (re-matches #"\d+" raw)) ::invalid
++      :else (let [v (js/parseInt raw 10)] (if (<= lo v hi) v ::invalid)))))
++
++(defn- outline-options
++  "getPageOutline's paging options from the query (LC-135), or {:error message} naming the parameter."
++  [db page url]
++  (let [params (.-searchParams url)
++        depth (outline-int-param url "depth" 1 50)
++        limit (outline-int-param url "limit" 1 200)
++        max-chars (outline-int-param url "max-chars" 100 1000000)
++        raw-cursor (.get params "cursor")
++        cursor (decode-cursor raw-cursor)
++        raw-root (.get params "root")
++        root-uuid (when raw-root (parse-uuid raw-root))
++        root (when root-uuid (d/entity db [:block/uuid root-uuid]))]
++    (cond
++      (= ::invalid depth) {:error "depth: must be a whole number from 1 to 50"}
++      (= ::invalid limit) {:error "limit: must be a whole number from 1 to 200"}
++      (= ::invalid max-chars) {:error "max-chars: must be a whole number from 100 to 1000000"}
++      (and raw-cursor (nil? cursor)) {:error "cursor: not a cursor this outline gave; pass a next-cursor from the same page and root, or leave it out"}
++      (and raw-root (nil? root-uuid)) {:error (str "root: not a block UUID: " raw-root)}
++      (and raw-root (or (nil? root) (entity-util/hidden? root) (page? root)
++                        (not= (:db/id page) (:db/id (:block/page root)))))
++      {:error (str "root: no visible block " raw-root " on this page")}
++      :else
++      (let [raw-uuids (.get params "uuids")
++            raw-queries (.get params "queries")
++            raw-properties (.get params "properties")
++            names (when (and raw-properties (not= "all" raw-properties) (not= "none" raw-properties))
++                    (map string/trim (string/split raw-properties #",")))
++            resolved (map (fn [n] [n (when (seq n)
++                                       (or (resolve-property db n)
++                                           (some->> (d/datoms db :avet :block/name (string/lower-case n))
++                                                    (map #(d/entity db (:e %)))
++                                                    (filter property?)
++                                                    first)))])
++                          names)
++            unknown (first (keep (fn [[n p]] (when (nil? p) n)) resolved))
++            idents (set (map (fn [[_ p]] (entity-ident p)) resolved))]
++        (cond
++          (and raw-uuids (not (#{"true" "false"} raw-uuids))) {:error "uuids: must be true or false"}
++          (and raw-queries (not (#{"full" "line"} raw-queries))) {:error "queries: must be full or line"}
++          (= "" raw-properties) {:error "properties: give all, none, or property titles or idents separated by commas"}
++          unknown {:error (str "properties: no property " (pr-str unknown))}
++          :else
++          {:depth depth :limit limit :max-chars max-chars :cursor cursor :root root
++           :uuids? (= "true" raw-uuids)
++           :query-line? (= "line" raw-queries)
++           :keep-property? (cond
++                             (= "none" raw-properties) (constantly false)
++                             names (fn [{:keys [ident]}] (contains? idents ident))
++                             :else nil)})))))
++
+ (def ^:private allowed-property-types
+   (into (set db-property-type/user-built-in-property-types)
+         db-property-type/user-allowed-internal-property-types))
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 110736c..e1b72b5 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -185,7 +185,7 @@
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+    "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A \"/\" is allowed where Logseq allows it: in a journal title that the graph's journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
+-   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. A large page can be read in parts: depth expands only that many levels and names each block it folds with its UUID and descendant count, root reads one block's subtree, and limit or max-chars end the outline after a whole top-level block with a next-cursor to pass as cursor. Past the 2,000-block budget the outline stops after the last whole top-level block and answers truncated with a next-cursor. Unavailable for E2EE graphs."]
++   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. A large page can be read in parts: depth expands only that many levels and names each block it folds with its UUID and descendant count, root reads one block's subtree, and limit or max-chars end the outline after a whole top-level block with a next-cursor to pass as cursor. Past the 2,000-block budget the outline stops after the last whole top-level block and answers truncated with a next-cursor. uuids, properties and queries make it leaner: each line's ((uuid)), only the property lines named, and Query blocks as one line. Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+    "getSyncStatus" ["Read a graph's sync status" "Returns where the graph's sync log stands, how big the graph is and how many clients are connected, in one read that writes nothing. t is the latest sync transaction; last-written-at (ISO) and last-op (the outliner operation, such as delete-blocks) are those of the transaction at t, both null when the log holds no row for t. checksum is the checksum as stored, never recomputed, null when none is stored. page-count is the pages and journals listPages lists, and block-count counts the blocks on those pages, property value blocks included, so it can be higher than listPageBlocks shows; neither counts hidden pages, the Recycle bin or Private content (anything tagged Private or a tag extending it, and everything on or under it). On an E2EE graph tag titles are encrypted, so Private can't be recognised and the counts may include it: counts-include-private is then true, as is e2ee. clients holds counts only, from the app's live connections (WebSockets; API calls are not connections): connected (connections that identified a user), users (distinct users), own (the caller's connections), others (connected minus own; own and others are null when the request names no caller) and editing (connections reporting a block being edited). It names no user, email, device or block, and presence carries no device or client kind."]
+@@ -712,7 +712,13 @@
+            {:name "max-chars" :in "query" :schema {:type "integer" :minimum 100 :maximum 1000000}
+             :description "Most characters of markdown per call: the outline ends after the last whole top-level block (or root child) that fits, with a next-cursor. The first one is always returned, however long."}
+            {:name "cursor" :in "query" :schema {:type "string"}
+-            :description "The previous call's next-cursor, with the same page and root: the outline resumes after the last block it returned."}])
++            :description "The previous call's next-cursor, with the same page and root: the outline resumes after the last block it returned."}
++           {:name "uuids" :in "query" :schema {:type "boolean" :default false}
++            :description "true ends each block's line with its UUID as ((uuid)), so a write can target any block from one read; a folded block then gives only its count."}
++           {:name "properties" :in "query" :schema {:type "string" :default "all"}
++            :description "Which property lines print: all, none, or property titles (matched ignoring case) or idents separated by commas, such as Priority,component. Status and a heading level always show in the line itself."}
++           {:name "queries" :in "query" :schema {:enum ["full" "line"] :default "full"}
++            :description "line prints a Query block as one line ending (query), without its query text; full prints the query as before."}])
+     (= "getBlocks" operation-id)
+     (into [{:name "ids" :in "query" :required true :schema {:type "string"}
+             :description "Comma-separated block or page UUIDs, at most 100."}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_outline_options_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_outline_options_test.cljs
+new file mode 100644
+index 0000000..9326e13
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_outline_options_test.cljs
+@@ -0,0 +1,106 @@
++(ns logseq.db-sync.semantic-outline-options-test
++  "getPageOutline's shape options (LC-136): uuids=true ends each block line with its ((uuid)), so a
++  write can target any block from one read; properties picks which property lines print (all, none,
++  or a list of titles or idents); queries=line prints a Query block as one line instead of its
++  query text. Their defaults leave the outline as it was."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(def query-text "{:query [:find ?b :where [?b :block/title \"Write the spec\"]]}")
++
++(defn- with-page [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ page-id] (outliner-page/create! conn "Options" {})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++              inserted (request! self "POST" "/semantic/block-trees"
++                                 {:target-id (str page-id)
++                                  :blocks [{:title "Write the spec"
++                                            :properties {"logseq.property/status" "Todo"
++                                                         "logseq.property/priority" "High"
++                                                         "logseq.property/deadline" 1795000000000}
++                                            :children [{:title "Notes"}]}
++                                           {:title "Open items" :query query-text}]})
++              _ (is (= 201 (:status inserted)) (pr-str (:body inserted)))
++              uuid-of (fn [title] (str (:block/uuid (d/entity @conn (ffirst (d/q '[:find ?b :in $ ?t :where [?b :block/title ?t]]
++                                                                                   @conn title))))))]
++        (run {:self self :page-id page-id :uuid-of uuid-of}))
++      (p/catch #(is false (str "unexpected error: " %)))
++      (p/finally done)))
++
++(defn- outline! [self page-id query]
++  (p/let [{:keys [status body]} (request! self "GET" (str "/semantic/pages/" page-id "/outline" (when query (str "?" query))) nil)]
++    (is (= 200 status) (str query ": " (pr-str body)))
++    (:markdown body)))
++
++(deftest outline-uuids-end-each-line-test
++  (async done
++    (with-page done
++      (fn [{:keys [self page-id uuid-of]}]
++        (p/let [plain (outline! self page-id "properties=none&queries=line")
++                with-ids (outline! self page-id "uuids=true&properties=none&queries=line")
++                folded (outline! self page-id "uuids=true&properties=none&queries=line&depth=1")]
++          (is (= "- [Todo] Write the spec\n  - Notes\n- Open items (query)" plain))
++          (is (= (str "- [Todo] Write the spec ((" (uuid-of "Write the spec") "))\n"
++                      "  - Notes ((" (uuid-of "Notes") "))\n"
++                      "- Open items ((" (uuid-of "Open items") ")) (query)")
++                 with-ids))
++          (testing "a folded block names its uuid once, then the count"
++            (is (= (str "- [Todo] Write the spec ((" (uuid-of "Write the spec") ")) (+1 block)\n"
++                        "- Open items ((" (uuid-of "Open items") ")) (query)")
++                   folded))))))))
++
++(deftest outline-properties-picks-the-lines-test
++  (async done
++    (with-page done
++      (fn [{:keys [self page-id]}]
++        (p/let [all (outline! self page-id nil)
++                none (outline! self page-id "properties=none")
++                some-by-title (outline! self page-id "properties=priority")
++                some-by-ident (outline! self page-id "properties=logseq.property/deadline,Priority")]
++          (is (string/includes? all "Priority:: [[High]]") "the default prints every property line")
++          (is (string/includes? all "Deadline:: "))
++          (is (not (string/includes? none "::")) "none prints no property lines")
++          (is (string/includes? some-by-title "Priority:: [[High]]") "a title matches ignoring case")
++          (is (not (string/includes? some-by-title "Deadline::")))
++          (is (string/includes? some-by-ident "Deadline:: "))
++          (is (string/includes? some-by-ident "Priority:: ")))))))
++
++(deftest outline-queries-line-hides-query-text-test
++  (async done
++    (with-page done
++      (fn [{:keys [self page-id]}]
++        (p/let [full (outline! self page-id nil)
++                line (outline! self page-id "queries=line")]
++          (is (string/includes? full ":find ?b") "the default prints the query, as before")
++          (is (not (string/includes? line ":find")) "queries=line leaves the query text out")
++          (is (string/includes? line "- Open items (query)")))))))
++
++(deftest outline-shape-options-are-checked-test
++  (async done
++    (with-page done
++      (fn [{:keys [self page-id]}]
++        (p/let [responses (p/all (map #(request! self "GET" (str "/semantic/pages/" page-id "/outline?" %) nil)
++                                      ["uuids=yes" "queries=short" "properties=" "properties=nosuchproperty"]))]
++          (doseq [[param {:keys [status body]}] (map vector ["uuids" "queries" "properties" "properties"] responses)]
++            (is (= 400 status) (str param ": " (pr-str body)))
++            (is (string/starts-with? (str (:error body)) param) (pr-str body))))))))

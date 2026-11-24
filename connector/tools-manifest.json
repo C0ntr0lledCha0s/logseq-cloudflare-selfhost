@@ -309,7 +309,7 @@
       "idempotentHint": true,
       "openWorldHint": false
     },
-    "firstLine": "Read a whole page as markdown with tags, properties and links resolved; the usual way to read."
+    "firstLine": "Read a page as markdown with links resolved; depth, root and cursor read a big one in parts."
   },
   {
     "name": "get_property",
