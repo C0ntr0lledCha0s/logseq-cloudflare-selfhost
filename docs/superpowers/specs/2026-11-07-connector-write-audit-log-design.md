@@ -373,3 +373,15 @@ All connector tests run in `@cloudflare/vitest-pool-workers` against real D1 wit
 5. **Snapshot compression.** Store snapshots as plain JSON text (this design, about 55 MB at 300 writes a day), or gzip them into a BLOB to roughly halve storage at some CPU cost on the 10 ms budget?
 6. **Read-cost rows.** Keep the `kind = 'read'` row each `get_activity_log` call writes (2 rows, so the usage report can count the log's reads exactly), or drop it and report the log's reads as part of the account-wide D1 total?
 7. **Retention.** 90 days by default, as for backups. Shorter or longer?
+
+### Owner answers (2026-11-23)
+
+The owner kept every default as built:
+
+1. **Daily digest.** Left out. The weekly review in the owner's Logseq skill reads `get_activity_log`.
+2. **Large deletes.** Refuse a delete whose subtree is over 2,000 blocks or 100 KB. A cut-off snapshot can't support an undo, and deleting in parts works.
+3. **E2EE graphs.** Accept that only the addressed blocks' encrypted summaries are kept.
+4. **Client id.** The User-Agent family is enough. Carrying the OAuth client id would need every grant to re-consent.
+5. **Snapshot compression.** Plain JSON text. The 10 ms CPU budget matters more than D1 storage.
+6. **Read-cost rows.** Keep the `kind = 'read'` rows (2 rows written per call).
+7. **Retention.** 90 days (`AUDIT_RETENTION_DAYS`).

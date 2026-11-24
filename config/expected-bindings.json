@@ -24,6 +24,7 @@
   "var:COGNITO_CLIENT_ID",
   "var:COGNITO_ISSUER",
   "var:COGNITO_JWKS_URL",
+  "var:R2_ASSET_UPLOAD_BUCKET",
   "version_metadata:CF_VERSION_METADATA",
   "worker_loader:LOADER"
 ]

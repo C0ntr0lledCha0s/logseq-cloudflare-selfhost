@@ -149,6 +149,8 @@ The cache can be up to two hours old, and the owner may delete pages in the app,
 
 If `getBlocks` fails, the call fails: `verify: getBlocks failed: <reason>`. It never returns unverified UUIDs as if verified. With `verify: false` the call is skipped and the summary line says the UUIDs come from an index of the stated age.
 
+*As built (item 63b, 2026-11-23):* verify reads with the default summary view instead of `view=signals`, still one `getBlocks` request, so it sees each page's current title and closes risk 6's remaining gap. A title match whose span the current title no longer matches by the matcher's own rules (`matchLinks` on the span alone) goes to `dropped_stale` with `renamed_to`, because the `[[UUID]]` link would show the new title in place of the draft's words. A rename the span still matches, an alias match and a related page are kept under the current title, with `renamed_from`. The summary line counts both.
+
 *As built (Stage 4):* verify runs after the limit is applied, so it reads only the suggestions that will be returned. A page is dropped to `dropped_stale` when the server lists it under `missing` or leaves it out of the blocks it returns. Related pages dropped this way are listed there too.
 
 ### 3.5 Inputs: the page being written and exclusions (panel)
@@ -297,7 +299,7 @@ At 200 calls a day: about 200 to 400 Worker requests, about 400 KV reads, about 
 3. **Masking heuristics.** A single `$` is not treated as math, so a Logseq inline `$x$` span could be matched. A `>` not at the start of a line is not a quote. Each mask rule has its own test, so a mutation run shows any rule left untested (`docs/solutions/testing/untested-rules-survive-mutation.md`).
 4. **Dictionary-word titles.** Single-word titles of 4 or more letters ("Apollo", "Delta") will match ordinary prose. Once per page, the stoplist and Claude's review of `linked_text` limit the harm; false positives remain likely on graphs with such titles.
 5. **CPU at 20,000 pages.** Measured by the bench, not by vitest (section 5).
-6. **Renamed pages.** *(Closed in review round 2: links are written as `[[<uuid>]]`.)* `view=signals` has no title, so a page renamed in the app since the cache was built is verified as present under its old title, and the suggested link names the old title. Logseq would then create a new page by that name when the text is written. The window is at most an hour (cron) and closes at once for renames through the connector. A later option is to compare titles with the default `getBlocks` view, at a higher sync cost.
+6. **Renamed pages.** *(Closed in review round 2: links are written as `[[<uuid>]]`. Item 63b: verify now reads current titles and drops a title match its page's new title no longer matches; see section 3.4's As built note.)* `view=signals` has no title, so a page renamed in the app since the cache was built is verified as present under its old title, and the suggested link names the old title. Logseq would then create a new page by that name when the text is written. The window is at most an hour (cron) and closes at once for renames through the connector. A later option is to compare titles with the default `getBlocks` view, at a higher sync cost.
 7. **UTF-16 offsets.** Spans must be JavaScript string indices so `linked_text` splices exactly for macrons and emoji; tests include "Māori Health" and an emoji before a title.
 8. **Class pages.** Section 2 reads the index as excluding tags and properties. If a Stage 1 test shows a user class does reach it, `COMMON_TITLES` covers the common single words, and the help text will say so.
 
@@ -345,3 +347,13 @@ Deploy is by merge to main. On first use after deploy, each graph rebuilds its i
 5. **Single `$` math.** Should inline `$x$` be masked, at the cost of prices such as "$40 for Workflow" losing the match?
 6. **KV writes.** The titles key doubles the cron's KV writes to 48 a day per graph. Fine for your number of graphs?
 7. **Graph-wide mode.** Do you want it as a later item, and if so as a `get_graph_health` check or a separate tool?
+
+### Owner answers (2026-11-23)
+
+1. **`verify`.** On by default. One extra read per call is worth it.
+2. **`COMMON_TITLES`.** Keep the list in section 3.3. Pass `exclude` for a page that shouldn't be linked in a given draft.
+3. **Ambiguous titles.** Keep `ambiguous` and no link. Preferring the page with more references could link the wrong person without saying so.
+4. **Renamed pages (risk 6).** Catch them: verify already reads each suggested page back, so it compares the live title in that same read, at no extra sync cost (Connector item 63b).
+5. **Single `$` math.** Don't mask it. Prices such as "$40" are common in the owner's notes.
+6. **KV writes.** Fine at the owner's number of graphs.
+7. **Graph-wide mode.** Later, as a `get_graph_health` check, not a separate tool.

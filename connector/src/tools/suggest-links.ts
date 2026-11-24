@@ -11,8 +11,8 @@ import type { SemanticStore } from "../semantic/store";
 import { ToolError, resolveGraph, runTool, textResult, withCallGraphs } from "./common";
 import { type KbTitlesPage, age, loadTitles } from "./kb-index";
 import type { OnSuccess } from "./readable";
-import type { GraphAccess } from "./semantic";
-import { requestSignals, semanticMatches } from "./semantic-search";
+import { type GraphAccess, graphFetch } from "./semantic";
+import { semanticMatches } from "./semantic-search";
 import { ALIAS_PATTERN, GRAPH_PARAM_DESCRIPTION, annotationsFor } from "./spec.mjs";
 
 export type { KbTitlesPage };
@@ -51,6 +51,13 @@ export interface Span {
 export interface PageRef {
   uuid: string;
   title: string;
+  /** The title the index had, when verify read back a different one (the page was renamed since the index was built). */
+  renamed_from?: string;
+}
+
+/** A page verify dropped: deleted, hidden or in the Recycle bin, or renamed to a title the span no longer matches (`renamed_to`). */
+export interface StalePage extends PageRef {
+  renamed_to?: string;
 }
 
 export interface Suggestion {
@@ -652,8 +659,38 @@ export function pageResolver(
 
 // The tool (spec sections 3.4, 3.5, 3.7, 3.8 and 4). Read-only: it reads the kb_index titles key
 // (rebuilding it as kb_index would when stale), matches, and verifies the suggested pages with one
-// getBlocks view=signals read. It never writes to the graph, logs no audit entry and never marks
-// the index dirty.
+// getBlocks read (the summary view, for their current titles). It never writes to the graph, logs
+// no audit entry and never marks the index dirty.
+
+/**
+ * verify's one getBlocks read (the summary view, so each page comes back with its current title):
+ * the UUIDs the server lists as missing, and each block it returns with its title (null when the
+ * block has none).
+ */
+async function readBack(
+  access: GraphAccess,
+  alias: string,
+  graphId: string,
+  pat: string,
+  uuids: string[],
+): Promise<{ titles: Map<string, string | null>; missing: Set<string> }> {
+  const response = await graphFetch(access, alias, pat, {
+    method: "GET",
+    path: `/api/v1/graphs/${encodeURIComponent(graphId)}/blocks`,
+    query: { ids: uuids.join(","), view: "summary" },
+  });
+  const body = (await response.json()) as { blocks?: unknown; missing?: unknown };
+  if (!Array.isArray(body.blocks)) throw new Error("getBlocks returned no blocks array");
+  const titles = new Map<string, string | null>();
+  for (const b of body.blocks as Record<string, unknown>[]) titles.set(String(b.uuid), typeof b.title === "string" ? b.title : null);
+  return { titles, missing: new Set(Array.isArray(body.missing) ? (body.missing as unknown[]).map(String) : []) };
+}
+
+/** Whether `title` matches the whole of `span` by the matcher's own rules (words ignoring case, joiners, punctuation, stoplist). */
+function spanMatches(span: Span, uuid: string, title: string): boolean {
+  const [hit] = matchLinks(span.text, [[uuid, title, []]], { exclude: new Set(), limit: 1 }).suggestions;
+  return hit !== undefined && hit.span.start === 0 && hit.span.end === span.text.length;
+}
 
 /** 31204 as "31,204", without an Intl formatter. */
 export function thousands(n: number): string {
@@ -666,7 +703,7 @@ export const SUGGEST_LINKS_DESCRIPTION =
   "Text inside [[links]], tags, block refs, macros, markdown links, URLs, inline code, code blocks, math, quotes and property keys is never matched, nor is a word joined into an email address, domain, path or identifier (by @, /, \\, _ or a dot before a letter or digit), nor are short or common titles (skipped_stoplist counts them). " +
   "Only pages in the knowledge index are suggested: no journals, tags, properties or pages tagged private. Two pages sharing a title are listed under ambiguous and never linked: ask which one is meant. " +
   `page names the page being written (UUID or title), and exclude names up to ${EXCLUDE_LIMIT} more pages never to suggest. limit is at most ${MAX_LIMIT} suggestions (default ${DEFAULT_LIMIT}), in draft order; truncated says when there were more. ` +
-  "verify (default true) reads the suggested pages back with one getBlocks request and moves any deleted since the index was built to dropped_stale; verify: false skips that and the first line says the UUIDs are unverified. " +
+  "verify (default true) reads the suggested and related pages back with one getBlocks request. A page deleted since the index was built moves to dropped_stale. A page renamed in the app since then: a title match whose span its new title no longer matches (by the same rules) moves to dropped_stale with renamed_to, because the [[UUID]] link would show the new title in place of the draft's words; an alias match, a related page, or a new title the span still matches is kept, with page.title the current title and renamed_from the old one. verify: false skips that and the first line says the UUIDs are unverified. " +
   "linked_text is the draft with the suggestions applied as [[UUID]] links: show the user each suggestion by its span text and page title, then write linked_text with update_block or insert_block_tree.";
 
 /** `ref` as one index page's UUID, from what `pageResolver` found; null (and a note) when no page has it; refused when several do. */
@@ -774,7 +811,9 @@ export function registerSuggestLinksTool(
     verify: z
       .boolean()
       .optional()
-      .describe("Read the suggested pages back with one getBlocks request and drop any deleted since the index was built (default true)."),
+      .describe(
+        "Read the suggested pages back with one getBlocks request and drop any deleted, or renamed to a title the span no longer matches, since the index was built (default true).",
+      ),
   };
   // With semantic search off, `related` is not in the schema; passthrough keeps a passed one visible so it is refused, not dropped.
   const inputSchema = semantic
@@ -860,24 +899,60 @@ export function registerSuggestLinksTool(
             ]);
             relatedList = await relatedPages(semantic, (await resolved()).graphId, text, titles.pages, skip);
           }
-          const droppedStale: PageRef[] = [];
+          const droppedStale: StalePage[] = [];
+          let droppedRenamed = 0;
+          let keptRenamed = 0;
           if (verify && suggestions.length + relatedList.length > 0) {
             const { graphId, pat } = await resolved();
             const ids = [...suggestions.map((s) => s.page.uuid), ...relatedList.map((r) => r.page.uuid)];
-            let found: Awaited<ReturnType<typeof requestSignals>>;
+            let found: Awaited<ReturnType<typeof readBack>>;
             try {
-              found = await requestSignals(access, alias, graphId, pat, ids);
+              found = await readBack(access, alias, graphId, pat, ids);
             } catch (error) {
               const reason = `verify: getBlocks failed: ${error instanceof Error ? error.message : String(error)}`;
               throw new ToolError(reason, error instanceof ToolError ? error.status : "verify-failed");
             }
             // A page the server lists as missing, or leaves out of blocks, is gone since the index was built.
-            const missing = new Set(found.missing);
-            const live = (uuid: string) => found.signals.has(uuid) && !missing.has(uuid);
-            for (const s of suggestions) if (!live(s.page.uuid)) droppedStale.push(s.page);
-            suggestions = suggestions.filter((s) => live(s.page.uuid));
+            const live = (uuid: string) => found.titles.has(uuid) && !found.missing.has(uuid);
+            // The page's title now, when it differs from the index's (renamed in the app since the build).
+            // A live page read back with no title (null) is taken as unchanged.
+            const renamedTo = (page: PageRef) => {
+              const current = found.titles.get(page.uuid) ?? null;
+              return current !== page.title ? current : null;
+            };
+            // A link is [[UUID]], which Logseq shows as the page's current title: a title match whose span
+            // that title no longer matches would change the draft's words, so it is dropped. An alias match,
+            // or a new title the span still matches, links the same page and is kept under its current title.
+            const kept: Suggestion[] = [];
+            for (const s of suggestions) {
+              if (!live(s.page.uuid)) {
+                droppedStale.push(s.page);
+                continue;
+              }
+              const current = renamedTo(s.page);
+              if (current === null) {
+                kept.push(s);
+              } else if (s.reason === "title" && !spanMatches(s.span, s.page.uuid, current)) {
+                droppedStale.push({ ...s.page, renamed_to: current });
+                droppedRenamed++;
+              } else {
+                // An alias match's reason ends with the page's title (`alias ‘OI’ of <title>`): name the current one.
+                const reason = s.reason === "title" ? s.reason : s.reason.slice(0, s.reason.length - s.page.title.length) + current;
+                kept.push({ ...s, page: { uuid: s.page.uuid, title: current, renamed_from: s.page.title }, reason });
+                keptRenamed++;
+              }
+            }
+            suggestions = kept;
+            // Related pages are by meaning, not by name, so a rename keeps them, under the current title.
             for (const r of relatedList) if (!live(r.page.uuid)) droppedStale.push(r.page);
-            relatedList = relatedList.filter((r) => live(r.page.uuid));
+            relatedList = relatedList
+              .filter((r) => live(r.page.uuid))
+              .map((r) => {
+                const current = renamedTo(r.page);
+                if (current === null) return r;
+                keptRenamed++;
+                return { ...r, page: { uuid: r.page.uuid, title: current, renamed_from: r.page.title } };
+              });
           }
 
           const built = new Date(titles.builtAt).toISOString();
@@ -886,8 +961,11 @@ export function registerSuggestLinksTool(
           const summary = [
             `${count} link ${count === 1 ? "suggestion" : "suggestions"} for graph "${alias}" (index built ${built.slice(11, 16)} UTC, ${ago})`,
             `${result.alreadyLinked.length} already linked`,
-            `${droppedStale.length} dropped as stale`,
+            `${droppedStale.length} dropped as stale${droppedRenamed > 0 ? ` (${droppedRenamed} renamed)` : ""}`,
             ...(wantRelated ? [`${relatedList.length} related`] : []),
+            ...(keptRenamed > 0
+              ? [`${keptRenamed} renamed since the index was built, shown by ${keptRenamed === 1 ? "its current title" : "their current titles"}`]
+              : []),
             ...(verify ? [] : [`not verified (verify: false): the UUIDs come from the index built ${ago}`]),
             ...notes,
           ].join("; ");

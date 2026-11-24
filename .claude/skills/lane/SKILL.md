@@ -12,11 +12,12 @@ The lanes are described in `docs/lanes/README.md`, and `CLAUDE.md` has the repo 
 
 1. Get today's date in the owner's time zone with `TZ=Pacific/Auckland date +%F`.
 2. Read the tracker settings from `.claude/lanes.local.json` (`{"graph": "<alias>", "page": "<issues page title>"}`). The file is untracked, so it keeps the graph's name out of the repo. If it's missing, call `list_graphs`: if exactly one graph is connected, use it with the page **Logseq Connector Issues**. Otherwise ask the owner, and offer to write the file. Never put the graph name or page UUIDs in a committed file, commit message or PR body.
-3. If the argument is an item number (`N` or `LC-N`), find the item and read it. Read only.
-   - Each item is one heading task whose title starts `LC-N:`. Find it with `search_graph` for `LC-N`, then read it with `get_blocks` (`view: "outline"`): its tags, its properties (Status, Priority, phase, component, dependsOn, foundIn, branch, pr-url) and the notes under it, which end in a **Log** block of dated entries.
-   - Finished items are on the page's archive (the page title plus ` Archive`). If the task is Done or Canceled, say so and stop unless the owner insists.
-   - If its `dependsOn` names an item that isn't Done, say so and ask before continuing.
+3. If the argument is an item number (`N` or `LC-N`), find the item's task and read it. Read only.
+   - Each item is one heading task whose title starts `LC-N:`, with its own `itemNumber`. Find it with one `datalog_query` for the block whose `itemNumber` property equals N, on the issues page or its archive (the page title plus ` Archive`, which holds Done and Canceled items), both matched by title. Match properties by their title (`itemNumber`, `component`, `dependsOn`, `foundIn`, `branch`, `pr-url`, plus the built-in Priority and Status), never by a hard-coded ident or UUID, and pull the task's uuid, title, tags, Priority, Status, component, dependsOn, foundIn, branch and pr-url with titles for the referenced values. If the query finds nothing, `search_graph` for `LC-N`.
+   - Read the item with `get_blocks` (`view: "outline"`): the notes under the task (Problem, Repro, Proposal, Acceptance criteria and so on) end in a **Log** block of dated entries. Take labels from the task's tags and component, and dependencies from `dependsOn`, never from text.
    - Old references such as `64d` or `Connector #58` are mapped to new numbers in the **Renumbered** notes under the page's Summary.
+   - If the task is already Done or Canceled, say so and stop unless the owner insists.
+   - If it depends on an item that isn't done (a `dependsOn` task whose Status isn't Done), say so and ask before continuing.
 4. Pick the lane from the item's type tag, unless the owner named one:
    - `bug` for **Bug**, or a described defect
    - `feature` for **Feature** or **Improvement**
@@ -70,12 +71,13 @@ Read `status` first.
 
 ## 5. Logseq write-back (always ask)
 
-Show `closeout.logseq_update` (or the spike's `logseq_update_hint`) and the property changes below. Ask once: "Write this to LC-N's Log and set it to In Review?" Only on yes, follow the Logseq skill's writing rules:
+Show `closeout.logseq_update` (or the spike's `logseq_update_hint`) and the result's `logseq_properties` (`{status, phase, branch, pr_url}`; a feature stopped at its spec or plan returns it too). If you opened a PR, put its URL in `pr_url` first. Ask once: "Write this to LC-N's Log and set its Status to <status>, phase, branch and pr-url?" Only on yes, follow the Logseq skill's writing rules:
 
-- Find the item's task (`search_graph` for `LC-N`) and its **Log** child block. Insert the draft entry as the Log's last child with one `insert_block_children` call. If the item has no Log block, add one as the task's last child, with the entry under it.
-- Set the facts as properties, never as text, with one `batch_set_block_property` on the task: Status In Review, phase `review`, `branch`, and `pr-url` (it holds several PRs, so a follow-up PR is added, not replaced). After merge and deploy: Status Done. Then move a Done item to the archive page, after the archive's last item.
-- For a feature still in spec, add only a "**Spec <date>**" entry to the Log with a link to the file, and set phase `plan`.
+- Find the item's task as in section 1 step 3, and its **Log** child block. Insert the draft entry as the Log's last child with one `insert_block_children` call. If the item has no Log block, add one as the task's last child, with the entry under it.
+- Set the facts as properties, never as text, in one `batch_set_block_property` call on the task: Status from `status`, `phase`, `branch`, and `pr-url` from `pr_url` (`pr-url` holds several PRs, so a follow-up PR is added, not replaced). Leave out any that are null: a null means "leave it as it is".
+- After merge and deploy, set Status Done and move the task to the archive page, after the archive's last item.
+- For a feature still in spec, add only a "**Spec <date>**" entry to the Log with a link to the file.
 - Proposed new items from the closeout are created only on the owner's yes, each as its own numbered item (see section 4).
-- Read back once to confirm, and report in one line.
+- Read the task back once with `get_block`, and report in one line, naming any property that didn't take (missing, or a different value from the one sent).
 
 Also pass on `compound.skill_suggestions` and `docs.skill_note`. They are changes for the owner's own Logseq skill, which lives outside this repo. Offer them as suggestions; don't apply them.

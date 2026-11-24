@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
-index f98b81a..61f8d81 100644
+index f98b81a6b..61f8d81c2 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
 @@ -213,7 +213,9 @@
@@ -63,7 +63,7 @@ index f98b81a..61f8d81 100644
  (def ^:private join-limit
    "The join cap while run-query's d/q runs, else nil: join-tuples counts only then."
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 932ce1d..f8eece6 100644
+index 932ce1d00..f8eece631 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -18,6 +18,7 @@
@@ -317,11 +317,11 @@ index 932ce1d..f8eece6 100644
      (= :semantic/named-query handler) (datalog/handle-named-query (assoc context
                                                                           :resolve-tag resolve-tag-selector
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index d589362..75fe5d5 100644
+index 4f5516fb5..ab91ace9f 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -3,6 +3,18 @@
-             [flatland.ordered.map :refer [ordered-map]]
+@@ -4,6 +4,18 @@
+             [logseq.common.config :as common-config]
              [reitit.core :as r]))
  
 +(def max-changes
@@ -339,7 +339,7 @@ index d589362..75fe5d5 100644
  (def operations
    [{:method "GET" :path "/api/v1/graphs"
      :handler :semantic/graphs-list :operation-id "listGraphs" :scope "logseq/read" :rate-class :read}
-@@ -104,6 +116,8 @@
+@@ -105,6 +117,8 @@
      :handler :semantic/search :operation-id "searchGraph" :scope "logseq/read" :rate-class :read}
     {:method "GET" :path "/api/v1/graphs/:graph-id/block-changes" :internal-path "/semantic/block-changes"
      :handler :semantic/block-changes :operation-id "listBlockChanges" :scope "logseq/read" :rate-class :read}
@@ -348,7 +348,7 @@ index d589362..75fe5d5 100644
     ;; A read: POST only because the query can be long.
     {:method "POST" :path "/api/v1/graphs/:graph-id/query" :internal-path "/semantic/query"
      :handler :semantic/datalog-query :operation-id "datalogQuery" :scope "logseq/read" :rate-class :read}
-@@ -215,6 +229,8 @@
+@@ -216,6 +230,8 @@
     "getAsset" ["Get an asset download link" "Returns asset metadata and a five-minute signed URL for the asset block's R2 object. The URL does not require an Authorization header. On plain graphs, use it to display image content. On E2EE graphs the object contains encrypted file bytes and must be decrypted with the graph AES key before display."]
     "searchGraph" ["Search graph resources" "Searches pages, blocks, tags, properties, and assets by title and returns cursor-paginated results. An exact title match ranks first, then pages, tags, properties and assets, then blocks."]
     "listBlockChanges" ["List changed blocks for a search index" "Feeds an external search index. Without since, lists every content block in UUID order. With since (the t of an earlier response) and that response's epoch, lists the blocks whose indexed text may have changed since then (their own text, an ancestor's or page's title, a referenced title, their tags, or their position) and, under removed, the UUIDs that are no longer content blocks. Each block carries its page title, its ancestors' text as a breadcrumb, its own text with references shown as titles, and the tags on it, its ancestors and its page. Answers 410 when the changes since that point are unavailable (the graph was re-uploaded or reset, or too much changed): list again without since. Unavailable for E2EE graphs."]
@@ -357,7 +357,7 @@ index d589362..75fe5d5 100644
     "datalogQuery" ["Run a read-only Datalog query"
                     (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
                          " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
-@@ -628,6 +644,17 @@
+@@ -629,6 +645,17 @@
                   {:name "epoch" :in "query"
                    :description "The epoch of the response that since came from."
                    :schema {:type "string"}}]))
@@ -375,7 +375,7 @@ index d589362..75fe5d5 100644
      (= "listGraphs" operation-id)
      (into [{:name "name" :in "query" :schema {:type "string"}
              :description "Exact graph name, matched case-insensitively."}])
-@@ -709,6 +736,7 @@
+@@ -710,6 +737,7 @@
                    "listKnowledgeIndex"
                    (list-response :pages "KnowledgeIndexEntry" "A cursor page of knowledge index entries")
                    "listBlockChanges" (entity-response "BlockChangesResponse" "A cursor page of changed blocks")
@@ -383,7 +383,7 @@ index d589362..75fe5d5 100644
                    "getPage" (entity-response "PageDetailResponse" "A page with its tags and property values")
                    "getPageOutline" (entity-response "PageOutlineResponse" "A page with its block tree as a markdown outline")
                    "updatePage" (entity-response "PageResponse" "The updated page")
-@@ -745,6 +773,9 @@
+@@ -746,6 +774,9 @@
            "429" {:description "Rate limit exceeded"}}
           (case operation-id
             "listBlockChanges" {"410" {:description "Changes since that point are unavailable; list again without since"}}
@@ -393,7 +393,7 @@ index d589362..75fe5d5 100644
             "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name>, an unknown param, or a body field the call doesn't take"}
                              "404" {:description "No named query has that name; the error lists the names"}
                              "409" {:description "The graph is E2EE"}
-@@ -1180,6 +1211,30 @@
+@@ -1181,6 +1212,30 @@
                                            :tags {:type "array" :items {:type "string"}
                                                   :description "Titles of the tags on the block, its ancestors and its page."}
                                            :updated-at {:type "integer"}}}
@@ -426,7 +426,7 @@ index d589362..75fe5d5 100644
                                        :properties {:epoch {:type "string"}
 diff --git a/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
 new file mode 100644
-index 0000000..84d834b
+index 000000000..84d834bd2
 --- /dev/null
 +++ b/deps/db-sync/test/logseq/db_sync/semantic_changes_since_test.cljs
 @@ -0,0 +1,773 @@
@@ -1204,7 +1204,7 @@ index 0000000..84d834b
 +          (p/catch #(is false (str % "\n" (.-stack %))))
 +          (p/finally done)))))
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index 930f019..7c05207 100644
+index 930f01994..7c05207be 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 @@ -15,6 +15,7 @@

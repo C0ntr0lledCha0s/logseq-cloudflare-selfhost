@@ -343,9 +343,19 @@ Finally, `scripts/check.sh` runs on HEAD; the manifest check passes unchanged.
 4. **Out-of-scope message.** It lists the aliases the token covers, which helps Claude correct itself but tells it the names of other graphs in scope. Keep, or just say "outside its scope"?
 5. **Token name in stamps.** The audit log records `service:<name>`; the graph's `editedBy` stays `claude`. Should a service write stamp a distinct value (for example `claude-service`) so the app can tell scheduled edits apart? That would need a change to patch 0034.
 
+### Owner answers (2026-11-23)
+
+The owner kept every default as built:
+
+1. **Write tools for read-only tokens.** Keep them listed and refuse with a reason. An unknown-tool error would not say why.
+2. **Expiry.** 90 days by default and 365 at most, for every access level.
+3. **`.mcp.json`.** Keep it in the repo.
+4. **Out-of-scope message.** Keep naming the aliases the token covers. They are only ever the owner's own graphs, and naming them helps Claude correct itself.
+5. **Token name in stamps.** Service writes keep the `claude` stamp. The audit log already records `service:<name>`.
+
 ## 12. As built
 
-The result follows the design. These are the places where it differs or adds detail. Section 11 is still open: no owner answers are recorded, so every default there (tools stay listed for a read-only token, 90 and 365 days, `.mcp.json` checked in, aliases named in the out-of-scope message, the `claude` stamp) is as designed.
+The result follows the design. These are the places where it differs or adds detail. The owner answered section 11 on 2026-11-23 and kept every default there (tools stay listed for a read-only token, 90 and 365 days, `.mcp.json` checked in, aliases named in the out-of-scope message, the `claude` stamp), as designed.
 
 - **`ServiceTokenStore` has three more methods.** Besides `list`, `create`, `get`, `revoke` and `touch`, it has `findByHash` (the verify lookup), `nameInUse` and `remove`. `nameInUse` runs before the insert, so a duplicate name is refused as `name: “x” is already in use by another token, revoked or not.` (HTTP 409) instead of surfacing the unique-index error. A revoked token keeps its name, so a name can't be reused. `remove` is used only when the wizard's read-back disagrees with what was submitted; it deletes the row and answers 500 naming the field.
 - **Wizard details.** The created page has no copy button: it shows the token in a read-only field to select and copy. `POST /tokens/:id/revoke` only matches a UUID id. It redirects with 303 to `/tokens` whether or not this call revoked the token (a second revoke keeps the first time), and answers 404 for an id that doesn't exist. The create form echoes back only values that are already valid, never an invalid name. A graph chosen in the form that is no longer connected is refused as `graph: a chosen graph is not connected`. The expiry check is `expires_at <= now` in verification and in the list's status, so a token shows as expired at the instant it stops working.
