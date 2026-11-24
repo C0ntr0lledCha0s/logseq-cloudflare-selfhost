@@ -57,6 +57,8 @@ export interface AffectedTarget {
   displayType?: string;
   /** A code block's language, given with its display type. */
   lang?: string;
+  /** batch_set_block_property and batch_delete_block_property: the properties the call named for this block, in call order, each once. */
+  properties?: string[];
 }
 
 /**
@@ -177,8 +179,10 @@ export function toAffectedTargets(response: unknown): AffectedTarget[] {
     if (Array.isArray(holder.affected)) {
       for (const item of holder.affected) {
         const a = target(item, "affected");
-        if (a) display(a, blocks.find((b) => b?.uuid === a.uuid));
-        if (a) out.push(a);
+        // A batch property write answers one affected entry per batch entry: name each block once (LC-140).
+        if (!a || out.some((o) => o.role === "affected" && o.uuid === a.uuid)) continue;
+        display(a, blocks.find((b) => b?.uuid === a.uuid));
+        out.push(a);
       }
     }
   };
@@ -370,12 +374,32 @@ export function resultJson(result: CallToolResult): unknown {
  * A write's targets and summary, from its result. Whatever context the response carries is read, so
  * nothing here can fail a call after its write; a tool in `NO_CONTEXT_TOOLS` simply names none.
  */
-export function describeWrite(tool: string, result: CallToolResult, reason: string | undefined): { targets: AffectedTarget[]; summary: string } {
+export function describeWrite(
+  tool: string,
+  result: CallToolResult,
+  reason: string | undefined,
+  args?: unknown,
+): { targets: AffectedTarget[]; summary: string } {
   const response = record(resultJson(result));
   const targets = tool === "delete_blank_blocks" ? blankBlockTargets(response) : toAffectedTargets(response);
+  if (PROPERTY_BATCHES.has(tool)) nameProperties(targets, args);
   const unavailable = response?.context === "unavailable" ? (text(response["context-reason"]) ?? "") : undefined;
   const truncated = response?.truncated === true ? { cleared: typeof response.cleared === "number" ? response.cleared : undefined } : undefined;
   return { targets, summary: summarise(targets, { tool, reason, dryRun: response?.["dry-run"] === true, unavailable, truncated }) };
+}
+
+const PROPERTY_BATCHES = new Set(["batch_set_block_property", "batch_delete_block_property"]);
+
+/** Gives each affected block the property-ids the call's entries named for it, in order, each once (LC-140). */
+function nameProperties(targets: AffectedTarget[], args: unknown): void {
+  const body = record(record(args)?.body);
+  const entries = Array.isArray(body?.entries) ? body.entries.map(record) : [];
+  for (const t of targets) {
+    if (t.role !== "affected") continue;
+    const names = entries.filter((e) => e?.["block-id"] === t.uuid).map((e) => text(e?.["property-id"]));
+    const unique = [...new Set(names.filter((n): n is string => typeof n === "string" && n !== ""))];
+    if (unique.length > 0) t.properties = unique;
+  }
 }
 
 /** `result` with `summary` as its first content item, or unchanged when the summary is empty. */

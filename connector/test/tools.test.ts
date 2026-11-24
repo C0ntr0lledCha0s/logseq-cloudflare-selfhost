@@ -2004,9 +2004,9 @@ const BLANK_RESPONSE = {
 /** The answer a successful call of `name` gets here: delete_blank_blocks' own shape, else CONTEXT_RESPONSE. */
 const okResponse = (name: string): Record<string, unknown> => (name === "delete_blank_blocks" ? BLANK_RESPONSE : CONTEXT_RESPONSE);
 
-/** The targets the audit row keeps for `response` to a call of `name`, as describeWrite reads them. */
-const targetsOf = (name: string, response: unknown) =>
-  describeWrite(name, { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined).targets;
+/** The targets the audit row keeps for `response` to a call of `name` with `args`, as describeWrite reads them. */
+const targetsOf = (name: string, response: unknown, args?: unknown) =>
+  describeWrite(name, { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined, args).targets;
 
 interface AuditDbRow {
   id: number;
@@ -2107,7 +2107,7 @@ describe("audit log", () => {
       rows_read: 1,
     });
     expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
-    expect(JSON.parse(ok.row.targets!), name).toEqual(targetsOf(name, okResponse(name)));
+    expect(JSON.parse(ok.row.targets!), name).toEqual(targetsOf(name, okResponse(name), args));
     expect(JSON.parse(ok.row.targets!).length, name).toBeGreaterThan(0);
     // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
     const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
@@ -2163,7 +2163,7 @@ describe("audit log", () => {
         where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
       const preview = await callAudited(name, dryArgs);
       expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
-      expect(JSON.parse(preview.row.targets!), name).toEqual(targetsOf(name, dry));
+      expect(JSON.parse(preview.row.targets!), name).toEqual(targetsOf(name, dry, dryArgs));
       // dry-run: false is a real call.
       const real =
         where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };

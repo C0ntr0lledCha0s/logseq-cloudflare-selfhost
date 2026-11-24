@@ -153,9 +153,20 @@ function parseJson(text: string | null): unknown {
   }
 }
 
+/**
+ * The row's targets, each affected block once. Rows written before LC-140 hold one target per batch
+ * entry, so a batch that set three properties on a block named it three times.
+ */
 function targetsOf(row: AuditRow): AffectedTarget[] {
   const parsed = parseJson(row.targets);
-  return Array.isArray(parsed) ? (parsed as AffectedTarget[]) : [];
+  if (!Array.isArray(parsed)) return [];
+  const seen = new Set<string>();
+  return (parsed as AffectedTarget[]).filter((t) => {
+    if (t?.role !== "affected" || typeof t.uuid !== "string") return true;
+    if (seen.has(t.uuid)) return false;
+    seen.add(t.uuid);
+    return true;
+  });
 }
 
 function addressedOf(row: AuditRow): string[] {

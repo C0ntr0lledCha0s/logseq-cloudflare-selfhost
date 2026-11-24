@@ -236,6 +236,37 @@ describe("summarise", () => {
     );
   });
 
+  // LC-140: the server answers one affected entry per batch entry, so a batch that sets three
+  // properties on a block named it three times, in the summary and in the audit log's targets.
+  it("names each block once when a batch sets several properties on it, with the properties it set", () => {
+    const [flights, agenda] = batchSetBlockProperty.response.affected;
+    const response = { updated: 6, affected: [flights, flights, flights, agenda, agenda, agenda] };
+    const args = {
+      body: {
+        entries: [
+          { "block-id": flights.uuid, "property-id": "logseq.property/status", value: "Done" },
+          { "block-id": flights.uuid, "property-id": "Priority", value: "High" },
+          { "block-id": flights.uuid, "property-id": "logseq.property/status", value: "Todo" },
+          { "block-id": agenda.uuid, "property-id": "block/tags", value: ["Task"] },
+          { "block-id": agenda.uuid, "property-id": "component", value: "lanes" },
+          { "block-id": agenda.uuid, "property-id": "Priority", value: "Low" },
+        ],
+      },
+    };
+    const result = { content: [{ type: "text" as const, text: JSON.stringify(response) }] };
+    const { targets, summary } = describeWrite("batch_set_block_property", result, undefined, args);
+    expect(targets.map((t) => [t.uuid, t.properties])).toEqual([
+      [flights.uuid, ["logseq.property/status", "Priority"]],
+      [agenda.uuid, ["block/tags", "component", "Priority"]],
+    ]);
+    expect(summary).toBe('Set properties on 2 blocks:\n- Nov 5th, 2026 > Notes > "Book flights"\n- Nov 5th, 2026 > Meeting > "Agenda"');
+    // Without the call's arguments the targets are still one per block, with no properties named.
+    expect(toAffectedTargets(response).map((t) => t.uuid)).toEqual([flights.uuid, agenda.uuid]);
+    // batch_delete_block_property names the properties it removed the same way.
+    const deleted = describeWrite("batch_delete_block_property", result, undefined, args).targets;
+    expect(deleted.map((t) => t.properties?.length)).toEqual([2, 3]);
+  });
+
   it("says a dry run changed nothing", () => {
     expect(summaryOf("delete-blocks-dry-run", "check first")).toBe(
       'Dry run, nothing changed: would delete 1 block:\n- Nov 5th, 2026 > Notes > "Book flights" (+1 child, 2 references)\nReason: check first',
