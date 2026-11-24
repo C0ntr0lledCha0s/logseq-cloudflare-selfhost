@@ -125,9 +125,19 @@ The rule: Opus where a wrong call ships a bad fix or lets a defect through, and 
 3. **Promote.** Once a lesson has been seen twice, it becomes a defect class in `REVIEW.md` or a *Gotcha* in `CLAUDE.md`.
 4. **Prune.** Findings that skeptics refute in more than one lane become *Known false positives* in `REVIEW.md`. Rules that a fix made obsolete are removed.
 5. **Retro.** The compounder reads the run's statistics: rounds, refutations, re-checks left open, skipped checks and blocked stages. From these it proposes changes to the lanes themselves, each with its evidence. `/lane` shows them, and the owner decides. Approved ones land as a `chore(lanes): …` commit.
-6. **Beyond the repo.** The issue's Logseq entry gets a dated *Built* note, and lessons about how Claude should use the connector come back as suggestions for the owner's own Logseq skill. The owner applies both.
+6. **Beyond the repo.** The item's Logseq task gets a dated *Built* entry in its Log block, with Status, branch and PR set as properties, and lessons about how Claude should use the connector come back as suggestions for the owner's own Logseq skill. The owner applies both.
 
 Run `/compound` to capture a lesson from work done outside a lane.
+
+## The issues page
+
+The lanes read items from the owner's issues page and never write to it without asking. Each item there has the same shape:
+
+- **One block per item.** A heading task titled `LC-N: <summary>`, so a search for `LC-N` finds it. The number is also in the `itemNumber` property and is never shared or reused: a split-out or follow-up piece of work gets the next free number.
+- **A type tag.** Bug, Feature, Improvement, Spike or Chore. An Epic is a group that ships as one PR; its child items each have their own number and point at it with `parent-work`.
+- **Facts as properties.** Status, Priority, phase, component, dependsOn, branch, pr-url (one or more PRs that delivered it) and foundIn (the PR whose review raised it). Never as text in the title or body.
+- **Notes under the task.** Problem, Repro, Expected, Proposal, Acceptance criteria and Workaround, as in the graph's class templates, then a **Log** block holding dated entries (Built, Verified, Shipped).
+- **Archive.** Done and Canceled items move to the page's archive, so the open page stays small enough to read in one call.
 
 ## Setting up
 
