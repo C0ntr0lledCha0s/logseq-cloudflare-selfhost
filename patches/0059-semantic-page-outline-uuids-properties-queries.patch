@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index bd96f3d..4f65b44 100644
+index 128d5f2..8480bf9 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -418,11 +418,12 @@
@@ -159,10 +159,10 @@ index bd96f3d..4f65b44 100644
    (into (set db-property-type/user-built-in-property-types)
          db-property-type/user-allowed-internal-property-types))
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index 110736c..e1b72b5 100644
+index 0022f9e..ea041f4 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -185,7 +185,7 @@
+@@ -198,7 +198,7 @@
     "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
     "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A \"/\" is allowed where Logseq allows it: in a journal title that the graph's journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
     "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
@@ -171,7 +171,7 @@ index 110736c..e1b72b5 100644
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
     "getSyncStatus" ["Read a graph's sync status" "Returns where the graph's sync log stands, how big the graph is and how many clients are connected, in one read that writes nothing. t is the latest sync transaction; last-written-at (ISO) and last-op (the outliner operation, such as delete-blocks) are those of the transaction at t, both null when the log holds no row for t. checksum is the checksum as stored, never recomputed, null when none is stored. page-count is the pages and journals listPages lists, and block-count counts the blocks on those pages, property value blocks included, so it can be higher than listPageBlocks shows; neither counts hidden pages, the Recycle bin or Private content (anything tagged Private or a tag extending it, and everything on or under it). On an E2EE graph tag titles are encrypted, so Private can't be recognised and the counts may include it: counts-include-private is then true, as is e2ee. clients holds counts only, from the app's live connections (WebSockets; API calls are not connections): connected (connections that identified a user), users (distinct users), own (the caller's connections), others (connected minus own; own and others are null when the request names no caller) and editing (connections reporting a block being edited). It names no user, email, device or block, and presence carries no device or client kind."]
-@@ -712,7 +712,13 @@
+@@ -727,7 +727,13 @@
             {:name "max-chars" :in "query" :schema {:type "integer" :minimum 100 :maximum 1000000}
              :description "Most characters of markdown per call: the outline ends after the last whole top-level block (or root child) that fits, with a next-cursor. The first one is always returned, however long."}
             {:name "cursor" :in "query" :schema {:type "string"}

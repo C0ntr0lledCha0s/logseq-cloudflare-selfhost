@@ -1,8 +1,8 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 0887b9b..0034f1e 100644
+index e9f134c..3bbff0a 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-@@ -6052,13 +6052,15 @@
+@@ -6064,13 +6064,15 @@
  
  (def ^:private health-checks
    ["orphan-tags" "orphan-properties" "duplicate-titles" "pages-without-summary" "pages-without-tags"
@@ -20,7 +20,7 @@ index 0887b9b..0034f1e 100644
  
  (def ^:private default-health-checks
    (vec (remove opt-in-health-checks health-checks)))
-@@ -6227,11 +6229,67 @@
+@@ -6239,11 +6241,67 @@
    (let [raw (.get (.-searchParams url) param)]
      (when (seq raw) (vec (distinct (string/split raw #","))))))
  
@@ -89,7 +89,7 @@ index 0887b9b..0034f1e 100644
    (let [visible (fn [entities] (remove #(contains? private (:db/id %)) entities))
          by-title (fn [entities] (paginate-by (partial title-key db) entities limit cursor))
          pages-check (fn [pages]
-@@ -6270,6 +6328,29 @@
+@@ -6282,6 +6340,29 @@
                :items #(mapv (fn [{:keys [holder target-uuid reason]}]
                                (assoc (holder-response holder) :target-uuid target-uuid :reason reason))
                              %))
@@ -119,7 +119,7 @@ index 0887b9b..0034f1e 100644
        "missing-tag-properties"
        (let [{:keys [pairs from skipped]} tag-properties]
          (cond-> (update (paginate-by (fn [{:keys [holder tag]}] [(uuid-string (:block/uuid holder)) (uuid-string (:block/uuid tag))])
-@@ -6335,6 +6416,7 @@
+@@ -6347,6 +6428,7 @@
              (and (.has (.-searchParams url) "tag-properties") (not (some #{"missing-tag-properties"} checks)))
              (http/bad-request "tag-properties needs the missing-tag-properties check")
              (unused-health-parameter-error url checks) (http/bad-request (unused-health-parameter-error url checks))
@@ -127,7 +127,7 @@ index 0887b9b..0034f1e 100644
              :else
              ;; The pairs are read only when their check runs, so a malformed stored value doesn't
              ;; stop the other checks.
-@@ -6343,7 +6425,9 @@
+@@ -6355,7 +6437,9 @@
                (if-let [error (:error tag-properties)]
                  (http/bad-request error)
                  (let [options {:prefix prefix :time-filters time-filters :limit limit :cursor cursor
@@ -139,10 +139,10 @@ index 0887b9b..0034f1e 100644
                                                           checks)}))))))
  
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index e8f0709..6e13ca6 100644
+index 693fd86..a5e8258 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -191,7 +191,7 @@
+@@ -204,7 +204,7 @@
     "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
     "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
     "getSyncStatus" ["Read a graph's sync status" "Returns where the graph's sync log stands, how big the graph is and how many clients are connected, in one read that writes nothing. t is the latest sync transaction; last-written-at (ISO) and last-op (the outliner operation, such as delete-blocks) are those of the transaction at t, both null when the log holds no row for t. checksum is the checksum as stored, never recomputed, null when none is stored. page-count is the pages and journals listPages lists, and block-count counts the blocks on those pages, property value blocks included, so it can be higher than listPageBlocks shows; neither counts hidden pages, the Recycle bin or Private content (anything tagged Private or a tag extending it, and everything on or under it). On an E2EE graph tag titles are encrypted, so Private can't be recognised and the counts may include it: counts-include-private is then true, as is e2ee. clients holds counts only, from the app's live connections (WebSockets; API calls are not connections): connected (connections that identified a user), users (distinct users), own (the caller's connections), others (connected minus own; own and others are null when the request names no caller) and editing (connections reporting a block being edited). It names no user, email, device or block, and presence carries no device or client kind."]
@@ -151,7 +151,7 @@ index e8f0709..6e13ca6 100644
     "listKnowledgeIndex" ["List the knowledge index" "Returns a cursor-paginated index of the non-journal user pages in title order, for building a knowledge-base overview: each page's tags, the classes they extend, its summary (the text after summary-prefix in its first top-level block, links shown as titles), how many entities reference it (as in getPageBacklinks' total), when it was created and last updated, and its aliases (the titles of its alias pages, sorted, leaving out hidden and recycled ones and any an excluded tag leaves out; [] when it has none). Built-in pages are left out, and so are pages tagged with any tag named in exclude-tags or a tag that extends one. Unavailable for E2EE graphs."]
     "getPage" ["Get a page" "Returns one page block by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status and Description), without loading its block tree."]
     "updatePage" ["Update a page" "Renames one page identified by its block UUID. A page title is a name, not block text: a title starting with # to ###### and whitespace (# Name) is refused with 400 naming the title, and nothing changes."]
-@@ -658,7 +658,11 @@
+@@ -673,7 +673,11 @@
              :description "Most items listed per relation. Counts are always complete."}])
      (= "getGraphHealth" operation-id)
      (into (concat [{:name "checks" :in "query" :schema {:type "string"}
@@ -164,7 +164,7 @@ index e8f0709..6e13ca6 100644
                     {:name "tag-properties" :in "query" :schema {:type "string"}
                      :description "The expected tag-property pairs missing-tag-properties checks, as a JSON array of 1 to 50 pairs, such as [{\"tag\": \"Book\", \"property\": \"author\"}], each tag and property a UUID, ident or title; a pair given twice is checked once. Replaces the stored pairs (HEALTH_TAG_PROPERTIES) for this call. Needs the missing-tag-properties check."}
                     {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200 :default 50}
-@@ -1222,7 +1226,7 @@
+@@ -1237,7 +1241,7 @@
                 :HealthCheckResult {:type "object" :required ["count" "items"]
                                     :properties {:count {:type "integer"}
                                                  :items {:type "array"
@@ -173,7 +173,7 @@ index e8f0709..6e13ca6 100644
                                                          :items {}}
                                                  :next-cursor {:type "string"}
                                                  :pairs {:type "array"
-@@ -1237,7 +1241,10 @@
+@@ -1252,7 +1256,10 @@
                                                             :items {:type "object"
                                                                     :properties {:entry {:type "string"} :reason {:type "string"}}}}
                                                  :note {:type "string"
@@ -349,10 +349,10 @@ index d14c8d8..2f144db 100644
      (is (= "listKnowledgeIndex" (:operationId (operation "/api/v1/graphs/{graph-id}/knowledge-index"))))
      (is (= #{"graph-id" "limit" "cursor" "exclude-tags" "summary-prefix"}
 diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-index eee3184..b8ff2bc 100644
+index ca71361..f7d385a 100644
 --- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
 +++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
-@@ -51,6 +51,7 @@
+@@ -52,6 +52,7 @@
              [logseq.db-sync.semantic-outline-options-test]
              [logseq.db-sync.semantic-batch-update-blocks-test]
              [logseq.db-sync.semantic-work-items-query-test]

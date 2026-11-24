@@ -1,5 +1,5 @@
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
-index 4f65b44..0887b9b 100644
+index 8480bf9..e9f134c 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
 @@ -3408,6 +3408,148 @@
@@ -243,7 +243,7 @@ index 4f65b44..0887b9b 100644
  
      :semantic/refresh-refs
      (p/let [body (body-clj request)
-@@ -7095,7 +7182,7 @@
+@@ -7107,7 +7194,7 @@
      :semantic/pages-update :semantic/pages-delete})
  
  (def ^:private block-handlers
@@ -253,10 +253,10 @@ index 4f65b44..0887b9b 100644
  
  (def ^:private block-property-handlers
 diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-index e1b72b5..7ec5795 100644
+index ea041f4..6c812e4 100644
 --- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
 +++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
-@@ -79,6 +79,8 @@
+@@ -92,6 +92,8 @@
      :handler :semantic/blocks-set-property :operation-id "setBlockProperty" :scope "logseq/write" :rate-class :write}
     {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
      :handler :semantic/blocks-delete-property :operation-id "deleteBlockProperty" :scope "logseq/write" :rate-class :write}
@@ -265,7 +265,7 @@ index e1b72b5..7ec5795 100644
     {:method "POST" :path "/api/v1/graphs/:graph-id/block-properties/batch-set" :internal-path "/semantic/block-properties/batch-set"
      :handler :semantic/blocks-batch-set-property :operation-id "batchSetBlockProperty" :scope "logseq/write" :rate-class :write}
     {:method "POST" :path "/api/v1/graphs/:graph-id/block-properties/batch-delete" :internal-path "/semantic/block-properties/batch-delete"
-@@ -205,6 +207,7 @@
+@@ -218,6 +220,7 @@
                               " A page with more than 2000 blocks, or pages with more than 10000 together, are refused with 422 naming the page where the bound was passed. A page may end with no blocks; the app may add an empty block back when it is opened."
                               " An apply takes 1 to 100 block-ids (UUIDs, each once, ignoring case) and refuses the whole call, naming block-ids[i] and writing nothing: 400 for an entry that isn't a UUID or repeats an earlier one, 404 for one that names no block (or one in the Recycle bin), and 409 when, judged again inside the write's transaction, the block is no longer blank (it has text), has children, is referenced, is in a template, is being edited in the app, is not on a listed page, is not a plain block or is Private. So only blocks that are still plain blank leaves on the named pages are deleted, never a block that changed since the dry run."
                               " The apply deletes them all in one transaction, answers deleted, the graph's t after the write and, per page in request order, how many it deleted and how many blocks it still holds (remaining-blocks), and answers 500 naming any block still there afterwards.")]
@@ -273,7 +273,7 @@ index e1b72b5..7ec5795 100644
     "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
     "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are refused on a Query block's query (the block holding its text), which stays Clojure code, and are otherwise judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
     "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
-@@ -449,6 +452,15 @@
+@@ -464,6 +467,15 @@
                                             :items {:type "string"}}
                                 :target-id {:type "string" :description target-selector-description}
                                 :position {:enum ["before" "after" "first-child" "last-child"]}}}
@@ -289,7 +289,7 @@ index e1b72b5..7ec5795 100644
      "batchMoveBlocks" {:required ["moves"]
                         :properties {:moves {:type "array" :minItems 1 :maxItems 100
                                              :items {:type "object" :required ["block-ids" "target-id" "position"]
-@@ -729,7 +741,7 @@
+@@ -744,7 +756,7 @@
      (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees"} operation-id)
      (into [{:name "verbose" :in "query" :schema {:type "boolean" :default true}
              :description "false returns only the inserted blocks' UUIDs, nested as inserted, and a count, without echoing their titles."}])
