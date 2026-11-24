@@ -267,6 +267,15 @@ describe("summarise", () => {
     expect(deleted.map((t) => t.properties?.length)).toEqual([2, 3]);
   });
 
+  it("names each block a batch_update_blocks call renamed (LC-137)", () => {
+    const [flights, agenda] = batchSetBlockProperty.response.affected;
+    const response = { updated: 2, entries: [{ uuid: flights.uuid, kind: "block", title: "LC-1: x" }], affected: [flights, agenda] };
+    const result = { content: [{ type: "text" as const, text: JSON.stringify(response) }] };
+    expect(describeWrite("batch_update_blocks", result, "shorten titles").summary).toBe(
+      'Updated 2 blocks:\n- Nov 5th, 2026 > Notes > "Book flights"\n- Nov 5th, 2026 > Meeting > "Agenda"\nReason: shorten titles',
+    );
+  });
+
   it("says a dry run changed nothing", () => {
     expect(summaryOf("delete-blocks-dry-run", "check first")).toBe(
       'Dry run, nothing changed: would delete 1 block:\n- Nov 5th, 2026 > Notes > "Book flights" (+1 child, 2 references)\nReason: check first',

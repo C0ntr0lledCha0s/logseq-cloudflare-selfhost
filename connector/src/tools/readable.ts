@@ -79,6 +79,7 @@ export const CONTEXT_TOOLS: Readonly<Record<string, readonly [string, string]>> 
   capture_to_today: ["Inserted", "insert"],
   create_task: ["Created", "create"],
   update_block: ["Updated", "update"],
+  batch_update_blocks: ["Updated", "update"],
   set_block_property: ["Set a property on", "set a property on"],
   delete_block_property: ["Removed a property from", "remove a property from"],
   batch_set_block_property: ["Set properties on", "set properties on"],

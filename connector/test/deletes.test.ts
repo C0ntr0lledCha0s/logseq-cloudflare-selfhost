@@ -53,6 +53,7 @@ const DESTRUCTIVE_KINDS: Record<string, "always" | "when" | "never"> = {
   // Patch 0038: a reorder rewrites which page each slot links and keeps every slot.
   reorder_favorites: "never",
   update_block: "never",
+  batch_update_blocks: "never",
   update_page: "never",
   update_property: "when",
   update_tag: "never",
@@ -121,6 +122,7 @@ describe("the delete table", () => {
   it("returns null for every never tool, with representative arguments", () => {
     const representative: Record<string, Record<string, unknown>> = {
       update_block: { graph: "notes", "block-id": "b1", body: { title: "New text" } },
+      batch_update_blocks: { graph: "notes", body: { entries: [{ "block-id": "b1", title: "New text" }] } },
       update_page: { graph: "notes", "page-id": "Plans", body: { title: "Plans 2026" } },
       refresh_refs: { graph: "notes", body: { apply: true } },
       promote_page_to_tag: { graph: "notes", "page-id": "Person", body: { extends: ["Agent"] } },
@@ -432,6 +434,7 @@ describe("dry runs", () => {
       promote_page_to_tag: "query",
       delete_blocks: "body",
       batch_move_blocks: "body",
+      batch_update_blocks: "body",
       batch_insert_block_trees: "body",
       // Patch 0037 (code blocks) gives the two tree inserts a dry run; both are `never` deletes.
       insert_block_children: "body",

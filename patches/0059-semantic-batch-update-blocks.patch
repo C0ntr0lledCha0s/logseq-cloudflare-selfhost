@@ -1,0 +1,422 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index 4f65b44..0887b9b 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -3408,6 +3408,148 @@
+   [^js url]
+   (.get (.-searchParams url) "target-label"))
+ 
++
++;; Defined further down, with the writes that use them first.
++(declare unverified! entry-label-checks bulk-write-response)
++
++(defn- prepare-block-update
++  "updateBlock's checks for `body` ({:title, :display-type?, :lang?}) on `block`, made before
++  anything is written: {:error {:status :error}}, or the plan apply-block-update! writes.
++  display-type and lang (patch 0037) are checked as set_block_property checks them; the title is
++  judged on the block's final type, the body's (or its fence's) or else the stored one. A text
++  block's title that is one fence converts it, unless convert-fences=false; a page's, tag's or
++  property's title is a name, never converted. batchUpdateBlocks (LC-137) runs the same checks."
++  [db block body convert? e2ee?]
++  (let [fields (keep (fn [[k ident]]
++                       (when (contains? body k) [ident (display-value db ident (get body k) block)]))
++                     [[:display-type display-type-ident] [:lang lang-ident]])
++        explicit (into {} (map (fn [[ident prepared]] [ident (:value prepared)])) fields)
++        ;; Only a text block's fence converts: a code, math or quote block's title is its
++        ;; content, as the app's parse-block skips extraction for a block with a display-type.
++        fence (when (and (true? convert?) (not e2ee?) block (= "block" (block-kind block))
++                         (nil? (display-type-ident block)))
++                (fence-display-block (:title body)))
++        ;; update_block doesn't make Query blocks (patch 0050): an advanced query fence stays text.
++        fence (if (= :query (:type fence)) {:kept update-query-fence-reason} fence)
++        converted (when (:type fence) fence)
++        fence-error (when converted
++                      (fence-refusal converted (get explicit display-type-ident) (get explicit lang-ident)))
++        type (or (get explicit display-type-ident) (:type converted))
++        lang (or (get explicit lang-ident) (:lang converted))
++        given (cond-> {} type (assoc display-type-ident type) lang (assoc lang-ident lang))
++        title (if converted (:title converted) (:title body))
++        final-type (or type (some-> block display-type-ident))
++        ;; patch 0050: only a Query block Claude made changes; its value block takes checked text.
++        query-guard (when (and block (non-blank-string? (:title body))) (query-block-refusal db block body))
++        query-holder-id (when (and block (nil? query-guard))
++                          (let [part (query-block-part db block)] (when (:value? part) (:holder part))))
++        refuse (fn [error] {:error {:status 400 :error error}})]
++    (cond
++      (or (nil? block) (not (non-blank-string? (:title body))))
++      (refuse "invalid block-id or title")
++      query-guard {:error query-guard}
++      (= ::invalid convert?) (refuse convert-fences-refusal)
++      (some (comp :error second) fields) (refuse (some (comp :error second) fields))
++      fence-error (refuse fence-error)
++      (and (not e2ee?) (contains? #{"page" "tag" "property"} (block-kind block))
++           (name-heading-refusal (block-kind block) (:title body)))
++      (refuse (name-heading-refusal (block-kind block) (:title body)))
++      (and (some? lang) (not= :code final-type)) (refuse "lang needs display-type code")
++      :else {:block block :body body :type type :lang lang :given given :title title
++             :final-type final-type :query-holder-id query-holder-id :converted converted :fence fence})))
++
++(defn- apply-block-update!
++  "Writes `plan` (from prepare-block-update) inside a transaction on `tx-conn`, and reads it back;
++  returns the prepared title. The type is written first, so the outliner's save sees it and leaves a
++  typed title's `# ` lines alone."
++  [tx-conn {:keys [block body type lang given title final-type query-holder-id]} e2ee?]
++  (when type (set-display-type! tx-conn (:db/id block) type))
++  (when lang (outliner-property/set-block-property! tx-conn (:db/id block) lang-ident lang))
++  (let [prepared (prepare-block-title! tx-conn e2ee? title final-type)]
++    (outliner-core/save-block! tx-conn
++                               (assoc prepared :block/uuid (:block/uuid block))
++                               :encrypted-title? e2ee? :encrypted-name (:name body))
++    (unverified! (keep (fn [[ident value]] (read-back-display @tx-conn (:db/id block) ident value))
++                       given))
++    ;; A Claude-made query is stored as sent and stays Clojure code.
++    (when query-holder-id
++      (unverified! (map (fn [reason] (str "title: " reason))
++                        (read-back-query-block @tx-conn query-holder-id (:title body) true))))
++    prepared))
++
++(defn- block-update-result
++  "What updateBlock answers for one block `plan` wrote, as `db` now has it: its uuid, kind and stored
++  title, what was escaped, its display type, and whether a fence converted or stayed text."
++  [db {:keys [block body converted fence]} prepared e2ee?]
++  (let [stored (d/entity db [:block/uuid (:block/uuid block)])]
++    (cond-> (with-display
++              (with-escaped
++                {:uuid (str (:block/uuid block)) :kind (block-kind block)
++                 ;; The stored title shows what was escaped; E2EE stores the input.
++                 :title (if e2ee? (:title body) (:block/title stored))}
++                prepared)
++              stored)
++      converted (assoc :converted "fence")
++      (:kept fence) (assoc :kept [{:path "title" :reason (:kept fence)}]))))
++
++(defn- batch-update-blocks
++  "batchUpdateBlocks (LC-137): up to 100 title changes, each checked as updateBlock checks one before
++  anything is written, then applied in order in one transaction. A refused entry refuses the call,
++  naming it. A block may be named by one entry only. A dry run writes to a throwaway copy."
++  [^js self conn db body url e2ee? creator]
++  (let [entries (:entries body)
++        dry-run? (dry-run-option body)
++        convert? (convert-fences-option url)]
++    (cond
++      e2ee? (http/error-response "batch title updates are unavailable for E2EE graphs; use updateBlock" 409)
++      (not (and (sequential? entries) (<= 1 (count entries) 100)))
++      (http/bad-request "entries: give 1 to 100 entries, each {block-id, title}")
++      (= ::invalid dry-run?) (http/bad-request "dry-run must be a boolean")
++      (labels-error entries) (http/bad-request (labels-error entries))
++      :else
++      (let [blocks (mapv #(when (map? %) (find-entity db (:block-id %))) entries)
++            first-index (reduce-kv (fn [m i b] (if (and b (not (contains? m (:db/id b)))) (assoc m (:db/id b) i) m)) {} blocks)
++            duplicate (some (fn [[i b]] (when (and b (not= i (get first-index (:db/id b))))
++                                          [i (get first-index (:db/id b))]))
++                            (map-indexed vector blocks))
++            plans (mapv (fn [entry block]
++                          (if (map? entry)
++                            (prepare-block-update db block entry convert? false)
++                            {:error {:status 400 :error "must be an object {block-id, title}"}}))
++                        entries blocks)
++            refused (first (keep-indexed (fn [i plan] (when (:error plan) [i (:error plan)])) plans))]
++        (cond
++          duplicate
++          (http/bad-request (str "entry " (first duplicate) ": block " (:block-id (nth entries (first duplicate)))
++                                 " is already in entry " (second duplicate) "; name each block once"))
++          refused
++          (let [[i {:keys [status error]}] refused]
++            (http/error-response (str "entry " i ": " error) status))
++          :else
++          (let [prepared (volatile! [])
++                write-conn (if dry-run? (dry-run-conn conn) conn)]
++            (answering-unverified
++             #(refusing-labels
++               (fn []
++                 (atomic-write! write-conn creator false :save-block
++                                (fn [tx-conn]
++                                  (check-labels! @tx-conn false (entry-label-checks entries plans :block))
++                                  (vreset! prepared
++                                           (vec (map-indexed
++                                                 (fn [i plan]
++                                                   (try (apply-block-update! tx-conn plan false)
++                                                        (catch :default error
++                                                          (if-let [message (::unverified (ex-data error))]
++                                                            (throw (ex-info (str "entry " i ": " message) {::unverified (str "entry " i ": " message)}))
++                                                            (throw error)))))
++                                                 plans)))))
++                 (when-not dry-run? (broadcast-change! self))
++                 (bulk-write-response
++                  {:updated (count plans)
++                   :entries (mapv (fn [plan p] (block-update-result @write-conn plan p false)) plans @prepared)
++                   :affected (:affected (affected-context @write-conn (map :block plans) false))}
++                  dry-run? 200))))))))))
++
+ (defn- handle-blocks [{:keys [^js self request ^js url conn db handler path-params e2ee? creator] :as context}]
+   (case handler
+ 
+@@ -3419,80 +3561,25 @@
+     :semantic/blocks-update
+     (p/let [body (body-clj request)
+             block (find-entity db (:block-id path-params))]
+-      ;; display-type and lang (patch 0037) are checked as set_block_property checks them; the title
+-      ;; is judged on the block's final type, the body's (or its fence's) or else the stored one. A
+-      ;; text block's title that is one fence converts it, unless convert-fences=false; a page's,
+-      ;; tag's or property's title is a name, never converted.
+-      (let [fields (keep (fn [[k ident]]
+-                           (when (contains? body k) [ident (display-value db ident (get body k) block)]))
+-                         [[:display-type display-type-ident] [:lang lang-ident]])
+-            explicit (into {} (map (fn [[ident prepared]] [ident (:value prepared)])) fields)
+-            convert? (convert-fences-option url)
+-            ;; Only a text block's fence converts: a code, math or quote block's title is its
+-            ;; content, as the app's parse-block skips extraction for a block with a display-type.
+-            fence (when (and (true? convert?) (not e2ee?) (= "block" (some-> block block-kind))
+-                             (nil? (display-type-ident block)))
+-                    (fence-display-block (:title body)))
+-            ;; update_block doesn't make Query blocks (patch 0050): an advanced query fence stays text.
+-            fence (if (= :query (:type fence)) {:kept update-query-fence-reason} fence)
+-            converted (when (:type fence) fence)
+-            fence-error (when converted
+-                          (fence-refusal converted (get explicit display-type-ident) (get explicit lang-ident)))
+-            type (or (get explicit display-type-ident) (:type converted))
+-            lang (or (get explicit lang-ident) (:lang converted))
+-            given (cond-> {} type (assoc display-type-ident type) lang (assoc lang-ident lang))
+-            title (if converted (:title converted) (:title body))
+-            final-type (or type (display-type-ident block))
+-            ;; patch 0050: only a Query block Claude made changes; its value block takes checked text.
+-            query-guard (when (and block (non-blank-string? (:title body))) (query-block-refusal db block body))
+-            query-holder-id (when (and block (nil? query-guard))
+-                              (let [part (query-block-part db block)] (when (:value? part) (:holder part))))]
+-        (cond
+-          (or (nil? block) (not (non-blank-string? (:title body))))
+-          (http/bad-request "invalid block-id or title")
+-          query-guard (http/error-response (:error query-guard) (:status query-guard))
+-          (= ::invalid convert?) (http/bad-request convert-fences-refusal)
+-          (some (comp :error second) fields) (http/bad-request (some (comp :error second) fields))
+-          fence-error (http/bad-request fence-error)
+-          (and (not e2ee?) (contains? #{"page" "tag" "property"} (block-kind block))
+-               (name-heading-refusal (block-kind block) (:title body)))
+-          (http/bad-request (name-heading-refusal (block-kind block) (:title body)))
+-          (and (some? lang) (not= :code final-type)) (http/bad-request "lang needs display-type code")
+-          :else
++      (let [plan (prepare-block-update db block body (convert-fences-option url) e2ee?)]
++        (if-let [{:keys [status error]} (:error plan)]
++          (if (= 400 status) (http/bad-request error) (http/error-response error status))
+           (let [prepared (volatile! nil)]
+             (answering-unverified
+              #(refusing-labels
+                (fn []
+-                 ;; One transaction: the type is written first, so the outliner's save sees it and
+-                 ;; leaves a typed title's `# ` lines alone.
+                  (atomic-write! conn creator false :save-block
+                                 (fn [tx-conn]
+                                   (check-labels! @tx-conn e2ee? [{:id (:db/id block) :label (target-label-param url)}])
+-                                  (when type (set-display-type! tx-conn (:db/id block) type))
+-                                  (when lang (outliner-property/set-block-property! tx-conn (:db/id block) lang-ident lang))
+-                                  (vreset! prepared (prepare-block-title! tx-conn e2ee? title final-type))
+-                                  (outliner-core/save-block! tx-conn
+-                                                             (assoc @prepared :block/uuid (:block/uuid block))
+-                                                             :encrypted-title? e2ee? :encrypted-name (:name body))
+-                                  (unverified! (keep (fn [[ident value]] (read-back-display @tx-conn (:db/id block) ident value))
+-                                                     given))
+-                                  ;; A Claude-made query is stored as sent and stays Clojure code.
+-                                  (when query-holder-id
+-                                    (unverified! (map (fn [reason] (str "title: " reason))
+-                                                      (read-back-query-block @tx-conn query-holder-id (:title body) true))))))
++                                  (vreset! prepared (apply-block-update! tx-conn plan e2ee?))))
+                  (broadcast-change! self)
+-                 (let [stored (d/entity @conn [:block/uuid (:block/uuid block)])]
+-                   (http/json-response nil (with-context-or-unavailable
+-                                             (cond-> (with-display
+-                                                       (with-escaped
+-                                                         {:uuid (str (:block/uuid block)) :kind (block-kind block)
+-                                                          ;; The stored title shows what was escaped; E2EE stores the input.
+-                                                          :title (if e2ee? (:title body) (:block/title stored))}
+-                                                         @prepared)
+-                                                       stored)
+-                                               converted (assoc :converted "fence")
+-                                               (:kept fence) (assoc :kept [{:path "title" :reason (:kept fence)}]))
+-                                             (fn [] (target-context @conn block e2ee?))))))))))))
++                 (http/json-response nil (with-context-or-unavailable
++                                           (block-update-result @conn plan @prepared e2ee?)
++                                           (fn [] (target-context @conn block e2ee?)))))))))))
++
++    :semantic/blocks-batch-update
++    (p/let [body (body-clj request)]
++      (batch-update-blocks self conn db body url e2ee? creator))
+ 
+     :semantic/refresh-refs
+     (p/let [body (body-clj request)
+@@ -7095,7 +7182,7 @@
+     :semantic/pages-update :semantic/pages-delete})
+ 
+ (def ^:private block-handlers
+-  #{:semantic/blocks-get :semantic/blocks-update :semantic/blocks-delete :semantic/blocks-move
++  #{:semantic/blocks-get :semantic/blocks-update :semantic/blocks-batch-update :semantic/blocks-delete :semantic/blocks-move
+     :semantic/blocks-insert-children :semantic/blocks-insert-tree :semantic/refresh-refs})
+ 
+ (def ^:private block-property-handlers
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index e1b72b5..7ec5795 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -79,6 +79,8 @@
+     :handler :semantic/blocks-set-property :operation-id "setBlockProperty" :scope "logseq/write" :rate-class :write}
+    {:method "DELETE" :path "/api/v1/graphs/:graph-id/blocks/:block-id/properties/:property-id" :internal-path "/semantic/blocks/:block-id/properties/:property-id"
+     :handler :semantic/blocks-delete-property :operation-id "deleteBlockProperty" :scope "logseq/write" :rate-class :write}
++   {:method "POST" :path "/api/v1/graphs/:graph-id/block-updates/batch" :internal-path "/semantic/block-updates/batch"
++    :handler :semantic/blocks-batch-update :operation-id "batchUpdateBlocks" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/block-properties/batch-set" :internal-path "/semantic/block-properties/batch-set"
+     :handler :semantic/blocks-batch-set-property :operation-id "batchSetBlockProperty" :scope "logseq/write" :rate-class :write}
+    {:method "POST" :path "/api/v1/graphs/:graph-id/block-properties/batch-delete" :internal-path "/semantic/block-properties/batch-delete"
+@@ -205,6 +207,7 @@
+                              " A page with more than 2000 blocks, or pages with more than 10000 together, are refused with 422 naming the page where the bound was passed. A page may end with no blocks; the app may add an empty block back when it is opened."
+                              " An apply takes 1 to 100 block-ids (UUIDs, each once, ignoring case) and refuses the whole call, naming block-ids[i] and writing nothing: 400 for an entry that isn't a UUID or repeats an earlier one, 404 for one that names no block (or one in the Recycle bin), and 409 when, judged again inside the write's transaction, the block is no longer blank (it has text), has children, is referenced, is in a template, is being edited in the app, is not on a listed page, is not a plain block or is Private. So only blocks that are still plain blank leaves on the named pages are deleted, never a block that changed since the dry run."
+                              " The apply deletes them all in one transaction, answers deleted, the graph's t after the write and, per page in request order, how many it deleted and how many blocks it still holds (remaining-blocks), and answers 500 naming any block still there afterwards.")]
++   "batchUpdateBlocks" ["Update several block titles" "Replaces the titles of up to 100 blocks in one transaction, each entry as updateBlock would change one block: a title starting with # to ###### and a space becomes the block's heading, an unknown #word is stored escaped as \\# (listed under the entry's escaped), display-type and lang make a code, math or quote block whose title is stored verbatim, a text block whose whole title is one fence converts unless convert-fences=false, and only Query blocks Claude made can change. Every entry is checked before anything is written: a refused entry refuses the whole call, naming it (entry 2: invalid block-id or title), and a block may be named by one entry only. Each entry may give a target-label. The answer gives updated, each entry's result as updateBlock answers it (uuid, kind, stored title, escaped, display type, converted or kept) and each block's context under affected. dry-run applies the entries to a throwaway copy of the graph and answers the same, changing nothing. Unavailable for E2EE graphs (409); use updateBlock there."]
+    "batchMoveBlocks" ["Move blocks to several targets" "Applies up to 100 moves in order in one transaction, each like moveBlocks: its blocks go before, after, into the first-child or into the last-child position of its target. A block may be moved by one entry only. If any move is invalid or cannot be applied, none is. Each moved block is named under affected with where it was (from) and is (to). dry-run checks and applies the moves to a throwaway copy of the graph without changing it, and answers the same affected, with to read from that copy."]
+    "batchInsertBlockTrees" ["Insert block trees into several pages" (str "Applies up to 100 entries in order in one transaction. Each entry addresses a block or page by target-id, or a page by title with page (the page is created when no page has that name), sets the entry's properties on it, and inserts its block trees. Use it to build or fill several pages, with their tags and properties, in one call. " value-notes " Tags an earlier entry gives a page count for the later entries for that page. display-type and lang in an entry's properties are refused on a Query block's query (the block holding its text), which stays Clojure code, and are otherwise judged on the block's type once every entry has applied: lang needs code, and a property limited to the Code, Math or Quote tag judges the block by the type the batch leaves it with. If any entry is invalid, nothing is written. dry-run checks and applies the entries to a throwaway copy of the graph without changing it, and answers each entry's target and blocks as the real call would, with would-create on an entry whose page would be created and count, the blocks it would add. Inline #tags that name an existing tag are applied; any other # that Logseq would read as a tag (an issue number, an unknown word) is stored escaped as \\# so it stays text, and the response lists those tags under escaped. " heading-note " " typed-block-note " " query-block-note)]
+    "getBlock" ["Get a block" "Returns one block or page by UUID, with its tags and property values (user and library properties, and built-ins the editor shows such as Status, Priority and Deadline), without loading an unbounded tree."]
+@@ -449,6 +452,15 @@
+                                            :items {:type "string"}}
+                                :target-id {:type "string" :description target-selector-description}
+                                :position {:enum ["before" "after" "first-child" "last-child"]}}}
++    "batchUpdateBlocks" {:required ["entries"]
++                         :properties {:entries {:type "array" :minItems 1 :maxItems 100
++                                                :items {:type "object" :required ["block-id" "title"]
++                                                        :properties {:block-id {:type "string"}
++                                                                     :title {:type "string"}
++                                                                     :display-type display-type-schema
++                                                                     :lang lang-schema
++                                                                     :target-label target-label-schema}}}
++                                      :dry-run dry-run-schema}}
+     "batchMoveBlocks" {:required ["moves"]
+                        :properties {:moves {:type "array" :minItems 1 :maxItems 100
+                                             :items {:type "object" :required ["block-ids" "target-id" "position"]
+@@ -729,7 +741,7 @@
+     (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees"} operation-id)
+     (into [{:name "verbose" :in "query" :schema {:type "boolean" :default true}
+             :description "false returns only the inserted blocks' UUIDs, nested as inserted, and a count, without echoing their titles."}])
+-    (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees" "updateBlock"} operation-id)
++    (contains? #{"insertBlockTree" "insertBlockChildren" "captureToToday" "batchInsertBlockTrees" "updateBlock" "batchUpdateBlocks"} operation-id)
+     (conj convert-fences-parameter)
+     (= "listTasks" operation-id)
+     (into [{:name "status" :in "query" :schema {:$ref "#/components/schemas/TaskStatusSelector"}}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_batch_update_blocks_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_batch_update_blocks_test.cljs
+new file mode 100644
+index 0000000..466571c
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_batch_update_blocks_test.cljs
+@@ -0,0 +1,116 @@
++(ns logseq.db-sync.semantic-batch-update-blocks-test
++  "batchUpdateBlocks (LC-137) changes up to 100 block titles in one call and one transaction, each
++  as updateBlock would change it: a `## ` prefix becomes the heading, an unknown #word is escaped,
++  display-type and lang make a code block whose title is stored verbatim. A refused entry refuses
++  the whole call, naming it, and writes nothing; a dry run applies the entries to a throwaway copy."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- with-blocks
++  "A page holding `n` blocks titled b0, b1, … made by the outliner."
++  [done n run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ page-id] (outliner-page/create! conn "Batch" {})
++              ids (vec (repeatedly n random-uuid))
++              _ (outliner-core/insert-blocks! conn (vec (map-indexed (fn [i id] {:block/uuid id :block/title (str "b" i)}) ids))
++                                              (d/entity @conn [:block/uuid page-id])
++                                              {:sibling? false :keep-uuid? true :bottom? true})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}]
++        (run {:conn conn :self self :page-id page-id :ids ids}))
++      (p/catch #(is false (str "unexpected error: " %)))
++      (p/finally done)))
++
++(defn- stored [conn id]
++  (let [e (d/entity @conn [:block/uuid id])]
++    {:title (:block/title e)
++     :heading (:logseq.property/heading e)
++     :display (some-> (:logseq.property.node/display-type e) name)}))
++
++(def path "/semantic/block-updates/batch")
++
++(deftest batch-update-applies-each-entry-as-update-block-would-test
++  (async done
++    (with-blocks done 4
++      (fn [{:keys [conn self ids]}]
++        (p/let [[a b c d*] ids
++                response (request! self "POST" path
++                                   {:entries [{:block-id (str a) :title "Plain rename"}
++                                              {:block-id (str b) :title "## Section"}
++                                              {:block-id (str c) :title "Fix LC-5 and #58 today"}
++                                              {:block-id (str d*) :title "# a comment\nprint(1)" :display-type "code" :lang "python"}]})]
++          (is (= 200 (:status response)) (pr-str (:body response)))
++          (is (= 4 (get-in response [:body :updated])))
++          (is (= {:title "Plain rename" :heading nil :display nil} (stored conn a)))
++          (is (= {:title "Section" :heading 2 :display nil} (stored conn b)) "a ## prefix becomes the heading")
++          (is (= "Fix LC-5 and \\#58 today" (:title (stored conn c))) "an unknown #word is escaped")
++          (is (= {:title "# a comment\nprint(1)" :heading nil :display "code"} (stored conn d*)) "a code title is stored verbatim")
++          (testing "the answer names each block, in entry order, and what each entry escaped"
++            (is (= (map str ids) (map :uuid (get-in response [:body :affected]))))
++            (is (= (map str ids) (map :uuid (get-in response [:body :entries]))))
++            (is (= ["#58"] (get-in response [:body :entries 2 :escaped])))))))))
++
++(deftest batch-update-takes-100-entries-in-one-call-test
++  (async done
++    (with-blocks done 100
++      (fn [{:keys [conn self ids]}]
++        (p/let [response (request! self "POST" path {:entries (map-indexed (fn [i id] {:block-id (str id) :title (str "LC-" i ": renamed")}) ids)})
++                too-many (request! self "POST" path {:entries (map (fn [id] {:block-id (str id) :title "x"}) (conj ids (first ids)))})]
++          (is (= 200 (:status response)) (pr-str (:body response)))
++          (is (= (map #(str "LC-" % ": renamed") (range 100)) (map #(:title (stored conn %)) ids)))
++          (is (= 400 (:status too-many)))
++          (is (string/starts-with? (get-in too-many [:body :error]) "entries:")))))))
++
++(deftest batch-update-refuses-the-whole-call-naming-the-entry-test
++  (async done
++    (with-blocks done 2
++      (fn [{:keys [conn self ids]}]
++        (p/let [[a b] ids
++                missing (request! self "POST" path {:entries [{:block-id (str a) :title "changed"}
++                                                              {:block-id (str (random-uuid)) :title "x"}]})
++                blank (request! self "POST" path {:entries [{:block-id (str a) :title "changed"}
++                                                            {:block-id (str b) :title ""}]})
++                twice (request! self "POST" path {:entries [{:block-id (str a) :title "one"}
++                                                            {:block-id (str a) :title "two"}]})
++                bad-lang (request! self "POST" path {:entries [{:block-id (str a) :title "changed"}
++                                                               {:block-id (str b) :title "x" :lang "python"}]})
++                label (request! self "POST" path {:entries [{:block-id (str a) :title "changed"}
++                                                            {:block-id (str b) :title "x" :target-label "Batch > nothing like it"}]})]
++          (doseq [[label' response status prefix] [["missing block" missing 400 "entry 1:"]
++                                                   ["blank title" blank 400 "entry 1:"]
++                                                   ["a block twice" twice 400 "entry 1:"]
++                                                   ["lang without code" bad-lang 400 "entry 1:"]
++                                                   ["a target-label that doesn't fit" label 409 "entry 1"]]]
++            (is (= status (:status response)) (str label' ": " (pr-str (:body response))))
++            (is (string/starts-with? (str (get-in response [:body :error])) prefix) (str label' ": " (pr-str (:body response)))))
++          (is (= ["b0" "b1"] [(:title (stored conn a)) (:title (stored conn b))]) "nothing was written"))))))
++
++(deftest batch-update-dry-run-changes-nothing-test
++  (async done
++    (with-blocks done 1
++      (fn [{:keys [conn self ids]}]
++        (p/let [response (request! self "POST" path {:dry-run true :entries [{:block-id (str (first ids)) :title "## Would be"}]})]
++          (is (= 200 (:status response)) (pr-str (:body response)))
++          (is (true? (get-in response [:body :dry-run])))
++          (is (= "Would be" (get-in response [:body :entries 0 :title])) "the answer shows what would be stored")
++          (is (= "b0" (:title (stored conn (first ids)))) "the graph is unchanged"))))))

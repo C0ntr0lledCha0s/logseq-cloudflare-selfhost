@@ -135,6 +135,7 @@ const NOTHING_OVERWRITTEN = "it adds new blocks, pages or files and overwrites n
 /** What each write tool reads before it writes (§3.4's table). Every non-read tool has an entry. */
 export const SNAPSHOT_PLAN: Readonly<Record<string, SnapshotPlanEntry>> = Object.freeze({
   update_block: blockSummary((a) => [a["block-id"]]),
+  batch_update_blocks: blockSummary((a) => entries(a, "entries").map((e) => e["block-id"])),
   set_block_property: blockSummary((a) => [a["block-id"]]),
   delete_block_property: blockSummary((a) => [a["block-id"]]),
   batch_set_block_property: blockSummary((a) => entries(a, "entries").map((e) => e["block-id"])),

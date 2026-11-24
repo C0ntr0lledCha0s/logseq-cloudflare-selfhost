@@ -281,6 +281,7 @@ const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",
   "update_block",
+  "batch_update_blocks",
   "update_tag",
   "update_property",
   "set_block_property",
@@ -1921,6 +1922,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   delete_blocks: { body: { "block-ids": [B1, B2] } },
   refresh_refs: { body: { "page-id": PAGE_UUID, apply: true } },
   update_block: { "block-id": B1, body: { title: "New title" } },
+  batch_update_blocks: { body: { entries: [{ "block-id": B1, title: "One" }, { "block-id": B2, title: "Two" }] } },
   delete_block: { "block-id": B1 },
   move_blocks: { body: { "block-ids": [B1], "target-id": B2, position: "after" } },
   batch_move_blocks: { body: { moves: [{ "block-ids": [B1], "target-id": B2, position: "after" }] } },
@@ -1953,6 +1955,7 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   delete_blocks: [B1, B2],
   refresh_refs: [PAGE_UUID],
   update_block: [B1],
+  batch_update_blocks: [B1, B2],
   delete_block: [B1],
   move_blocks: [B1, B2],
   batch_move_blocks: [B1, B2],
@@ -3267,7 +3270,7 @@ describe("list_changes_since", () => {
     const tool = (await listTools()).find((t) => t.name === "list_changes_since");
     expect(tool, "list_changes_since is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(61);
+    expect(committedManifest).toHaveLength(62);
   });
 
   it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
@@ -3310,7 +3313,7 @@ describe("get_graph_schema", () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
     expect(tool, "get_graph_schema is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(61);
+    expect(committedManifest).toHaveLength(62);
     expect(committedManifest.map((t) => t.name)).toContain("get_graph_schema");
   });
 
