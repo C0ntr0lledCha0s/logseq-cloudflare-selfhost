@@ -1,0 +1,424 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+index 6d2e34d..31a36dc 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/datalog.cljs
+@@ -1411,6 +1411,29 @@
+                              (string/join ", " (map #(str (:block/title %) ": " (client-kind %) " " (:block/uuid %)) candidates))
+                              "); give the one you mean by UUID")})))))
+ 
++(defn- resolve-entity-param
++  "An :entity param's value (LC-138's parent): the db id of the one visible page or block `value`
++  names, by UUID or by title as client-candidates finds it (a page wins over blocks of the same
++  title), echoed as {:title :uuid}. Refused, naming params.<name>, when it names none or several."
++  [db private? {param-name :name} value]
++  (let [field (str "params." param-name)
++        found (fn [e] {:input (:db/id e) :echo {:title (or (:block/title e) "") :uuid (str (:block/uuid e))}})]
++    (cond
++      (or (not (string? value)) (= "" value)) {:error (str field ": must be a page or block title or UUID (a string)")}
++      (common-util/uuid-string? value)
++      (let [e (d/entity db [:block/uuid (uuid (string/lower-case value))])]
++        (if (and e (not (entity-util/hidden? e)) (not (private? (:db/id e))))
++          (found e)
++          {:error (str field ": no page or block with UUID " value)}))
++      :else
++      (let [candidates (client-candidates db value private?)
++            pages (filter #(= "page" (client-kind %)) candidates)]
++        (cond
++          (empty? candidates) {:error (str field ": no page or block titled " (pr-str value))}
++          (empty? (next candidates)) (found (first candidates))
++          (= 1 (count pages)) (found (first pages))
++          :else {:error (str field ": " (pr-str value) " matches " (count candidates) " entities; give the one you mean by UUID")})))))
++
+ (defn resolve-params
+   "The inputs of named query `entry` from the `given` params (keyword keys) and the defaults:
+   {:inputs [one per param, in order] :params {name echo}} or {:errors [message …]}, each message
+@@ -1442,7 +1465,25 @@
+                                      (= :days type) (resolve-days-param now param value)
+                                      (= :client type) (if (contains? given k)
+                                                         (resolve-client-param db @private? (get acc (:of param)) param value)
+-                                                        {:absent true})))))
++                                                        {:absent true})
++                                     ;; LC-138 (work-items): optional params without a default are
++                                     ;; absent unless given; an optional property the graph lacks
++                                     ;; is absent too, unless it was given.
++                                     (and (nil? value) (not (contains? given k))) {:absent true}
++                                     (= :optional-property type)
++                                     (let [r (resolve-property-param db resolve-property param value)]
++                                       (if (and (:error r) (not (contains? given k))) {:absent true} r))
++                                     (= :boolean type) (if (boolean? value)
++                                                         {:input value :echo value}
++                                                         {:error (str "params." param-name ": must be true or false")})
++                                     (= :integer type) (let [[lo hi] (:bounds param)]
++                                                         (if (and (integer? value) (<= lo value hi))
++                                                           {:input value :echo value}
++                                                           {:error (str "params." param-name ": must be a whole number from " lo " to " hi)}))
++                                     (= :enum type) (if (some #(= value %) (:values param))
++                                                      {:input value :echo value}
++                                                      {:error (str "params." param-name ": must be one of " (string/join ", " (:values param)))})
++                                     (= :entity type) (resolve-entity-param db @private? param value)))))
+                         {} params)
+         resolved (map #(get by-name (:name %)) params)
+         errors (concat unknown (keep :error resolved))]
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+index 8353a2d..ee55d29 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/named_queries.cljs
+@@ -70,6 +70,7 @@
+    :page-blocks 10000
+    :tasks 10000
+    :open-tasks 2000
++   :items 2500
+    :reads 30000})
+ 
+ (defn- bump! [{:keys [bounds work] :as ctx} bound n]
+@@ -334,6 +335,67 @@
+              (distinct))
+             (datoms* ctx :avet :block/tags task-class)))))
+ 
++(def ^:private priority-rank
++  {:logseq.property/priority.urgent 0
++   :logseq.property/priority.high 1
++   :logseq.property/priority.medium 2
++   :logseq.property/priority.low 3})
++
++(defn work-items
++  "LC-138: the entities tagged tag (or a tag extending it) that aren't private, each tagged datom
++  charged to :items. open (default true, but false when number is given) keeps those whose status
++  isn't Done or Canceled; number keeps the one whose number_property value is it; parent keeps
++  those whose parent_property value is parent, or whose parent block or page is. Each row is
++  [order number status priority phase components depends-on item]: number from number_property,
++  status and priority by title, phase and components by their values' titles, and depends-on as
++  each dependency's number (its title when it has none). Sorted by priority (Urgent first, none
++  last) then number, by number, or by number descending; order is the row's place in that sort.
++  An optional property the graph doesn't have (phase_property, component_property,
++  depends_property, parent_property) gives empty values."
++  [ctx {:keys [tag parent open number sort number_property parent_property component_property
++               phase_property depends_property]}]
++  (let [{:keys [db]} ctx
++        private? (private-fn ctx)
++        finished (into #{} (keep #(d/entid db %)) [:logseq.property/status.done :logseq.property/status.canceled])
++        title-of (fn [e] (or (first-value* ctx e :block/title) ""))
++        refs (fn [e attr] (if attr (visible-values ctx private? e attr) []))
++        number-of (fn [e]
++                    (when number_property
++                      (when-let [v (first-value* ctx e number_property)]
++                        (if (number? (first-value* ctx v :logseq.property/value))
++                          (first-value* ctx v :logseq.property/value)
++                          nil))))
++        open? (if (some? open) open (nil? number))
++        rows (into []
++                   (keep (fn [e]
++                           (let [status (first-value* ctx e :logseq.property/status)
++                                 n (number-of e)]
++                             (when (and (not (private? e))
++                                        (or (not open?) (not (contains? finished status)))
++                                        (or (nil? number) (= number n))
++                                        (or (nil? parent)
++                                            (some #(= parent %) (refs e parent_property))
++                                            (= parent (first-value* ctx e :block/parent))
++                                            (= parent (first-value* ctx e :block/page))))
++                               (let [priority (first-value* ctx e :logseq.property/priority)
++                                     rank (get priority-rank (some->> priority (#(first-value* ctx % :db/ident))) 4)]
++                                 {:e e :number n :rank rank
++                                  :status (some-> status title-of)
++                                  :priority (some-> priority title-of)
++                                  :phase (some-> (first (refs e phase_property)) title-of)
++                                  :components (mapv title-of (refs e component_property))
++                                  :depends (mapv #(or (number-of %) (title-of %)) (refs e depends_property))})))))
++                   (tagged ctx private? tag :items))
++        big js/Number.MAX_SAFE_INTEGER
++        sorted (sort-by (case sort
++                          "number" (fn [r] [(or (:number r) big) (:e r)])
++                          "number-desc" (fn [r] [(- (or (:number r) (- big))) (:e r)])
++                          (fn [r] [(:rank r) (or (:number r) big) (:e r)]))
++                        rows)]
++    (vec (map-indexed (fn [i {:keys [e number status priority phase components depends]}]
++                        [(inc i) number status priority phase components depends e])
++                      sorted))))
++
+ (defn pages-missing-property
+   "Pages tagged tag (or a tag extending it), each tagged entity charged to :tagged, that aren't
+   private and have no visible value for property. Rows [page]."
+@@ -388,6 +450,10 @@
+                               (constantly "list one of its pages' tasks with datalog_query")]
+                       :open-tasks ["found more than" #(str "open tasks of " % " (its open-tasks bound)")]
+                       :reads ["stopped after" (constantly reads-counted)]}}}
++   "work-items"
++   {:advice "give a narrower tag, a parent or a number"
++    :bounds {:items ["stopped after" "tagged blocks and pages (its items bound)"]
++             :reads ["stopped after" reads-counted]}}
+    "pages-missing-property"
+    {:advice "give a narrower tag"
+     :bounds {:tagged ["stopped after" "tagged pages and blocks (its tagged bound)"]
+@@ -451,6 +517,18 @@
+              " 2. Keep those whose status isn't Done or Canceled and that aren't private, each counted " (b :open-tasks) "."
+              " 3. Read each one's " (get-in params ["client_property" :title]) " values, else its page's, leaving out private ones;"
+              " each value's title is a client (empty when there is none). 4. One row per client and task, by client title." reads))
++      "work-items"
++      (str "1. Read the blocks and pages tagged " (tag-text (get params "tag")) ", each counted " (b :items)
++           ", leaving out private ones and the Recycle bin."
++           (if (some? (get params "open"))
++             (if (get params "open") " 2. Keep those whose status isn't Done or Canceled." " 2. Keep every status.")
++             (if (some? (get params "number")) " 2. Keep every status." " 2. Keep those whose status isn't Done or Canceled."))
++           (when-let [n (get params "number")] (str " Keep the one whose " (get-in params ["number_property" :title]) " is " n "."))
++           (when-let [p (get params "parent")] (str " Keep those under " (or (not-empty (:title p)) (:uuid p)) "."))
++           " 3. Read each one's number, status, priority, phase, components and dependencies;"
++           " a property this graph doesn't have gives empty values."
++           " 4. One row per item, " (case (get params "sort") "number" "by number." "number-desc" "by number, highest first." "by priority, then number.")
++           reads)
+       "pages-missing-property"
+       (str "1. Read the pages and blocks tagged " (tag-text (get params "tag")) ", each counted " (b :tagged) "."
+            " 2. Keep the pages that aren't private and have no value for " (get-in params ["property" :title])
+@@ -502,7 +580,24 @@
+     :bounds [:tagged :reads]
+     :run pages-missing-property
+     :params [{:name "tag" :type :tag :required true}
+-             {:name "property" :type :property :required true}]}))
++             {:name "property" :type :property :required true}]}
++
++   "work-items"
++   {:title "Work items"
++    :description "Blocks and pages tagged tag (default Work Item, with tags that extend it): one row per item with its number, status, priority, phase, components and dependencies (as numbers), open ones by default, sorted by priority then number. number picks one item whatever its status; sort number-desc with limit 1 gives the highest number; parent keeps the items under one page or Epic. Properties are matched by title, so any graph can use it."
++    :columns ["order" "number" "status" "priority" "phase" "component" "depends-on" "item"]
++    :bounds [:items :reads]
++    :run work-items
++    :params [{:name "tag" :type :tag :default "Work Item"}
++             {:name "open" :type :boolean}
++             {:name "number" :type :integer :bounds [0 1000000000]}
++             {:name "parent" :type :entity}
++             {:name "sort" :type :enum :values ["priority" "number" "number-desc"] :default "priority"}
++             {:name "number_property" :type :property :default "itemNumber" :types #{:number}}
++             {:name "parent_property" :type :optional-property :default "parent-work"}
++             {:name "component_property" :type :optional-property :default "component"}
++             {:name "phase_property" :type :optional-property :default "phase"}
++             {:name "depends_property" :type :optional-property :default "dependsOn"}]}))
+ 
+ (defn run-named
+   "Runs named query `query-name` on `db` (a db value, never the conn) with `resolved`
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index 6c812e4..693fd86 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -267,7 +267,7 @@
+    "getGraphSchema" ["Get the graph's schema"
+                      "Lists every user tag and property with its details and usage counts in one call, for a schema or drift review, instead of list_tags and get_tag per tag. sections is tags, properties or both (the default, comma-separated); any other value is refused. Each tag has uuid, ident, title, extends (the tags it extends), properties (its own tag properties, built-in ones included) and object-count (the objects tagged with it directly; a tag that extends it counts its own). Each property has uuid, ident, title, type, cardinality, choices (in the editor's order, each with usage-count: how many values are that choice, counted by the choice's id), classes for a node property, value-count (its values, one per value of a many property; Logseq's empty placeholder is not a value) and used-by-tags (the tags that list it as a tag property). Private content and the Recycle bin are left out of every item and every count: a tag, property or object tagged Private (or with a tag that extends Private), on or under such a page or block, or in the Recycle bin is neither listed nor counted, so a choice held only by Private blocks has usage-count 0. Built-in tags and properties (Task, Status and the like) are hidden unless built-in=true. Each section is in title order with a complete count and at most limit items (1 to 200, default 50); to page through one section, pass that section alone in sections with its next-cursor. Each refusal names its parameter. Unavailable for E2EE graphs."]
+    "datalogQuery" ["Run a read-only Datalog query"
+-                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
++                   (str "Runs a read-only Datalog query against the graph and returns the rows. Prefer run_named_query when one of its queries fits (projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property, work-items): each runs as server code under named bounds of its own, not as Datalog under these caps. query is the vector form [:find … :where …] or the map form {:find […] :where […]} as EDN, at most 4,000 characters, with the keys :find, :in, :where, :with and :keys (also :strs and :syms). inputs is an EDN vector of the values bound to :in after $ (at most 20 values and 4,000 characters; #uuid and keywords work)."
+                         " There are no rules: a rules field, % in :in and a rule call are each refused with 400 naming run_named_query, because a tree of rules expands without reading data and can run for seconds before any cap stops it."
+                         " The query is read as data and never evaluated, and it runs on a read-only view of the graph: a write form (:db/add, :db/retract, :db/retractEntity, :db.fn/…, a map with :db/id) anywhere in query or inputs is refused. Only pure functions can be called (comparisons, arithmetic, get-else, get-some, missing?, ground, untuple, count, clojure.string/includes?, starts-with?, ends-with?, lower-case, upper-case, blank? and the type predicates); rand, range, the regex functions, clojure.string/join, replace and split, the print functions, the collection constructors (vector, list, set, hash-map, array-map, tuple) and a function passed in through inputs (a ?variable in function position) are refused. str, + and keyword take at most one ?variable, the other arguments literals ([(str \"#\" ?t) ?s] runs, [(str ?a ?b) ?s] is refused), because a chain of clauses joining two values could double one at every clause. A function given a collection from inputs answers 422 naming it, because it would print or walk the whole collection once per joined row: only and, contains?, count, empty?, false?, get, get-else, get-some, ground, identical?, identity, missing?, nil?, not, not-empty, or, some?, true?, type and untuple take one, so bind its items with [?x ...] in :in or test membership with (contains? ?x ?v); aggregates other than count, count-distinct and distinct refuse collection values the same way. Text the functions and aggregates return counts toward a cap of 5,000,000 characters of text per query (the text cap): past it the query stops with 422 naming the cap; identity, ground, untuple, get, get-else, get-some, not-empty, max and min pass values through and build none. Every call of a function, predicate or aggregate counts toward 20,000 function calls per query (the call cap): each clause runs once per joined row, so past it the query stops with 422 naming the cap; narrow the rows before the function clauses. Every not, not-join, or and or-join joins, subtracts or sums every row bound so far, so each charges the rows it joins, subtracts or sums toward 200,000 rows of relation work per query (the work cap), whatever its inner clauses match, and nested ones charge once per level; past it the query stops with 422 naming the cap. Every function binding ([(f ?x) ?y]) copies every column of every row bound so far, so a query may hold at most 12 function bindings (at any depth; predicates don't count; more answer 422 before running), and each charges the rows x columns of the relation it returns toward 100,000 copied values per query (the width cap): from a page and its blocks, 8 bindings fit about 1,900 rows and 12 about 1,000, and past it the query stops with 422 naming the cap, so return extra attributes with (pull ?b [...]) in :find, which runs only on the kept rows, bind fewer values with functions or narrow the rows first; predicates and data patterns charge nothing. The only source is $. Every where clause must share a variable with the others, through a data pattern, a function binding, or, or-join, not or not-join: clauses linked only by a predicate are a cross product and are refused. A data pattern joined to two or more bound rows scans its whole attribute, so to step up from bound blocks use get-some, which reads one datom per row ([(get-some $ ?b :block/parent) [_ ?p]])."
+                         " Private content is left out, as if it weren't in the graph: anything tagged Private (any case) or with a tag that extends Private, every block on such a page or under such a block, and every reference to one of those, in rows, pulls (reverse refs too), missing?, get-else and aggregates. The Private tag itself stays visible. Content in the Recycle bin is left out the same way, as list_tasks and the other reads leave it out: a page delete_page moved there with its blocks, and a block delete_block moved there."
+@@ -281,6 +281,7 @@
+                          " client is a client's title or UUID, and lists only that client's tasks: those whose own client_property values, else their page's, include it. A title matches exactly, else a page or tag name ignoring case; when several pages, tags or blocks share it, a page wins when exactly one of them is a page, and otherwise the call is refused with 400 naming each one's kind and UUID, oldest first, so give the UUID you mean. A client that is null, empty or not a string, an unknown title or UUID (a private or recycled one reads as unknown), or a client_property that is a default or url property (its values are per-block text) is refused with 400 naming params.client, never all clients. params.client echoes the client used, as title and uuid. With client, it reads only the blocks holding the client and the blocks on those that are pages, not every Task, so a graph whose Task count stops the full run can still be asked about one client; it then stops with 422 after 10,000 blocks holding the client or on its pages (its tasks bound): list one of its pages' tasks with datalog_query; or when it finds more than 2,000 open tasks of the client, counted once a task is found to be the client's (its open-tasks bound): mark the client's finished tasks Done or Canceled, or list one of its pages' tasks with datalog_query."
+                          " Without client, it stops with 422 after 10,000 blocks tagged Task (its tasks bound): give a client (params.client); or when it finds more than 2,000 open tasks (its open-tasks bound): give a client (params.client), or mark finished tasks Done or Canceled; with a default or url client_property, which can't take a client, list one client's tasks with datalog_query instead."
+                          " pages-missing-property (params tag and property, both required): pages tagged tag, or a tag extending it, with no value for property; column page. It stops with 422 after 2,500 tagged pages and blocks (its tagged bound): give a narrower tag."
++                         " work-items (params tag, default Work Item; open, default true but false when number is given; number; parent, a page or block title or UUID; sort, priority (default), number or number-desc; and number_property, default itemNumber, with parent_property, component_property, phase_property and depends_property, defaults parent-work, component, phase and dependsOn, each left empty when the graph has no such property unless given): blocks and pages tagged tag, or a tag extending it, that aren't private, one row each, with columns order, number, status, priority, phase, component, depends-on (each dependency's number, else its title) and item. Open items by default, sorted by priority (Urgent first, none last) then number; number picks one item whatever its status, sort number-desc with limit 1 gives the highest number, and parent keeps the items whose parent_property is that page or block, or that sit under it. It stops with 422 after 2,500 tagged blocks and pages (its items bound): give a narrower tag, a parent or a number."
+                          " Every datom read, the privacy checks' included, counts toward 30,000 reads (its reads bound, the backstop over every read); the other bounds count candidates, not reads, so each can stop a query first. A query that passes one of its bounds answers 422 naming the bound and what to narrow, never part of the rows."
+                          " Every default can be overridden in params, e.g. {\"tag\": \"Client\", \"days\": 14}. A tag param is a tag title (exact, else ignoring case), UUID or ident, and covers every tag extending it; a property param is a property title, UUID or ident; days is an integer from 1 to 3650. Rows come back sorted by the first column (oldest first for the dated queries, by client title for tasks, in creation order for pages-missing-property), each page or task as uuid and title, so the uuid is a handle for the other tools."
+                          " The response has name, the resolved params (titles and idents; a tag's includes lists the tags extending it), columns, total-rows, returned, truncated, plan (the steps the query took, each with its bound and number) and work (what each bound counted, and reads), then rows."
+@@ -353,7 +354,7 @@
+             (= "page-id" parameter)
+             (assoc :description page-selector-description)
+             (= "name" parameter)
+-            (assoc :description "The named query: projects-untouched, meetings-without-decision, open-tasks-by-client or pages-missing-property (exactly, lower case with hyphens).")))
++            (assoc :description "The named query: projects-untouched, meetings-without-decision, open-tasks-by-client, pages-missing-property or work-items (exactly, lower case with hyphens).")))
+         (re-seq #":([^/]+)" path)))
+ 
+ (def ^:private pagination-parameters
+@@ -873,7 +874,7 @@
+            "runNamedQuery" {"400" {:description "A param that doesn't resolve or is out of range, named as params.<name> (params.client: a client that isn't a string, is unknown, or whose title several entities share with no single page among them), an unknown param, or a body field the call doesn't take"}
+                             "404" {:description "No named query has that name; the error lists the names"}
+                             "409" {:description "The graph is E2EE"}
+-                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, or any query's reads bound); with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, its open-tasks bound only the client's open tasks, and the error names the client; without params.client, open-tasks-by-client's error advises giving one (params.client), except for a default or url client_property, where it advises datalog_query"}}
++                            "422" {:description "The query passed one of its named bounds, and no rows came back: the error names the query, the bound and its value, and what to narrow (projects-untouched's tagged and page-blocks bounds, meetings-without-decision's meetings, decisions and ancestor-steps bounds, open-tasks-by-client's tasks and open-tasks bounds, pages-missing-property's tagged bound, work-items' items bound, or any query's reads bound); with params.client, open-tasks-by-client's tasks bound counts the blocks holding the client or on its pages, its open-tasks bound only the client's open tasks, and the error names the client; without params.client, open-tasks-by-client's error advises giving one (params.client), except for a default or url client_property, where it advises datalog_query"}}
+            "datalogQuery" {"422" {:description "The query scanned more than 20,000 datoms (the scan cap), built more than 20,000 rows while joining (the join cap), built more than 5,000,000 characters of text (the text cap), made more than 20,000 function calls (the call cap), did more than 200,000 rows of relation work (the work cap), had function bindings copy more than 100,000 values (the width cap) or gave a function a collection from inputs that it would print or walk whole, and was stopped, or matched more than 2,500 rows (the row cap) or more than 20,000 values inside collections (the value cap, which counts each character of text as a value) and was refused before sorting them; the error names the cap. Narrow it with a tag, page or attribute value"}}
+            "createPage" {"201" (entity-response "PageResponse" "The created page")
+                          "409" (entity-response "TitleConflict" "The title is already used; nothing was created")}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+index 44987eb..be24d89 100644
+--- a/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
++++ b/deps/db-sync/test/logseq/db_sync/semantic_datalog_query_test.cljs
+@@ -2166,7 +2166,7 @@
+       (p/finally done)))
+ 
+ (def ^:private names
+-  ["projects-untouched" "meetings-without-decision" "open-tasks-by-client" "pages-missing-property"])
++  ["projects-untouched" "meetings-without-decision" "open-tasks-by-client" "pages-missing-property" "work-items"])
+ 
+ (deftest named-projects-untouched-test
+   (async done
+@@ -2483,12 +2483,15 @@
+     (is (not-any? #(contains? entry %) [:query :rules]) query-name)
+     ;; open-tasks-by-client's params (client_property, then the optional client, patch 0054) are
+     ;; its client-bound legacy form's; the form without a client takes client_property alone.
+-    (is (= (mapv :name (:params entry))
+-           (mapv :name (:params (get legacy-named-queries (if (= "open-tasks-by-client" query-name)
+-                                                            "open-tasks-by-client (client)"
+-                                                            query-name)))))
+-        query-name)
+-    (is (= (:columns entry) (mapv str (get-in legacy-named-queries [query-name :query :keys]))) query-name))
++    ;; work-items (LC-138) was written as code from the start, so it has no legacy Datalog twin;
++    ;; semantic-work-items-query-test covers it through the handler.
++    (when-not (= "work-items" query-name)
++      (is (= (mapv :name (:params entry))
++             (mapv :name (:params (get legacy-named-queries (if (= "open-tasks-by-client" query-name)
++                                                              "open-tasks-by-client (client)"
++                                                              query-name)))))
++          query-name)
++      (is (= (:columns entry) (mapv str (get-in legacy-named-queries [query-name :query :keys]))) query-name)))
+   (doseq [[query-name {:keys [query rules params]}] legacy-named-queries]
+     (let [normalised (datalog/normalise-query query)
+           inputs (mapv (fn [{:keys [type binding]}]
+@@ -2870,7 +2873,7 @@
+         (is (= defaults (bounds v)) (pr-str v))))
+     (testing "the default bounds, as the release bundle set them (stage 5)"
+       (is (= {:meetings 2000 :decisions 10000 :ancestor-steps 10000 :tagged 2500 :page-blocks 10000
+-              :tasks 10000 :open-tasks 2000 :reads 30000}
++              :tasks 10000 :open-tasks 2000 :items 2500 :reads 30000}
+              defaults)))))
+ 
+ 
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_work_items_query_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_work_items_query_test.cljs
+new file mode 100644
+index 0000000..efd3ee0
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_work_items_query_test.cljs
+@@ -0,0 +1,123 @@
++(ns logseq.db-sync.semantic-work-items-query-test
++  "run_named_query work-items (LC-138): one row per work item (blocks tagged Work Item, or a tag
++  extending it), with its number, status, priority, phase, components and dependencies, matched by
++  property title so any graph can use it. Open items by default, ordered by priority then number;
++  number picks one item whatever its status; sort number-desc with limit 1 gives the highest number;
++  parent keeps the items under one page or Epic; private items never appear."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                (some? body) (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- ok! [response status]
++  (p/let [response response]
++    (is (= status (:status response)) (pr-str response))
++    response))
++
++(defn- with-items
++  "A tracker page with Work Item, Bug (extends it), Epic (extends it) and Private, the properties
++  itemNumber (number), component (text, many), dependsOn (node, many) and parent-work (node), and:
++  LC-1 Work Item, Low, Backlog; LC-2 Bug, Done; LC-3 Bug, High, Todo, component api, dependsOn
++  LC-1; LC-4 Epic, Medium, Todo; LC-5 Bug under epic LC-4 (parent-work), Medium, Doing; LC-6 Bug
++  tagged Private too; and a plain Task with no Work Item tag."
++  [done run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ page-id] (outliner-page/create! conn "Tracker" {})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++              _ (ok! (request! self "POST" "/semantic/tags" {:title "Work Item" :extends ["logseq.class/Task"]}) 201)
++              _ (ok! (request! self "POST" "/semantic/tags" {:title "Bug" :extends ["Work Item"]}) 201)
++              _ (ok! (request! self "POST" "/semantic/tags" {:title "Epic" :extends ["Work Item"]}) 201)
++              _ (ok! (request! self "POST" "/semantic/tags" {:title "Private"}) 201)
++              _ (ok! (request! self "POST" "/semantic/properties" {:title "itemNumber" :type "number"}) 201)
++              _ (ok! (request! self "POST" "/semantic/properties" {:title "component" :type "default" :cardinality "db.cardinality/many"}) 201)
++              _ (ok! (request! self "POST" "/semantic/properties" {:title "dependsOn" :type "node" :cardinality "db.cardinality/many"}) 201)
++              _ (ok! (request! self "POST" "/semantic/properties" {:title "parent-work" :type "node"}) 201)
++              item (fn [n tags status priority & {:as more}]
++                     {:title (str "LC-" n ": item " n)
++                      :properties (merge {"Tags" tags "itemNumber" n "logseq.property/status" status}
++                                         (when priority {"logseq.property/priority" priority})
++                                         more)})
++              _ (ok! (request! self "POST" "/semantic/block-trees"
++                               {:target-id (str page-id)
++                                :blocks [(item 1 ["Work Item"] "Backlog" "Low")
++                                         (item 2 ["Bug"] "Done" "High")
++                                         (item 4 ["Epic"] "Todo" "Medium")
++                                         (item 6 ["Bug" "Private"] "Todo" "High")
++                                         {:title "plain task" :properties {"logseq.property/status" "Todo"}}]})
++                     201)
++              uuid-of (fn [title] (str (:block/uuid (d/entity @conn (ffirst (d/q '[:find ?b :in $ ?t :where [?b :block/title ?t]] @conn title))))))
++              _ (ok! (request! self "POST" "/semantic/block-trees"
++                               {:target-id (str page-id)
++                                :blocks [(item 3 ["Bug"] "Todo" "High" "component" ["api"] "dependsOn" [(uuid-of "LC-1: item 1")])
++                                         (item 5 ["Bug"] "Doing" "Medium" "parent-work" (uuid-of "LC-4: item 4"))]})
++                     201)]
++        (run {:self self :conn conn :uuid-of uuid-of}))
++      (p/catch #(is false (str "unexpected error: " %)))
++      (p/finally done)))
++
++(defn- work-items! [self params & {:keys [limit]}]
++  (request! self "POST" "/semantic/named-queries/work-items" (cond-> {:params params} limit (assoc :limit limit))))
++
++(defn- numbers [response]
++  (let [columns (get-in response [:body :columns])
++        i (.indexOf (clj->js columns) "number")]
++    (mapv #(nth % i) (get-in response [:body :rows]))))
++
++(deftest work-items-lists-open-items-by-priority-then-number-test
++  (async done
++    (with-items done
++      (fn [{:keys [self uuid-of]}]
++        (p/let [response (work-items! self {})]
++          (is (= 200 (:status response)) (pr-str (:body response)))
++          (is (= ["order" "number" "status" "priority" "phase" "component" "depends-on" "item"] (get-in response [:body :columns])))
++          (is (= [3 4 5 1] (numbers response)) "High, then Medium by number, then Low; Done, private and untagged left out")
++          (testing "each row carries its values, and the item's uuid and title"
++            (let [[order number status priority _phase component depends item] (first (get-in response [:body :rows]))]
++              (is (= [1 3 "Todo" "High" ["api"] [1]] [order number status priority component depends]))
++              (is (= {:block/uuid (uuid-of "LC-3: item 3") :block/title "LC-3: item 3"} item)))))))))
++
++(deftest work-items-number-sort-tag-and-parent-test
++  (async done
++    (with-items done
++      (fn [{:keys [self]}]
++        (p/let [by-number (work-items! self {:number 2})
++                highest (work-items! self {:sort "number-desc"} :limit 1)
++                with-done (work-items! self {:open false})
++                bugs (work-items! self {:tag "Bug"})
++                epic (work-items! self {:parent "LC-4: item 4"})]
++          (is (= [2] (numbers by-number)) "number finds the item whatever its status")
++          (is (= [5] (numbers highest)) "number-desc with limit 1 gives the highest number among open items")
++          (is (= [2 3 4 5 1] (numbers with-done)) "open false keeps Done items too")
++          (is (= [3 5] (numbers bugs)) "a tag keeps its own items and those of tags extending it")
++          (is (= [5] (numbers epic)) "parent keeps the items whose parent-work is that block"))))))
++
++(deftest work-items-refuses-bad-params-naming-them-test
++  (async done
++    (with-items done
++      (fn [{:keys [self]}]
++        (p/let [responses (p/all [(work-items! self {:sort "newest"})
++                                  (work-items! self {:number "two"})
++                                  (work-items! self {:open "yes"})
++                                  (work-items! self {:parent "no such page"})
++                                  (work-items! self {:number_property "noSuchProperty"})])]
++          (doseq [[param {:keys [status body]}] (map vector ["sort" "number" "open" "parent" "number_property"] responses)]
++            (is (= 400 status) (str param ": " (pr-str body)))
++            (is (string/includes? (str (:error body)) (str "params." param)) (str param ": " (pr-str body)))))))))
+diff --git a/deps/db-sync/test/logseq/db_sync/test_runner.cljs b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+index 643b286..ca71361 100644
+--- a/deps/db-sync/test/logseq/db_sync/test_runner.cljs
++++ b/deps/db-sync/test/logseq/db_sync/test_runner.cljs
+@@ -48,6 +48,10 @@
+             [logseq.db-sync.semantic-query-block-test]
+             [logseq.db-sync.semantic-sync-status-test]
+             [logseq.db-sync.semantic-delete-blank-blocks-test]
++            [logseq.db-sync.semantic-outline-paging-test]
++            [logseq.db-sync.semantic-outline-options-test]
++            [logseq.db-sync.semantic-batch-update-blocks-test]
++            [logseq.db-sync.semantic-work-items-query-test]
+             [logseq.db-sync.storage-test]
+             [logseq.db-sync.tx-sanitize-test]
+             [logseq.db-sync.worker-allowed-users-test]

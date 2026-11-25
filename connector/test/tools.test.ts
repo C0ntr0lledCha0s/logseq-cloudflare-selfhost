@@ -28,6 +28,7 @@ import {
   checkManifest,
   firstLineFor,
   graphOperations,
+  OUTLINE_MAX_CHARS,
 } from "../src/tools/spec.mjs";
 
 const ORIGIN = "https://mcp.example.com";
@@ -280,6 +281,7 @@ const DESTRUCTIVE_NAMED = [
   "batch_delete_block_property",
   "update_page",
   "update_block",
+  "batch_update_blocks",
   "update_tag",
   "update_property",
   "set_block_property",
@@ -1103,6 +1105,24 @@ describe("routing", () => {
     }
   });
 
+  // LC-135: a page over the 150,000-character result cap used to come back cut mid-JSON.
+  it("get_page_outline defaults to max-chars=100000, so the server ends a long outline with a next-cursor", async () => {
+    syncHandler = () => Response.json({ uuid: "p1", kind: "page", title: "P", markdown: "- a", "block-count": 1, truncated: false });
+    const plain = await callTool("get_page_outline", { graph: "work", "page-id": "P" });
+    expect(plain.isError, plain.text).toBe(false);
+    expect(new URL(syncRequests[0].url).searchParams.get("max-chars")).toBe(String(OUTLINE_MAX_CHARS));
+
+    syncRequests = [];
+    await callTool("get_page_outline", { graph: "work", "page-id": "P", "max-chars": 5000, depth: 1, uuids: true });
+    const sent = new URL(syncRequests[0].url).searchParams;
+    expect([sent.get("max-chars"), sent.get("depth"), sent.get("uuids")]).toEqual(["5000", "1", "true"]);
+
+    const maxChars = (await listTools()).find((t) => t.name === "get_page_outline").inputSchema.properties["max-chars"];
+    expect(maxChars.default).toBe(OUTLINE_MAX_CHARS);
+    expect(maxChars.description).toContain("next-cursor");
+    expect(OUTLINE_MAX_CHARS).toBeLessThan(RESULT_CHAR_LIMIT);
+  });
+
   it("write tool on read-mode graph refused without sync call", async () => {
     for (const [name, args] of [
       ["create_page", { graph: "notes", body: { title: "x" } }],
@@ -1902,6 +1922,7 @@ const AUDIT_CALLS: Record<string, Record<string, unknown>> = {
   delete_blocks: { body: { "block-ids": [B1, B2] } },
   refresh_refs: { body: { "page-id": PAGE_UUID, apply: true } },
   update_block: { "block-id": B1, body: { title: "New title" } },
+  batch_update_blocks: { body: { entries: [{ "block-id": B1, title: "One" }, { "block-id": B2, title: "Two" }] } },
   delete_block: { "block-id": B1 },
   move_blocks: { body: { "block-ids": [B1], "target-id": B2, position: "after" } },
   batch_move_blocks: { body: { moves: [{ "block-ids": [B1], "target-id": B2, position: "after" }] } },
@@ -1934,6 +1955,7 @@ const AUDIT_ADDRESSED: Record<string, string[]> = {
   delete_blocks: [B1, B2],
   refresh_refs: [PAGE_UUID],
   update_block: [B1],
+  batch_update_blocks: [B1, B2],
   delete_block: [B1],
   move_blocks: [B1, B2],
   batch_move_blocks: [B1, B2],
@@ -2004,9 +2026,9 @@ const BLANK_RESPONSE = {
 /** The answer a successful call of `name` gets here: delete_blank_blocks' own shape, else CONTEXT_RESPONSE. */
 const okResponse = (name: string): Record<string, unknown> => (name === "delete_blank_blocks" ? BLANK_RESPONSE : CONTEXT_RESPONSE);
 
-/** The targets the audit row keeps for `response` to a call of `name`, as describeWrite reads them. */
-const targetsOf = (name: string, response: unknown) =>
-  describeWrite(name, { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined).targets;
+/** The targets the audit row keeps for `response` to a call of `name` with `args`, as describeWrite reads them. */
+const targetsOf = (name: string, response: unknown, args?: unknown) =>
+  describeWrite(name, { content: [{ type: "text", text: JSON.stringify(response) }] }, undefined, args).targets;
 
 interface AuditDbRow {
   id: number;
@@ -2107,7 +2129,7 @@ describe("audit log", () => {
       rows_read: 1,
     });
     expect(JSON.parse(ok.row.addressed!), name).toEqual(AUDIT_ADDRESSED[name]);
-    expect(JSON.parse(ok.row.targets!), name).toEqual(targetsOf(name, okResponse(name)));
+    expect(JSON.parse(ok.row.targets!), name).toEqual(targetsOf(name, okResponse(name), args));
     expect(JSON.parse(ok.row.targets!).length, name).toBeGreaterThan(0);
     // The targets' pages, and a page the call names by title (batch_insert_block_trees' page: Meeting).
     const named = name === "batch_insert_block_trees" ? ["meeting"] : [];
@@ -2163,7 +2185,7 @@ describe("audit log", () => {
         where === "query" ? { ...args, "dry-run": true } : { ...args, body: { ...(args.body as object), "dry-run": true } };
       const preview = await callAudited(name, dryArgs);
       expect(preview.row, name).toMatchObject({ status: "ok", dry_run: 1 });
-      expect(JSON.parse(preview.row.targets!), name).toEqual(targetsOf(name, dry));
+      expect(JSON.parse(preview.row.targets!), name).toEqual(targetsOf(name, dry, dryArgs));
       // dry-run: false is a real call.
       const real =
         where === "query" ? { ...args, "dry-run": false } : { ...args, body: { ...(args.body as object), "dry-run": false } };
@@ -2686,7 +2708,7 @@ describe("edit stamps header", () => {
         if (key in args) continue;
         if (Array.isArray(schema.enum)) args[key] = schema.enum[0];
         else if (schema.type === "string") args[key] = "Meeting";
-        else if (schema.type === "integer" || schema.type === "number") args[key] = 5;
+        else if (schema.type === "integer" || schema.type === "number") args[key] = Math.max(5, schema.minimum ?? 5);
         else if (schema.type === "boolean") args[key] = true;
       }
       const run = await stampedRun(name, args, true);
@@ -2979,7 +3001,7 @@ describe("queries help", () => {
     ["why no rules", "a tree of rules expands without reading data and can run for seconds before any cap stops it"],
     ["a step up without rules", "To step up from a block use get-some ([(get-some $ ?b :block/parent) [_ ?p]])"],
     ["ancestors without rules", "for every ancestor use run_named_query's meetings-without-decision, or step up one level at a time"],
-    ["named queries as code", "run_named_query runs one of four fixed queries as server code, not Datalog"],
+    ["named queries as code", "run_named_query runs one of five fixed queries as server code, not Datalog"],
     ["plan", "Each answer carries plan (the steps and their bounds)"],
     ["work", "and work (what it counted)"],
     ["a named query's 422 names its bound", "A query that passes one of its bounds answers 422 naming the bound and what to narrow, such as a smaller days or a narrower tag"],
@@ -2989,8 +3011,9 @@ describe("queries help", () => {
     ["run_named_query, preferred", "Prefer run_named_query when one fits"],
     ["projects-untouched", "when one fits: projects-untouched,"],
     ["meetings-without-decision", "projects-untouched, meetings-without-decision,"],
-    ["open-tasks-by-client", "meetings-without-decision, open-tasks-by-client and"],
-    ["pages-missing-property", "open-tasks-by-client and pages-missing-property, each"],
+    ["open-tasks-by-client", "meetings-without-decision, open-tasks-by-client,"],
+    ["pages-missing-property", "open-tasks-by-client, pages-missing-property and work-items, each"],
+    ["work-items", "params.number to find one item by its number"],
     ["defaults can be overridden", "each with defaults you can override in params"],
     ["a missing default is a 400", "a default the graph doesn't have (no Business Meeting tag, say) answers 400 naming the param"],
     ["limit", "cut to limit rows (default 50, maximum 200)"],
@@ -3199,7 +3222,7 @@ describe("get_graph_health and missing tag properties", () => {
     ]) {
       expect(tool.description, phrase).toContain(phrase);
     }
-    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties. Defaults to orphan-tags");
+    expect(JSON.stringify(tool.inputSchema)).toContain("broken-refs, missing-tag-properties, duplicate-values, title-key-mismatch. Defaults to orphan-tags");
     const param = tool.inputSchema.properties["tag-properties"];
     expect(param?.type).toBe("string");
     expect(param.description).toContain("JSON array of 1 to 50 pairs");
@@ -3208,11 +3231,21 @@ describe("get_graph_health and missing tag properties", () => {
 // Review s-stage-6-2: five checks each cost over 1 s of Durable Object CPU at 20,000 pages, so the
 // default call leaves them out and a call runs them only when it names them.
 describe("get_graph_health's default check set", () => {
-  it("connector_help names the default four and says the other five run only when named, one per call on a large graph", async () => {
+  it("connector_help names the default four and says the other seven run only when named, one per call on a large graph", async () => {
     const help = (await callTool("connector_help", {})).text;
     expect(help).toContain(
-      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks, and on a large graph name one of them per call.",
+      "A get_graph_health call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; duplicate-titles, pages-without-summary, pages-without-tags, broken-refs, missing-tag-properties, duplicate-values and title-key-mismatch run only when named in checks, and on a large graph name one of them per call.",
     );
+  });
+
+  // LC-139: an issue tracker's item numbers stay unique and in step with the titles that show them.
+  it("connector_help says how duplicate-values and title-key-mismatch keep item numbers right", async () => {
+    const help = (await callTool("connector_help", {})).text;
+    expect(help).toContain("duplicate-values with property itemNumber lists each number held by more than one item");
+    expect(help).toContain("title-key-mismatch with property itemNumber and key-prefix LC- lists the items whose title doesn't start with their key");
+    const props = (await listTools()).find((t) => t.name === "get_graph_health").inputSchema.properties;
+    expect(props.property.description).toContain("Needed by them and refused without them.");
+    expect(props["key-prefix"].description).toContain("LC-10 isn't LC-1");
   });
 
   it("connector_help says the page-check parameters are refused without their checks", async () => {
@@ -3234,7 +3267,7 @@ describe("get_graph_health's default check set", () => {
   it("the vendored description and checks parameter name the default four and say the others run only when named", async () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_health");
     expect(tool.description).toContain(
-      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs and missing-tag-properties run only when named in checks",
+      "A call without checks runs orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices. duplicate-titles, pages-without-summary, pages-without-tags, broken-refs, missing-tag-properties, duplicate-values and title-key-mismatch run only when named in checks",
     );
     expect(tool.inputSchema.properties.checks.description).toContain(
       "Defaults to orphan-tags, orphan-properties, mismatched-choice-values and orphan-choices; the others run only when named",
@@ -3248,7 +3281,7 @@ describe("list_changes_since", () => {
     const tool = (await listTools()).find((t) => t.name === "list_changes_since");
     expect(tool, "list_changes_since is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(61);
+    expect(committedManifest).toHaveLength(62);
   });
 
   it("starts with its routing line and carries the window forms, the cursor rule and the blind spots", async () => {
@@ -3291,7 +3324,7 @@ describe("get_graph_schema", () => {
     const tool = (await listTools()).find((t) => t.name === "get_graph_schema");
     expect(tool, "get_graph_schema is listed").toBeDefined();
     expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
-    expect(committedManifest).toHaveLength(61);
+    expect(committedManifest).toHaveLength(62);
     expect(committedManifest.map((t) => t.name)).toContain("get_graph_schema");
   });
 

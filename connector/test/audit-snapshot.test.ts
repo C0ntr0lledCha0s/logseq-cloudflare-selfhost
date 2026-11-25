@@ -168,6 +168,13 @@ const ALL_WRITES = committedManifest.filter((e) => !e.annotations.readOnlyHint).
 /** Spec §3.4's table: each tool with a pre-read, one call, and the GET it must make first. */
 const PRE_READS: Record<string, { args: Record<string, unknown>; path: string; ids?: string; view?: string; source: string }> = {
   update_block: { args: { "block-id": B1, body: { title: "New title" } }, path: "/blocks", ids: B1, view: "summary", source: "getBlocks" },
+  batch_update_blocks: {
+    args: { body: { entries: [{ "block-id": B1, title: "One" }, { "block-id": B2, title: "Two" }] } },
+    path: "/blocks",
+    ids: `${B1},${B2}`,
+    view: "summary",
+    source: "getBlocks",
+  },
   set_block_property: { args: { "block-id": B1, "property-id": "Venue", body: { value: "Library" } }, path: "/blocks", ids: B1, view: "summary", source: "getBlocks" },
   delete_block_property: { args: { "block-id": B1, "property-id": "Venue" }, path: "/blocks", ids: B1, view: "summary", source: "getBlocks" },
   batch_set_block_property: {

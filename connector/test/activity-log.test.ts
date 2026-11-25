@@ -310,6 +310,19 @@ function escape(text: string): string {
 }
 
 describe("filters", () => {
+  // LC-140: rows written before the fix hold one target per batch entry, so a batch that set three
+  // properties on a block named it three times. A listing names each block once.
+  it("an entry that holds a block several times lists it once, and the summary line counts it once", async () => {
+    const at = Date.now() - 1000;
+    const b2 = "bbbbbbbb-0000-4000-8000-000000000002";
+    const a1 = target("Notes", NOTES, [], "Book flights");
+    const a2 = target("Notes", NOTES, [], "Agenda", b2);
+    await row({ at, tool: "batch_set_block_property", targets: [a1, a1, a1, a2, a2, a2] });
+    const { json, lines } = await activity({});
+    expect(json.entries[0].targets.map((t: { uuid: string }) => t.uuid)).toEqual([B1, b2]);
+    expect(lines[0]).toContain('"Book flights" (+1 more)');
+  });
+
   it("page by UUID or by title in any case, never a prefix, a substring or a LIKE pattern", async () => {
     const now = Date.now() - 1000;
     const notes = await row({ at: now - 5, pages: `notes\n${NOTES}`, targets: [target("Notes", NOTES, [], "a")] });

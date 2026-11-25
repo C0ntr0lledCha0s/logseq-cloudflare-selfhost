@@ -154,6 +154,7 @@ export const DELETE_RULES = Object.freeze({
   },
 
   update_block: { never: "overwrites the block's text; the before-snapshot keeps the old text" },
+  batch_update_blocks: { never: "overwrites each block's text; the before-snapshot keeps the old texts" },
   update_page: { never: "overwrites the page's title; the before-snapshot keeps the old one" },
   refresh_refs: { never: "rewrites each changed block's text; the before-snapshot keeps it" },
   promote_page_to_tag: { never: "converts the page in place, keeping its UUID, blocks, values and references" },
@@ -204,6 +205,7 @@ export const DRY_RUN_TOOLS = Object.freeze({
   promote_page_to_tag: "query",
   delete_blocks: "body",
   batch_move_blocks: "body",
+  batch_update_blocks: "body",
   batch_insert_block_trees: "body",
   insert_block_children: "body",
   insert_block_tree: "body",

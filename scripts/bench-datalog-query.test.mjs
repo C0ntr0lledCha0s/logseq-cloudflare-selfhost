@@ -204,7 +204,7 @@ test("--named --json gives one record per named query and size, with work for ea
   const out = JSON.parse(run.stdout);
   assert.equal(out.mode, "named");
   assert.equal(out.runs, 2);
-  assert.deepEqual(Object.keys(out.bounds).sort(), ["ancestor-steps", "decisions", "meetings", "open-tasks", "page-blocks", "reads", "tagged", "tasks"]);
+  assert.deepEqual(Object.keys(out.bounds).sort(), ["ancestor-steps", "decisions", "items", "meetings", "open-tasks", "page-blocks", "reads", "tagged", "tasks"]);
   assert.equal(out.records.length, (NAMED.length + CLIENT_RUNS.length) * 2);
   for (const pages of [150, 300]) {
     const at = out.records.filter((r) => r.pages === pages);
@@ -299,7 +299,7 @@ test("--bounds stops a named query at the bound it names, and --bounds refuses a
   }
   const bad = spawnSync(process.execPath, [script, "--named", "--bounds", "nope=1"], { encoding: "utf8" });
   assert.equal(bad.status, 2);
-  assert.match(bad.stderr, /--bounds: unknown bound nope \(bounds: meetings, decisions, ancestor-steps, tagged, page-blocks, tasks, open-tasks, reads\)/);
+  assert.match(bad.stderr, /--bounds: unknown bound nope \(bounds: meetings, decisions, ancestor-steps, tagged, page-blocks, tasks, open-tasks, items, reads\)/);
   const notWhole = spawnSync(process.execPath, [script, "--named", "--bounds", "reads=x"], { encoding: "utf8" });
   assert.equal(notWhole.status, 2);
   assert.match(notWhole.stderr, /--bounds: reads needs a whole number/);

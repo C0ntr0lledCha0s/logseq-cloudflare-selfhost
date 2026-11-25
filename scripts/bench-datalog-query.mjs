@@ -470,7 +470,7 @@ export const NAMED = {
   "pages-missing-property": ["tagged", "reads"],
 };
 /** Every named bound, as default-bounds names them. */
-export const NAMED_BOUNDS = ["meetings", "decisions", "ancestor-steps", "tagged", "page-blocks", "tasks", "open-tasks", "reads"];
+export const NAMED_BOUNDS = ["meetings", "decisions", "ancestor-steps", "tagged", "page-blocks", "tasks", "open-tasks", "items", "reads"];
 const DAY_MS = 86_400_000;
 
 /**

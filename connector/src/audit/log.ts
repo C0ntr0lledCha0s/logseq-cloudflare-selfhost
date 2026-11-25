@@ -726,7 +726,7 @@ export function audited(
       throw await fail(error);
     }
 
-    const { targets, summary } = describeWrite(tool, result, reason);
+    const { targets, summary } = describeWrite(tool, result, reason, rest);
     // A response that names nothing (update_page, promote_page_to_tag) is logged with the page its snapshot read.
     const logged = targets.length === 0 && snapshot.subject ? [snapshot.subject] : targets;
     const lines: string[] = [];

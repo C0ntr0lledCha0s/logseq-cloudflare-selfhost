@@ -1,0 +1,387 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+index be17b7a..128d5f2 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -445,29 +445,116 @@
+        (remove entity-util/hidden?)
+        (sort-by :block/order)))
+ 
+-(defn- page-outline [db page max-blocks]
+-  (let [lines (transient [])
+-        n (volatile! 0)
+-        truncated? (volatile! false)]
+-    (letfn [(walk [entity depth]
+-              (doseq [block (outline-children db entity)]
+-                (if (>= @n max-blocks)
+-                  (vreset! truncated? true)
+-                  (let [indent (apply str (repeat depth "  "))
+-                        status (some-> (:logseq.property/status block) :block/title)
+-                        title (or (db-content/recur-replace-uuid-in-block-title block) "")
+-                        typed (outline-typed-text block title (str indent "  "))
+-                        ;; A typed block has no heading (patch 0037).
+-                        heading (when-not typed (outline-heading-level block))]
+-                    (vswap! n inc)
+-                    (conj! lines (str indent "- " (when status (str "[" status "] "))
+-                                      (when heading (str (apply str (repeat heading "#")) " ")) (or typed title)))
+-                    (doseq [line (outline-property-lines db block indent)] (conj! lines line))
+-                    (walk block (inc depth))))))]
+-      (walk page 0))
+-    {:markdown (string/join "\n" (persistent! lines))
+-     :block-count @n
+-     :truncated @truncated?}))
++(defn- outline-descendant-count
++  "How many visible blocks sit under `entity`, at any depth."
++  [db entity]
++  (reduce + 0 (map #(inc (outline-descendant-count db %)) (outline-children db entity))))
++
++(defn- outline-cursor-key [block]
++  [(str (:block/order block)) (str (:block/uuid block))])
++
++(defn- page-outline
++  "A page's (or one root block's) block tree as a markdown outline. With no options it is the whole
++  tree up to `max-blocks`. LC-135: `depth` expands that many levels (below the root, when there is
++  one) and ends each block it doesn't expand with its uuid and the count under it; `root` outlines
++  one block's subtree, its own line first; `limit` and `max-chars` end the outline after a whole
++  top-level block (or root child), and `cursor` resumes after the last one returned. A page of the
++  outline always holds at least one such block, so paging moves on however small max-chars is."
++  ([db page max-blocks] (page-outline db page max-blocks {}))
++  ([db page max-blocks {:keys [depth root limit cursor max-chars]}]
++   (let [n (volatile! 0)
++         omitted (volatile! 0)
++         truncated? (volatile! false)
++         render (fn render [lines block level budget & [line-only?]]
++                  ;; Appends `block` and what it expands to `lines`; returns the lines. Stops adding
++                  ;; blocks once `budget` (a volatile count of blocks left) is spent.
++                  (if (<= @budget 0)
++                    (do (vreset! truncated? true) lines)
++                    (let [indent (apply str (repeat level "  "))
++                          status (some-> (:logseq.property/status block) :block/title)
++                          title (or (db-content/recur-replace-uuid-in-block-title block) "")
++                          typed (outline-typed-text block title (str indent "  "))
++                          ;; A typed block has no heading (patch 0037).
++                          heading (when-not typed (outline-heading-level block))
++                          children (outline-children db block)
++                          fold? (and (not line-only?) depth (seq children) (>= (+ level (if root 0 1)) depth))
++                          hidden (when fold? (outline-descendant-count db block))
++                          line (str indent "- " (when status (str "[" status "] "))
++                                    (when heading (str (apply str (repeat heading "#")) " ")) (or typed title)
++                                    (when fold? (str " (+" hidden (if (= 1 hidden) " block" " blocks")
++                                                     ": ((" (:block/uuid block) ")))")))]
++                      (vswap! budget dec)
++                      (when fold? (vswap! omitted + hidden))
++                      (let [lines (into (conj lines line) (outline-property-lines db block indent))]
++                        (if (or fold? line-only?)
++                          lines
++                          (reduce (fn [lines child] (render lines child (inc level) budget)) lines children))))))
++         container (or root page)
++         base (if root 1 0)
++         units (cond->> (outline-children db container)
++                 cursor (drop-while #(not (pos? (compare (outline-cursor-key %) cursor)))))
++         budget (volatile! max-blocks)
++         head (if (and root (nil? cursor)) (render [] root 0 (volatile! 1) true) [])
++         _ (when (seq head) (vswap! budget dec))
++         result (loop [lines head units units emitted 0 last-unit nil]
++                  (if-let [unit (first units)]
++                    (let [before-n @budget
++                          before-omitted @omitted
++                          unit-lines (render [] unit base budget)
++                          size (count (string/join "\n" (into lines unit-lines)))
++                          over-chars? (and max-chars (pos? emitted) (> size max-chars))
++                          over-blocks? (and (pos? emitted) @truncated?)]
++                      (cond
++                        (or over-chars? over-blocks?)
++                        (do (vreset! budget before-n)
++                            (vreset! omitted before-omitted)
++                            (when over-chars? (vreset! truncated? false))
++                            {:lines lines :last last-unit :more? true})
++                        (and limit (= (inc emitted) limit))
++                        {:lines (into lines unit-lines) :last unit :more? (boolean (seq (rest units)))}
++                        @truncated?
++                        {:lines (into lines unit-lines) :last unit :more? (boolean (seq (rest units)))}
++                        :else
++                        (recur (into lines unit-lines) (rest units) (inc emitted) unit)))
++                    {:lines lines :last last-unit :more? false}))]
++     (vreset! n (- max-blocks @budget))
++     (cond-> {:markdown (string/join "\n" (:lines result))
++              :block-count @n
++              :truncated @truncated?}
++       depth (assoc :omitted-blocks @omitted)
++       (and (:more? result) (:last result)) (assoc :next-cursor (encode-cursor (outline-cursor-key (:last result))))))))
++
++(defn- outline-int-param
++  "The whole number query parameter `name` within [lo, hi], nil when absent, or ::invalid."
++  [url name lo hi]
++  (let [raw (.get (.-searchParams url) name)]
++    (cond
++      (nil? raw) nil
++      (not (re-matches #"\d+" raw)) ::invalid
++      :else (let [v (js/parseInt raw 10)] (if (<= lo v hi) v ::invalid)))))
++
++(defn- outline-options
++  "getPageOutline's paging options from the query (LC-135), or {:error message} naming the parameter."
++  [db page url]
++  (let [params (.-searchParams url)
++        depth (outline-int-param url "depth" 1 50)
++        limit (outline-int-param url "limit" 1 200)
++        max-chars (outline-int-param url "max-chars" 100 1000000)
++        raw-cursor (.get params "cursor")
++        cursor (decode-cursor raw-cursor)
++        raw-root (.get params "root")
++        root-uuid (when raw-root (parse-uuid raw-root))
++        root (when root-uuid (d/entity db [:block/uuid root-uuid]))]
++    (cond
++      (= ::invalid depth) {:error "depth: must be a whole number from 1 to 50"}
++      (= ::invalid limit) {:error "limit: must be a whole number from 1 to 200"}
++      (= ::invalid max-chars) {:error "max-chars: must be a whole number from 100 to 1000000"}
++      (and raw-cursor (nil? cursor)) {:error "cursor: not a cursor this outline gave; pass a next-cursor from the same page and root, or leave it out"}
++      (and raw-root (nil? root-uuid)) {:error (str "root: not a block UUID: " raw-root)}
++      (and raw-root (or (nil? root) (entity-util/hidden? root) (page? root)
++                        (not= (:db/id page) (:db/id (:block/page root)))))
++      {:error (str "root: no visible block " raw-root " on this page")}
++      :else {:depth depth :limit limit :max-chars max-chars :cursor cursor :root root})))
+ 
+ (defn- non-blank-string? [v]
+   (and (string? v) (seq v)))
+@@ -3103,8 +3190,11 @@
+           (cond
+             (not (page? page)) (http/bad-request "block is not a page")
+             e2ee? (http/error-response "page outlines are unavailable for E2EE graphs" 409)
+-            :else (http/json-response nil (merge (block-detail-response db page)
+-                                                 (page-outline db page max-outline-blocks))))
++            :else (let [{:keys [error] :as options} (outline-options db page url)]
++                    (if error
++                      (http/bad-request error)
++                      (http/json-response nil (merge (block-detail-response db page)
++                                                     (page-outline db page max-outline-blocks options))))))
+           (http/not-found))))
+ 
+     :semantic/pages-references
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+index b2a3995..0022f9e 100644
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -198,7 +198,7 @@
+    "listPages" ["List pages" "Returns a cursor-paginated list of page blocks in the graph."]
+    "createPage" ["Create a page" "Creates a page block with the supplied title. Refuses with 409 and writes nothing when a page, journal, tag or property already uses the title, compared case-insensitively as Logseq compares page names; the error names each one's kind, title and UUID, so there is no need to search before creating. Refuses with 400 and writes nothing when the title holds \"/\" or \"#\", which Logseq doesn't allow in a page title; the error names the character and the title. A \"/\" is allowed where Logseq allows it: in a journal title that the graph's journal title format reads as a date (17/11/2026 under dd/MM/yyyy, any case), which creates that journal, and in the title of a page in the Recycle bin, which is restored instead. Not checked on E2EE graphs, whose names are ciphertext."]
+    "listPageBlocks" ["List a page's blocks" "Returns a cursor-paginated list of the page's top-level blocks, including each selected block's descendant tree. Titles are stored text: a heading's level is not in them (getBlock or getPageOutline shows it)."]
+-   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its whole block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. Large pages are truncated (see truncated and block-count). Unavailable for E2EE graphs."]
++   "getPageOutline" ["Read a page as an outline" "Returns a page with its tags and property values, plus its block tree as a markdown outline: page and block references appear as [[titles]] instead of UUIDs, task status as [Status], a heading as its markdown prefix (## Section), a code block as a ```lang fence, a math block as $$…$$ and a quote block as > lines (none with a heading prefix), and other block property values (user and library properties, and built-ins the editor shows such as Priority and Deadline) as indented key:: value lines. A large page can be read in parts: depth expands only that many levels and names each block it folds with its UUID and descendant count, root reads one block's subtree, and limit or max-chars end the outline after a whole top-level block with a next-cursor to pass as cursor. Past the 2,000-block budget the outline stops after the last whole top-level block and answers truncated with a next-cursor. Unavailable for E2EE graphs."]
+    "listPageReferences" ["List references to a page" "Returns a cursor-paginated flat list of blocks and pages that reference the addressed page. Results are not recursively expanded."]
+    "getPageBacklinks" ["Show how a page is used" "Returns everything that points at a page, tag or property, grouped by relation with a complete count for each: references (blocks and pages whose text links it), tagged (objects tagged with it), property-values (entities with a property whose value is it, or whose text value links it, each with that property) and other (references Logseq records for other reasons, such as using it as a property key). Each group lists at most limit items, most recently updated first; total counts distinct entities. Use listPageReferences or listTagObjects to page through a whole group. Unavailable for E2EE graphs."]
+    "getSyncStatus" ["Read a graph's sync status" "Returns where the graph's sync log stands, how big the graph is and how many clients are connected, in one read that writes nothing. t is the latest sync transaction; last-written-at (ISO) and last-op (the outliner operation, such as delete-blocks) are those of the transaction at t, both null when the log holds no row for t. checksum is the checksum as stored, never recomputed, null when none is stored. page-count is the pages and journals listPages lists, and block-count counts the blocks on those pages, property value blocks included, so it can be higher than listPageBlocks shows; neither counts hidden pages, the Recycle bin or Private content (anything tagged Private or a tag extending it, and everything on or under it). On an E2EE graph tag titles are encrypted, so Private can't be recognised and the counts may include it: counts-include-private is then true, as is e2ee. clients holds counts only, from the app's live connections (WebSockets; API calls are not connections): connected (connections that identified a user), users (distinct users), own (the caller's connections), others (connected minus own; own and others are null when the request names no caller) and editing (connections reporting a block being edited). It names no user, email, device or block, and presence carries no device or client kind."]
+@@ -717,6 +717,17 @@
+     (into [{:name "q" :in "query" :required true :schema {:type "string"}}
+            {:name "types" :in "query" :schema {:type "string"}
+             :description "Comma-separated result types to include: pages, blocks, tags, properties, assets. Defaults to all; any other value is rejected."}])
++    (= "getPageOutline" operation-id)
++    (into [{:name "depth" :in "query" :schema {:type "integer" :minimum 1 :maximum 50}
++            :description "Levels to expand: 1 gives one line per top-level block. A block not expanded ends with (+N blocks: ((uuid))), naming it and how many blocks sit under it; omitted-blocks counts them all. With root, levels below the root. Leave out for the whole tree."}
++           {:name "root" :in "query" :schema {:type "string"}
++            :description "A block UUID on this page: outline that block (its own line first) and its descendants instead of the whole page."}
++           {:name "limit" :in "query" :schema {:type "integer" :minimum 1 :maximum 200}
++            :description "Most top-level blocks (with root, root's children) per call, each with everything under it; next-cursor reads on."}
++           {:name "max-chars" :in "query" :schema {:type "integer" :minimum 100 :maximum 1000000}
++            :description "Most characters of markdown per call: the outline ends after the last whole top-level block (or root child) that fits, with a next-cursor. The first one is always returned, however long."}
++           {:name "cursor" :in "query" :schema {:type "string"}
++            :description "The previous call's next-cursor, with the same page and root: the outline resumes after the last block it returned."}])
+     (= "getBlocks" operation-id)
+     (into [{:name "ids" :in "query" :required true :schema {:type "string"}
+             :description "Comma-separated block or page UUIDs, at most 100."}
+@@ -1171,7 +1182,12 @@
+                                              {:type "object" :required ["markdown" "block-count" "truncated"]
+                                               :properties {:markdown {:type "string"}
+                                                            :block-count {:type "integer"}
+-                                                           :truncated {:type "boolean"}}}]}
++                                                           :truncated {:type "boolean"
++                                                                       :description "The 2,000-block budget ended this call's outline; next-cursor reads on."}
++                                                           :omitted-blocks {:type "integer"
++                                                                            :description "With depth: how many blocks the outline didn't expand."}
++                                                           :next-cursor {:type "string"
++                                                                         :description "Present when more top-level blocks follow: pass it as cursor."}}}]}
+                :PageRef {:type "object" :required ["uuid" "kind" "title"]
+                          :properties {:uuid {:type "string"}
+                                       :kind {:type "string"}
+diff --git a/deps/db-sync/test/logseq/db_sync/semantic_outline_paging_test.cljs b/deps/db-sync/test/logseq/db_sync/semantic_outline_paging_test.cljs
+new file mode 100644
+index 0000000..e8baad4
+--- /dev/null
++++ b/deps/db-sync/test/logseq/db_sync/semantic_outline_paging_test.cljs
+@@ -0,0 +1,178 @@
++(ns logseq.db-sync.semantic-outline-paging-test
++  "getPageOutline reads part of a page (LC-135): depth stops the outline after n levels and names
++  each block it doesn't expand with its uuid and how many blocks sit under it; root outlines one
++  block's subtree; limit and cursor page through the top-level blocks (or root's children), never
++  splitting a block; max-chars ends a page of the outline at a block boundary with a next-cursor
++  instead of a result too large to read. With none of them the outline is unchanged."
++  (:require [cljs.test :refer [async deftest is testing]]
++            [clojure.string :as string]
++            [datascript.core :as d]
++            [logseq.db-sync.test-sql :as test-sql]
++            [logseq.db-sync.worker.handler.sync :as sync-handler]
++            [logseq.db.sqlite.export :as sqlite-export]
++            [logseq.outliner.core :as outliner-core]
++            [logseq.outliner.page :as outliner-page]
++            [promesa.core :as p]))
++
++(defn- request!
++  "One semantic API request through the real handler; returns {:status :body}."
++  [self method path body]
++  (p/let [url (str "http://localhost" path (if (string/includes? path "?") "&" "?") "graph-id=graph-1")
++          response (sync-handler/handle-http
++                    self
++                    (js/Request. url (clj->js (cond-> {:method method
++                                                       :headers {"content-type" "application/json"}}
++                                                body (assoc :body (js/JSON.stringify (clj->js body)))))))
++          text (.text response)]
++    {:status (.-status response)
++     :body (when (seq text)
++             (try (js->clj (js/JSON.parse text) :keywordize-keys true)
++                  (catch :default _ text)))}))
++
++(defn- with-page
++  "A page holding the tree `blocks` ({:title :children}), inserted through insertBlockTree."
++  [done blocks run]
++  (-> (p/let [conn (sqlite-export/create-conn)
++              [_ page-id] (outliner-page/create! conn "Paging" {})
++              self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++              inserted (request! self "POST" "/semantic/block-trees" {:target-id (str page-id) :blocks blocks})
++              _ (is (= 201 (:status inserted)) (pr-str (:body inserted)))
++              uuid-of (fn [title] (str (:block/uuid (d/entity @conn (ffirst (d/q '[:find ?b :in $ ?t :where [?b :block/title ?t]]
++                                                                                   @conn title))))))]
++        (run {:conn conn :self self :page-id page-id :uuid-of uuid-of}))
++      (p/catch #(is false (str "unexpected error: " %)))
++      (p/finally done)))
++
++(def tree
++  [{:title "A" :children [{:title "a1"} {:title "a2" :children [{:title "a2x"}]}]}
++   {:title "B"}
++   {:title "C" :children [{:title "c1"}]}])
++
++(defn- outline! [self page-id query]
++  (request! self "GET" (str "/semantic/pages/" page-id "/outline" (when query (str "?" query))) nil))
++
++(deftest outline-without-paging-parameters-is-unchanged-test
++  (async done
++    (with-page done tree
++      (fn [{:keys [self page-id]}]
++        (p/let [{:keys [status body]} (outline! self page-id nil)]
++          (is (= 200 status))
++          (is (= "- A\n  - a1\n  - a2\n    - a2x\n- B\n- C\n  - c1" (:markdown body)))
++          (is (= 7 (:block-count body)))
++          (is (false? (:truncated body)))
++          (is (not (contains? body :next-cursor)))
++          (is (not (contains? body :omitted-blocks))))))))
++
++(deftest outline-depth-names-each-block-it-does-not-expand-test
++  (async done
++    (with-page done tree
++      (fn [{:keys [self page-id uuid-of]}]
++        (p/let [one (outline! self page-id "depth=1")
++                two (outline! self page-id "depth=2")]
++          (testing "depth=1: one line per top-level block, each folded block naming its uuid and count"
++            (is (= 200 (:status one)) (pr-str (:body one)))
++            (is (= (str "- A (+3 blocks: ((" (uuid-of "A") ")))\n- B\n- C (+1 block: ((" (uuid-of "C") ")))")
++                   (get-in one [:body :markdown])))
++            (is (= 3 (get-in one [:body :block-count])))
++            (is (= 4 (get-in one [:body :omitted-blocks])) "every block not shown is counted"))
++          (testing "depth=2 folds only what lies deeper"
++            (is (= (str "- A\n  - a1\n  - a2 (+1 block: ((" (uuid-of "a2") ")))\n- B\n- C\n  - c1")
++                   (get-in two [:body :markdown])))
++            (is (= 1 (get-in two [:body :omitted-blocks])))))))))
++
++(deftest outline-root-reads-one-subtree-test
++  (async done
++    (with-page done tree
++      (fn [{:keys [conn self page-id uuid-of]}]
++        (p/let [whole (outline! self page-id (str "root=" (uuid-of "A")))
++                shallow (outline! self page-id (str "root=" (uuid-of "A") "&depth=1"))
++                [_ other-page] (outliner-page/create! conn "Elsewhere" {})
++                _ (request! self "POST" "/semantic/block-trees" {:target-id (str other-page) :blocks [{:title "far"}]})
++                foreign (outline! self page-id (str "root=" (uuid-of "far")))
++                missing (outline! self page-id (str "root=" (random-uuid)))
++                malformed (outline! self page-id "root=not-a-uuid")]
++          (is (= "- A\n  - a1\n  - a2\n    - a2x" (get-in whole [:body :markdown])) "the root and everything under it")
++          (is (= 4 (get-in whole [:body :block-count])))
++          (is (= (str "- A\n  - a1\n  - a2 (+1 block: ((" (uuid-of "a2") ")))") (get-in shallow [:body :markdown]))
++              "depth counts levels below the root")
++          (doseq [[label response] [["a block on another page" foreign] ["an unknown uuid" missing] ["not a uuid" malformed]]]
++            (is (= 400 (:status response)) label)
++            (is (string/starts-with? (str (get-in response [:body :error])) "root:") (str label ": " (pr-str (:body response))))))))))
++
++(deftest outline-limit-and-cursor-page-through-top-level-blocks-test
++  (async done
++    (with-page done tree
++      (fn [{:keys [self page-id uuid-of]}]
++        (p/let [first-page (outline! self page-id "limit=2")
++                cursor (get-in first-page [:body :next-cursor])
++                second-page (outline! self page-id (str "limit=2&cursor=" (js/encodeURIComponent cursor)))
++                rooted (outline! self page-id (str "root=" (uuid-of "A") "&limit=1"))
++                rooted-next (outline! self page-id (str "root=" (uuid-of "A") "&limit=1&cursor="
++                                                       (js/encodeURIComponent (get-in rooted [:body :next-cursor]))))]
++          (is (= "- A\n  - a1\n  - a2\n    - a2x\n- B" (get-in first-page [:body :markdown])) "a block is never split")
++          (is (string? cursor))
++          (is (= "- C\n  - c1" (get-in second-page [:body :markdown])))
++          (is (not (contains? (:body second-page) :next-cursor)) "the last page has no next-cursor")
++          (testing "with root, the pages are root's children; the root's own line comes on the first page only"
++            (is (= "- A\n  - a1" (get-in rooted [:body :markdown])))
++            (is (= "  - a2\n    - a2x" (get-in rooted-next [:body :markdown])))))))))
++
++(deftest outline-max-chars-ends-at-a-block-boundary-test
++  (async done
++    (with-page done (mapv (fn [i] {:title (str "Block " i " " (apply str (repeat 120 "x")))
++                                   :children [{:title (str "child " i)}]})
++                          (range 10))
++      (fn [{:keys [self page-id]}]
++        (p/let [pages (p/loop [cursor nil acc []]
++                        (p/let [response (outline! self page-id (str "max-chars=200"
++                                                                    (when cursor (str "&cursor=" (js/encodeURIComponent cursor)))))
++                                acc (conj acc response)
++                                next (get-in response [:body :next-cursor])]
++                          (if (and next (< (count acc) 20)) (p/recur next acc) acc)))
++                markdowns (map #(get-in % [:body :markdown]) pages)
++                tiny (outline! self page-id "max-chars=100")]
++          (is (every? #(= 200 (:status %)) pages))
++          (is (every? #(<= (count %) 200) markdowns) "each page stays within max-chars")
++          (is (= (get-in (first pages) [:body :markdown])
++                 (string/join "\n" (take 2 (string/split-lines (get-in (first pages) [:body :markdown])))))
++              "a page ends after a whole top-level block and its children")
++          (is (= 20 (count (mapcat string/split-lines markdowns))) "every block once, across the pages")
++          (is (= (count (distinct (mapcat string/split-lines markdowns))) 20) "none twice")
++          (testing "a first block larger than max-chars is still returned, so paging always moves on"
++            (is (= 200 (:status tiny)))
++            (is (= 2 (count (string/split-lines (get-in tiny [:body :markdown])))))
++            (is (string? (get-in tiny [:body :next-cursor])))))))))
++
++(deftest outline-paging-parameters-are-checked-test
++  (async done
++    (with-page done tree
++      (fn [{:keys [self page-id]}]
++        (p/let [responses (p/all (map #(outline! self page-id %)
++                                      ["depth=0" "depth=x" "depth=51" "limit=0" "limit=201"
++                                       "max-chars=99" "max-chars=1000001" "cursor=garbage"]))]
++          (doseq [[query {:keys [status body]}] (map vector ["depth" "depth" "depth" "limit" "limit" "max-chars" "max-chars" "cursor"]
++                                                      responses)]
++            (is (= 400 status) (str query ": " (pr-str body)))
++            (is (string/starts-with? (str (:error body)) query) (str query ": " (pr-str body)))))))))
++
++(deftest outline-block-budget-gives-a-cursor-test
++  ;; A page past the 2,000-block budget used to answer truncated with no way on. Now the outline stops
++  ;; after the last whole top-level block within the budget and gives a next-cursor.
++  (async done
++    (-> (p/let [conn (sqlite-export/create-conn)
++                [_ page-id] (outliner-page/create! conn "Big" {})
++                page (d/entity @conn [:block/uuid page-id])
++                _ (outliner-core/insert-blocks! conn (mapv (fn [i] {:block/uuid (random-uuid) :block/title (str "b" i)}) (range 2050))
++                                                page {:sibling? false :keep-uuid? true :bottom? true})
++                self #js {:conn conn :sql (test-sql/make-sql) :schema-ready true}
++                first-page (outline! self page-id nil)
++                second-page (outline! self page-id (str "cursor=" (js/encodeURIComponent (get-in first-page [:body :next-cursor]))))
++                lines (concat (string/split-lines (get-in first-page [:body :markdown]))
++                              (string/split-lines (get-in second-page [:body :markdown])))]
++          (is (true? (get-in first-page [:body :truncated])))
++          (is (= 2000 (get-in first-page [:body :block-count])))
++          (is (string? (get-in first-page [:body :next-cursor])))
++          (is (= 50 (get-in second-page [:body :block-count])))
++          (is (= 2050 (count (distinct lines))) "every block once across the two calls"))
++        (p/catch #(is false (str "unexpected error: " %)))
++        (p/finally done))))
